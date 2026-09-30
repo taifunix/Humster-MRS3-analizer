@@ -30,6 +30,8 @@ and defines the narrow correctness changes identified by the audit.
 No live tester run, trading admission, mutation of user databases, HTML deletion,
 new schema version or change to the on-disk schema contract, or heuristic
 reduction of the candidate/structure universe.
+The separately authorized [Performance v2 optional commission contract](2026-09-30-performance-v2-optional-commission-evidence.md)
+owns its v7 schema change and does not alter this optimization scope.
 Source final compacted-payload proof and legacy empty-import deletion evidence
 remain deferred by the user. Historical standalone v3/v4 importers are unchanged
 unless separately specified and verified on their actual report path.

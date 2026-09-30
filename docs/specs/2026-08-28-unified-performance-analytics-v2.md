@@ -120,6 +120,9 @@ from typed plateau facts by the selected analysis configuration.
 
 `strategy_results` stores the report period, exchange/commission facts,
 initial balance, imported full-report metrics and the current result identity.
+For active `SINGLE_MODE` and collections, [optional commission evidence](2026-09-30-performance-v2-optional-commission-evidence.md)
+governs nullable `commission_rate` in schema v7; actual fees and PnL remain
+report facts.
 `strategy_actions` stores typed current report actions, including:
 
 ```text

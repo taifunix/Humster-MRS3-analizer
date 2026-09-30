@@ -276,6 +276,20 @@ def _decimal(value: object, field: str) -> Decimal:
     return result
 
 
+def _canonical_decimal(value: object, field: str) -> str:
+    if not isinstance(value, str):
+        raise PerformanceV2InputError(f"invalid {field}: must be canonical decimal text")
+    decimal = _decimal(value, field)
+    canonical = format(decimal, "f")
+    if "." in canonical:
+        canonical = canonical.rstrip("0").rstrip(".")
+    if canonical == "-0":
+        canonical = "0"
+    if value != canonical:
+        raise PerformanceV2InputError(f"invalid {field}: must be canonical decimal text")
+    return canonical
+
+
 def _positive_int(value: object, field: str) -> int:
     if type(value) is not int or value <= 0:
         raise PerformanceV2InputError(f"invalid {field}")
@@ -537,16 +551,38 @@ def _manifest_diagnostics(
     return result, diagnostics
 
 
-def _commission(manifest: Mapping[str, object]) -> tuple[dict[str, str], str, str]:
-    value = manifest.get("commission_contract")
-    if not isinstance(value, Mapping):
-        raise PerformanceV2InputError("shared commission contract is missing")
-    contract: dict[str, str] = {}
-    for field in _COMMISSION_FIELDS:
-        if field not in value:
-            raise PerformanceV2InputError(f"shared commission contract is missing {field}")
-        contract[field] = str(_decimal(value[field], field))
-    contract_id = _text(manifest.get("commission_contract_id"), "commission contract id")
+def _commission(
+    manifest: Mapping[str, object], *, optional: bool = False
+) -> tuple[dict[str, str], str, str]:
+    has_contract = "commission_contract" in manifest
+    has_contract_id = "commission_contract_id" in manifest
+    if not has_contract and not has_contract_id:
+        if not optional:
+            raise PerformanceV2InputError("shared commission contract is missing")
+        value: object = None
+    elif has_contract != has_contract_id:
+        raise PerformanceV2InputError("commission contract and ID must be present together")
+    else:
+        value = manifest.get("commission_contract")
+        if value is None:
+            raise PerformanceV2InputError("shared commission contract is malformed")
+    if value is None:
+        contract: dict[str, str] = {}
+        contract_id = ""
+    else:
+        if not isinstance(value, Mapping):
+            raise PerformanceV2InputError("shared commission contract is malformed")
+        contract = {}
+        if set(value) == {"TakerFee"}:
+            contract["TakerFee"] = _canonical_decimal(value["TakerFee"], "TakerFee")
+        elif set(value) == set(_COMMISSION_FIELDS):
+            for field in _COMMISSION_FIELDS:
+                contract[field] = _canonical_decimal(value[field], field)
+        else:
+            raise PerformanceV2InputError("shared commission contract has unsupported fields")
+        contract_id = _text(manifest.get("commission_contract_id"), "commission contract id")
+        if len(contract_id) != _HASH_SIZE or contract_id != sha256(_canonical_json(contract)).hexdigest():
+            raise PerformanceV2InputError("commission contract ID does not match contract")
     tester_hash = _text(manifest.get("tester_config_sha256"), "tester config hash")
     if len(tester_hash) != _HASH_SIZE:
         raise PerformanceV2InputError("tester config hash is malformed")
@@ -636,8 +672,12 @@ def read_performance_v2_inbox(
             contract, contract_id, tester_hash = {}, "", ""
             run_mode = "SINGLE_MODE_COLLECTION"
         else:
-            contract, contract_id, tester_hash = _commission(manifest)
             run_mode = manifest.get("run_mode", "FAST")
+            if run_mode not in {"FAST", "RUNS", "SINGLE_MODE"}:
+                raise PerformanceV2InputError("unsupported inbox run mode")
+            contract, contract_id, tester_hash = _commission(
+                manifest, optional=run_mode == "SINGLE_MODE"
+            )
         if run_mode not in {"FAST", "RUNS", "SINGLE_MODE", "SINGLE_MODE_COLLECTION"}:
             raise PerformanceV2InputError("unsupported inbox run mode")
         raw_test_start = manifest.get("test_start")
@@ -799,7 +839,7 @@ def read_performance_v2_inbox(
                 plateau_by_key[key] = fact
             exchange_name = _text(raw.get("exchange_name", strategy.get("exchange", {}).get("name") if isinstance(strategy.get("exchange"), Mapping) else None), "exchange name")
             entry_contract, entry_contract_id, entry_tester_hash = (
-                _commission(raw) if is_collection else (contract, contract_id, tester_hash)
+                _commission(raw, optional=True) if is_collection else (contract, contract_id, tester_hash)
             )
             entry_start, entry_end = (
                 (raw.get("test_start"), raw.get("test_end")) if is_collection else (test_start, test_end)

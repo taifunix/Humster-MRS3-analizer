@@ -1942,7 +1942,7 @@ def _result_values(entry: PreparedV2Entry, report: ParsedPerformanceV2Report, co
         effective_start,
         effective_end,
         exchange_name,
-        Decimal(contract["TakerFee"]),
+        Decimal(contract["TakerFee"]) if "TakerFee" in contract else None,
         _decimal_metric(report.metrics, "Initial balance", default=Decimal("0")),
         _decimal_metric(report.metrics, "Final balance", default=Decimal("0")),
         _decimal_metric(report.metrics, "Total PnL"),

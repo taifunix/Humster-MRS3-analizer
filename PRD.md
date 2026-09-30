@@ -252,6 +252,7 @@ M5 не зависит от UI. README не меняется до появлен
 | Статус | Документ | Назначение | Зависимости |
 | --- | --- | --- | --- |
 | Active | [Heavy database optimization](docs/specs/2026-09-28-heavy-database-optimization.md), [plan](docs/superpowers/plans/2026-09-28-heavy-database-optimization.md) | исправления подтвержденных DB-дефектов и оптимизация Source/materialization/analysis/PerformanceDB; safe_to_delete deferred | актуальные контракты каждого модуля; Performance import boundary на `8f59c2c` |
+| Implemented / independently reviewed | [Performance v2 optional commission evidence](docs/specs/2026-09-30-performance-v2-optional-commission-evidence.md), [ADR-0049](docs/decisions/0049-performance-v2-optional-commission-evidence.md), [verification](progress.md) | `SINGLE_MODE`/collections can import verified HTML without tester fee settings; unknown `commission_rate` is SQL `NULL` in schema v7 | legacy FAST/RUNS and v1 contracts, HTML fee/PnL facts, v5/v6 read compatibility |
 | Accepted | [Repository foundation](docs/specs/2026-08-10-mrs3-v07-repository-foundation.md) | структура репозитория и workflow | — |
 | Active prerequisite | [Safe runner smoke-test](docs/specs/2026-08-10-v06-runner-safe-root-json-smoke.md) | безопасная проверка панели и одного реального прогона | локальный tester; до v0.7 implementation |
 | Active | [v0.7 legacy selection](docs/specs/2026-08-10-v07-legacy-selection.md) | последовательность import → materializer → unified input → selector | v4 evidence, event-filter spec |

@@ -217,14 +217,15 @@ def build_single_mode_collection_inbox(
                     "test_start": prepared_entry.test_start,
                     "test_end": prepared_entry.test_end,
                     "tester_config_sha256": prepared_entry.tester_config_sha256,
-                    "commission_contract": dict(prepared_entry.commission_contract),
-                    "commission_contract_id": prepared_entry.commission_contract_id,
                     "analysis_run_id": prepared_entry.analysis_run_id,
                     "candidate_identity": prepared_entry.candidate_identity,
                     "order_plateau_diagnostics": _entry_diagnostics(prepared_entry, manifest),
                     "member_inbox_path": str(member),
                     "member_manifest_sha256": prepared.manifest_sha256,
                 })
+                if prepared_entry.commission_contract:
+                    entry["commission_contract"] = dict(prepared_entry.commission_contract)
+                    entry["commission_contract_id"] = prepared_entry.commission_contract_id
                 entries.append(entry)
             members.append({
                 "inbox_path": str(member),

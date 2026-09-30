@@ -14,7 +14,8 @@ import duckdb
 from .config import PanelPathSettings, load_duckdb_import_settings, load_panel_path_settings
 
 
-_SCHEMA_VERSION = "6"
+_SCHEMA_VERSION = "7"
+_V6_SCHEMA_VERSION = "6"
 _V5_SCHEMA_VERSION = "5"
 _DATABASE_NAME = "strategy_performance.duckdb"
 _MAX_WORKERS = 64
@@ -228,7 +229,7 @@ CREATE TABLE IF NOT EXISTS strategy_results (
     report_start_utc TIMESTAMPTZ NOT NULL,
     report_end_utc TIMESTAMPTZ NOT NULL,
     exchange VARCHAR NOT NULL,
-    commission_rate DECIMAL(38,12) NOT NULL,
+    commission_rate DECIMAL(38,12),
     initial_balance DECIMAL(38,12) NOT NULL,
     final_balance DECIMAL(38,12) NOT NULL,
     total_pnl DECIMAL(38,12),
@@ -355,6 +356,10 @@ CREATE TABLE IF NOT EXISTS optimizer_prepared_inputs (
     )
 );
 """
+
+_RESULT_CHILD_TABLES = (
+    "strategy_actions", "strategy_equity", "window_metrics", "optimizer_prepared_inputs",
+)
 
 _SELECTION_SCHEMA = """
 CREATE TABLE IF NOT EXISTS selection_runs (
@@ -645,7 +650,9 @@ def _require_v5_catalog(connection: duckdb.DuckDBPyConnection) -> None:
         raise PerformanceV2StoreError("Performance database has an unexpected catalog")
 
 
-def _require_v6_catalog(connection: duckdb.DuckDBPyConnection) -> None:
+def _require_equity_catalog(
+    connection: duckdb.DuckDBPyConnection, *, schema_version: str, commission_nullable: str,
+) -> None:
     _require_v4_markers(connection)
     tables, sequences, indexes = _catalog_objects(connection)
     equity_columns = tuple(
@@ -669,8 +676,14 @@ def _require_v6_catalog(connection: duckdb.DuckDBPyConnection) -> None:
         )
     } | {("PRIMARY KEY", ("result_id", "algo_version"))}
     actual_constraints = {(kind, tuple(columns)) for kind, columns in constraints}
+    commission_column = connection.execute(
+        """select data_type, is_nullable
+             from information_schema.columns
+            where table_schema = 'main' and table_name = 'strategy_results'
+              and column_name = 'commission_rate'"""
+    ).fetchone()
     if (
-        _schema_version(connection) != _SCHEMA_VERSION
+        _schema_version(connection) != schema_version
         or tables != _EXPECTED_TABLES
         or sequences != _EXPECTED_SEQUENCES
         or indexes != _EXPECTED_INDEXES
@@ -678,6 +691,7 @@ def _require_v6_catalog(connection: duckdb.DuckDBPyConnection) -> None:
         or _table_columns(connection, "strategy_results") != _V5_RESULT_COLUMNS
         or _table_columns(connection, "optimizer_prepared_inputs") != _PREPARED_COLUMNS
         or equity_columns != _EQUITY_QUALITY_COLUMNS
+        or commission_column != ("DECIMAL(38,12)", commission_nullable)
         or actual_constraints != expected_constraints
         or primary_keys != [("result_id", "algo_version")]
         or has_foreign_key
@@ -685,22 +699,33 @@ def _require_v6_catalog(connection: duckdb.DuckDBPyConnection) -> None:
         raise PerformanceV2StoreError("Performance database has an unexpected catalog")
 
 
+def _require_v6_catalog(connection: duckdb.DuckDBPyConnection) -> None:
+    _require_equity_catalog(connection, schema_version=_V6_SCHEMA_VERSION, commission_nullable="NO")
+
+
+def _require_v7_catalog(connection: duckdb.DuckDBPyConnection) -> None:
+    _require_equity_catalog(connection, schema_version=_SCHEMA_VERSION, commission_nullable="YES")
+
+
 def require_performance_v2(connection: duckdb.DuckDBPyConnection) -> None:
     """Fail closed unless the connection already contains the v2 schema."""
     if _schema_version(connection) != _SCHEMA_VERSION:
-        raise PerformanceV2StoreError("Performance database does not have schema version 6")
-    _require_v6_catalog(connection)
+        raise PerformanceV2StoreError("Performance database does not have schema version 7")
+    _require_v7_catalog(connection)
 
 
 def require_performance_v2_readable(connection: duckdb.DuckDBPyConnection) -> int:
-    """Accept exact read-only v5/v6 catalogs without migrating or repairing."""
+    """Accept exact read-only v5/v6/v7 catalogs without migrating or repairing."""
     version = _schema_version(connection)
     if version == _V5_SCHEMA_VERSION:
         _require_v5_catalog(connection)
         return 5
-    if version == _SCHEMA_VERSION:
+    if version == _V6_SCHEMA_VERSION:
         _require_v6_catalog(connection)
         return 6
+    if version == _SCHEMA_VERSION:
+        _require_v7_catalog(connection)
+        return 7
     raise PerformanceV2StoreError("Performance database schema version requires upgrade")
 
 
@@ -952,6 +977,95 @@ def _migrate_schema_v5_to_v6(connection: duckdb.DuckDBPyConnection) -> None:
     _require_v6_catalog(connection)
 
 
+def _migrate_schema_v6_to_v7(connection: duckdb.DuckDBPyConnection) -> None:
+    _require_v6_catalog(connection)
+    try:
+        connection.execute("begin transaction")
+        _alter_v6_commission_with_children(connection)
+        connection.execute("update schema_info set value = '7' where key = 'schema_version'")
+        _require_v7_catalog(connection)
+        connection.execute("commit")
+    except Exception as error:
+        _rollback_quietly(connection)
+        raise PerformanceV2StoreError(
+            f"Performance database schema migration failed (v6->v7 commission_rate): {error}"
+        ) from error
+    _require_v7_catalog(connection)
+
+
+def _alter_v6_commission_with_children(connection: duckdb.DuckDBPyConnection) -> None:
+    snapshots = {
+        table_name: f"__performance_v2_v7_{table_name}"
+        for table_name in _RESULT_CHILD_TABLES
+    }
+    table_sql = {
+        table_name: connection.execute(
+            """select sql from duckdb_tables()
+                where schema_name = 'main' and table_name = ?""",
+            [table_name],
+        ).fetchone()[0]
+        for table_name in (*_RESULT_CHILD_TABLES, "strategy_results")
+    }
+    if any(not sql for sql in table_sql.values()):
+        raise RuntimeError("v6 catalog is missing DuckDB table recreation SQL")
+    index_sql = dict(
+        connection.execute(
+            """select index_name, sql from duckdb_indexes()
+                where schema_name = 'main'
+                  and table_name in ('strategy_results', 'strategy_actions', 'strategy_equity')
+                  and sql is not null"""
+        ).fetchall()
+    )
+    columns = {
+        table_name: tuple(
+            row[0]
+            for row in connection.execute(
+                """select column_name from information_schema.columns
+                    where table_schema = 'main' and table_name = ?
+                    order by ordinal_position""",
+                [table_name],
+            ).fetchall()
+        )
+        for table_name in _RESULT_CHILD_TABLES
+    }
+    for table_name, snapshot in snapshots.items():
+        connection.execute(f"create temp table {snapshot} as select * from {table_name}")
+        connection.execute(f"drop table {table_name}")
+    parent_table = "__performance_v2_v7_strategy_results"
+    parent_sql = table_sql["strategy_results"].replace(
+        "CREATE TABLE strategy_results(", f"CREATE TABLE {parent_table}(", 1
+    )
+    if parent_sql == table_sql["strategy_results"]:
+        raise RuntimeError("v6 catalog has unexpected strategy_results recreation SQL")
+    connection.execute(parent_sql)
+    result_columns = tuple(
+        row[0]
+        for row in connection.execute(
+            """select column_name from information_schema.columns
+                where table_schema = 'main' and table_name = 'strategy_results'
+                order by ordinal_position"""
+        ).fetchall()
+    )
+    result_column_list = ", ".join(result_columns)
+    connection.execute(
+        f"insert into {parent_table} ({result_column_list}) "
+        f"select {result_column_list} from strategy_results"
+    )
+    connection.execute("drop index strategy_results_strategy_id_idx")
+    connection.execute("drop table strategy_results")
+    connection.execute(f"alter table {parent_table} rename to strategy_results")
+    connection.execute("alter table strategy_results alter column commission_rate drop not null")
+    for table_name, snapshot in snapshots.items():
+        connection.execute(table_sql[table_name])
+        column_list = ", ".join(columns[table_name])
+        connection.execute(
+            f"insert into {table_name} ({column_list}) select {column_list} from {snapshot}"
+        )
+        connection.execute(f"drop table {snapshot}")
+    for sql in index_sql.values():
+        connection.execute(sql)
+
+
 def decode_optimizer_source_metadata(
     payload: object,
     imported_at_utc: object,
@@ -1001,9 +1115,11 @@ def initialize_performance_v2(
     *,
     create_if_missing: bool = True,
 ) -> None:
-    """Initialize or migrate the isolated Performance v2 schema to v6."""
+    """Initialize or migrate the isolated Performance v2 schema to v7."""
     version = _schema_version(connection)
-    if version is not None and version not in {"2", "3", "4", _V5_SCHEMA_VERSION, _SCHEMA_VERSION}:
+    if version is not None and version not in {
+        "2", "3", "4", _V5_SCHEMA_VERSION, _V6_SCHEMA_VERSION, _SCHEMA_VERSION,
+    }:
         raise PerformanceV2StoreError("Performance database has an unsupported schema version")
     if version == "2":
         _require_schema_v2_for_migration(connection)
@@ -1022,10 +1138,15 @@ def initialize_performance_v2(
         _migrate_schema_v3_to_v4(connection)
         _migrate_schema_v4_to_v5(connection)
         _migrate_schema_v5_to_v6(connection)
+        _migrate_schema_v6_to_v7(connection)
+        require_performance_v2(connection)
+        return
+    if version == _V6_SCHEMA_VERSION:
+        _migrate_schema_v6_to_v7(connection)
         require_performance_v2(connection)
         return
     if version == _SCHEMA_VERSION:
-        _require_v6_catalog(connection)
+        _require_v7_catalog(connection)
         try:
             connection.execute("begin transaction")
             _add_window_columns(connection)
@@ -1040,15 +1161,18 @@ def initialize_performance_v2(
         _migrate_schema_v3_to_v4(connection)
         _migrate_schema_v4_to_v5(connection)
         _migrate_schema_v5_to_v6(connection)
+        _migrate_schema_v6_to_v7(connection)
         require_performance_v2(connection)
         return
     if version == "4":
         _migrate_schema_v4_to_v5(connection)
         _migrate_schema_v5_to_v6(connection)
+        _migrate_schema_v6_to_v7(connection)
         require_performance_v2(connection)
         return
     if version == _V5_SCHEMA_VERSION:
         _migrate_schema_v5_to_v6(connection)
+        _migrate_schema_v6_to_v7(connection)
         require_performance_v2(connection)
         return
     if not create_if_missing:

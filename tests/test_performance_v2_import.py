@@ -109,19 +109,20 @@ def _inbox(tmp_path: Path, names: tuple[str, ...] = ("alpha",), *, orders: int =
                 "source_report_sha256": sha256(report).hexdigest(),
             }
         )
+    commission_contract = {
+        "MakerFee": "0.0002",
+        "TakerFee": "0.0004",
+        "SlippagePercent": "0.01",
+        "FundingRate": "0.0001",
+        "FundingIntervalHours": "8",
+    }
     manifest = {
         "schema_version": 1,
         "batch_id": "v2-test",
         "expected_strategy_names": list(names),
         "tester_config_sha256": "t" * 64,
-        "commission_contract": {
-            "MakerFee": "0.0002",
-            "TakerFee": "0.0004",
-            "SlippagePercent": "0.01",
-            "FundingRate": "0.0001",
-            "FundingIntervalHours": "8",
-        },
-        "commission_contract_id": "c" * 64,
+        "commission_contract": commission_contract,
+        "commission_contract_id": sha256(json.dumps(commission_contract, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
         "run_mode": "FAST",
         "entries": entries,
         "v6_provenance": {
@@ -183,6 +184,92 @@ def _rewrite_report(request: PerformanceV2ImportRequest, replacement: bytes) -> 
     manifest = json.loads(manifest_path.read_text())
     manifest["entries"][0]["source_report_sha256"] = sha256(replacement).hexdigest()
     manifest_path.write_text(json.dumps(manifest))
+
+
+def _single_mode_manifest(request: PerformanceV2ImportRequest, *, omit_commission: bool) -> None:
+    manifest_path = request.inbox / "inbox_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["run_mode"] = "SINGLE_MODE"
+    manifest["test_start"] = "2026-01-01"
+    manifest["test_end"] = "2026-01-09"
+    if omit_commission:
+        manifest.pop("commission_contract")
+        manifest.pop("commission_contract_id")
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+
+def test_single_mode_add_and_replace_store_unknown_commission_as_sql_null(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path)
+    _single_mode_manifest(request, omit_commission=True)
+
+    added = import_performance_v2(request)
+    assert added.imported_count == 1
+    target = performance_v2_database_path(request.config)
+    with duckdb.connect(str(target), read_only=True) as connection:
+        strategy_id, result_id, rate, fees, pnl = connection.execute(
+            """select s.strategy_id, r.result_id, r.commission_rate, r.total_fees, r.total_pnl
+               from strategies s join strategy_results r on r.strategy_id = s.strategy_id"""
+        ).fetchone()
+        assert rate is None
+        assert fees == Decimal("0.1")
+        assert pnl == Decimal("9.9")
+        before_actions = connection.execute(
+            "select action_index, fee from strategy_actions where result_id = ? order by action_index", [result_id]
+        ).fetchall()
+    changed = FIXTURE.read_bytes().replace(b"1009.9", b"1019.9")
+    _rewrite_report(request, changed)
+    replaced = import_performance_v2(
+        PerformanceV2ImportRequest(
+            request.inbox, request.report_root, request.config,
+            mode="REPLACE", replacement_strategy_ids={"alpha": strategy_id},
+            listing_dates_path=request.listing_dates_path,
+        )
+    )
+    assert replaced.imported_count == 1
+    with duckdb.connect(str(target), read_only=True) as connection:
+        assert connection.execute(
+            "select commission_rate from strategy_results where result_id = ?", [result_id]
+        ).fetchone() == (None,)
+        assert connection.execute(
+            "select action_index, fee from strategy_actions where result_id = ? order by action_index", [result_id]
+        ).fetchall() == before_actions
+
+
+@pytest.mark.parametrize("mode", ["ADD", "REPLACE"])
+def test_optional_commission_preserves_persisted_financial_facts(tmp_path: Path, mode: str) -> None:
+    snapshots = []
+    for label, omit_commission in (("known", False), ("unknown", True)):
+        request, _ = _request(tmp_path / label)
+        _single_mode_manifest(request, omit_commission=False)
+        if mode == "REPLACE":
+            assert import_performance_v2(request).imported_count == 1
+            with duckdb.connect(str(performance_v2_database_path(request.config)), read_only=True) as connection:
+                strategy_id = connection.execute("select strategy_id from strategies where strategy_name = 'alpha'").fetchone()[0]
+            _rewrite_report(request, FIXTURE.read_bytes().replace(b"1009.9", b"1019.9"))
+        if omit_commission:
+            _single_mode_manifest(request, omit_commission=True)
+        if mode == "REPLACE":
+            request = replace(request, mode="REPLACE", replacement_strategy_ids={"alpha": strategy_id})
+        assert import_performance_v2(request).imported_count == 1
+        with duckdb.connect(str(performance_v2_database_path(request.config)), read_only=True) as connection:
+            rate, *financial = connection.execute(
+                """select commission_rate, initial_balance, final_balance, total_pnl,
+                          total_pnl_pct, max_drawdown, max_drawdown_pct, total_fees,
+                          total_trades from strategy_results"""
+            ).fetchone()
+            actions = connection.execute(
+                """select action_index, timestamp_utc, symbol, order_id, action, size,
+                          post_size, post_side, pnl, fee, balance
+                     from strategy_actions order by action_index"""
+            ).fetchall()
+            equity = connection.execute(
+                "select sample_index, timestamp_utc, wallet, equity from strategy_equity order by sample_index"
+            ).fetchall()
+        snapshots.append((rate, financial, actions, equity))
+    known, unknown = snapshots
+    assert known[0] == Decimal("0.0004")
+    assert unknown[0] is None
+    assert known[1:] == unknown[1:]
 
 
 def test_import_phase_evidence_is_bounded_and_keeps_audit_schema(tmp_path: Path, monkeypatch) -> None:
@@ -1765,6 +1852,10 @@ def test_import_migrates_existing_v4_target_before_current_schema_gate(tmp_path:
             "    cost DECIMAL(38,12),\n",
         ):
             schema = schema.replace(definition, "")
+        schema = schema.replace(
+            "    commission_rate DECIMAL(38,12),\n",
+            "    commission_rate DECIMAL(38,12) NOT NULL,\n",
+        )
         connection.execute("create table schema_info (key varchar primary key, value varchar not null)")
         connection.execute(schema)
         connection.execute(_SELECTION_SCHEMA)
@@ -1784,7 +1875,7 @@ def test_import_migrates_existing_v4_target_before_current_schema_gate(tmp_path:
     with duckdb.connect(str(target), read_only=True) as connection:
         assert connection.execute(
             "select value from schema_info where key = 'schema_version'"
-        ).fetchone() == ("6",)
+        ).fetchone() == ("7",)
 
 
 def test_bare_duckdb_target_is_not_initialized_by_import(tmp_path: Path) -> None:
@@ -1954,6 +2045,22 @@ def test_result_values_persist_full_precision_effective_provenance(tmp_path: Pat
 
     assert values["report_start_utc"] == effective_start
     assert values["report_end_utc"] == effective_end
+
+
+def test_result_values_keep_actual_fees_when_commission_rate_is_unknown(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path)
+    prepared = read_performance_v2_inbox(request.inbox, request.report_root)
+    parsed = parse_current_performance_v2_html(FIXTURE.read_bytes(), request.config)
+    now = datetime(2026, 1, 10, tzinfo=timezone.utc)
+
+    with_rate = import_module._result_values(prepared.entries[0], parsed, {"TakerFee": "0.0004"}, now)
+    without_rate = import_module._result_values(prepared.entries[0], parsed, {}, now)
+
+    assert with_rate["commission_rate"] == Decimal("0.0004")
+    assert without_rate["commission_rate"] is None
+    assert {key: value for key, value in with_rate.items() if key != "commission_rate"} == {
+        key: value for key, value in without_rate.items() if key != "commission_rate"
+    }
 
 
 def test_warmup_does_not_publish_when_the_only_trade_crosses_warmup(tmp_path: Path) -> None:

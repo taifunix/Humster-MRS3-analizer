@@ -301,6 +301,27 @@ def test_read_only_export_uses_cached_completed_trades_and_blanks_cache_miss(
         ).fetchone()[0] == 777
 
 
+def test_read_only_export_blanks_unknown_commission_without_changing_financial_facts(tmp_path: Path) -> None:
+    database, strategy_id = _export_database(tmp_path / "strategy_performance.duckdb")
+    with duckdb.connect(str(database)) as connection:
+        connection.execute("update strategy_results set commission_rate = null where strategy_id = ?", [strategy_id])
+
+    before_file = (sha256(database.read_bytes()).hexdigest(), database.stat().st_mtime_ns)
+    _, payload = export_performance_v2(database, PerformanceV2ExportSelection(all_active=True))
+    after_file = (sha256(database.read_bytes()).hexdigest(), database.stat().st_mtime_ns)
+
+    sheet = load_workbook(BytesIO(payload), data_only=True)["All candidates"]
+    headers = [cell.value for cell in sheet[1]]
+    assert "Commission rate" not in headers
+    assert sheet.max_row >= 2
+    assert before_file == after_file
+    with duckdb.connect(str(database), read_only=True) as connection:
+        assert connection.execute(
+            "select commission_rate, initial_balance, final_balance, total_pnl, total_fees "
+            "from strategy_results where strategy_id = ?", [strategy_id],
+        ).fetchone() == (None, Decimal("100.000000000000"), Decimal("101.000000000000"), Decimal("1.000000000000"), Decimal("0.000000000000"))
+
+
 def test_read_only_export_omits_invalid_cached_equity_facts_without_writes(tmp_path: Path, monkeypatch) -> None:
     database, strategy_id = _export_database(tmp_path / "strategy_performance.duckdb")
     with duckdb.connect(str(database)) as connection:

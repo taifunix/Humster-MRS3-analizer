@@ -1,6 +1,6 @@
 """Reproducible, copy-only M5 measurements for Performance v2 selection.
 
-This harness never targets the Panel's configured database. Pass a frozen v6
+This harness never targets the Panel's configured database. Pass a frozen v6/v7
 copy outside the repository; every mutating run uses a temporary copy of it.
 """
 from __future__ import annotations
@@ -287,11 +287,11 @@ def _validate_database_copy(path: Path) -> dict[str, object]:
     stat = source.stat()
     with duckdb.connect(str(source), read_only=True) as connection:
         version = require_performance_v2_readable(connection)
-        if version != 6:
-            raise ValueError("database copy must already have Performance v2 schema v6")
+        if version not in {6, 7}:
+            raise ValueError("database copy must already have Performance v2 schema v6 or v7")
     return {
         "path": source,
-        "schema_version": 6,
+        "schema_version": version,
         "size_bytes": stat.st_size,
         "mtime_ns": stat.st_mtime_ns,
     }
@@ -574,7 +574,7 @@ def run_recalculation_profiles(
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--database-copy", required=True, type=Path, help="frozen Performance v2 schema-v6 DuckDB copy outside the repository")
+    parser.add_argument("--database-copy", required=True, type=Path, help="frozen Performance v2 schema-v6/v7 DuckDB copy outside the repository")
     parser.add_argument("--confirm-frozen-copy", action="store_true", help="confirm the supplied file is not the live/default database")
     parser.add_argument("--symbol", required=True)
     parser.add_argument("--side", required=True, choices=("LONG", "SHORT"))

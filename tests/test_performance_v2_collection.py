@@ -53,6 +53,7 @@ def _member(
     run_id: str,
     isolated_strategy: bool = False,
     report_name: str | None = None,
+    commission: bool = True,
 ) -> tuple[Path, Path, Path]:
     strategy_root = (tmp_path / "strategies") if isolated_strategy else (tmp_path.parent / "strategies")
     strategy_root.mkdir(parents=True, exist_ok=True)
@@ -70,13 +71,15 @@ def _member(
     ).hexdigest()
     strategy_hash = sha256(strategy_bytes).hexdigest()
     report_hash = sha256(report_path.read_bytes()).hexdigest()
+    contract = {**_CONTRACT_FIELDS, "TakerFee": taker}
+    contract_id = sha256(json.dumps(contract, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     manifest = {
         "schema_version": 1,
         "batch_id": f"batch-{name}",
         "expected_strategy_names": [name],
         "tester_config_sha256": run_id.ljust(64, "x")[:64],
-        "commission_contract": {**_CONTRACT_FIELDS, "TakerFee": taker},
-        "commission_contract_id": run_id.ljust(64, "c")[:64],
+        "commission_contract": contract,
+        "commission_contract_id": contract_id,
         "source_mode": "metadata_only",
         "run_mode": "SINGLE_MODE",
         "test_start": start,
@@ -109,6 +112,9 @@ def _member(
             }},
         },
     }
+    if not commission:
+        manifest.pop("commission_contract")
+        manifest.pop("commission_contract_id")
     inbox = tmp_path / "inboxes" / name
     inbox.mkdir(parents=True)
     (inbox / "inbox_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
@@ -136,6 +142,25 @@ def test_collection_reads_heterogeneous_member_context_without_merging_it(tmp_pa
     ]
     assert [entry.commission_contract["TakerFee"] for entry in prepared.entries] == ["0.0004", "0.0007"]
     assert [entry.analysis_run_id for entry in prepared.entries] == ["a" * 64, "b" * 64]
+
+
+def test_collection_preserves_member_without_commission_pair(tmp_path: Path) -> None:
+    member, report_root, strategy_root = _member(
+        tmp_path / "member", "alpha", start="2026-01-01", end="2026-01-09",
+        taker="0.0004", run_id="a" * 64, commission=False,
+    )
+    collection = build_single_mode_collection_inbox(
+        tmp_path / "collections", "collection-1", [member],
+        report_root=report_root, trusted_strategy_root=strategy_root,
+    )
+    manifest = json.loads((collection / "inbox_manifest.json").read_text(encoding="utf-8"))
+    entry = manifest["entries"][0]
+    assert "commission_contract" not in entry
+    assert "commission_contract_id" not in entry
+
+    prepared = read_performance_v2_inbox(collection, report_root, strategy_root=strategy_root)
+    assert prepared.entries[0].commission_contract == {}
+    assert prepared.entries[0].commission_contract_id == ""
 
 
 def test_collection_builder_binds_registered_names_to_exact_prepared_read(tmp_path: Path) -> None:

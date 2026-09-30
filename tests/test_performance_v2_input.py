@@ -19,6 +19,10 @@ import mrs3.performance_v2_input as input_module
 from mrs3.performance_v2_store import PerformanceV2Config
 
 
+def test_commission_reader_keeps_integral_trailing_zeroes() -> None:
+    assert input_module._canonical_decimal("10", "FundingIntervalHours") == "10"
+
+
 def _strategy(name: str, *, side: str = "LONG", orders: int = 1) -> dict[str, object]:
     active = "ma_long" if side == "LONG" else "ma_short"
     close = "ma_close_long" if side == "LONG" else "ma_close_short"
@@ -78,19 +82,21 @@ def _inbox(tmp_path: Path, *, mode: str = "FAST", orders: int = 1, diagnostics: 
             for index in range(1, orders + 1)
         ]
         diagnostics = {"candidate-1": {"order_count": orders, "orders": orders_diagnostics}}
+    contract = {
+        "MakerFee": "0.0002",
+        "TakerFee": "0.0004",
+        "SlippagePercent": "0.01",
+        "FundingRate": "0.0001",
+        "FundingIntervalHours": "8",
+    }
+    contract_id = sha256(json.dumps(contract, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     manifest = {
         "schema_version": 1,
         "batch_id": mode.lower(),
         "expected_strategy_names": ["BTC-demo"],
         "tester_config_sha256": "t" * 64,
-        "commission_contract": {
-            "MakerFee": "0.0002",
-            "TakerFee": "0.0004",
-            "SlippagePercent": "0.01",
-            "FundingRate": "0.0001",
-            "FundingIntervalHours": "8",
-        },
-        "commission_contract_id": "c" * 64,
+        "commission_contract": contract,
+        "commission_contract_id": contract_id,
         "run_mode": mode,
         "entries": [
             {
@@ -156,6 +162,80 @@ def test_single_mode_bare_report_filename_resolves_under_configured_root(tmp_pat
     report = report_root / "BTC-demo.html"
     assert prepared.entries[0].report_path == report.resolve()
     assert prepared.entries[0].report_sha256 == sha256(report.read_bytes()).hexdigest()
+
+
+def test_single_mode_accepts_absent_commission_pair(tmp_path: Path) -> None:
+    inbox, report_root = _single_mode_inbox(tmp_path)
+    manifest_path = inbox / "inbox_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest.pop("commission_contract")
+    manifest.pop("commission_contract_id")
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    prepared = read_performance_v2_inbox(inbox, report_root)
+
+    assert prepared.commission_contract == {}
+    assert prepared.commission_contract_id == ""
+    assert prepared.entries[0].commission_contract == {}
+
+
+@pytest.mark.parametrize("mode", ("FAST", "RUNS"))
+def test_legacy_mode_still_rejects_absent_commission_pair(tmp_path: Path, mode: str) -> None:
+    inbox, report_root = _inbox(tmp_path, mode=mode)
+    manifest_path = inbox / "inbox_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest.pop("commission_contract")
+    manifest.pop("commission_contract_id")
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(PerformanceV2InputError, match="commission contract is missing"):
+        read_performance_v2_inbox(inbox, report_root)
+
+
+@pytest.mark.parametrize("mutation", [
+    "partial",
+    "id_only",
+    "null",
+    "nonfinite",
+    "noncanonical",
+    "mismatch",
+    "extra",
+])
+def test_single_mode_rejects_malformed_present_commission_pair(tmp_path: Path, mutation: str) -> None:
+    inbox, report_root = _single_mode_inbox(tmp_path / mutation)
+    manifest_path = inbox / "inbox_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if mutation == "partial":
+        manifest.pop("commission_contract_id")
+    elif mutation == "id_only":
+        manifest.pop("commission_contract")
+    elif mutation == "null":
+        manifest["commission_contract"] = None
+        manifest["commission_contract_id"] = None
+    elif mutation == "nonfinite":
+        manifest["commission_contract"]["TakerFee"] = "NaN"
+    elif mutation == "noncanonical":
+        manifest["commission_contract"]["TakerFee"] = "0.00040"
+    elif mutation == "extra":
+        manifest["commission_contract"]["unexpected"] = "1"
+    else:
+        manifest["commission_contract_id"] = "0" * 64
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(PerformanceV2InputError, match="commission|contract|TakerFee|canonical"):
+        read_performance_v2_inbox(inbox, report_root)
+
+
+def test_single_mode_without_commission_still_requires_tester_config_hash(tmp_path: Path) -> None:
+    inbox, report_root = _single_mode_inbox(tmp_path)
+    manifest_path = inbox / "inbox_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    for field in ("commission_contract", "commission_contract_id", "tester_config_sha256"):
+        manifest.pop(field)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(PerformanceV2InputError, match="tester config hash"):
+        read_performance_v2_inbox(inbox, report_root)
 
 
 def test_single_mode_changed_report_hash_is_rejected_during_staging(tmp_path: Path) -> None:

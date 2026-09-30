@@ -1,5 +1,10 @@
 # Performance v2: качество роста equity — анализ и проект
 
+**Schema-version update (2026-09-30):** [Optional commission evidence](2026-09-30-performance-v2-optional-commission-evidence.md)
+supersedes the v6-only writer/read matrix below: current writers use v7;
+read-only equity-cache access supports v6 and v7, while v5 keeps its sentinel.
+The equity-quality calculation and admission rules here are unchanged.
+
 **Статус:** R7.3 утверждена; M0–M4 приняты, M5 измеряется.
 **Версия:** R7.3, 2026-09-25.
 **Назначение:** спецификация для обсуждения и независимой проверки плана.

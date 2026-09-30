@@ -3,6 +3,7 @@
 **Status:** Approved for implementation
 **Date:** 2026-09-28
 **Governing dependency:** `docs/specs/2026-09-03-performance-v2-retest-workflow.md`
+**Commission exception:** [optional Performance v2 commission evidence](2026-09-30-performance-v2-optional-commission-evidence.md).
 ## Goal
 
 Allow an operator to run several ordinary `SINGLE_MODE` tester batches, keep
@@ -81,7 +82,7 @@ per-entry batch context:
 
 - `test_start` and `test_end`;
 - `tester_config_sha256`;
-- `commission_contract` and `commission_contract_id`;
+- optional paired `commission_contract` and `commission_contract_id`;
 - per-strategy `analysis_run_id` and existing candidate provenance.
 
 Legacy schema-version-1 inboxes remain readable without change. Collection
@@ -90,7 +91,8 @@ parser, staging and transaction. Prepared entries carry their own range and
 commission context; report validation and persisted `commission_rate` use the
 entry context rather than a collection-wide value. The report remains the
 authority for its parsed period and initial balance, while its member inbox
-remains the authority for the tester commission/config snapshot.
+remains the authority for the tester config hash and any available commission
+rate. An absent rate persists as SQL `NULL`; HTML fees and PnL remain authoritative.
 
 ## Invariants
 

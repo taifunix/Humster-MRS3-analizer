@@ -22,7 +22,7 @@ def _load_benchmark():
 
 
 def _frozen_fixture(tmp_path: Path) -> Path:
-    database = tmp_path / "frozen-v6-copy.duckdb"
+    database = tmp_path / "frozen-v7-copy.duckdb"
     connection = duckdb.connect(str(database))
     initialize_performance_v2(connection)
     start = connection.execute("select timestamptz '2026-01-01 00:00:00+00'").fetchone()[0]
@@ -155,7 +155,7 @@ def test_benchmark_rejects_wal_and_in_repository_paths_before_opening(
         benchmark._validate_database_copy(inside)
 
 
-def test_benchmark_rejects_non_v6_without_changing_source(tmp_path: Path) -> None:
+def test_benchmark_rejects_v5_without_changing_source(tmp_path: Path) -> None:
     benchmark = _load_benchmark()
     source = _frozen_fixture(tmp_path)
     with duckdb.connect(str(source)) as connection:
@@ -217,6 +217,7 @@ def test_benchmark_runs_all_warm_consumer_modes_without_writing_source(tmp_path:
     assert len(lines) == 4
     assert all(record["warmup_runs"] == 1 and len(record["measured_runs"]) == 3 for record in lines)
     assert all(record["cache_state"] == "all_warm" for record in lines)
+    assert all(record["schema_version"] == 7 for record in lines)
     assert all(record["decision_rows"] for record in lines)
     assert all(run["sql"]["read_queries"] > 0 for record in lines for run in record["measured_runs"])
     assert all(run["sql"]["connections_opened"] > 0 for record in lines for run in record["measured_runs"])

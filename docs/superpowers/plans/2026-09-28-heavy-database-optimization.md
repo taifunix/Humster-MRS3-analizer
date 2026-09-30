@@ -306,6 +306,11 @@ scope добавление scope workers не ускоряет последов�
   a speedup. No live import run was performed; the 409-report production tail
   remains unattributed. Phase8, commit, and tail attribution remain open, so
   IMP-02 stays unchecked.
+- Performance v2 optional commission evidence is governed separately by
+  [the v7 specification](../../specs/2026-09-30-performance-v2-optional-commission-evidence.md)
+  and [ADR-0049](../../decisions/0049-performance-v2-optional-commission-evidence.md).
+  It removes the missing tester-fee metadata blocker for `SINGLE_MODE` and
+  collections. It does not attribute the long import tail or claim import speed.
 - [ ] **IMP-03 — общий HTML inventory.** `performance_v2_html.py`, `performance.py`.
   Переиспользовать decode/raw-markup inventory current-header gate и общего parser.
   Не убирать required/duplicate header, size/action limits и source order checks.

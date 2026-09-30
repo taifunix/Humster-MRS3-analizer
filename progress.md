@@ -1,6 +1,40 @@
 # MRS3 — current verification
 
-**Updated:** 2026-09-29
+## Performance v2 optional commission evidence (2026-09-30, implemented/reviewed)
+
+The user requested a simpler PerformanceDB import contract. A source audit
+found that five tester commission settings block capture/import although v2
+persists only `TakerFee` as `commission_rate`; HTML supplies actual action fees,
+total fees and PnL. The new [spec](docs/specs/2026-09-30-performance-v2-optional-commission-evidence.md)
+and [ADR-0049](docs/decisions/0049-performance-v2-optional-commission-evidence.md)
+govern nullable-rate schema v7 and optional `SINGLE_MODE`/collection evidence.
+Independent Advisor R5 returned `PLAN_APPROVED` for the actual DuckDB 1.5.5
+migration: the validated v6 parent index and four FK children prevent direct
+`ALTER`, so v7 reconstructs them in one transaction and validates the v7
+catalog before commit. RED importer tests reproduced the missing-contract
+rejection and absent-`TakerFee` `KeyError`; ADD/REPLACE now store SQL `NULL`
+without changing HTML financial facts. Focused store/import/selection tests
+passed 357, runner/input/collection/Panel/Portfolio tests passed 446 with
+5 Windows symlink skips, and revised store/v5-compatibility tests passed 67.
+The old v6-only benchmark scripts and fixture assumptions were updated; their
+focused suite passed 31. The first full 5,630-test run finished 5,620 passed,
+9 Windows symlink skips and one failure in unchanged Panel Portfolio Stage 1
+job lookup (`test_stage2_classifies_deleted_artifact_before_start`). That
+module passed independently (244 passed, 1 skip). The ordinary-order full
+suite excluding all 14 modified test files passed 4,770/4 skipped; a focused
+preceding-modules plus failed-test run passed 211/4 skipped. The full suite
+with all changed tests then passed 5,623/9 skipped, 30 warnings on C: in
+2,834.19 s. The first Portfolio failure did not reproduce; its cause remains
+unproven. No Performance v2 test failed in either full run.
+Additional review regressions passed: nine cross-module canonical/hash cases,
+eight malformed/missing commission-pair cases, and same-connection migration
+retry after injected failure. Independent Claude Opus 5/high final review
+returned `CODE_REVIEW_PASS`, closing all findings including the non-reproduced
+Portfolio failure. All dedicated temporary test directories on D: and C:
+were removed after the runs.
+No real tester or user database has been opened for write or migrated.
+
+**Updated:** 2026-09-30
 **Current branch:** `perf/heavy-db-optimization`, initially based on fetched `origin/main` `8f59c2c`; integrates the later `84ad285` collection lifecycle
 
 ## Heavy database optimization implementation (2026-09-28)

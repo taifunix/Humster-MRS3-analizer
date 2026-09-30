@@ -809,19 +809,17 @@ def test_retest_manifest_round_trips_through_v2_store_ingest_with_mixed_runs(tmp
                 "candidate_identity": candidate,
             }
         )
+    commission_contract = {
+        "MakerFee": "0.0002", "TakerFee": "0.0004", "SlippagePercent": "0.01",
+        "FundingRate": "0.0001", "FundingIntervalHours": "8",
+    }
     inbox_manifest = {
         "schema_version": 1,
         "batch_id": batch.run_id,
         "expected_strategy_names": [entry["strategy_name"] for entry in entries],
         "tester_config_sha256": "t" * 64,
-        "commission_contract": {
-            "MakerFee": "0.0002",
-            "TakerFee": "0.0004",
-            "SlippagePercent": "0.01",
-            "FundingRate": "0.0001",
-            "FundingIntervalHours": "8",
-        },
-        "commission_contract_id": "c" * 64,
+        "commission_contract": commission_contract,
+        "commission_contract_id": sha256(json.dumps(commission_contract, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
         "run_mode": "FAST",
         "entries": entries,
         "v6_provenance": {

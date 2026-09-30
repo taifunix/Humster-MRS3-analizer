@@ -915,7 +915,7 @@ def selection_equity_facts_token(
         except PerformanceV2StoreError as error:
             raise EquityQualityCacheError("Performance database schema is invalid") from error
     cache_rows: dict[int, tuple[object, object]] = {}
-    if version == 6 and rows:
+    if version in {6, 7} and rows:
         ids = tuple(int(row[1]) for row in rows)
         raw = connection.execute(
             """select result_id, source_revision, facts_sha256 from equity_quality_metrics

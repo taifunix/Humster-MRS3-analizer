@@ -274,16 +274,17 @@ def _make_inbox(tmp_path: Path) -> tuple[Path, Path, dict[Path, bytes]]:
             "source_strategy_sha256": sha256(strategy_bytes).hexdigest(),
             "source_report_sha256": sha256(report).hexdigest(),
         })
+    commission_contract = {
+        "MakerFee": "0.0002", "TakerFee": "0.0004", "SlippagePercent": "0.01",
+        "FundingRate": "0.0001", "FundingIntervalHours": "8",
+    }
     manifest = {
         "schema_version": 1,
         "batch_id": "panel-v2-test",
         "expected_strategy_names": ["P1", "P2"],
         "tester_config_sha256": "t" * 64,
-        "commission_contract": {
-            "MakerFee": "0.0002", "TakerFee": "0.0004", "SlippagePercent": "0.01",
-            "FundingRate": "0.0001", "FundingIntervalHours": "8",
-        },
-        "commission_contract_id": "c" * 64,
+        "commission_contract": commission_contract,
+        "commission_contract_id": sha256(json.dumps(commission_contract, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
         "run_mode": "FAST",
         "test_start": "2026-01-01",
         "test_end": "2026-01-09",

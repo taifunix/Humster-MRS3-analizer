@@ -46,8 +46,10 @@ def _canonical_decimal(value: object, field: str) -> str:
         raise InboxCaptureError(f"invalid {field}") from error
     if not decimal.is_finite():
         raise InboxCaptureError(f"non-finite {field}")
-    result = format(decimal, "f").rstrip("0").rstrip(".")
-    if result in {"", "-0"}:
+    result = format(decimal, "f")
+    if "." in result:
+        result = result.rstrip("0").rstrip(".")
+    if result == "-0":
         return "0"
     return result
 
@@ -88,7 +90,10 @@ def _canonical_json(document: object) -> bytes:
 
 
 def _commission_contract(
-    config: RunnerConfig, tester_config_bytes: bytes | None = None
+    config: RunnerConfig,
+    tester_config_bytes: bytes | None = None,
+    *,
+    optional_taker: bool = False,
 ) -> tuple[dict[str, str], str, str]:
     snapshot = tester_config_bytes
     if snapshot is None:
@@ -99,6 +104,8 @@ def _commission_contract(
     try:
         document = json.loads(snapshot.decode("utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        if optional_taker:
+            return {}, "", sha256(snapshot).hexdigest()
         raise InboxCaptureError("could not read tester_config") from error
     if not isinstance(document, dict):
         values = None
@@ -109,7 +116,15 @@ def _commission_contract(
         # Hamster Bot's local config is also emitted as a flat JSON object.
         values = document
     if not isinstance(values, dict):
+        if optional_taker:
+            return {}, "", sha256(snapshot).hexdigest()
         raise InboxCaptureError("tester_config object is missing")
+    if optional_taker:
+        try:
+            contract = {"TakerFee": _canonical_decimal(values["TakerFee"], "TakerFee")}
+        except (KeyError, InboxCaptureError):
+            return {}, "", sha256(snapshot).hexdigest()
+        return contract, sha256(_canonical_json(contract)).hexdigest(), sha256(snapshot).hexdigest()
     missing = next((field for field in _COMMISSION_FIELDS if field not in values), None)
     if missing is not None:
         raise InboxCaptureError(f"missing commission field: {missing}")
@@ -255,7 +270,9 @@ def capture_run_snapshot_inbox(
         raise InboxCaptureError("unsupported tester run mode")
     if isinstance(workers, bool) or not isinstance(workers, int) or workers < 1:
         raise InboxCaptureError("inbox workers must be a positive integer")
-    contract, contract_id, tester_config_hash = _commission_contract(config, tester_config_bytes)
+    contract, contract_id, tester_config_hash = _commission_contract(
+        config, tester_config_bytes, optional_taker=run_mode == "SINGLE_MODE"
+    )
     _reject_reparse_components(config.inbox_root)
     inbox_root = config.inbox_root.resolve()
     inbox = inbox_root / job_id
@@ -315,8 +332,6 @@ def capture_run_snapshot_inbox(
             "batch_id": job_id,
             "expected_strategy_names": list(names),
             "tester_config_sha256": tester_config_hash,
-            "commission_contract": contract,
-            "commission_contract_id": contract_id,
             "source_mode": "metadata_only" if run_mode == "SINGLE_MODE" else "direct",
             "run_mode": run_mode,
             "test_start": test_start,
@@ -325,6 +340,9 @@ def capture_run_snapshot_inbox(
             "entries": entries,
             "v6_provenance": json.loads(json.dumps(dict(provenance), sort_keys=True)),
         }
+        if contract:
+            manifest["commission_contract"] = contract
+            manifest["commission_contract_id"] = contract_id
         _atomic_bytes(inbox / "inbox_manifest.json", _canonical_json(manifest))
         return inbox
     except BaseException:

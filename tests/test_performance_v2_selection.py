@@ -36,6 +36,7 @@ from mrs3.performance_v2_selection import (
     run_selection,
     selection_cache_missing_strategy_ids,
     selection_cache_status,
+    selection_equity_facts_token,
     write_selection_workbook,
     retest_cohort_request,
 )
@@ -1073,6 +1074,24 @@ def _candidate_db(tmp_path: Path) -> duckdb.DuckDBPyConnection:
         ],
     )
     return connection
+
+
+def test_selection_equity_token_reads_v7_equity_cache(tmp_path: Path) -> None:
+    connection = _candidate_db(tmp_path)
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
+    queries: list[str] = []
+
+    class CountingConnection:
+        def execute(self, sql: str, parameters: object = None):
+            queries.append(sql.lower())
+            return connection.execute(sql) if parameters is None else connection.execute(sql, parameters)
+
+    try:
+        selection_equity_facts_token(CountingConnection(), request)
+    finally:
+        connection.close()
+
+    assert any("from equity_quality_metrics" in sql for sql in queries)
 
 
 def _clone_current_candidate(connection: duckdb.DuckDBPyConnection, name: str) -> tuple[int, int]:

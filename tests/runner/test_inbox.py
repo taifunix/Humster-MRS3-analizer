@@ -7,11 +7,44 @@ from pathlib import Path
 import pytest
 
 import mrs3.runner.inbox as inbox_module
+import mrs3.performance_v2_input as input_module
 from mrs3.runner.config import RunnerConfig
 from mrs3.runner.inbox import InboxCaptureError, capture_run_snapshot_inbox, capture_verified_inbox
 from mrs3.runner.results import WizardResult
 from mrs3.runner.workflow import BatchPlan
 from mrs3.panel import PanelController
+
+
+def test_commission_decimal_keeps_integral_trailing_zeroes() -> None:
+    assert inbox_module._canonical_decimal("10", "FundingIntervalHours") == "10"
+
+
+@pytest.mark.parametrize("raw", (
+    "10", "10.0", "-0", "0E-8", "1E+2", "-1.2500", "0.000000000001",
+    "12345678901234567890.12345678901234567890",
+))
+def test_single_mode_commission_capture_and_reader_agree_on_canonical_bytes(tmp_path: Path, raw: str) -> None:
+    snapshot = json.dumps({"tester_config": {"TakerFee": raw}}).encode()
+    contract, contract_id, tester_hash = inbox_module._commission_contract(
+        _config(tmp_path), snapshot, optional_taker=True
+    )
+    assert input_module._commission({
+        "commission_contract": contract,
+        "commission_contract_id": contract_id,
+        "tester_config_sha256": tester_hash,
+    }, optional=True) == (contract, contract_id, sha256(snapshot).hexdigest())
+
+
+def test_reader_accepts_existing_five_field_hash_with_legacy_integral_value() -> None:
+    # Older capture encoded an intended integral 10 as the canonical text "1".
+    contract = {"MakerFee": "0.0002", "TakerFee": "0.0004", "SlippagePercent": "0.01",
+                "FundingRate": "0.0001", "FundingIntervalHours": "1"}
+    contract_id = sha256(json.dumps(contract, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    assert input_module._commission({
+        "commission_contract": contract,
+        "commission_contract_id": contract_id,
+        "tester_config_sha256": "a" * 64,
+    }) == (contract, contract_id, "a" * 64)
 
 
 def _config(tmp_path: Path, *, complete: bool = True) -> RunnerConfig:
@@ -280,6 +313,72 @@ def test_single_mode_inbox_keeps_report_as_configured_filename_only(tmp_path: Pa
     manifest = json.loads((inbox / "inbox_manifest.json").read_text(encoding="utf-8"))
     assert manifest["entries"][0]["report_path"] == report.name
     assert not (inbox / "reports").exists()
+
+
+def test_single_mode_capture_keeps_config_hash_without_usable_commission(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    config.tester_config.write_bytes(b"not-json")
+    report = tmp_path / "my_test_runs" / "run.html"
+    report.parent.mkdir(parents=True)
+    report.write_bytes((Path(__file__).parents[1] / "fixtures" / "performance" / "report_import.html").read_bytes())
+    strategy = {"name": "MRS3 Demo", "exchange": {"name": "Bybit"}, "basic": {"symbol": "ONUSDT", "time_frame": "1h"}}
+    strategy_path = tmp_path / "strategy.json"
+    strategy_path.write_bytes(json.dumps(strategy, sort_keys=True, separators=(",", ":")).encode())
+
+    inbox = capture_run_snapshot_inbox(
+        config, "single-metadata", {"MRS3 Demo": strategy}, {"MRS3 Demo": report},
+        tester_config_bytes=config.tester_config.read_bytes(),
+        provenance={"analysis_run_id": "a" * 64, "generation_manifest_sha256": "b" * 64, "strategy_json_sha256": {"MRS3 Demo.json": "c" * 64}},
+        test_start="2026-08-01", test_end="2026-08-18", run_mode="SINGLE_MODE",
+        strategy_paths={"MRS3 Demo": strategy_path},
+    )
+
+    manifest = json.loads((inbox / "inbox_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["tester_config_sha256"] == sha256(b"not-json").hexdigest()
+    assert "commission_contract" not in manifest
+    assert "commission_contract_id" not in manifest
+
+
+def test_single_mode_capture_emits_only_canonical_taker_fee(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    snapshot = json.dumps({"tester_config": {"TakerFee": "0.00040"}}).encode()
+    report = tmp_path / "run.html"
+    report.write_bytes((Path(__file__).parents[1] / "fixtures" / "performance" / "report_import.html").read_bytes())
+    strategy = {"name": "MRS3 Demo", "exchange": {"name": "Bybit"}}
+    strategy_path = tmp_path / "MRS3 Demo.json"
+    strategy_path.write_bytes(json.dumps(strategy, separators=(",", ":")).encode())
+
+    inbox = capture_run_snapshot_inbox(
+        config, "single-taker", {"MRS3 Demo": strategy}, {"MRS3 Demo": report},
+        tester_config_bytes=snapshot,
+        provenance={"analysis_run_id": "a" * 64, "generation_manifest_sha256": "b" * 64, "strategy_json_sha256": {"MRS3 Demo.json": "c" * 64}},
+        test_start="2026-08-01", test_end="2026-08-18", run_mode="SINGLE_MODE",
+        strategy_paths={"MRS3 Demo": strategy_path},
+    )
+
+    manifest = json.loads((inbox / "inbox_manifest.json").read_text(encoding="utf-8"))
+    contract = {"TakerFee": "0.0004"}
+    assert manifest["commission_contract"] == contract
+    assert manifest["commission_contract_id"] == sha256(json.dumps(contract, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def test_fast_capture_keeps_mandatory_five_field_contract(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    config.tester_config.write_bytes(b"not-json")
+    report = tmp_path / "run.html"
+    report.write_bytes(b'<pre>{"name":"A","exchange":{"name":"Bybit"}}</pre>')
+    strategy = {"name": "A", "exchange": {"name": "Bybit"}}
+    strategy_path = tmp_path / "A.json"
+    strategy_path.write_bytes(json.dumps(strategy, separators=(",", ":")).encode())
+
+    with pytest.raises(InboxCaptureError, match="tester_config"):
+        capture_run_snapshot_inbox(
+            config, "fast-invalid", {"A": strategy}, {"A": report},
+            tester_config_bytes=b"not-json",
+            provenance={"analysis_run_id": "a" * 64, "generation_manifest_sha256": "b" * 64, "strategy_json_sha256": {"A.json": "c" * 64}},
+            test_start="2026-08-01", test_end="2026-08-18", run_mode="FAST",
+            strategy_paths={"A": strategy_path},
+        )
 
 
 def test_single_mode_replace_rejects_reparse_inbox_before_recursive_delete(

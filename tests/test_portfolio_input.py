@@ -699,7 +699,7 @@ def test_snapshot_assembly_wraps_generic_errors_and_preserves_coded_errors(tmp_p
 def test_snapshot_contains_full_candidate_source_and_digest(tmp_path: Path) -> None:
     snapshot = _snapshot(_database(tmp_path), [REQUEST])
 
-    assert snapshot.source_schema_version == "6"
+    assert snapshot.source_schema_version == "7"
     assert snapshot.database_kind == "unified_performance_v2"
     assert snapshot.database_instance_id
     assert snapshot.candidates[0]["result_id"]
@@ -711,6 +711,22 @@ def test_snapshot_contains_full_candidate_source_and_digest(tmp_path: Path) -> N
     assert len(snapshot.digest) == 64
     assert snapshot.decision_replay == "AVAILABLE"
     assert snapshot.tick_replay == "UNAVAILABLE"
+
+
+def test_snapshot_keeps_unknown_commission_as_none_without_changing_admission_or_financials(tmp_path: Path) -> None:
+    database = _database(tmp_path)
+    baseline = _snapshot(database, [REQUEST])
+    with duckdb.connect(str(database)) as connection:
+        connection.execute("update strategy_results set commission_rate = null")
+
+    snapshot = _snapshot(database, [REQUEST])
+
+    assert snapshot.payload["results"].items[0]["commission_rate"] is None
+    assert snapshot.candidates[0]["strategy_id"] == baseline.candidates[0]["strategy_id"]
+    assert snapshot.candidates[0]["result_id"] == baseline.candidates[0]["result_id"]
+    for field in ("total_pnl", "total_fees", "max_drawdown", "max_drawdown_pct"):
+        assert snapshot.candidates[0][field] == baseline.candidates[0][field]
+    assert snapshot.window_metrics == baseline.window_metrics
 
 
 def test_snapshot_identity_and_nested_window_are_immutable() -> None:

@@ -671,6 +671,10 @@ def test_v2_accepts_external_strategy_only_under_trusted_output_root(tmp_path: P
         "wizard_run_id": "wizard-1",
         "exchange_name": "Bybit",
     }
+    commission_contract = {
+        "MakerFee": "0.00001", "TakerFee": "0.00005", "SlippagePercent": "0",
+        "FundingRate": "0", "FundingIntervalHours": "8",
+    }
     manifest = {
         "schema_version": 1,
         "run_mode": "SINGLE_MODE",
@@ -678,14 +682,8 @@ def test_v2_accepts_external_strategy_only_under_trusted_output_root(tmp_path: P
         "test_end": "2026-08-31",
         "expected_strategy_names": ["A"],
         "entries": [entry],
-        "commission_contract": {
-            "MakerFee": "0.00001",
-            "TakerFee": "0.00005",
-            "SlippagePercent": "0",
-            "FundingRate": "0",
-            "FundingIntervalHours": "8",
-        },
-        "commission_contract_id": "commission-1",
+        "commission_contract": commission_contract,
+        "commission_contract_id": sha256(json.dumps(commission_contract, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
         "tester_config_sha256": "b" * 64,
         "v6_provenance": {
             "analysis_run_id": "run-1",
@@ -740,19 +738,17 @@ def test_v2_rejects_external_strategy_for_direct_inbox(tmp_path: Path) -> None:
         "wizard_run_id": "wizard-1",
         "exchange_name": "Bybit",
     }
+    commission_contract = {
+        "MakerFee": "0.00001", "TakerFee": "0.00005", "SlippagePercent": "0",
+        "FundingRate": "0", "FundingIntervalHours": "8",
+    }
     manifest = {
         "schema_version": 1,
         "run_mode": "FAST",
         "expected_strategy_names": ["A"],
         "entries": [entry],
-        "commission_contract": {
-            "MakerFee": "0.00001",
-            "TakerFee": "0.00005",
-            "SlippagePercent": "0",
-            "FundingRate": "0",
-            "FundingIntervalHours": "8",
-        },
-        "commission_contract_id": "commission-1",
+        "commission_contract": commission_contract,
+        "commission_contract_id": sha256(json.dumps(commission_contract, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
         "tester_config_sha256": "b" * 64,
         "v6_provenance": {
             "analysis_run_id": "run-1",
