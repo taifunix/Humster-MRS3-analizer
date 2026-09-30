@@ -442,6 +442,26 @@ portfolio tests. Record a fixed synthetic preparation-only before/after timing
 as stage evidence, with no whole-import percentage claim. OPT-01b-D3 received
 independent Opus 5/high `PLAN_APPROVED`.
 
+## OPT-01c: reuse the prepared input digest during import
+
+For AVAILABLE Phase 8 inputs, persist the `source_digest` already computed by
+`prepare_optimizer_input`, removing the importer's duplicate canonical source
+serialization/hash. This narrowly supersedes OPT-01b's requirement to retain
+both digest computations in the importer. UNAVAILABLE inputs retain the local
+`source_digest(source)` fallback and their existing reason and null payload.
+
+The source is immutable during preparation. Stored digest, prepared object's
+digest and decoded JSON digest must agree; canonical payload bytes, byte limit,
+storage codec, preparation version, row ordering and transaction rollback remain
+unchanged. No cache, new helper, schema change or concurrency setting is added.
+
+Acceptance: patch both bound digest references to demonstrate one digest call
+for AVAILABLE (two before the change), preserve two calls and exact reasons for
+missing facts/unsupported sizing, compare full decoded payload bytes and source
+before/after, and retain import rollback across all child and ledger tables.
+Only focused checks are required; no whole-import speed percentage is claimed.
+The narrow v2 implementation plan received independent `PLAN_APPROVED`.
+
 ## CALC-01a: one flat timeline per cold selection result
 
 Within `_selection_window_job`, obtain missing windows from the existing

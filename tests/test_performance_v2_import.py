@@ -332,8 +332,9 @@ def test_import_phase8_failure_keeps_rollback_and_partial_timing(tmp_path: Path,
         import_performance_v2(request)
 
     with duckdb.connect(str(performance_v2_database_path(request.config)), read_only=True) as connection:
-        assert connection.execute("select count(*) from strategies").fetchone() == (0,)
-        assert connection.execute("select count(*) from import_runs").fetchone() == (0,)
+        for table in ("strategies", "strategy_results", "strategy_actions", "strategy_equity",
+                      "optimizer_prepared_inputs", "import_runs", "import_files"):
+            assert connection.execute(f"select count(*) from {table}").fetchone() == (0,), table
     audit = json.loads((request.config.database_root / "import_audit.v2.json").read_text(encoding="utf-8"))
     assert audit["schema_version"] == 2
     assert audit["error"] == "injected phase8 failure"
@@ -940,6 +941,51 @@ def test_import_persists_phase8_typed_facts_and_one_prepared_status(tmp_path: Pa
     assert prepared[0:3] == ("UNAVAILABLE", "MISSING_TYPED_FACTS", "5")
     assert isinstance(prepared[3], str) and len(prepared[3]) == 64
     assert prepared[4] is None
+
+
+@pytest.mark.parametrize(
+    "overrides, reason, expected_calls",
+    [({}, None, 1), ({"sizing_use_upnl": None}, "MISSING_TYPED_FACTS", 2),
+     ({"sizing_use_fix": True}, "UNSUPPORTED_SIZING", 2)],
+)
+def test_phase8_reuses_available_digest_without_changing_payload(
+    tmp_path: Path, monkeypatch, overrides, reason, expected_calls,
+) -> None:
+    import mrs3.performance_v2_optimizer as optimizer_module
+    from tests.test_performance_v2_optimizer import _source, _typed_candidate_database
+
+    database, (result_id,) = _typed_candidate_database(tmp_path)
+    source = _source(result_id=result_id, **overrides)
+    before = source.to_document()
+    expected_digest = source_digest(source)
+    availability, prepared = optimizer_module.prepare_optimizer_input(source)
+    expected_json = prepared.to_json() if prepared is not None else None
+    assert availability.reason == reason
+    calls = []
+
+    def counted(value):
+        calls.append(value)
+        return source_digest(value)
+
+    monkeypatch.setattr(import_module, "source_digest", counted)
+    monkeypatch.setattr(optimizer_module, "source_digest", counted)
+    with duckdb.connect(str(database)) as connection:
+        import_module._persist_phase8_prepared(connection, source, source.revision_timestamp_utc)
+        status, stored_reason, digest, payload = connection.execute(
+            "select availability_status, unavailable_reason, source_digest, prepared_json "
+            "from optimizer_prepared_inputs where result_id = ?", [result_id],
+        ).fetchone()
+
+    assert len(calls) == expected_calls
+    assert (status, stored_reason) == (availability.status, reason)
+    assert digest == expected_digest
+    assert source.to_document() == before
+    if prepared is None:
+        assert payload is None
+    else:
+        decoded = decode_prepared_storage(payload)
+        assert decoded.encode("utf-8") == expected_json.encode("utf-8")
+        assert digest == prepared.source_digest == json.loads(decoded)["source_digest"]
 
 
 def test_import_persists_available_prepared_artifact_and_digest(tmp_path: Path) -> None:

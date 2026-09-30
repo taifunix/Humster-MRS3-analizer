@@ -638,8 +638,8 @@ def _persist_phase8_prepared(
     source: OptimizerSourceInput,
     prepared_at_utc: datetime,
 ) -> None:
-    digest = source_digest(source)
     availability, prepared = prepare_optimizer_input(source, preparation_version=PREPARATION_VERSION)
+    digest = prepared.source_digest if prepared is not None else source_digest(source)
     prepared_json = encode_prepared_storage(prepared.to_json()) if prepared is not None else None
     connection.execute(
         """insert into optimizer_prepared_inputs

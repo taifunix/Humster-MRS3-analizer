@@ -1,5 +1,47 @@
 # MRS3 — current verification
 
+## PerformanceDB continuation and import digest (2026-09-30, 18:33 local)
+
+The one-off recovery received independent `CODE_REVIEW_PASS` after a pending-WAL
+resume fixture, corrupted-prefix refusal, unchanged-source SHA check and owned
+fixture cleanup. It is now running as a detached hidden process (launcher
+176540, worker 9152), with durable C TEMP status/stdout/stderr. Initial status
+is `PREFLIGHT`; final verification and live cutover are still pending. It resumes
+6,399 missing prepared rows and then verifies all typed rows and decoded payloads.
+The original source remains read-only. Do not start a second recovery writer.
+
+OPT-01c removes the duplicate source digest computation for AVAILABLE Phase 8
+inputs, reusing the builder's digest. UNAVAILABLE fallback and canonical payload
+bytes remain unchanged. RED reproduced two digest calls instead of one; focused
+checks passed 7 in 9.01 seconds, including both unavailable reasons and rollback
+across child and ledger tables. Independent `CODE_REVIEW_PASS` and clean
+`git diff --check` accept this narrow change. Dedicated C test files were removed.
+This is one redundant pass removed, not a measured whole-import speedup.
+
+## PerformanceDB operational update (2026-09-30, 17:58 local)
+
+The second compact builder process is no longer present; its execution session
+is unavailable and its final JSON report is empty. The last progress event was
+17,408/23,887 prepared rows. A 14.419 GiB staging database and its WAL remain.
+There is no completed verification or published candidate, so do not cut over
+or treat this staging file as a backup. The session log subsequently identified
+a usage-limit termination at 17:51:27 local and command-session exit -1 exactly
+60 seconds later. No application traceback or matching Windows crash/OOM event
+was found. Read-only stage recovery sees 17,488 committed prepared rows,
+contiguous IDs 1..17488, and all other table counts match the source. Normalized
+catalogs, sequences, instance markers and all 17,488 prepared metadata rows
+match. The remaining 6,399 payloads require resumption and then complete content
+verification. Next: reviewed one-off recovery in a detached hidden process with
+durable status/failure logs, preserving staged work on failure. The original
+v6 database remains unchanged; source SHA-256 was captured before recovery.
+
+[Incremental import audit](docs/reports/2026-09-30-performance-v2-import-speed.md)
+records live run 15 at 9,417 seconds between publication timestamps, with
+20,874,717 equity rows and 4,144,417 actions. An initial transcription omitted
+one action-count digit; the report is corrected. Index maintenance and serial
+prepared-input generation are candidates, not measured phase attributions.
+No new import-speed runtime changes or test suites were run for this audit.
+
 ## PerformanceDB size priority (2026-09-30, implementation in progress)
 
 User prioritized shrinking the existing main-checkout database without more
