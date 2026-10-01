@@ -47,6 +47,36 @@ def _flat_28d():
     )
 
 
+def test_monotonic_decimal_rounding_keeps_er_in_closed_range():
+    start = T - timedelta(days=14)
+    facts = _facts(
+        [
+            (start, Decimal("100")),
+            (T - timedelta(days=10), Decimal("100.000023733")),
+            (T - timedelta(days=5), Decimal("100.000296557")),
+            (T - timedelta(days=2), Decimal("100.000597682")),
+            (T, Decimal("100.001231779")),
+        ],
+        start=start,
+    )
+
+    assert facts.windows[0].days == 7
+    assert facts.windows[0].er == Decimal(1)
+
+    falling = _facts(
+        [
+            (start, Decimal("100")),
+            (T - timedelta(days=10), Decimal("99.999636105")),
+            (T - timedelta(days=5), Decimal("99.999211220")),
+            (T - timedelta(days=2), Decimal("99.998523992")),
+            (T, Decimal("99.997937860")),
+        ],
+        start=start,
+    )
+
+    assert falling.windows[0].er == Decimal(-1)
+
+
 def test_valid_equity_sample_requires_owned_utc_timestamps():
     engine = _engine()
     start = T - timedelta(days=28)

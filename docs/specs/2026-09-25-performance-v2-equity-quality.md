@@ -5,6 +5,15 @@ supersedes the v6-only writer/read matrix below: current writers use v7;
 read-only equity-cache access supports v6 and v7, while v5 keeps its sentinel.
 The equity-quality calculation and admission rules here are unchanged.
 
+**Numerical maintenance amendment (2026-10-01):** `ER` is a ratio of net
+log movement to total absolute log movement and therefore belongs to the
+closed interval `[-1, 1]`. Decimal rounding at precision 38 may place the
+computed quotient infinitesimally outside that interval. The calculation must
+clamp only that rounding residue to `[-1, 1]`; cache validation remains strict.
+Acceptance evidence includes the observed monotonic `GDXUSDT/LONG` shape that
+previously produced `1.0000000000000000000000000000000000001` and aborted a
+whole recalculation batch.
+
 **Статус:** R7.3 утверждена; M0–M4 приняты, M5 измеряется.
 **Версия:** R7.3, 2026-09-25.
 **Назначение:** спецификация для обсуждения и независимой проверки плана.

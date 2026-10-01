@@ -4385,3 +4385,50 @@ canonical entries are not overwritten and retain the importer's fail-closed
 schema gate. TDD reproduced the original `0/0` failure before the change; the
 focused bootstrap regressions passed (`6 passed, 1 skipped`), and the related
 Panel/import suites passed (`192 passed, 4 skipped`; existing pandas warnings).
+
+## PerformanceDB compact cutover (2026-09-30)
+
+The canonical live PerformanceDB is now the verified schema-v8 compact file.
+It is 18,201,718,784 bytes versus 43,546,324,992 bytes before cutover (58.2%
+smaller), with the same database instance ID and exact row content: 23,887
+results/prepared rows, 14,753,892 actions and 112,188,510 equity rows. All
+23,887 prepared payloads matched after decoding; the copied live file has
+SHA-256 `adab2caea9242ffc3b48be1bc64ff6f8c7f14570116adc90af59cf620a4399c3`.
+Post-rename schema/count/public-reader smoke passed. The old large database and
+temporary C: candidate files were deleted. No v6 database artifact remains in
+the project data or backup directories; recovery to v6 requires a full
+re-import or an external backup. Next: finish the disposable
+with/without compound timestamp-index benchmark, then either remove the unused
+indexes under an explicit schema contract or retain them with measured evidence.
+
+## PerformanceDB 2,070-report import profile (2026-10-01)
+
+The corrected listing workbook `input/bybit_tradfi_liquidity.xlsx` covered the
+whole six-symbol batch. Import job `cb258a1329754183aea314129d474b78`
+committed 2,070/2,070 reports with no skips or rejects. The canonical database
+is 19,393,163,264 bytes and reports 25,957 strategies/results, 57,115 orders and
+3,112 plateaus.
+
+Measured publication was 1,254.552 seconds: Phase 8 preparation 963.364 s,
+row publication 242.858 s, commit 45.777 s, admission/readback/finalize about
+1.5 s. OPT-01e now owns the next import optimization and has independent
+`PLAN_APPROVED` at revision v4. It requires reproducible full-row evidence and
+exclusive Phase 8 attribution before retaining batching, threads or processes;
+the final accepted Phase 8 median must improve by at least 20% without
+regressing total publication, row publication, commit or peak memory.
+
+The user-started all-pairs cache recalculation reached a terminal failure on
+`GDXUSDT/LONG`: result 9169 produced ER
+`1.0000000000000000000000000000000000001` because Decimal rounding crossed
+the mathematical upper bound by one final-place unit, and the unchanged strict
+cache validator rejected the batch. The shared equity calculation now clamps
+that mathematically bounded ratio to `[-1, 1]`; deterministic rising and
+falling regressions cover both limits. The complete equity quality/cache/
+selection test set passes (`248 passed`; existing pandas warnings), and a
+read-only calculation plus canonical encoding of live result 9169 succeeds.
+Panel was restarted with the fix and the operator started the all-pairs retry.
+A stale read-only diagnostic process initially held the DuckDB file; it was
+terminated, writer-open smoke passed, and the retry reached `RUNNING` with
+cache batches committing normally. Next: observe the terminal result, then
+establish the unchanged Phase 8 baseline and apply only the first measured
+optimization that passes OPT-01e.

@@ -249,7 +249,8 @@ def _window_facts(
     slope = sum(((x - xbar) * (y - ybar) for x, y in zip(xs, logs)), ZERO) / denominator
     path = sum((abs(right - left) for left, right in zip(logs, logs[1:])), ZERO)
     endpoint_log = logs[-1] - logs[0]
-    er = ZERO if path == ZERO else endpoint_log / path
+    # Triangle inequality bounds this ratio; clamp only removes Decimal rounding residue.
+    er = ZERO if path == ZERO else max(-ONE, min(ONE, endpoint_log / path))
     returns = Decimal(100) * (values[-1] / values[0] - ONE)
     return EquityWindowFacts(
         days,
