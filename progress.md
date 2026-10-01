@@ -1,5 +1,27 @@
 # MRS3 — current verification
 
+## Performance v2 fixed filter sequence (2026-10-01)
+
+In branch `feat/performance-v2-filter-sequence`, screen `4. Pareto and filters`
+has the fixed prefix Equity (default off), revised Lot, unified hard cutoffs,
+revised A/B, and top-five concentration (latter four default on). The guarded
+DD condition is `full DD > 23% AND known full PnL/30d < 3 * full DD`;
+`full PnL/30d <= 4%` and the guarded dual ratio remain independent OR rules.
+Only actual hard-cutoff losers in a published XLSX selection gain durable
+`User Status=REJECTED`; preview is read-only. Time consistency no longer
+excludes, while the window calculation and `Positive windows` XLSX evidence
+remain. Historical selection review import still accepts an enabled retired
+time stage through a private compatibility parse path.
+
+The post-change relevant combined pytest suites passed **566** with **4 Windows
+symlink skips** in 220.94 seconds from `.venv` and a unique C: TEMP directory,
+which was removed. `node --check src/mrs3/panel_web/app.js` and
+`git diff --check` passed. Independent Claude Opus 5/high re-review returned
+`CODE_REVIEW_PASS` after the historical replay regression was fixed. No live
+PerformanceDB, tester, portfolio runtime, schema migration, or historical
+snapshot rewrite was performed. Next: review and merge the scoped feature
+branch; research on later Pareto/ranking stages remains separate.
+
 ## Heavy DB closeout (2026-10-01)
 
 The current branch removes full-batch private optimizer preparation from ordinary

@@ -41,6 +41,7 @@ _STAGE_IDS = frozenset((
     "filter_low_trades",
     "filter_min_shift",
     "filter_equity_regime",
+    "filter_hard_cutoffs",
     "ab_deterioration",
     "pareto_window_b",
     "pareto_window_b_dd_shift",
@@ -74,7 +75,9 @@ _CANDIDATE_COLUMNS = (
     "capital_efficiency", "total_plateau_point_count",
     "ab_return_a_30d_pct", "ab_return_b_30d_pct", "ab_calendar_days_a", "ab_calendar_days_b", "ab_win_rate_b_pct",
     "ab_trade_rate_a_30d", "ab_trade_rate_b_30d", "ab_drawdown_b_pct", "ab_holding_p95_minutes",
+    "initial_balance", "history_days", "completed_cycle_count", "reliable_completed_cycle_count", "completed_profitable_cycle_count", "completed_cycle_net_pnl", "top5_pnl", "top5_share_pct", "pnl_after_top5", "completed_cycles_reliable",
     "best_trade_profit_share_pct", "pnl_without_best_trade", "pnl_without_best_trade_pct", "completed_profitable_trade_count", "best_trade_reliable",
+    "ab_completed_cycle_count",
     "positive_quarter_count", "positive_quarter_available_count", "positive_quarter_status", "robust_pnl_30d_pct", "worst_drawdown_pct", "worst_holding_p95_minutes",
     "ab_stability_ratio", "minimum_plateau_point_count",
     "lot_variant_group_key", "lot_variant_representative_strategy_id",
@@ -124,9 +127,24 @@ class SelectionRequest:
 @dataclass(frozen=True, slots=True)
 class SelectionConfig:
     ab_final_days: int = 14
-    ab_return_floor_pct: Decimal = Decimal("5")
+    ab_return_floor_pct: Decimal = Decimal("4")
     ab_return_divisor: Decimal = Decimal("10")
-    ab_win_rate_floor_pct: Decimal = Decimal("58")
+    ab_win_rate_floor_pct: Decimal = Decimal("55")
+    ab_decline_cap_pct: Decimal = Decimal("15")
+    ab_completed_cycles: int = 25
+    lot_full_dd5_multiplier: Decimal = Decimal("1.10")
+    lot_full_dd_multiplier: Decimal = Decimal("1.10")
+    lot_tolerance: Decimal = Decimal("1e-9")
+    hard_dd_pct: Decimal = Decimal("23")
+    hard_dd_profit_multiplier: Decimal = Decimal("3")
+    hard_pnl30_floor_pct: Decimal = Decimal("4")
+    hard_ratio: Decimal = Decimal("0.75")
+    hard_min_history_days: int = 45
+    hard_min_cycles: int = 25
+    top5_share_pct: Decimal = Decimal("80")
+    top5_min_history_days: int = 45
+    top5_min_profitable_cycles: int = 25
+    # Kept for decoding older local configs; the old predicates are retired.
     ab_trade_rate_divisor: Decimal = Decimal("7")
     plateau_points_pareto_pnl_multiplier: Decimal = Decimal("2")
     best_trade_max_profit_share_pct: Decimal = Decimal("35")
@@ -134,12 +152,34 @@ class SelectionConfig:
     shift_near_tie_min_advantage_bp: int = 10
     lot_variant_redundancy_enabled: bool = True
 
+    @property
+    def ab_min_completed_cycles(self) -> int:
+        return self.ab_completed_cycles
+
+    @property
+    def top5_max_profit_share_pct(self) -> Decimal:
+        return self.top5_share_pct
+
+    @property
+    def top5_min_profitable_trades(self) -> int:
+        return self.top5_min_profitable_cycles
+
+    @property
+    def hard_cutoff_dd_pct(self) -> Decimal:
+        return self.hard_dd_pct
+
+    @property
+    def hard_cutoff_ratio(self) -> Decimal:
+        return self.hard_ratio
+
 
 def _error(code: str) -> PerformanceV2SelectionError:
     return PerformanceV2SelectionError(code)
 
 
-def parse_selection_request(payload: Mapping[str, object]) -> SelectionRequest:
+def parse_selection_request(
+    payload: Mapping[str, object], *, allow_retired_enabled: bool = False,
+) -> SelectionRequest:
     if set(payload) != {"symbol", "side", "stages"}:
         raise _error("INVALID_REQUEST")
     symbol = payload["symbol"]
@@ -178,6 +218,8 @@ def parse_selection_request(payload: Mapping[str, object]) -> SelectionRequest:
             raise _error("INVALID_STAGE")
         if scope not in _SCOPES:
             raise _error("INVALID_SCOPE")
+        if stage_id == "filter_time_consistency" and enabled and not allow_retired_enabled:
+            raise _error("RETIRED_STAGE")
         min_shift_pct = _positive_decimal(raw["min_shift_pct"], "min_shift_pct") if stage_id == "filter_min_shift" and enabled else None
         pnl_tolerance_pct = _bounded_decimal(raw["pnl_tolerance_pct"], "pnl_tolerance_pct", Decimal(0), Decimal(100)) if stage_id in {"pareto_shift_near_tie", "pareto_close_ma_near_tie"} and enabled else None
         top_n = _positive_int(raw["top_n"], "top_n") if stage_id == "rank_robust_top_n" else None
@@ -268,6 +310,36 @@ def _bounded_decimal(value: object, name: str, lower: Decimal, upper: Decimal) -
     return parsed
 
 
+def _bounded_decimal_inclusive(value: object, name: str, lower: Decimal, upper: Decimal) -> Decimal:
+    if isinstance(value, bool):
+        raise _error(f"INVALID_CONFIG_{name}")
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        raise _error(f"INVALID_CONFIG_{name}") from None
+    if not parsed.is_finite() or parsed < lower or parsed > upper:
+        raise _error(f"INVALID_CONFIG_{name}")
+    return parsed
+
+
+def _at_least_decimal(value: object, name: str, lower: Decimal) -> Decimal:
+    parsed = _positive_decimal(value, name)
+    if parsed < lower:
+        raise _error(f"INVALID_CONFIG_{name}")
+    return parsed
+
+
+def _nonnegative_decimal(value: object, name: str) -> Decimal:
+    return _bounded_decimal_inclusive(value, name, Decimal(0), Decimal("1e999"))
+
+
+def _positive_bounded_decimal(value: object, name: str, upper: Decimal) -> Decimal:
+    parsed = _positive_decimal(value, name)
+    if parsed > upper:
+        raise _error(f"INVALID_CONFIG_{name}")
+    return parsed
+
+
 def _positive_int(value: object, name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise _error(f"INVALID_CONFIG_{name}")
@@ -285,6 +357,11 @@ def load_selection_config(path: Path) -> SelectionConfig:
     selected = section.get("finalist_selection", {})
     if not isinstance(selected, Mapping):
         raise _error("INVALID_CONFIG")
+    def setting(name: str, default: object, *aliases: str) -> object:
+        for key in (name, *aliases):
+            if key in selected:
+                return selected[key]
+        return default
     final_days = selected.get("ab_final_days", 14)
     if isinstance(final_days, bool) or not isinstance(final_days, int) or final_days < 1:
         raise _error("INVALID_CONFIG_ab_final_days")
@@ -295,9 +372,23 @@ def load_selection_config(path: Path) -> SelectionConfig:
         raise _error("INVALID_CONFIG_lot_variant_redundancy_enabled")
     return SelectionConfig(
         ab_final_days=final_days,
-        ab_return_floor_pct=_positive_decimal(selected.get("ab_return_floor_pct", 5), "ab_return_floor_pct"),
-        ab_return_divisor=_positive_decimal(selected.get("ab_return_divisor", 10), "ab_return_divisor"),
-        ab_win_rate_floor_pct=_positive_decimal(selected.get("ab_win_rate_floor_pct", 58), "ab_win_rate_floor_pct"),
+        ab_return_floor_pct=_nonnegative_decimal(setting("ab_return_floor_pct", 4), "ab_return_floor_pct"),
+        ab_return_divisor=_at_least_decimal(setting("ab_return_divisor", 10), "ab_return_divisor", Decimal(1)),
+        ab_win_rate_floor_pct=_bounded_decimal_inclusive(setting("ab_win_rate_floor_pct", 55), "ab_win_rate_floor_pct", Decimal(0), Decimal(100)),
+        ab_decline_cap_pct=_at_least_decimal(setting("ab_decline_cap_pct", 15), "ab_decline_cap_pct", _nonnegative_decimal(setting("ab_return_floor_pct", 4), "ab_return_floor_pct")),
+        ab_completed_cycles=_positive_int(setting("ab_completed_cycles", 25, "ab_min_completed_cycles"), "ab_completed_cycles"),
+        lot_full_dd5_multiplier=_at_least_decimal(setting("lot_full_dd5_multiplier", 1.10), "lot_full_dd5_multiplier", Decimal(1)),
+        lot_full_dd_multiplier=_at_least_decimal(setting("lot_full_dd_multiplier", 1.10), "lot_full_dd_multiplier", Decimal(1)),
+        lot_tolerance=_positive_decimal(setting("lot_tolerance", "1e-9"), "lot_tolerance"),
+        hard_dd_pct=_positive_decimal(setting("hard_dd_pct", 23, "hard_cutoff_dd_pct"), "hard_dd_pct"),
+        hard_dd_profit_multiplier=_positive_decimal(setting("hard_dd_profit_multiplier", 3), "hard_dd_profit_multiplier"),
+        hard_pnl30_floor_pct=_nonnegative_decimal(setting("hard_pnl30_floor_pct", 4), "hard_pnl30_floor_pct"),
+        hard_ratio=_positive_bounded_decimal(setting("hard_ratio", "0.75", "hard_cutoff_ratio"), "hard_ratio", Decimal(1)),
+        hard_min_history_days=_positive_int(setting("hard_min_history_days", 45), "hard_min_history_days"),
+        hard_min_cycles=_positive_int(setting("hard_min_cycles", 25), "hard_min_cycles"),
+        top5_share_pct=_bounded_decimal_inclusive(setting("top5_share_pct", 80, "top5_max_profit_share_pct"), "top5_share_pct", Decimal(0), Decimal(100)),
+        top5_min_history_days=_positive_int(setting("top5_min_history_days", 45), "top5_min_history_days"),
+        top5_min_profitable_cycles=_positive_int(setting("top5_min_profitable_cycles", 25, "top5_min_profitable_trades"), "top5_min_profitable_cycles"),
         ab_trade_rate_divisor=_positive_decimal(selected.get("ab_trade_rate_divisor", 7), "ab_trade_rate_divisor"),
         plateau_points_pareto_pnl_multiplier=_positive_decimal(
             selected.get("plateau_points_pareto_pnl_multiplier", 2),
@@ -400,16 +491,17 @@ def _window_b_holding_p95_minutes(
     return {int(result_id): Decimal(str(p95)) for result_id, p95 in rows if p95 is not None}
 
 
-def _best_trade_facts(
-    connection: duckdb.DuckDBPyConnection, request: SelectionRequest
-) -> dict[int, tuple[Decimal | None, Decimal | None, int | None, bool]]:
+def _completed_cycle_facts(
+    connection: duckdb.DuckDBPyConnection, request: SelectionRequest, config: SelectionConfig,
+) -> dict[int, dict[str, object]]:
     cohort_sql, cohort_params = _cohort_clause(request)
     rows = connection.execute(
         """with actions as (
                  select a.result_id, a.timestamp_utc, a.action_index, lower(a.action) as kind,
-                        a.post_size, lower(a.post_side) as post_side, a.pnl, lower(s.side) as expected_side,
-                        case when a.post_size <> 0 and lower(a.post_side) in ('long', 'short')
-                                  and lower(a.post_side) <> lower(s.side) then 1 else 0 end as side_flip
+                         a.post_size, lower(a.post_side) as post_side, a.pnl, lower(s.side) as expected_side,
+                         r.report_start_utc, r.report_end_utc, r.effective_start_utc, r.effective_end_utc,
+                         case when a.post_size <> 0 and lower(a.post_side) in ('long', 'short')
+                                   and lower(a.post_side) <> lower(s.side) then 1 else 0 end as side_flip
                    from strategy_actions a
                    join strategy_results r on r.result_id = a.result_id
                    join strategies s on s.strategy_id = r.strategy_id and s.current_result_id = r.result_id
@@ -421,38 +513,83 @@ def _best_trade_facts(
                     over (partition by result_id order by timestamp_utc, action_index rows unbounded preceding) as position_number
                    from actions
              ), trips as (
-                 select result_id, position_number,
-                        max(side_flip) as side_flip,
-                        max(case when kind = 'closed' and post_size = 0 then 1 else 0 end) as completed,
-                        sum(pnl) filter (where kind in ('decreased', 'closed')) as trip_pnl
-                   from numbered
-                  group by result_id, position_number
-             ), completed as (
-                 select result_id, trip_pnl
-                   from trips
-                  where position_number > 0 and completed = 1 and side_flip = 0 and trip_pnl is not null
-             ), reliable as (
-                 select result_id, max(side_flip) = 0 as reliable from numbered group by result_id
-             ), summary as (
-                 select result_id,
-                        max(trip_pnl) filter (where trip_pnl > 0) as best_trade_pnl,
-                        sum(trip_pnl) as completed_pnl,
-                        sum(case when trip_pnl > 0 then trip_pnl else 0 end) as gross_positive_pnl,
-                        count(*) filter (where trip_pnl > 0) as positive_count
-                   from completed group by result_id
-             )
-             select reliable.result_id, summary.best_trade_pnl, summary.completed_pnl,
-                    summary.gross_positive_pnl, summary.positive_count, reliable.reliable
-               from reliable left join summary using (result_id)""",
-        [request.symbol, request.side, *cohort_params],
+                  select result_id, position_number,
+                         max(side_flip) as side_flip,
+                         min(report_start_utc) as report_start_utc,
+                         min(report_end_utc) as report_end_utc,
+                         min(effective_start_utc) as effective_start_utc,
+                         min(effective_end_utc) as effective_end_utc,
+                         min(timestamp_utc) filter (where kind = 'opened' and post_size <> 0 and post_side = expected_side) as opened_at,
+                         max(timestamp_utc) filter (where kind = 'closed' and post_size = 0) as closed_at,
+                         max(case when kind = 'closed' and post_size = 0 then 1 else 0 end) as completed,
+                         sum(pnl) filter (where kind in ('decreased', 'closed')) as trip_pnl,
+                         count(*) filter (where kind in ('decreased', 'closed') and pnl is null) as missing_pnl
+                    from numbered
+                   group by result_id, position_number
+              )
+              select result_id, report_start_utc, report_end_utc, effective_start_utc, effective_end_utc,
+                     opened_at, closed_at, trip_pnl, side_flip, completed, missing_pnl
+                    from trips
+                   where position_number > 0""",
+         [request.symbol, request.side, *cohort_params],
     ).fetchall()
-    facts: dict[int, tuple[Decimal | None, Decimal | None, int | None, bool]] = {}
-    for result_id, best, total, gross, count, reliable in rows:
-        best_value, total_value, gross_value = (_decimal_or_none(value) for value in (best, total, gross))
-        if not reliable or best_value is None or total_value is None or gross_value is None or gross_value <= 0:
-            facts[int(result_id)] = (None, None, None, bool(reliable))
+    grouped: dict[int, list[tuple[object, ...]]] = {}
+    for row in rows:
+        grouped.setdefault(int(row[0]), []).append(row)
+    facts: dict[int, dict[str, object]] = {}
+    for result_id, cycles in grouped.items():
+        report_start = _utc_datetime(cycles[0][1])
+        report_end = _utc_datetime(cycles[0][2])
+        effective_start = _utc_datetime(cycles[0][3])
+        effective_end = _utc_datetime(cycles[0][4])
+        if report_end is None:
+            facts[result_id] = {"completed_cycles_reliable": False}
             continue
-        facts[int(result_id)] = (best_value / gross_value * 100, total_value - best_value, int(count), True)
+        effective_start = effective_start or report_start or report_end
+        effective_end = effective_end or report_end
+        history_days = Decimal(str((effective_end - effective_start).total_seconds())) / Decimal(86400)
+        reliable = all(bool(cycle[8] == 0) for cycle in cycles)
+        completed = [cycle for cycle in cycles if cycle[9] == 1 and _decimal_or_none(cycle[7]) is not None]
+        if any(cycle[9] == 1 and (cycle[10] or _decimal_or_none(cycle[7]) is None) for cycle in cycles):
+            reliable = False
+        full_pnls = [_decimal_or_none(cycle[7]) for cycle in completed]
+        full_pnls = [pnl for pnl in full_pnls if pnl is not None]
+        b_end = effective_end
+        b_start = b_end - timedelta(days=config.ab_final_days)
+        b_cycles = [cycle for cycle in completed if _utc_datetime(cycle[6]) is not None and b_start <= _utc_datetime(cycle[6]) <= b_end]
+        b_pnls = [_decimal_or_none(cycle[7]) for cycle in b_cycles]
+        b_pnls = [pnl for pnl in b_pnls if pnl is not None]
+        if not reliable:
+            facts[result_id] = {
+                "completed_cycles_reliable": False, "history_days": history_days,
+                "completed_cycle_count": None, "completed_profitable_cycle_count": None,
+                "completed_cycle_net_pnl": None, "top5_pnl": None, "top5_share_pct": None,
+                "pnl_after_top5": None, "ab_completed_cycle_count": None, "ab_win_rate_b_pct": None,
+                "best_trade_profit_share_pct": None, "pnl_without_best_trade": None,
+                "pnl_without_best_trade_pct": None, "completed_profitable_trade_count": None,
+                "best_trade_reliable": False,
+            }
+            continue
+        net = sum(full_pnls, Decimal(0))
+        positive = sorted((pnl for pnl in full_pnls if pnl > 0), reverse=True)
+        best = positive[0] if positive else None
+        top5 = sum(positive[:5], Decimal(0))
+        b_positive = sum(pnl > 0 for pnl in b_pnls)
+        b_negative = sum(pnl < 0 for pnl in b_pnls)
+        b_win_rate = Decimal(b_positive) * 100 / Decimal(b_positive + b_negative) if b_positive + b_negative else None
+        facts[result_id] = {
+            "completed_cycles_reliable": True, "history_days": history_days,
+            "completed_cycle_count": len(full_pnls), "reliable_completed_cycle_count": len(full_pnls), "completed_profitable_cycle_count": len(positive),
+            "completed_cycle_net_pnl": net, "top5_pnl": top5,
+            "top5_share_pct": top5 / net * 100 if net > 0 else None,
+            "pnl_after_top5": net - top5, "ab_completed_cycle_count": len(b_pnls),
+            "ab_win_rate_b_pct": b_win_rate,
+            "best_trade_profit_share_pct": best / sum(positive, Decimal(0)) * 100 if best is not None else None,
+            "pnl_without_best_trade": net - best if best is not None else None,
+            "pnl_without_best_trade_pct": None,
+            "completed_profitable_trade_count": len(positive) if positive else None,
+            "best_trade_reliable": True,
+        }
     return facts
 
 
@@ -1110,7 +1247,7 @@ def load_selection_candidates(
     equity_source_columns = " r.imported_at_utc, r.optimizer_source_metadata_json,"
     holding_minutes = _holding_quantiles_minutes(connection, request)
     b_holding_minutes = _window_b_holding_p95_minutes(connection, request, config)
-    best_trade_facts = _best_trade_facts(connection, request)
+    cycle_facts = _completed_cycle_facts(connection, request, config)
     cached_metrics = _selection_cached_metrics(connection, request) if cache_only else None
     rows = connection.execute(
         """select s.strategy_id, s.strategy_name, s.symbol, s.side, s.timeframe, s.close_ma_len,
@@ -1165,12 +1302,8 @@ def load_selection_candidates(
             pnl_30d = None if full_metrics is None else _return_30d(full_metrics, report_start, report_end)
             drawdown = _decimal_or_none(max_drawdown_pct)
             risk_scale = Decimal(5) / drawdown if drawdown is not None and drawdown > 0 else None
-            best_share, pnl_without_best, positive_trade_count, best_trade_reliable = best_trade_facts.get(result_id, (None, None, None, False))
+            completed_facts = cycle_facts.get(result_id, {"completed_cycles_reliable": False})
             initial_balance_value = _decimal_or_none(initial_balance)
-            pnl_without_best_pct = (
-                pnl_without_best / initial_balance_value * 100
-                if pnl_without_best is not None and initial_balance_value is not None and initial_balance_value > 0 else None
-            )
             candidate = {
                 "strategy_id": int(strategy_id), "strategy_name": str(strategy_name), "symbol": str(symbol),
                 "side": str(side), "timeframe": str(timeframe), "close_ma_len": int(close_ma_len),
@@ -1180,6 +1313,7 @@ def load_selection_candidates(
                 "report_start_utc": report_start, "report_end_utc": report_end,
                 "reported_start_utc": reported_start, "reported_end_utc": reported_end,
                 "effective_start_utc": effective_start, "effective_end_utc": effective_end,
+                "initial_balance": initial_balance_value,
                 "total_trades": None if full_metrics is None else full_metrics.trade_count,
                 "trades_30d": None if full_metrics is None else _trade_rate_30d(full_metrics, report_start, report_end),
                 "pnl_30d_pct": pnl_30d,
@@ -1191,9 +1325,7 @@ def load_selection_candidates(
                 **ab_metrics, "ab_holding_p95_minutes": b_holding_minutes.get(result_id),
                 "first_shift_bp": None, "scaled_lot_sum": None, "capital_proxy": None,
                 "capital_efficiency": None, "total_plateau_point_count": None,
-                "best_trade_profit_share_pct": best_share, "pnl_without_best_trade": pnl_without_best,
-                "pnl_without_best_trade_pct": pnl_without_best_pct,
-                "completed_profitable_trade_count": positive_trade_count, "best_trade_reliable": best_trade_reliable,
+                **completed_facts,
                 "positive_quarter_count": positive_quarters[0],
                 "positive_quarter_available_count": positive_quarters[1],
                 "positive_quarter_status": positive_quarters[2],
@@ -1202,6 +1334,8 @@ def load_selection_candidates(
                 "ab_stability_ratio": None, "minimum_plateau_point_count": None,
                 "lot_variant_group_key": None, "lot_variant_representative_strategy_id": pd.NA,
             }
+            if candidate.get("pnl_without_best_trade") is not None and initial_balance_value is not None and initial_balance_value > 0:
+                candidate["pnl_without_best_trade_pct"] = candidate["pnl_without_best_trade"] / initial_balance_value * 100
             candidates[int(strategy_id)] = candidate
         if order_id is not None:
             number = int(order_id)
@@ -1594,38 +1728,116 @@ def _equity_workbook_values(cached: object) -> dict[str, object]:
     }
 
 
+_FIXED_PREFIX = (
+    "filter_equity_regime", "filter_lot_variant_redundancy", "filter_hard_cutoffs",
+    "ab_deterioration", "filter_best_trade_dependency",
+)
+
+
 def effective_selection_stages(
     request: SelectionRequest, config: SelectionConfig = SelectionConfig(),
 ) -> tuple[SelectionStage, ...]:
     explicit_ids = {stage.id for stage in request.stages}
     stages = list(request.stages)
     if _LOT_VARIANT_STAGE_ID not in explicit_ids and config.lot_variant_redundancy_enabled:
-        stages.insert(0, SelectionStage(_LOT_VARIANT_STAGE_ID, True, "pair_side_timeframe"))
-    elif _LOT_VARIANT_STAGE_ID in explicit_ids:
-        lot_stage = next(stage for stage in stages if stage.id == _LOT_VARIANT_STAGE_ID)
-        stages = [lot_stage, *(stage for stage in stages if stage.id != _LOT_VARIANT_STAGE_ID)]
-    if "filter_equity_regime" in explicit_ids:
-        equity_stage = next(stage for stage in stages if stage.id == "filter_equity_regime")
-        stages = [stage for stage in stages if stage.id != "filter_equity_regime"]
-        stages.insert(1 if stages and stages[0].id == _LOT_VARIANT_STAGE_ID else 0, equity_stage)
-    return tuple(stages)
+        stages.append(SelectionStage(_LOT_VARIANT_STAGE_ID, True, "pair_side_timeframe"))
+    by_id = {stage.id: stage for stage in stages}
+    prefix = [by_id[stage_id] for stage_id in _FIXED_PREFIX if stage_id in by_id]
+    remainder = [stage for stage in stages if stage.id not in _FIXED_PREFIX]
+    return tuple([*prefix, *remainder])
 
 
 def _scope_groups(frame: pd.DataFrame, scope: StageScope):
     return frame.groupby([] if scope == "pair_side" else ["timeframe"], dropna=False, sort=False) if scope != "pair_side" else [(None, frame)]
 
 
-def _ab_eliminates(row: pd.Series, config: SelectionConfig) -> bool | None:
-    fields = ("ab_return_a_30d_pct", "ab_return_b_30d_pct", "ab_win_rate_b_pct", "ab_trade_rate_a_30d", "ab_trade_rate_b_30d")
-    if any(field not in row or not _present(row[field]) for field in fields):
-        return None
-    a, b, win_b, trades_a, trades_b = (row[field] for field in fields)
-    return (
-        b <= config.ab_return_floor_pct
-        or (a > 0 and b <= a / config.ab_return_divisor)
-        or win_b < config.ab_win_rate_floor_pct
-        or (trades_a > 0 and trades_b <= trades_a / config.ab_trade_rate_divisor)
-    )
+def _hard_cutoff_evidence(row: pd.Series, config: SelectionConfig) -> tuple[bool, str | None]:
+    dd = _decimal_or_none(row.get("max_drawdown_pct"))
+    pnl = _decimal_or_none(row.get("pnl_30d_pct"))
+    history = _decimal_or_none(row.get("history_days"))
+    cycles = _integer(row.get("completed_cycle_count"))
+    if cycles is None:
+        cycles = _integer(row.get("reliable_completed_cycle_count"))
+    if _is_bool(row.get("completed_cycles_reliable"), False):
+        cycles = None
+    b_pnl = _decimal_or_none(row.get("ab_return_b_30d_pct"))
+    triggered: list[str] = []
+    if dd is not None and pnl is not None and dd > config.hard_dd_pct and pnl < config.hard_dd_profit_multiplier * dd:
+        triggered.append("DD_PROFIT_GUARD")
+    if pnl is not None and pnl <= config.hard_pnl30_floor_pct:
+        triggered.append("PNL30_FLOOR")
+    if (
+        history is not None and history >= config.hard_min_history_days
+        and cycles is not None and cycles >= config.hard_min_cycles
+        and dd is not None and dd > 0 and pnl is not None and b_pnl is not None
+        and pnl / dd < config.hard_ratio and b_pnl / dd < config.hard_ratio
+    ):
+        triggered.append("DUAL_RATIO")
+    if not triggered:
+        return False, None
+    known_values = {
+        "full_dd_pct": dd,
+        "full_pnl30_pct": pnl,
+        "b_pnl30_pct": b_pnl,
+        "history_days": history,
+        "reliable_completed_cycles": cycles,
+        "full_ratio": pnl / dd if dd is not None and dd > 0 and pnl is not None else None,
+        "b_ratio": b_pnl / dd if dd is not None and dd > 0 and b_pnl is not None else None,
+        "dd_threshold_pct": config.hard_dd_pct,
+        "dd_profit_multiplier": config.hard_dd_profit_multiplier,
+        "pnl30_floor_pct": config.hard_pnl30_floor_pct,
+        "ratio_threshold": config.hard_ratio,
+        "min_history_days": config.hard_min_history_days,
+        "min_reliable_cycles": config.hard_min_cycles,
+    }
+    payload = {
+        "applicability": {
+            "dd_profit_guard": dd is not None and pnl is not None,
+            "pnl30_floor": pnl is not None,
+            "dual_ratio": {
+                "history_gate": history is not None and history >= config.hard_min_history_days,
+                "cycle_gate": cycles is not None and cycles >= config.hard_min_cycles,
+                "positive_full_dd": dd is not None and dd > 0,
+                "full_pnl30_known": pnl is not None,
+                "b_pnl30_known": b_pnl is not None,
+            },
+        },
+        "missing": sorted(
+            name for name in ("full_dd_pct", "full_pnl30_pct", "b_pnl30_pct", "history_days", "reliable_completed_cycles")
+            if known_values[name] is None
+        ),
+        "triggered": triggered,
+        "values": {
+            name: str(value) if isinstance(value, Decimal) else value
+            for name, value in known_values.items()
+        },
+    }
+    return True, "FILTER_HARD_CUTOFFS:" + json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+def _ab_evidence(row: pd.Series, config: SelectionConfig) -> tuple[bool | None, str | None]:
+    a = _decimal_or_none(row.get("ab_return_a_30d_pct"))
+    b = _decimal_or_none(row.get("ab_return_b_30d_pct"))
+    win_b = _decimal_or_none(row.get("ab_win_rate_b_pct"))
+    b_cycles = _integer(row.get("ab_completed_cycle_count"))
+    triggered: list[str] = []
+    if b is not None and b <= config.ab_return_floor_pct:
+        triggered.append(f"B_PNL30_FLOOR(b={b})")
+    if (
+        a is not None and b is not None and a > 0
+        and b <= a / config.ab_return_divisor and b <= config.ab_decline_cap_pct
+    ):
+        triggered.append(f"A_B_DECLINE(a={a},b={b})")
+    if b_cycles is not None and b_cycles >= config.ab_completed_cycles and win_b is not None and win_b < config.ab_win_rate_floor_pct:
+        triggered.append(f"B_WIN_RATE(cycles={b_cycles},win={win_b})")
+    if triggered:
+        return True, "AB_DETERIORATION;" + ";".join(triggered)
+    incomplete = b is None
+    if b is not None and b <= config.ab_decline_cap_pct and a is None:
+        incomplete = True
+    if b_cycles is None or (b_cycles >= config.ab_completed_cycles and win_b is None):
+        incomplete = True
+    return (False, "AB_NOT_EVALUATED_INSUFFICIENT_DATA") if incomplete else (False, None)
 
 
 _LOT_VARIANT_STAGE_ID = "filter_lot_variant_redundancy"
@@ -1673,39 +1885,47 @@ def _integer(value: object) -> int | None:
     return int(parsed)
 
 
+def _is_bool(value: object, expected: bool) -> bool:
+    return isinstance(value, (bool, np.bool_)) and bool(value) is expected
+
+
 def _lot_variant_structure(row: pd.Series) -> tuple[tuple[object, ...], tuple[Decimal, ...]] | None:
     close_ma = _integer(row.get("close_ma_len"))
     order_count = _integer(row.get("order_count"))
     if close_ma is None or order_count is None or order_count < 1:
         return None
-    fields: list[tuple[int, int, Decimal]] = []
+    fields: list[tuple[int, int, Decimal, Decimal]] = []
     for order in range(1, order_count + 1):
         open_ma = _integer(row.get(f"order_{order}_open_ma_len"))
         shift = _integer(row.get(f"order_{order}_shift_bp"))
+        open_multiplier = _decimal_or_none(row.get(f"order_{order}_open_multiplier"))
         lot = _decimal_or_none(row.get(f"order_{order}_lot_x"))
-        if open_ma is None or shift is None or lot is None:
+        if (
+            open_ma is None or shift is None or open_multiplier is None or lot is None
+            or not open_multiplier.is_finite() or not lot.is_finite()
+        ):
             return None
-        fields.append((open_ma, shift, lot))
-    fields.sort(key=lambda value: (value[0], value[1], value[2]))
+        fields.append((open_ma, shift, open_multiplier, lot))
+    fields.sort(key=lambda value: (value[0], value[1], value[2], value[3]))
     symbol, side, timeframe = (row.get(name) for name in ("symbol", "side", "timeframe"))
     if any(value is None or pd.isna(value) for value in (symbol, side, timeframe)):
         return None
-    pairs = tuple((open_ma, shift) for open_ma, shift, _ in fields)
-    lots = tuple(lot for _, _, lot in fields)
+    pairs = tuple((open_ma, shift, open_multiplier) for open_ma, shift, open_multiplier, _ in fields)
+    lots = tuple(lot for _, _, _, lot in fields)
     return (str(symbol), str(side), str(timeframe), close_ma, order_count, pairs), lots
 
 
 def _lot_variant_group_key(structure: tuple[object, ...]) -> str:
     symbol, side, timeframe, close_ma, order_count, pairs = structure
     return json.dumps(
-        [symbol, side, timeframe, close_ma, order_count, [[open_ma, shift] for open_ma, shift in pairs]],
+        [symbol, side, timeframe, close_ma, order_count, [[open_ma, shift, str(multiplier)] for open_ma, shift, multiplier in pairs]],
         ensure_ascii=False,
         separators=(",", ":"),
     )
 
 
 def _lot_variant_eliminated(
-    result: pd.DataFrame, group: pd.DataFrame, *, protect_equity: bool = False,
+    result: pd.DataFrame, group: pd.DataFrame, config: SelectionConfig, *, protect_equity: bool = False,
 ) -> list[object]:
     candidates: dict[tuple[object, ...], list[tuple[object, tuple[Decimal, ...]]]] = {}
     for index, row in group.iterrows():
@@ -1717,15 +1937,20 @@ def _lot_variant_eliminated(
         candidates.setdefault(group_id, []).append((index, structure[1]))
 
     eliminated: list[object] = []
+    tolerance = config.lot_tolerance
     for group_id, members in candidates.items():
-        if len(members) < 2 or len({lots for _, lots in members}) < 2:
+        if len(members) != 2:
             continue
         rows = result.loc[[index for index, _ in members]]
-        if any(
-            _decimal_or_none(rows.iloc[position].get(metric)) is None
-            for position in range(len(rows))
-            for metric in _LOT_VARIANT_METRICS
-        ):
+        equal: list[object] = []
+        income: list[object] = []
+        for index, lots in members:
+            spread = max(lots) - min(lots)
+            if spread <= tolerance:
+                equal.append(index)
+            elif spread > tolerance:
+                income.append(index)
+        if len(equal) != 1 or len(income) != 1:
             continue
         strategy_ids: dict[object, int] = {}
         for index in rows.index:
@@ -1734,32 +1959,54 @@ def _lot_variant_eliminated(
                 break
             strategy_ids[index] = int(raw_id)
         else:
-            if protect_equity:
-                dispositions = [result.at[index, "equity_regime_disposition"] for index in rows.index]
-                if any(value not in {"PASS", "BLOCK", "BLOCK_IF_ERF_ENABLED"} for value in dispositions):
-                    result.loc[rows.index, "elimination_reason"] = "LOT_GROUP_EQUITY_UNASSESSED"
-                    continue
-                if any(value != "PASS" for value in dispositions):
-                    result.loc[rows.index, "elimination_reason"] = "LOT_GROUP_EQUITY_BLOCKED"
-                    continue
-
-            def winner_key(index: object) -> tuple[object, ...]:
-                row = rows.loc[index]
-                values = [_decimal_or_none(row[metric]) for metric in _LOT_VARIANT_METRICS]
-                assert all(value is not None for value in values)
-                dd5, capital, robust, drawdown, profit_factor = values
-                return (-dd5, capital, -robust, drawdown, -profit_factor, strategy_ids[index], row.get("_source_order", index))
-
-            winner = min(rows.index, key=winner_key)
+            equal_index, income_index = equal[0], income[0]
+            equal_row, income_row = result.loc[equal_index], result.loc[income_index]
+            equal_lots = members[next(i for i, (index, _) in enumerate(members) if index == equal_index)][1]
+            income_lots = members[next(i for i, (index, _) in enumerate(members) if index == income_index)][1]
+            initial_equal = _decimal_or_none(equal_row.get("initial_balance"))
+            initial_income = _decimal_or_none(income_row.get("initial_balance"))
+            equal_dd = _decimal_or_none(equal_row.get("max_drawdown_pct"))
+            income_dd = _decimal_or_none(income_row.get("max_drawdown_pct"))
+            equal_full = _decimal_or_none(equal_row.get("pnl_30d_pct"))
+            income_full = _decimal_or_none(income_row.get("pnl_30d_pct"))
+            equal_b = _decimal_or_none(equal_row.get("ab_return_b_30d_pct"))
+            income_b = _decimal_or_none(income_row.get("ab_return_b_30d_pct"))
+            equal_total, income_total = sum(equal_lots, Decimal(0)), sum(income_lots, Decimal(0))
+            complete = all(value is not None and value.is_finite() for value in (
+                initial_equal, initial_income, equal_dd, income_dd, equal_full, income_full, equal_b, income_b,
+            )) and initial_equal > 0 and initial_income > 0 and abs(initial_equal - initial_income) <= tolerance
+            complete = complete and equal_dd > 0 and income_dd > 0 and equal_full > 0 and equal_b > 0
+            complete = complete and equal_total > 0 and income_total > 0 and abs(equal_total - income_total) <= tolerance
+            if not complete:
+                continue
+            equal_full_dd5 = equal_full * 5 / equal_dd
+            income_full_dd5 = income_full * 5 / income_dd
+            equal_b_dd5 = equal_b * 5 / equal_dd
+            income_b_dd5 = income_b * 5 / income_dd
+            income_wins = (
+                income_full_dd5 >= config.lot_full_dd5_multiplier * equal_full_dd5
+                and income_dd <= config.lot_full_dd_multiplier * equal_dd
+                and income_b_dd5 >= equal_b_dd5
+                and income_b >= equal_b
+            )
+            winner, loser = (income_index, equal_index) if income_wins else (equal_index, income_index)
+            failed = []
+            if not income_wins:
+                if income_full_dd5 < config.lot_full_dd5_multiplier * equal_full_dd5:
+                    failed.append("FULL_DD5")
+                if income_dd > config.lot_full_dd_multiplier * equal_dd:
+                    failed.append("FULL_DD")
+                if income_b_dd5 < equal_b_dd5:
+                    failed.append("B_DD5")
+                if income_b < equal_b:
+                    failed.append("B_PNL30")
             structure = group_id[:-2]
             key = _lot_variant_group_key(structure)
             result.loc[rows.index, "lot_variant_group_key"] = key
             result.loc[rows.index, "lot_variant_representative_strategy_id"] = strategy_ids[winner]
-            losers = [index for index in rows.index if index != winner]
-            if losers:
-                eliminated.extend(losers)
-                result.loc[losers, "auto_status"] = "FILTERED"
-                result.loc[losers, "elimination_reason"] = "LOT_VARIANT_REDUNDANT"
+            eliminated.append(loser)
+            result.loc[loser, "auto_status"] = "FILTERED"
+            result.loc[loser, "elimination_reason"] = "LOT_VARIANT_" + (";".join(failed) if failed else "INCOME_WINS")
     return eliminated
 
 
@@ -1864,7 +2111,7 @@ def run_selection(
         if stage.id == _LOT_VARIANT_STAGE_ID:
             survivors = result.loc[result["finalist"]]
             for _, group in _scope_groups(survivors, stage.scope):
-                eliminated = _lot_variant_eliminated(result, group, protect_equity=equity_filter_enabled)
+                eliminated = _lot_variant_eliminated(result, group, config, protect_equity=False)
                 if eliminated:
                     result.loc[eliminated, column] = True
                     result.loc[eliminated, "finalist"] = False
@@ -1954,6 +2201,7 @@ def run_selection(
             }
             continue
         survivors = result.loc[result["finalist"]]
+        stage_evidence: dict[object, str] = {}
         for _, group in _scope_groups(survivors, stage.scope):
             if stage.id in {"filter_holding_outlier", "filter_low_trades"}:
                 metric = "holding_p95_minutes" if stage.id == "filter_holding_outlier" else "trades_30d"
@@ -1973,34 +2221,43 @@ def run_selection(
                     lambda shifts: any(_present(value) and Decimal(str(value)) < threshold_bp for value in shifts), axis=1
                 ) if shift_columns else pd.Series(False, index=group.index)
                 eliminated = group.index[failed]
+            elif stage.id == "filter_hard_cutoffs":
+                eliminated = []
+                for index, row in group.iterrows():
+                    decision, evidence = _hard_cutoff_evidence(row, config)
+                    if decision:
+                        eliminated.append(index)
+                        stage_evidence[index] = evidence or stage.id.upper()
             elif stage.id == "filter_best_trade_dependency":
-                evaluable = group["best_trade_reliable"].fillna(False) & (
-                    pd.to_numeric(group["completed_profitable_trade_count"], errors="coerce") >= config.best_trade_min_profitable_trades
-                )
-                failed = evaluable & (
-                    (pd.to_numeric(group["pnl_without_best_trade"], errors="coerce") <= 0)
-                    | (pd.to_numeric(group["best_trade_profit_share_pct"], errors="coerce") > float(config.best_trade_max_profit_share_pct))
-                )
-                eliminated = group.index[failed.fillna(False)]
+                eliminated = []
+                for index, row in group.iterrows():
+                    reliable_value = row.get("completed_cycles_reliable", row.get("top5_reliable", False))
+                    reliable = _is_bool(reliable_value, True)
+                    history = _decimal_or_none(row.get("history_days"))
+                    count = _integer(row.get("completed_profitable_cycle_count"))
+                    share = _decimal_or_none(row.get("top5_share_pct"))
+                    net = _decimal_or_none(row.get("completed_cycle_net_pnl"))
+                    if (
+                        reliable and history is not None and history >= config.top5_min_history_days
+                        and count is not None and count >= config.top5_min_profitable_cycles
+                        and net is not None and net > 0 and share is not None and share > config.top5_share_pct
+                    ):
+                        eliminated.append(index)
+                        stage_evidence[index] = f"FILTER_BEST_TRADE_DEPENDENCY;TOP5_SHARE(share={share},net={net},remainder={_decimal_or_none(row.get('pnl_after_top5'))})"
+                    elif not reliable or any(value is None for value in (history, count, net, share)):
+                        if result.at[index, "elimination_reason"] is None:
+                            result.at[index, "elimination_reason"] = "TOP5_NOT_EVALUATED_INSUFFICIENT_DATA"
             elif stage.id == "filter_time_consistency":
-                status = group.get("positive_quarter_status")
-                if status is not None:
-                    failed = status.eq("FAIL")
-                else:
-                    if not {"positive_quarter_available_count", "positive_quarter_count"}.issubset(group.columns):
-                        continue
-                    available = pd.to_numeric(group["positive_quarter_available_count"], errors="coerce")
-                    positive = pd.to_numeric(group["positive_quarter_count"], errors="coerce")
-                    failed = available.eq(4) & positive.lt(3)
-                eliminated = group.index[failed.fillna(False)]
+                eliminated = []
             elif stage.id == "ab_deterioration":
                 eliminated = []
                 for index, row in group.iterrows():
-                    decision = _ab_eliminates(row, config)
-                    if decision is None:
-                        result.at[index, "elimination_reason"] = "AB_NOT_EVALUATED_INSUFFICIENT_DATA"
-                    elif decision:
+                    decision, evidence = _ab_evidence(row, config)
+                    if decision:
                         eliminated.append(index)
+                        stage_evidence[index] = evidence or stage.id.upper()
+                    elif evidence is not None and result.at[index, "elimination_reason"] is None:
+                        result.at[index, "elimination_reason"] = evidence
             else:
                 if stage.id == "pareto_conditional_close_ma" and len(group) <= 3:
                     stage_counts[stage.id] = {"enabled": True, "eliminated": 0, "remaining": int(result["finalist"].sum())}
@@ -2017,7 +2274,9 @@ def run_selection(
             if len(eliminated):
                 result.loc[eliminated, column] = True
                 result.loc[eliminated, "finalist"] = False
-                result.loc[eliminated, "elimination_reason"] = stage.id.upper()
+                result.loc[eliminated, "elimination_reason"] = [
+                    stage_evidence.get(index, stage.id.upper()) for index in eliminated
+                ]
         if stage.id != _LOT_VARIANT_STAGE_ID or not implicit_lot_variant_stage:
             stage_counts[stage.id] = {"enabled": True, "eliminated": int(result[column].sum()), "remaining": int(result["finalist"].sum())}
     result.loc[result["auto_status"].isna() & result["finalist"], "auto_status"] = "FINALIST"
@@ -2079,7 +2338,7 @@ def write_selection_workbook(
     display = result.drop(columns=[
         column for column in result.columns
         if column.startswith("ab_") and column not in {
-            "ab_pnl_change_30d_pct", "ab_return_a_30d_pct", "ab_calendar_days_a", "ab_return_b_30d_pct", "ab_calendar_days_b", "ab_stability_ratio",
+            "ab_pnl_change_30d_pct", "ab_return_a_30d_pct", "ab_calendar_days_a", "ab_return_b_30d_pct", "ab_calendar_days_b", "ab_stability_ratio", "ab_completed_cycle_count", "ab_win_rate_b_pct",
         }
     ] + ["total_pnl", "total_pnl_pct", "max_drawdown", "total_fees", "risk_scale", "scaled_lot_sum", "daily_log_return", "_equity_cache"], errors="ignore").copy()
     equity_block_enabled = equity_request_enabled or any(column in display for column in equity_columns)
@@ -2089,7 +2348,7 @@ def write_selection_workbook(
                 display[column] = None
     if "ab_pnl_change_30d_pct" not in display:
         display["ab_pnl_change_30d_pct"] = None
-    enabled_stages = [stage for stage in request.stages if stage.enabled]
+    enabled_stages = [stage for stage in effective_selection_stages(request) if stage.enabled]
     reason_positions = {stage.id.upper(): index for index, stage in enumerate(enabled_stages, start=1)}
     reason_colors = {
         stage.id.upper(): "".join(
@@ -2105,8 +2364,8 @@ def write_selection_workbook(
     if "elimination_reason" in display:
         display["elimination_reason"] = display["elimination_reason"].map(
             lambda reason: (
-                f"{reason_positions[reason]}. {SELECTION_REASON_ALIASES.get(reason, reason)}"
-                if reason in reason_positions else SELECTION_REASON_ALIASES.get(reason, reason)
+                f"{reason_positions[reason.split(';', 1)[0]]}. {reason}"
+                if reason.split(';', 1)[0] in reason_positions else reason
             ) if isinstance(reason, str) else reason
         )
     for column in ("pnl_30d_pct", "profit_factor", "win_rate_pct"):
@@ -2225,7 +2484,7 @@ def write_selection_workbook(
         "pnl_30d_pct", "dd5_proxy", "ab_pnl_change_30d_pct", "ab_return_a_30d_pct", "ab_calendar_days_a", "ab_return_b_30d_pct", "ab_calendar_days_b", "positive_quarter_count",
         "capital_efficiency", "profit_factor", "max_drawdown_pct", "win_rate_pct", "total_trades", "trades_30d", "capital_proxy",
         "holding_p95_minutes", "holding_median_minutes",
-        "best_trade_profit_share_pct", "pnl_without_best_trade_pct", "completed_profitable_trade_count",
+        "history_days", "completed_cycle_count", "completed_profitable_cycle_count", "completed_cycle_net_pnl", "top5_pnl", "top5_share_pct", "pnl_after_top5", "ab_completed_cycle_count", "ab_win_rate_b_pct",
         "robust_pnl_30d_pct", "worst_drawdown_pct", "worst_holding_p95_minutes", "ab_stability_ratio",
         "rank_quality_robust_pnl", "rank_quality_worst_drawdown", "rank_quality_ab_stability", "rank_quality_first_shift", "rank_quality_minimum_plateau_points", "rank_quality_close_ma",
         "rank_weight_coverage_pct", "rank_weight_robust_pnl", "rank_weight_worst_drawdown", "rank_weight_ab_stability", "rank_weight_first_shift", "rank_weight_minimum_plateau_points", "rank_weight_close_ma",
@@ -2246,8 +2505,8 @@ def write_selection_workbook(
         "max_drawdown_pct": "DD", "win_rate_pct": "W/R", "total_trades": "Trades", "capital_proxy": "Lot DD5",
         "holding_p95_minutes": "Hold p95", "holding_median_minutes": "Hold M",
         "elimination_reason": "Причина",
-        "best_trade_profit_share_pct": "Best trade, %", "pnl_without_best_trade_pct": "PnL without best, %",
-        "completed_profitable_trade_count": "Positive trades", "positive_quarter_count": "Positive windows", "trades_30d": "Trades/30",
+        "history_days": "History days", "completed_cycle_count": "Completed cycles", "completed_profitable_cycle_count": "Profitable cycles", "completed_cycle_net_pnl": "Completed net PnL", "top5_pnl": "Top 5 PnL", "top5_share_pct": "Top 5 share, %", "pnl_after_top5": "PnL after top 5", "ab_completed_cycle_count": "B cycles", "ab_win_rate_b_pct": "B W/R",
+        "positive_quarter_count": "Positive windows", "trades_30d": "Trades/30",
         "robust_pnl_30d_pct": "Robust PnL/30", "worst_drawdown_pct": "Worst DD", "worst_holding_p95_minutes": "Worst Hold p95",
         "ab_stability_ratio": "A/B stability",
         "rank_quality_robust_pnl": "Rank q PnL", "rank_quality_worst_drawdown": "Rank q DD",

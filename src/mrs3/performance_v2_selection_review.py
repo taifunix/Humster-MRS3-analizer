@@ -83,6 +83,19 @@ def canonical_contract(request: SelectionRequest, config: SelectionConfig) -> tu
     return request_json, sha256(request_json.encode()).hexdigest(), config_json, sha256(config_json.encode()).hexdigest()
 
 
+def _legacy_effective_stage_order(request: SelectionRequest, lot_enabled: bool) -> list[str]:
+    ids = [stage.id for stage in request.stages]
+    if "filter_lot_variant_redundancy" in ids:
+        ids.remove("filter_lot_variant_redundancy")
+        ids.insert(0, "filter_lot_variant_redundancy")
+    elif lot_enabled:
+        ids.insert(0, "filter_lot_variant_redundancy")
+    if "filter_equity_regime" in ids:
+        ids.remove("filter_equity_regime")
+        ids.insert(1 if ids and ids[0] == "filter_lot_variant_redundancy" else 0, "filter_equity_regime")
+    return ids
+
+
 def database_instance_id(connection: duckdb.DuckDBPyConnection) -> str:
     row = connection.execute("select value from schema_info where key = 'database_instance_id'").fetchone()
     if not row:
@@ -215,6 +228,23 @@ def apply_prior_rejected(connection: duckdb.DuckDBPyConnection, candidates: pd.D
     return output
 
 
+def hard_cutoff_rejected_ids(
+    result: pd.DataFrame, request: SelectionRequest, config: SelectionConfig,
+) -> set[int]:
+    if not any(
+        stage.id == "filter_hard_cutoffs" and stage.enabled
+        for stage in effective_selection_stages(request, config)
+    ) or "eliminated_by_filter_hard_cutoffs" not in result:
+        return set()
+    return {
+        int(row["strategy_id"])
+        for row in result.to_dict(orient="records")
+        if row.get("eliminated_by_filter_hard_cutoffs") is True
+        and row.get("auto_status") == "FILTERED"
+        and str(row.get("elimination_reason") or "").startswith("FILTER_HARD_CUTOFFS:")
+    }
+
+
 def _cell(value: object) -> object:
     try:
         if pd.isna(value):
@@ -331,6 +361,9 @@ def persist_selection_snapshots(
             if "equity_quality_snapshot" in request_extra_json and request_extra_json["equity_quality_snapshot"] != equity_snapshot:
                 raise SelectionReviewError("SELECTION_REVIEW_INVALID_SELECTION")
             request_extra_json["equity_quality_snapshot"] = equity_snapshot
+        request_extra_json["effective_stage_order"] = [
+            stage.id for stage in effective_selection_stages(request, config)
+        ]
         if request_extra_json:
             parsed_request = json.loads(request_json)
             parsed_request.update(request_extra_json)
@@ -344,6 +377,17 @@ def persist_selection_snapshots(
         stale = sorted(strategy_id for strategy_id, result_id in expected.items() if current.get(strategy_id) != result_id)
         if stale:
             raise SelectionReviewError("SELECTION_REVIEW_STALE_RESULTS", details=stale)
+        source_revisions = result.attrs.get("source_revisions")
+        if source_revisions is None:
+            source_revisions = _current_equity_revisions(connection, list(expected))
+        elif not isinstance(source_revisions, Mapping) or set(source_revisions) != set(expected):
+            raise SelectionReviewError("SELECTION_REVIEW_INVALID_SELECTION")
+        current_sources = _current_equity_revisions(connection, list(expected))
+        stale = sorted(strategy_id for strategy_id, result_id in expected.items()
+                       if source_revisions.get(strategy_id, (None,))[0] != result_id
+                       or current_sources.get(strategy_id) != source_revisions.get(strategy_id))
+        if stale:
+            raise SelectionReviewError("SELECTION_REVIEW_STALE_RESULTS", details=stale)
         rank_stage = next((stage for stage in request.stages if stage.id == "rank_robust_top_n"), None)
         top_n = rank_stage.top_n if rank_stage and rank_stage.top_n else 20
         representative_count = int(result["auto_status"].isin(["FINALIST", "RESERVE"]).sum())
@@ -354,6 +398,8 @@ def persist_selection_snapshots(
             "equity_snapshot": equity_snapshot,
             "run_id": run_id, "request_json": request_json, "request_hash": request_hash,
             "config_json": config_json, "config_hash": config_hash, "expected": expected,
+            "source_revisions": source_revisions,
+            "hard_rejected_ids": hard_cutoff_rejected_ids(result, request, config),
             "top_n": top_n, "representative_count": representative_count, "run_hash": run_hash,
         })
 
@@ -369,6 +415,11 @@ def persist_selection_snapshots(
                 stale = _equity_snapshot_stale_ids(connection, item["equity_snapshot"])
                 if stale:
                     raise SelectionReviewError("SELECTION_REVIEW_STALE_RESULTS", details=stale)
+            current_sources = _current_equity_revisions(connection, list(item["expected"]))
+            stale = sorted(strategy_id for strategy_id, source in item["source_revisions"].items()
+                           if current_sources.get(strategy_id) != source)
+            if stale:
+                raise SelectionReviewError("SELECTION_REVIEW_STALE_RESULTS", details=stale)
             connection.execute(
                 """insert into selection_runs (
                     selection_run_id, database_instance_id, symbol, side, selection_contract_version,
@@ -380,7 +431,7 @@ def persist_selection_snapshots(
                  item["config_json"], item["config_hash"], len(result), item["representative_count"],
                  int((result["auto_status"] == "FINALIST").sum()), item["top_n"], item["run_hash"], now],
             )
-            stage_columns = [f"eliminated_by_{stage.id}" for stage in request.stages if stage.enabled]
+            stage_columns = [f"eliminated_by_{stage.id}" for stage in effective_selection_stages(request, config) if stage.enabled]
             rows: list[list[object]] = []
             for row in result.to_dict(orient="records"):
                 trace = canonical_json({column.removeprefix("eliminated_by_"): bool(row.get(column)) for column in stage_columns})
@@ -395,6 +446,15 @@ def persist_selection_snapshots(
                 "auto_rank", "auto_reason", "analog_group_key", "auto_analog_of_strategy_id", "prior_rejected",
                 "stage_trace_json",
             ), rows)
+            for strategy_id in sorted(item["hard_rejected_ids"]):
+                connection.execute(
+                    """insert into strategy_tags (strategy_id, tag, source, source_ref, updated_at_utc)
+                       values (?, 'REJECTED', 'SELECTION_HARD_CUTOFF', ?, ?)
+                       on conflict (strategy_id, tag) do update set
+                           source = excluded.source, source_ref = excluded.source_ref,
+                           updated_at_utc = excluded.updated_at_utc""",
+                    [strategy_id, item["run_id"], now],
+                )
         connection.execute("commit")
     except duckdb.ConstraintException as error:
         _rollback_quietly(connection)
@@ -626,18 +686,25 @@ def import_selection_review(connection: duckdb.DuckDBPyConnection, data: bytes) 
                 "symbol": request_document.get("symbol"),
                 "side": request_document.get("side"),
                 "stages": parsed_stages,
-            })
+            }, allow_retired_enabled=True)
             config_document = json.loads(run[4])
             if not isinstance(config_document, Mapping) or type(
                 config_document.get("lot_variant_redundancy_enabled")
             ) is not bool:
                 raise SelectionReviewError("SELECTION_REVIEW_SCHEMA_MISMATCH")
-            expected_stage_order = [
-                stage.id for stage in effective_selection_stages(
-                    saved_request,
-                    SelectionConfig(lot_variant_redundancy_enabled=config_document["lot_variant_redundancy_enabled"]),
+            if "effective_stage_order" in request_document:
+                expected_stage_order = [
+                    stage.id for stage in effective_selection_stages(
+                        saved_request,
+                        SelectionConfig(lot_variant_redundancy_enabled=config_document["lot_variant_redundancy_enabled"]),
+                    )
+                ]
+                if request_document["effective_stage_order"] != expected_stage_order:
+                    raise SelectionReviewError("SELECTION_REVIEW_SCHEMA_MISMATCH")
+            else:
+                expected_stage_order = _legacy_effective_stage_order(
+                    saved_request, config_document["lot_variant_redundancy_enabled"]
                 )
-            ]
         except (AttributeError, KeyError, StopIteration, TypeError, ValueError, json.JSONDecodeError):
             raise SelectionReviewError("SELECTION_REVIEW_SCHEMA_MISMATCH") from None
         if (
@@ -920,6 +987,7 @@ def effective_selection_decisions(
 
     result_iter = iter(result_rows())
     pending_result = next(result_iter, None)
+    latest_run_for_strategy: dict[int, str] = {}
 
     for run_position, (run_id, run_symbol, run_side, _raw_request) in enumerate(runs):
         run_key = str(run_id)
@@ -946,6 +1014,7 @@ def effective_selection_decisions(
             strategy_id, prior_rejected = int(pending_result[1]), pending_result[2]
             if active and (not overlay or strategy_id in review_strategy_ids):
                 assert state is not None
+                latest_run_for_strategy[strategy_id] = run_key
                 if strategy_id in latest_reviews:
                     review_row = latest_reviews[strategy_id]
                     status, rank = review_row["user_status"], review_row["user_rank"]
@@ -957,7 +1026,16 @@ def effective_selection_decisions(
         if run_positions.get(str(pending_result[0])) is not None:
             raise ValueError("selection results out of order")
         pending_result = next(result_iter, None)
-    return {strategy_id: decision for state in states.values() for strategy_id, decision in state.items()}
+    decisions = {strategy_id: decision for state in states.values() for strategy_id, decision in state.items()}
+    for (strategy_id,) in connection.execute(
+        "select strategy_id from strategy_tags where tag = 'REJECTED'"
+    ).fetchall():
+        strategy_id = int(strategy_id)
+        if strategy_id in latest_run_for_strategy:
+            prior = decisions.get(strategy_id)
+            rank = (prior[1] if prior else latest_reviews.get(strategy_id, {}).get("user_rank"))
+            decisions[strategy_id] = ("REJECTED", rank, latest_run_for_strategy[strategy_id])
+    return decisions
 
 
 def latest_effective_finalists(connection: duckdb.DuckDBPyConnection, symbol: str) -> tuple[bool, set[int]]:

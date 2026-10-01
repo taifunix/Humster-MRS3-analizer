@@ -245,6 +245,8 @@ from .performance_v2_selection import (
 from .performance_v2_selection_review import (
     SelectionReviewError,
     apply_prior_rejected,
+    hard_cutoff_rejected_ids,
+    _current_equity_revisions,
     import_retest_tags,
     import_selection_review,
     latest_effective_finalists,
@@ -4569,8 +4571,9 @@ class PanelController:
     def performance_v2_catalog(self) -> dict[str, object]:
         config = self._performance_v2_config()
         target = performance_v2_database_path(config)
+        selection_config = _json_value(asdict(load_selection_config(self.default_config.with_name("config.performance.json"))))
         if not target.is_file():
-            return {"strategies": []}
+            return {"strategies": [], "selection_config": selection_config}
         try:
             with duckdb.connect(str(target), read_only=True) as connection:
                 require_performance_v2_readable(connection)
@@ -4584,6 +4587,7 @@ class PanelController:
                         if strategy["symbol"] == symbol:
                             strategy["is_latest_finalist"] = int(strategy["strategy_id"]) in finalists
                 catalog["selection_pairs_with_runs"] = pairs_with_runs
+                catalog["selection_config"] = selection_config
                 return catalog
         except PerformanceV2ApiError:
             raise
@@ -5472,6 +5476,9 @@ class PanelController:
                         while len(self._selection_candidate_cache) > 8:
                             self._selection_candidate_cache.popitem(last=False)
                 result = run_selection(apply_prior_rejected(connection, candidates), request, selection_config)
+                result.attrs["source_revisions"] = _current_equity_revisions(
+                    connection, [int(strategy_id) for strategy_id in result["strategy_id"]]
+                )
             return request, result
         except EquitySchemaUpgradeRequiredError as error:
             raise PerformanceV2ApiError(error.code, status=409, message=str(error)) from error
@@ -5498,6 +5505,11 @@ class PanelController:
                     user_review_rows = latest_user_reviews_by_strategy(
                         connection, [int(strategy_id) for strategy_id in result["strategy_id"]]
                     )
+                    pending_rejected = hard_cutoff_rejected_ids(result, request, selection_config)
+                    for row in result.to_dict(orient="records"):
+                        strategy_id = int(row["strategy_id"])
+                        if row.get("prior_rejected") is True or strategy_id in pending_rejected:
+                            user_review_rows.setdefault(strategy_id, {})["user_status"] = "REJECTED"
                 workbook = write_selection_workbook(
                     result, Path(directory) / "finalists.xlsx", request, metadata, user_review_rows
                 )

@@ -631,14 +631,14 @@ def test_performance_v2_selection_preview_exposes_ordered_finalist_stages_withou
     assert 'id="performance-v2-selection-card"' in strategies
     assert "4. Pareto and filters" in strategies
     expected_stage_order = [
-        "filter_lot_variant_redundancy",
         "filter_equity_regime",
+        "filter_lot_variant_redundancy",
+        "filter_hard_cutoffs",
+        "ab_deterioration",
+        "filter_best_trade_dependency",
         "filter_holding_outlier",
         "filter_low_trades",
         "filter_min_shift",
-        "ab_deterioration",
-        "filter_best_trade_dependency",
-        "filter_time_consistency",
         "pareto_robust",
         "pareto_shift_near_tie",
         "pareto_window_b",
@@ -664,8 +664,8 @@ def test_performance_v2_selection_preview_exposes_ordered_finalist_stages_withou
     for stage_id in expected_stage_order:
         assert f'data-selection-stage="{stage_id}"' in strategies
     checked_stage_ids = {
-        "filter_lot_variant_redundancy", "filter_holding_outlier", "ab_deterioration", "pareto_dd5_balanced",
-        "filter_best_trade_dependency", "filter_time_consistency", "pareto_robust", "pareto_shift_near_tie",
+        "filter_lot_variant_redundancy", "filter_hard_cutoffs", "ab_deterioration", "filter_best_trade_dependency", "filter_holding_outlier", "pareto_dd5_balanced",
+        "pareto_robust", "pareto_shift_near_tie",
     }
     for stage_id in checked_stage_ids:
         stage = re.search(rf'<li class="selection-stage" data-selection-stage="{stage_id}">(.*?)</li>', strategies, re.S)
@@ -678,14 +678,16 @@ def test_performance_v2_selection_preview_exposes_ordered_finalist_stages_withou
     default_order = re.search(r"const defaultSelectionStageOrder = \[(.*?)\];", js, re.S)
     assert default_order
     assert re.findall(r"'([^']+)'", default_order.group(1)) == [
-        "filter_lot_variant_redundancy", "filter_equity_regime", "filter_holding_outlier", "filter_low_trades", "filter_min_shift", "ab_deterioration",
-        "filter_best_trade_dependency", "filter_time_consistency", "pareto_dd5_balanced",
-        "pareto_robust", "pareto_shift_near_tie", "pareto_close_ma_near_tie",
+        "filter_equity_regime", "filter_lot_variant_redundancy", "filter_hard_cutoffs", "ab_deterioration", "filter_best_trade_dependency",
+        "filter_holding_outlier", "filter_low_trades", "filter_min_shift", "pareto_dd5_balanced", "pareto_robust",
+        "pareto_shift_near_tie", "pareto_close_ma_near_tie",
     ]
     default_enabled = re.search(r"const defaultEnabledSelectionStages = new Set\(\[(.*?)\]\);", js, re.S)
     assert default_enabled
     assert "filter_low_trades" not in default_enabled.group(1)
     assert "filter_min_shift" not in default_enabled.group(1)
+    assert "filter_equity_regime" not in default_enabled.group(1)
+    assert "filter_hard_cutoffs" in default_enabled.group(1)
     assert "pareto_dd5_balanced" in default_enabled.group(1)
     assert "pareto_plateau_points_per_order" not in default_enabled.group(1)
     assert "pareto_close_ma_near_tie" not in default_enabled.group(1)
@@ -697,12 +699,28 @@ def test_performance_v2_selection_preview_exposes_ordered_finalist_stages_withou
     assert 'value="0.3"' in min_shift_stage.group(1)
     lot_stage = re.search(r'<li class="selection-stage" data-selection-stage="filter_lot_variant_redundancy">(.*?)</li>', strategies, re.S)
     assert lot_stage and 'data-selection-scope="pair_side_timeframe"' in lot_stage.group(1)
+    assert re.findall(r'data-selection-stage="(filter_equity_regime|filter_lot_variant_redundancy|filter_hard_cutoffs|ab_deterioration|filter_best_trade_dependency)"', strategies) == [
+        "filter_equity_regime", "filter_lot_variant_redundancy", "filter_hard_cutoffs", "ab_deterioration", "filter_best_trade_dependency",
+    ]
+    for stage_id in ("filter_equity_regime", "filter_lot_variant_redundancy", "filter_hard_cutoffs", "ab_deterioration", "filter_best_trade_dependency"):
+        stage = re.search(rf'<li class="selection-stage" data-selection-stage="{stage_id}">(.*?)</li>', strategies, re.S)
+        assert stage and 'data-selection-move' not in stage.group(1)
+        assert re.search(r'<small>[^<]+</small>', stage.group(1))
+    assert 'data-selection-stage="filter_time_consistency"' not in strategies
+    assert "filter_time_consistency" not in js
+    assert "PLANNED" not in strategies
+    assert "selection_config" in js
+    assert "full_dd5_multiplier" in js
+    assert "hard_dd_profit_multiplier" in js
+    assert "ab_completed_cycles" in js
+    assert "top5_share_pct" in js
+    assert "stage.dataset.selectionStage !== 'filter_equity_regime'" not in js
     assert "fixedSelectionPrefix" in js
     pair_side_stages = {"filter_holding_outlier", "filter_low_trades", "filter_min_shift", "ab_deterioration", "pareto_dd5_balanced"}
     for stage_id in pair_side_stages:
         stage = re.search(rf'<li class="selection-stage" data-selection-stage="{stage_id}">(.*?)</li>', strategies, re.S)
         assert stage and 'data-selection-scope="pair_side"' in stage.group(1)
-    for stage_id in set(expected_stage_order) - pair_side_stages - {"filter_equity_regime"}:
+    for stage_id in set(expected_stage_order) - pair_side_stages - {"filter_equity_regime", "filter_lot_variant_redundancy", "filter_hard_cutoffs", "filter_best_trade_dependency"}:
         stage = re.search(rf'<li class="selection-stage" data-selection-stage="{stage_id}">(.*?)</li>', strategies, re.S)
         assert stage and 'data-selection-scope="pair_side_timeframe"' in stage.group(1)
     assert '<select id="performance-v2-selection-pair">' in strategies
@@ -763,29 +781,38 @@ def test_performance_v2_selection_preview_exposes_ordered_finalist_stages_withou
     assert "fetch(" not in dirty_handler
 
 
-def test_equity_regime_filter_is_second_fixed_prefix_without_scope_or_move_controls() -> None:
+def test_fixed_five_stage_prefix_has_equity_off_and_no_scope_or_move_controls() -> None:
     html = _read("index.html")
     js = _read("app.js")
     strategies = html.split('id="strategies-dd5"', 1)[1].split('id="settings"', 1)[0]
     stage = re.search(r'<li class="selection-stage" data-selection-stage="filter_equity_regime">(.*?)</li>', strategies, re.S)
 
     assert stage
-    assert re.search(r'data-selection-stage="filter_equity_regime">\s*<span[^>]*>2</span>', stage.group(0))
+    assert re.search(r'data-selection-stage="filter_equity_regime">\s*<span[^>]*>1</span>', stage.group(0))
     assert '<input type="checkbox"' in stage.group(1)
     assert not re.search(r'<input type="checkbox" checked', stage.group(1))
     assert "data-selection-scope" not in stage.group(1)
     assert "data-selection-move" not in stage.group(1)
-    assert "Тихие периоды и редкие сделки не делают данные невалидными" in stage.group(1)
-    assert "основной горизонт H" in stage.group(1)
+    assert "quiet periods and sparse trades pass" in stage.group(1)
+    assert "main H horizon" in stage.group(1)
     assert 'id="performance-v2-equity-regime-help"' not in html
     assert 'aria-describedby="performance-v2-equity-regime-help"' not in stage.group(1)
     assert "filter_equity_regime' ? 'pair_side'" in js
     assert re.search(
-        r"const fixedSelectionPrefix = new Set\(\[\s*'filter_lot_variant_redundancy',\s*'filter_equity_regime'\s*\]\)",
+        r"const fixedSelectionPrefix = new Set\(\[\s*'filter_equity_regime',\s*'filter_lot_variant_redundancy',\s*'filter_hard_cutoffs',\s*'ab_deterioration',\s*'filter_best_trade_dependency',?\s*\]\);",
         js,
     )
     assert "fixedSelectionPrefix.has(target.dataset.selectionStage)" in js
     assert "fixedSelectionPrefix.has(stage.previousElementSibling?.dataset.selectionStage)" in js
+
+
+def test_every_selection_stage_keeps_a_nonempty_logic_description() -> None:
+    html = _read("index.html")
+    strategies = html.split('id="strategies-dd5"', 1)[1].split('id="settings"', 1)[0]
+    stages = re.findall(r'<li class="selection-stage" data-selection-stage="([^"]+)">(.*?)</li>', strategies, re.S)
+    assert stages
+    for stage_id, body in stages:
+        assert re.search(r"<small>\s*[^<]+\s*</small>", body), stage_id
 
 
 def test_equity_quality_rank_method_is_native_and_preserves_legacy_default_payload() -> None:
@@ -805,8 +832,8 @@ def test_equity_quality_rank_method_is_native_and_preserves_legacy_default_paylo
     assert "При robust_v1 короткая коррекция не меняет порядок" in strategies
     assert "equity_quality_v1 понижает WEAKENING" in strategies
     selection_stages = js.split("const selectionStages = () =>", 1)[1].split("const selectionPayload =", 1)[0]
-    assert "stage.dataset.selectionStage !== 'filter_equity_regime'" in selection_stages
-    assert "|| !!stage.querySelector('input[type=\"checkbox\"]')?.checked" in selection_stages
+    assert "stage.dataset.selectionStage !== 'filter_equity_regime'" not in selection_stages
+    assert "enabled: !!stage.querySelector('input[type=\"checkbox\"]')?.checked" in selection_stages
     assert "method: selectionMethod" in selection_stages
     assert "selectionMethod !== 'robust_v1'" in selection_stages
     assert "body: JSON.stringify(selectionPayload())" in js
@@ -814,19 +841,16 @@ def test_equity_quality_rank_method_is_native_and_preserves_legacy_default_paylo
     assert "[hidden] { display: none !important; }" in _read("app.css")
 
 
-def test_equity_preview_shows_unassessed_count_warning_and_keeps_stale_response_guard() -> None:
+def test_equity_preview_has_no_obsolete_lot_equity_warning_and_keeps_stale_response_guard() -> None:
     html = _read("index.html")
     js = _read("app.js")
 
-    warning = re.search(r'<p\b(?=[^>]*\bid="performance-v2-selection-equity-warning")[^>]*>', html)
-    assert warning and re.search(r"\bhidden\b", warning.group(0))
+    assert 'id="performance-v2-selection-equity-warning"' not in html
     equity_stage = re.search(r'<li class="selection-stage" data-selection-stage="filter_equity_regime">(.*?)</li>', html, re.S)
     assert equity_stage and not re.search(r'<input type="checkbox" checked', equity_stage.group(1))
     assert "[hidden] { display: none !important; }" in _read("app.css")
     assert 'role="status" aria-live="polite"' in html
-    assert "const updateSelectionEquityWarning" in js
-    assert "rankEnabled && equityMethod && lotEnabled && !equityEnabled" in js
-    assert "скрыть более сильный equity-вариант" in js
+    assert "updateSelectionEquityWarning" not in js
     assert "count.not_evaluated" in js
     assert "Не оценено" in js
     assert "revision !== selectionPreviewRevision" in js

@@ -3251,7 +3251,10 @@ def test_v2_stale_current_result_pointer_is_excluded_and_returns_404(tmp_path: P
     controller, database, _ = _controller_for_windows(tmp_path)
     with duckdb.connect(str(database)) as connection:
         connection.execute("update strategies set current_result_id = 999 where strategy_id = 1")
-    assert controller.performance_v2_catalog() == {"strategies": [], "selection_pairs_with_runs": []}
+    catalog = controller.performance_v2_catalog()
+    assert catalog["strategies"] == []
+    assert catalog["selection_pairs_with_runs"] == []
+    assert catalog["selection_config"]["hard_dd_pct"] == "23"
     with pytest.raises(PerformanceV2ApiError) as raised:
         controller.performance_v2_windows(
             {

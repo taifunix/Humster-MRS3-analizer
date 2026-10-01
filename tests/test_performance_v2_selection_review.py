@@ -76,6 +76,174 @@ def _result() -> pd.DataFrame:
     ])
 
 
+def test_hard_cutoff_publication_tags_only_actual_exclusion(tmp_path: Path) -> None:
+    connection = _database(tmp_path)
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "filter_hard_cutoffs", "enabled": True, "scope": "pair_side"},
+    ]})
+    result = _result()
+    result["eliminated_by_filter_hard_cutoffs"] = [True, False]
+    result.loc[0, "auto_status"] = "FILTERED"
+    result.loc[0, "elimination_reason"] = 'FILTER_HARD_CUTOFFS:{"triggered":["PNL30_FLOOR"]}'
+    metadata = new_run_metadata(connection, request)
+
+    persist_selection_snapshot(connection, request, SelectionConfig(), result, metadata, b"workbook")
+
+    assert connection.execute(
+        "select strategy_id, source, source_ref from strategy_tags where tag = 'REJECTED'"
+    ).fetchall() == [(1, "SELECTION_HARD_CUTOFF", metadata["selection_run_id"])]
+
+
+def test_hard_cutoff_engine_result_publishes_tag_and_reason(tmp_path: Path) -> None:
+    connection = _database(tmp_path)
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "filter_hard_cutoffs", "enabled": True, "scope": "pair_side"},
+    ]})
+    candidates = _result().drop(columns=["auto_status", "finalist", "elimination_reason"]).assign(
+        max_drawdown_pct=[24, 5], pnl_30d_pct=[5, 10],
+        history_days=[30, 30], completed_cycle_count=[0, 0],
+    )
+    result = run_selection(candidates, request)
+    metadata = new_run_metadata(connection, request)
+    assert result.loc[0, "eliminated_by_filter_hard_cutoffs"]
+    assert result.loc[0, "auto_status"] == "FILTERED"
+    reason = result.loc[0, "elimination_reason"]
+    assert reason.startswith("FILTER_HARD_CUTOFFS:")
+    evidence = json.loads(reason.partition(":")[2])
+    assert evidence["triggered"] == ["DD_PROFIT_GUARD"]
+    assert evidence["values"]["full_dd_pct"] == "24"
+    assert evidence["values"]["full_pnl30_pct"] == "5"
+
+    persist_selection_snapshot(connection, request, SelectionConfig(), result, metadata, b"workbook")
+
+    assert connection.execute(
+        "select strategy_id from strategy_tags where tag = 'REJECTED'"
+    ).fetchall() == [(1,)]
+    assert "DD_PROFIT_GUARD" in connection.execute(
+        "select auto_reason from selection_results where strategy_id = 1"
+    ).fetchone()[0]
+
+
+def test_hard_cutoff_tag_overrides_older_manual_status(tmp_path: Path) -> None:
+    connection = _database(tmp_path)
+    path, _ = _export(connection, tmp_path)
+    workbook = load_workbook(path)
+    sheet = workbook["All candidates"]
+    headers = {cell.value: cell.column for cell in sheet[1]}
+    sheet.cell(2, headers["User Status"]).value = "FINALIST"
+    sheet.cell(2, headers["User Rank"]).value = 1
+    edited = BytesIO()
+    workbook.save(edited)
+    import_selection_review(connection, edited.getvalue())
+    connection.execute(
+        "insert into strategy_tags (strategy_id, tag, source, source_ref, updated_at_utc) "
+        "values (1, 'REJECTED', 'SELECTION_HARD_CUTOFF', 'new-run', current_timestamp)"
+    )
+
+    assert effective_selection_decisions(connection)[1][:2] == ("REJECTED", 1)
+
+
+def test_hard_cutoff_tag_write_failure_rolls_back_snapshot(tmp_path: Path) -> None:
+    connection = _database(tmp_path)
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "filter_hard_cutoffs", "enabled": True, "scope": "pair_side"},
+    ]})
+    result = _result()
+    result["eliminated_by_filter_hard_cutoffs"] = [True, False]
+    result.loc[0, "auto_status"] = "FILTERED"
+    result.loc[0, "elimination_reason"] = 'FILTER_HARD_CUTOFFS:{"triggered":["PNL30_FLOOR"]}'
+
+    class FailingTagConnection:
+        def __getattr__(self, name):
+            return getattr(connection, name)
+
+        def execute(self, sql, parameters=None):
+            if "insert into strategy_tags" in sql.lower():
+                raise RuntimeError("tag write failed")
+            return connection.execute(sql, parameters) if parameters is not None else connection.execute(sql)
+
+    with pytest.raises(RuntimeError, match="tag write failed"):
+        persist_selection_snapshot(
+            FailingTagConnection(), request, SelectionConfig(), result,
+            new_run_metadata(connection, request), b"workbook",
+        )
+    for table in ("selection_runs", "selection_results", "strategy_tags"):
+        assert connection.execute(f"select count(*) from {table}").fetchone() == (0,)
+
+
+def test_selection_publication_rechecks_loaded_source_revision(tmp_path: Path) -> None:
+    connection = _database(tmp_path)
+    request = _request()
+    result = _result()
+    from mrs3.performance_v2_selection_review import _current_equity_revisions
+    result.attrs["source_revisions"] = _current_equity_revisions(connection, [1, 2])
+    connection.execute("update strategy_results set report_end_utc = report_end_utc + interval 1 second where result_id = 101")
+
+    with pytest.raises(SelectionReviewError, match="SELECTION_REVIEW_STALE_RESULTS"):
+        persist_selection_snapshot(
+            connection, request, SelectionConfig(), result,
+            new_run_metadata(connection, request), b"workbook",
+        )
+    for table in ("selection_runs", "selection_results", "strategy_tags"):
+        assert connection.execute(f"select count(*) from {table}").fetchone() == (0,)
+
+
+def test_catalog_exposes_selection_thresholds_without_database(tmp_path: Path) -> None:
+    local_config = tmp_path / "config.local.json"
+    local_config.write_text(json.dumps({"panel_paths": {"performance_db_root": "legacy"}}), encoding="utf-8")
+    (tmp_path / "config.performance.json").write_text(json.dumps({
+        "unified_performance_v2": {
+            "database_root": "missing",
+            "finalist_selection": {"hard_dd_pct": 27, "hard_dd_profit_multiplier": 4},
+        },
+    }), encoding="utf-8")
+
+    catalog = PanelController(tmp_path, local_config).strategies_performance_v2_catalog()
+
+    assert catalog["strategies"] == []
+    assert catalog["selection_config"]["hard_dd_pct"] == "27"
+    assert catalog["selection_config"]["hard_dd_profit_multiplier"] == "4"
+
+
+def test_panel_xlsx_shows_pending_hard_rejection_after_publication(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "panel"
+    database_root = root / "data"
+    database_root.mkdir(parents=True)
+    connection = _database(database_root, filename="strategy_performance.duckdb")
+    connection.close()
+    local_config = root / "config.local.json"
+    local_config.write_text(json.dumps({"panel_paths": {"performance_db_root": "legacy"}}), encoding="utf-8")
+    (root / "config.performance.json").write_text(
+        json.dumps({"unified_performance_v2": {"database_root": "data", "workers": 1}}), encoding="utf-8"
+    )
+    controller = PanelController(root, local_config)
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "filter_hard_cutoffs", "enabled": True, "scope": "pair_side"},
+    ]})
+    result = _result()
+    result["eliminated_by_filter_hard_cutoffs"] = [True, False]
+    result.loc[0, "auto_status"] = "FILTERED"
+    result.loc[0, "finalist"] = False
+    result.loc[0, "elimination_reason"] = 'FILTER_HARD_CUTOFFS:{"triggered":["PNL30_FLOOR"]}'
+    monkeypatch.setattr(controller, "_performance_v2_selection_result", lambda _payload: (request, result))
+
+    _, data = controller.strategies_performance_v2_selection({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
+    sheet = load_workbook(BytesIO(data))["All candidates"]
+    headers = {cell.value: cell.column for cell in sheet[1]}
+    values = {
+        sheet.cell(row, headers["ID"]).value: (
+            sheet.cell(row, headers["User Status"]).value,
+            sheet.cell(row, headers["Auto Status"]).value,
+        )
+        for row in range(2, sheet.max_row + 1)
+    }
+    assert values[1] == ("REJECTED", "FILTERED")
+    with duckdb.connect(str(database_root / "strategy_performance.duckdb"), read_only=True) as check:
+        assert check.execute(
+            "select source from strategy_tags where strategy_id = 1 and tag = 'REJECTED'"
+        ).fetchone() == ("SELECTION_HARD_CUTOFF",)
+
+
 def _export(connection: duckdb.DuckDBPyConnection, tmp_path: Path) -> tuple[Path, dict[str, str]]:
     request = _request()
     result = _result()
@@ -213,7 +381,7 @@ def _insert_history_fixture(connection: duckdb.DuckDBPyConnection, count: int) -
 
 @pytest.mark.parametrize("run_count", [2, 102])
 @pytest.mark.parametrize("symbol", [None, "BTCUSDT"])
-def test_effective_selection_decisions_bulk_history_uses_four_parent_reads(
+def test_effective_selection_decisions_bulk_history_uses_five_parent_reads(
     tmp_path: Path, run_count: int, symbol: str | None,
 ) -> None:
     connection = _database(tmp_path)
@@ -230,7 +398,7 @@ def test_effective_selection_decisions_bulk_history_uses_four_parent_reads(
         102: "c520caf0a6040741611470b8c5f3873e0119e7c5783f3f93ffcdb4cea2fc1cfd",
     }[run_count]
     assert sha256(repr(list(actual.items())).encode()).hexdigest() == expected_digest
-    assert len(counted.calls) <= 4
+    assert len(counted.calls) <= 5
     assert not any(" in (" in sql.lower() for sql, _ in counted.calls)
     if symbol is None:
         assert all(parameters in (None, []) for _, parameters in counted.calls)
@@ -479,7 +647,7 @@ def test_effective_selection_decisions_scoped_symbol_keeps_global_latest_review_
     }
     assert 12 not in btc_decisions
     assert all_decisions[12] == ("FINALIST", 77, "eth-reviewed")
-    assert len(counted.calls) == 4
+    assert len(counted.calls) == 5
     assert sum(parameters == ["BTCUSDT"] for _, parameters in counted.calls) == 3
 
 
@@ -515,7 +683,7 @@ def test_effective_selection_decisions_streams_results_across_fetchmany_boundary
     expected.append((1025, ("FINALIST", 7, "wide-overlay")))
     assert ordered == expected
     assert sha256(repr(ordered).encode()).hexdigest() == "910176a0c0df2ff052a8732a573c6b78644a9440aa9c74ce10a872fd2633593e"
-    assert len(counted.calls) == 4
+    assert len(counted.calls) == 5
     assert counted.fetchmany_sizes and all(size == 1024 for size in counted.fetchmany_sizes)
     assert len(counted.fetchmany_sizes) >= 2
 
@@ -645,6 +813,31 @@ def test_equity_quality_review_v2_round_trips_cached_decision_evidence(tmp_path:
     assert source["decision_facts"]["state"] == "INSUFFICIENT_HISTORY"
     assert source["decision_facts"]["equity_class"] is None
     assert source["facts"]["result_id"] == 101
+    assert import_selection_review(connection, path.read_bytes())["row_count"] == 2
+
+
+def test_equity_review_import_accepts_historical_retired_time_stage(tmp_path: Path) -> None:
+    connection = _database(tmp_path)
+    request, result = _equity_ranked_result(connection)
+    metadata = new_run_metadata(connection, request)
+    path = write_selection_workbook(result, tmp_path / "legacy-time.xlsx", request, metadata, _review_rows(result))
+    persist_selection_snapshot(connection, request, SelectionConfig(), result, metadata, path.read_bytes())
+    document = json.loads(connection.execute(
+        "select request_json from selection_runs where selection_run_id = ?", [metadata["selection_run_id"]]
+    ).fetchone()[0])
+    document.pop("effective_stage_order")
+    document["stages"].insert(-1, {
+        "id": "filter_time_consistency", "enabled": True, "scope": "pair_side_timeframe",
+        "min_shift_pct": None, "pnl_tolerance_pct": None, "top_n": None,
+    })
+    document["equity_quality_snapshot"]["effective_stage_order"] = [
+        "filter_lot_variant_redundancy", "filter_time_consistency", "rank_robust_top_n",
+    ]
+    connection.execute(
+        "update selection_runs set request_json = ? where selection_run_id = ?",
+        [json.dumps(document), metadata["selection_run_id"]],
+    )
+
     assert import_selection_review(connection, path.read_bytes())["row_count"] == 2
 
 
@@ -1016,10 +1209,13 @@ def test_production_selection_export_preserves_existing_tags_on_round_trip(tmp_p
     headers = {cell.value: cell.column for cell in sheet[1]}
     exported = {sheet.cell(row, headers["ID"]).value: sheet.cell(row, headers["RETEST"]).value for row in range(2, sheet.max_row + 1)}
     assert exported == {1: "RETEST", 2: None}
+    statuses = {sheet.cell(row, headers["ID"]).value: sheet.cell(row, headers["User Status"]).value
+                for row in range(2, sheet.max_row + 1)}
+    assert statuses == {1: "REJECTED", 2: None}
     assert all(
         sheet.cell(row, headers[name]).value is None
         for row in range(2, sheet.max_row + 1)
-        for name in ("User Status", "User Rank", "Analog Of ID", "Comment")
+        for name in ("User Rank", "Analog Of ID", "Comment")
     )
     for row in range(2, sheet.max_row + 1):
         sheet.cell(row, headers["User Status"]).value = "REJECTED" if sheet.cell(row, headers["ID"]).value == 1 else "FILTERED"

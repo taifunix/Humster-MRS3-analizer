@@ -1,5 +1,9 @@
 # Performance v2 lot-variant redundancy filter
 
+Status note (2026-10-01): the runtime order and representative rule below
+are superseded by the [filter sequence contract](2026-10-01-performance-v2-filter-sequence.md)
+once implemented. Historical selection snapshots retain this older rule.
+
 Status: implemented, verification in progress.
 
 ## Scope

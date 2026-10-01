@@ -1,5 +1,10 @@
 # Performance v2 robust finalist selection and ranking
 
+Status note (2026-10-01): the single-best-trade and time-consistency filter
+rules, their default use and stage ordering below are superseded for new
+selections by the [filter sequence contract](2026-10-01-performance-v2-filter-sequence.md)
+once implemented. Historical snapshot evidence remains readable as recorded.
+
 **Status:** Implemented and independently reviewed (`CODE_REVIEW_PASS`)
 **Date:** 2026-09-01
 **Depends on:** [Performance v2 finalist selection and XLSX](2026-08-31-performance-v2-finalist-selection.md)

@@ -1,5 +1,10 @@
 # Performance v2 finalist selection and XLSX
 
+Status note (2026-10-01): the A/B, single-best-trade, time-consistency and
+stage-order sections below are superseded for new selections by the
+[filter sequence contract](2026-10-01-performance-v2-filter-sequence.md)
+once implemented. Historical snapshots remain unchanged.
+
 **Status:** Accepted design; Stage 2 implementation in progress
 **Date:** 2026-08-31
 **Depends on:** [Unified Performance Analytics v2](2026-08-28-unified-performance-analytics-v2.md)

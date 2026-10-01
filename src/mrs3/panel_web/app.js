@@ -3271,6 +3271,8 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
     try {
       const result = await requestJson('/api/v2/strategies/performance-v2/catalog');
       performanceV2Strategies = Array.isArray(result.strategies) ? result.strategies : [];
+      performanceV2SelectionConfig = result.selection_config || null;
+      updatePerformanceV2SelectionHelp(performanceV2SelectionConfig);
       performanceV2SelectionPairsWithRuns = new Set(Array.isArray(result.selection_pairs_with_runs) ? result.selection_pairs_with_runs : []);
       syncPerformanceV2SelectionScope();
       const selectedStrategy = syncPerformanceV2WindowCatalog();
@@ -3356,29 +3358,36 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
   const selectionPreviewBadge = document.querySelector('#performance-v2-selection-badge');
   const selectionRankStage = document.querySelector('[data-selection-rank]');
   const selectionEquityStage = document.querySelector('[data-selection-stage="filter_equity_regime"]');
-  const selectionLotStage = document.querySelector('[data-selection-stage="filter_lot_variant_redundancy"]');
-  const selectionEquityWarning = document.querySelector('#performance-v2-selection-equity-warning');
-  const updateSelectionEquityWarning = () => {
-    const rankEnabled = !!selectionRankStage?.querySelector('input[type="checkbox"]')?.checked;
-    const equityMethod = selectionRankStage?.querySelector('[data-selection-method]')?.value === 'equity_quality_v1';
-    const lotEnabled = !!selectionLotStage?.querySelector('input[type="checkbox"]')?.checked;
-    const equityEnabled = !!selectionEquityStage?.querySelector('input[type="checkbox"]')?.checked;
-    const showWarning = rankEnabled && equityMethod && lotEnabled && !equityEnabled;
-    if (!selectionEquityWarning) return;
-    selectionEquityWarning.hidden = !showWarning;
-    selectionEquityWarning.textContent = showWarning
-      ? 'Внимание: фильтр лотов может скрыть более сильный equity-вариант до equity_quality_v1.'
-      : '';
+  let performanceV2SelectionConfig = null;
+  const selectionConfigValue = (config, key, fallback) => {
+    const source = config?.finalist_selection || config || {};
+    return source[key] == null ? fallback : source[key];
   };
-  const fixedSelectionPrefix = new Set(['filter_lot_variant_redundancy', 'filter_equity_regime']);
+  const selectionConfigNumber = (config, key, fallback) => String(selectionConfigValue(config, key, fallback));
+  const updatePerformanceV2SelectionHelp = (config) => {
+    if (!config) return;
+    const help = {
+      filter_lot_variant_redundancy: `Complete EQUAL/INCOME pairs use four AND checks: Full DD5 ≥ ${selectionConfigNumber(config, 'lot_full_dd5_multiplier', 1.1)}×, full DD ≤ ${selectionConfigNumber(config, 'lot_full_dd_multiplier', 1.1)}×, B DD5 ≥, and B PnL/30 ≥. Otherwise EQUAL survives. Units: percentage returns/DD; lot tolerance ${selectionConfigNumber(config, 'lot_tolerance', 1e-9)}.`,
+      filter_hard_cutoffs: `Exclude on OR: full DD > ${selectionConfigNumber(config, 'hard_dd_pct', 23)}% AND full PnL/30 < ${selectionConfigNumber(config, 'hard_dd_profit_multiplier', 3)}×DD; full PnL/30 ≤ ${selectionConfigNumber(config, 'hard_pnl30_floor_pct', 4)}%; or both ratios < ${selectionConfigNumber(config, 'hard_ratio', 0.75)} after ≥${selectionConfigNumber(config, 'hard_min_history_days', 45)} calendar days and ≥${selectionConfigNumber(config, 'hard_min_cycles', 25)} reliable cycles. Missing facts pass; published exclusions set User Status REJECTED.`,
+      ab_deterioration: `Exclude on OR: B PnL/30 ≤ ${selectionConfigNumber(config, 'ab_return_floor_pct', 4)}%; A > 0 with B ≤ A/${selectionConfigNumber(config, 'ab_return_divisor', 10)} and B ≤ ${selectionConfigNumber(config, 'ab_decline_cap_pct', 15)}%; or ≥${selectionConfigNumber(config, 'ab_completed_cycles', 25)} completed B cycles with B Win Rate < ${selectionConfigNumber(config, 'ab_win_rate_floor_pct', 55)}%. B is the final ${selectionConfigNumber(config, 'ab_final_days', 14)} calendar days; values are percentages and closed cycles.`,
+      filter_best_trade_dependency: `Legacy stage ID for top-five: exclude only when the five largest positive completed-cycle PnLs exceed ${selectionConfigNumber(config, 'top5_share_pct', 80)}% of positive completed net PnL after ≥${selectionConfigNumber(config, 'top5_min_history_days', 45)} calendar days and ≥${selectionConfigNumber(config, 'top5_min_profitable_cycles', 25)} profitable cycles. Equality passes; incomplete or nonpositive net is diagnostic.`,
+    };
+    for (const [stageId, text] of Object.entries(help)) {
+      const node = document.querySelector(`[data-selection-stage="${stageId}"] small`);
+      if (node) node.textContent = text;
+    }
+  };
+  const fixedSelectionPrefix = new Set([
+    'filter_equity_regime', 'filter_lot_variant_redundancy', 'filter_hard_cutoffs', 'ab_deterioration', 'filter_best_trade_dependency',
+  ]);
   const defaultSelectionStageOrder = [
-    'filter_lot_variant_redundancy', 'filter_equity_regime', 'filter_holding_outlier', 'filter_low_trades', 'filter_min_shift', 'ab_deterioration',
-    'filter_best_trade_dependency', 'filter_time_consistency', 'pareto_dd5_balanced',
-    'pareto_robust', 'pareto_shift_near_tie', 'pareto_close_ma_near_tie',
+    'filter_equity_regime', 'filter_lot_variant_redundancy', 'filter_hard_cutoffs', 'ab_deterioration', 'filter_best_trade_dependency',
+    'filter_holding_outlier', 'filter_low_trades', 'filter_min_shift', 'pareto_dd5_balanced', 'pareto_robust', 'pareto_shift_near_tie',
+    'pareto_close_ma_near_tie',
   ];
   const defaultEnabledSelectionStages = new Set([
-    'filter_lot_variant_redundancy', 'filter_holding_outlier', 'ab_deterioration', 'filter_best_trade_dependency',
-    'filter_time_consistency', 'pareto_dd5_balanced', 'pareto_robust',
+    'filter_lot_variant_redundancy', 'filter_hard_cutoffs', 'filter_holding_outlier', 'ab_deterioration', 'filter_best_trade_dependency',
+    'pareto_dd5_balanced', 'pareto_robust',
     'pareto_shift_near_tie',
   ]);
   if (selectionPreviewOrder) {
@@ -3433,10 +3442,7 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
   const selectionStages = () => {
     if (!selectionRankStage) throw new Error('Final rank stage is unavailable.');
     const selectionMethod = selectionRankStage.querySelector('[data-selection-method]')?.value || 'robust_v1';
-    return [...orderedSelectionStages()
-      .filter((stage) => stage.dataset.selectionStage !== 'filter_equity_regime'
-        || !!stage.querySelector('input[type="checkbox"]')?.checked)
-      .map((stage) => ({
+    return [...orderedSelectionStages().map((stage) => ({
     id: stage.dataset.selectionStage,
     enabled: !!stage.querySelector('input[type="checkbox"]')?.checked,
     scope: stage.querySelector('[data-selection-scope]')?.value || (stage.dataset.selectionStage === 'filter_equity_regime' ? 'pair_side' : undefined),
@@ -3527,7 +3533,6 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
 
   selectionPreviewStages.forEach((stage) => {
     stage.querySelector('input[type="checkbox"]')?.addEventListener('change', () => {
-      updateSelectionEquityWarning();
       markSelectionPreviewDirty(orderedSelectionStages().indexOf(stage));
       if (stage === selectionEquityStage) refreshSelectionCacheStatus();
     });
@@ -3542,17 +3547,14 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
     input.addEventListener('input', () => markSelectionPreviewDirty(orderedSelectionStages().indexOf(input.closest('[data-selection-stage]'))));
   });
   selectionRankStage?.querySelector('input[type="checkbox"]')?.addEventListener('change', () => {
-    updateSelectionEquityWarning();
     markSelectionPreviewDirty(orderedSelectionStages().length);
     refreshSelectionCacheStatus();
   });
   selectionRankStage?.querySelector('[data-selection-top-n]')?.addEventListener('input', () => markSelectionPreviewDirty(orderedSelectionStages().length));
   selectionRankStage?.querySelector('[data-selection-method]')?.addEventListener('change', () => {
-    updateSelectionEquityWarning();
     markSelectionPreviewDirty(orderedSelectionStages().length);
     if (selectionRankStage.querySelector('input[type="checkbox"]')?.checked) refreshSelectionCacheStatus();
   });
-  updateSelectionEquityWarning();
   performanceV2SelectionPair?.addEventListener('change', () => {
     syncPerformanceV2SelectionScope();
     markSelectionPreviewDirty();

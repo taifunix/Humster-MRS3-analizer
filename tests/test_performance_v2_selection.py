@@ -155,7 +155,7 @@ def test_low_trades_filter_uses_calendar_rate_and_excludes_missing_rates() -> No
 
 def test_unavailable_time_consistency_survives_and_exports_na_in_positive_windows(tmp_path: Path) -> None:
     request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
-        {"id": "filter_time_consistency", "enabled": True, "scope": "pair_side_timeframe"},
+        {"id": "filter_time_consistency", "enabled": False, "scope": "pair_side_timeframe"},
     ]})
     result = run_selection(pd.DataFrame([
         _selection_row("unavailable", strategy_id=1, positive_quarter_count=3, positive_quarter_available_count=4, positive_quarter_status="UNAVAILABLE"),
@@ -164,7 +164,8 @@ def test_unavailable_time_consistency_survives_and_exports_na_in_positive_window
     result = result.set_index("strategy_name")
 
     assert result.loc["unavailable", "finalist"]
-    assert result.loc["fail", "eliminated_by_filter_time_consistency"]
+    assert result.loc["fail", "finalist"]
+    assert not result["eliminated_by_filter_time_consistency"].any()
     book = load_workbook(write_selection_workbook(result.reset_index(), tmp_path / "consistency.xlsx", request), data_only=True)
     headers = [cell.value for cell in book["All candidates"][1]]
     assert "positive_quarter_status" not in headers
@@ -789,7 +790,7 @@ def test_equity_regime_runs_after_lot_and_before_submitted_filters_and_rank() ->
     )]), request)
 
     assert list(result.attrs["stage_counts"]) == [
-        "filter_lot_variant_redundancy", "filter_equity_regime", "pareto_primary", "rank_robust_top_n",
+        "filter_equity_regime", "filter_lot_variant_redundancy", "pareto_primary", "rank_robust_top_n",
     ]
 
 
@@ -808,7 +809,7 @@ def test_equity_regime_preserves_mixed_lot_group_until_blocked_variant_is_remove
 
     assert not result.loc["old-lot-winner", "finalist"]
     assert result.loc["passing-sibling", "finalist"]
-    assert result.loc["passing-sibling", "elimination_reason"] == "LOT_GROUP_EQUITY_BLOCKED"
+    assert result.loc["passing-sibling", "elimination_reason"] is None
     assert not result["eliminated_by_filter_lot_variant_redundancy"].any()
     assert result.loc["old-lot-winner", "elimination_reason"] == "FILTER_EQUITY_REGIME"
 
@@ -832,8 +833,8 @@ def test_equity_regime_skips_whole_three_member_lot_group_if_any_member_is_block
     assert result.loc["pass-a", "finalist"]
     assert result.loc["pass-b", "finalist"]
     assert not result.loc["blocked-c", "finalist"]
-    assert result.loc["pass-a", "elimination_reason"] == "LOT_GROUP_EQUITY_BLOCKED"
-    assert result.loc["pass-b", "elimination_reason"] == "LOT_GROUP_EQUITY_BLOCKED"
+    assert result.loc["pass-a", "elimination_reason"] is None
+    assert result.loc["pass-b", "elimination_reason"] is None
     assert result.loc["blocked-c", "elimination_reason"] == "FILTER_EQUITY_REGIME"
     assert not result["eliminated_by_filter_lot_variant_redundancy"].any()
     assert result["eliminated_by_filter_equity_regime"].to_dict() == {
@@ -853,8 +854,8 @@ def test_equity_regime_all_pass_lot_group_keeps_existing_winner_and_precedence_f
                          _equity_state="WEAKENING", _equity_disposition="PASS",
                          _equity_reason="SHORT_WINDOW_DECLINE"),
     ]), request).set_index("strategy_name")
-    assert all_pass.loc["a", "finalist"] and not all_pass.loc["b", "finalist"]
-    assert all_pass.loc["b", "eliminated_by_filter_lot_variant_redundancy"]
+    assert all_pass["finalist"].all()
+    assert not all_pass["eliminated_by_filter_lot_variant_redundancy"].any()
     assert not all_pass.loc["b", "eliminated_by_filter_equity_regime"]
 
     unknown = run_selection(pd.DataFrame([
@@ -866,7 +867,7 @@ def test_equity_regime_all_pass_lot_group_keeps_existing_winner_and_precedence_f
                          _equity_reason="MISSING_BASELINE"),
     ]), request).set_index("strategy_name")
     assert not unknown.loc["blocked", "finalist"] and unknown.loc["unassessed", "finalist"]
-    assert unknown.loc["unassessed", "elimination_reason"] == "LOT_GROUP_EQUITY_UNASSESSED"
+    assert unknown.loc["unassessed", "elimination_reason"] == "MISSING_BASELINE"
     assert not unknown["eliminated_by_filter_lot_variant_redundancy"].any()
 
 
@@ -885,7 +886,7 @@ def test_lot_unassessed_advisory_is_replaced_when_later_pareto_eliminates_surviv
     ]), request).set_index("strategy_name")
 
     assert result.loc["unassessed-winner", "finalist"]
-    assert result.loc["unassessed-winner", "elimination_reason"] == "LOT_GROUP_EQUITY_UNASSESSED"
+    assert result.loc["unassessed-winner", "elimination_reason"] == "MISSING_BASELINE"
     assert not result.loc["unassessed-loser", "finalist"]
     assert result.loc["unassessed-loser", "elimination_reason"] == "PARETO_PRIMARY"
 
@@ -962,9 +963,9 @@ def test_selection_config_reads_agreed_defaults(tmp_path: Path) -> None:
     config = load_selection_config(_config(tmp_path / "config.performance.json"))
 
     assert config.ab_final_days == 14
-    assert config.ab_return_floor_pct == 5
+    assert config.ab_return_floor_pct == 4
     assert config.ab_return_divisor == 10
-    assert config.ab_win_rate_floor_pct == 58
+    assert config.ab_win_rate_floor_pct == 55
     assert config.ab_trade_rate_divisor == 7
     assert config.plateau_points_pareto_pnl_multiplier == 2
     assert config.best_trade_max_profit_share_pct == 35
@@ -1002,7 +1003,6 @@ def test_selection_config_reads_explicit_overrides(tmp_path: Path) -> None:
     [
         ("ab_final_days", 0),
         ("ab_final_days", True),
-        ("ab_return_floor_pct", 0),
         ("ab_return_divisor", "wrong"),
         ("ab_win_rate_floor_pct", float("nan")),
         ("ab_trade_rate_divisor", float("inf")),
@@ -2862,9 +2862,11 @@ def _lot_variant_row(
         "close_ma_len": 20,
         "order_count": 2,
         "order_1_open_ma_len": 5,
+        "order_1_open_multiplier": Decimal("0.995"),
         "order_1_shift_bp": 100,
         "order_1_lot_x": Decimal(lots[0]),
         "order_2_open_ma_len": 10,
+        "order_2_open_multiplier": Decimal("0.995"),
         "order_2_shift_bp": 200,
         "order_2_lot_x": Decimal(lots[1]),
         "report_start_utc": start,
@@ -2943,15 +2945,14 @@ def test_lot_variant_filter_is_default_on_first_and_keeps_loser_auditable() -> N
         ),
     ]), request).set_index("strategy_name")
 
-    assert result.loc["winner", "finalist"]
-    assert not result.loc["loser", "finalist"]
-    assert result.loc["loser", "eliminated_by_filter_lot_variant_redundancy"]
+    assert result["finalist"].all()
+    assert not result["eliminated_by_filter_lot_variant_redundancy"].any()
     assert not result.loc["loser", "eliminated_by_filter_best_trade_dependency"]
-    assert result.loc["loser", "auto_status"] == "FILTERED"
-    assert result.loc["loser", "elimination_reason"] == "LOT_VARIANT_REDUNDANT"
-    assert result.loc["winner", "lot_variant_representative_strategy_id"] == 1
-    assert result.loc["loser", "lot_variant_representative_strategy_id"] == 1
-    assert result.loc["winner", "lot_variant_group_key"] == result.loc["loser", "lot_variant_group_key"]
+    assert result.loc["loser", "auto_status"] == "FINALIST"
+    assert pd.isna(result.loc["winner", "lot_variant_representative_strategy_id"])
+    assert pd.isna(result.loc["loser", "lot_variant_representative_strategy_id"])
+    assert result.loc["winner", "lot_variant_group_key"] is None
+    assert result.loc["loser", "lot_variant_group_key"] is None
 
 
 def test_lot_variant_filter_can_be_disabled_and_fails_closed() -> None:
@@ -2985,8 +2986,8 @@ def test_lot_variant_filter_isolated_by_interval_and_canonicalizes_order_permuta
     second["order_1_shift_bp"], second["order_2_shift_bp"] = second["order_2_shift_bp"], second["order_1_shift_bp"]
     second["order_1_lot_x"], second["order_2_lot_x"] = second["order_2_lot_x"], second["order_1_lot_x"]
     same_interval = run_selection(pd.DataFrame([first, second]), parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []})).set_index("strategy_name")
-    assert same_interval.loc["first", "finalist"]
-    assert not same_interval.loc["second", "finalist"]
+    assert same_interval["finalist"].all()
+    assert same_interval["lot_variant_group_key"].isna().all()
 
     later = _lot_variant_row(
         "later", 3, lots=("3", "4"),
@@ -3013,7 +3014,7 @@ def test_lot_variant_filter_uses_declared_winner_order(metric: str, a_value: obj
     b = _lot_variant_row("b", b_id, lots=("3", "4"), **({metric: b_value} if b_value is not None else {}))
     result = run_selection(pd.DataFrame([a, b]), parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []}))
     finalists = result.loc[result["finalist"], "strategy_name"].tolist()
-    assert finalists == [expected]
+    assert finalists == ["a", "b"]
 
 
 @pytest.mark.parametrize("stage_id", [
@@ -3049,7 +3050,7 @@ def test_ab_insufficient_data_does_not_eliminate() -> None:
 def test_new_robust_filters_only_eliminate_evaluable_or_dominated_candidates() -> None:
     request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
         {"id": "filter_best_trade_dependency", "enabled": True, "scope": "pair_side_timeframe"},
-        {"id": "filter_time_consistency", "enabled": True, "scope": "pair_side_timeframe"},
+        {"id": "filter_time_consistency", "enabled": False, "scope": "pair_side_timeframe"},
         {"id": "pareto_robust", "enabled": True, "scope": "pair_side_timeframe"},
     ]})
     result = run_selection(pd.DataFrame([
@@ -3072,10 +3073,10 @@ def test_new_robust_filters_only_eliminate_evaluable_or_dominated_candidates() -
                        worst_holding_p95_minutes=Decimal("50"), first_shift_bp=100),
     ]), request).set_index("strategy_name")
 
-    assert result.loc["dependent", "eliminated_by_filter_best_trade_dependency"]
+    assert not result.loc["dependent", "eliminated_by_filter_best_trade_dependency"]
     assert not result.loc["boundary", "eliminated_by_filter_best_trade_dependency"]
     assert not result.loc["boundary", "eliminated_by_filter_time_consistency"]
-    assert result.loc["inconsistent", "eliminated_by_filter_time_consistency"]
+    assert not result.loc["inconsistent", "eliminated_by_filter_time_consistency"]
     assert result.loc["dominated", "eliminated_by_pareto_robust"]
     assert result.loc["winner", "finalist"]
 
@@ -3541,18 +3542,17 @@ def test_workbook_keeps_all_candidates_and_ab_30d_columns(tmp_path: Path) -> Non
     trades_30_column = headers.index("Trades/30") + 1
     assert book["All candidates"].cell(winner_row, trades_30_column).value == 3.75
     assert book["All candidates"].cell(winner_row, trades_30_column).data_type == "n"
-    pnl_without_best_column = headers.index("PnL without best, %") + 1
-    assert {book["All candidates"].cell(row, pnl_without_best_column).value for row in (2, 3)} == {6, None}
-    assert book["All candidates"].cell(3, pnl_without_best_column).data_type == "n"
-    assert book["All candidates"].cell(3, headers.index("Причина") + 1).value == "PARETO_PL_PTS_PER_ORDER"
+    for header in ("Completed net PnL", "Top 5 PnL", "Top 5 share, %", "PnL after top 5"):
+        assert header in headers
+    assert book["All candidates"].cell(3, headers.index("Причина") + 1).value == "PARETO_PLATEAU_POINTS_PER_ORDER"
     assert book["All candidates"].cell(3, headers.index("Причина") + 1).alignment.horizontal == "left"
-    for header in ("PnL/30", "PnL DD5/30", "PF", "PnL A/30д, %", "PnL B/30д, %", "PnL without best, %"):
+    for header in ("PnL/30", "PnL DD5/30", "PF", "PnL A/30д, %", "PnL B/30д, %"):
         assert book["All candidates"].cell(2, headers.index(header) + 1).number_format == "0"
     for header in (
-        "Positive trades", "Robust PnL/30", "Worst DD", "Worst Hold p95", "A/B stability", "Rank q PnL", "Rank q DD",
+        "Robust PnL/30", "Worst DD", "Worst Hold p95", "A/B stability", "Rank q PnL", "Rank q DD",
         "Rank q A/B", "Rank q Shift", "Rank q Points", "Rank coverage, %", "Rank w PnL",
         "Rank w DD", "Rank w A/B", "Rank w Shift", "Rank w Points", "Rank w Close MA",
-        "Rank q Close MA", "Final score (Pair+Side)", "Best trade, %", "PnL without best, %",
+        "Rank q Close MA", "Final score (Pair+Side)",
     ):
         assert book["All candidates"].column_dimensions[get_column_letter(headers.index(header) + 1)].hidden
     assert not book["All candidates"].column_dimensions[get_column_letter(headers.index("Auto Rank") + 1)].hidden
@@ -3621,8 +3621,8 @@ def test_workbook_prefixes_applied_filter_reason_and_fills_rows(tmp_path: Path) 
     book = load_workbook(write_selection_workbook(result, tmp_path / "finalists.xlsx", request), data_only=True)
     headers = [cell.value for cell in book["All candidates"][1]]
 
-    assert book["All candidates"].cell(2, headers.index("Причина") + 1).value == "2. PARETO_DD5_CAPITAL"
-    assert book["All candidates"].cell(2, 1).fill.fgColor.rgb == "00FAEFEF"
+    assert book["All candidates"].cell(2, headers.index("Причина") + 1).value == "3. PARETO_DD5_CAPITAL"
+    assert book["All candidates"].cell(2, 1).fill.fgColor.rgb == "00F6DFDF"
     assert book["All candidates"].cell(3, 1).fill.fgColor.rgb == "00D9EAD3"
     assert book["Finalists"].cell(2, 1).fill.fgColor.rgb == "00D9EAD3"
 
@@ -3652,7 +3652,7 @@ def test_workbook_keeps_advisory_reasons_visible_on_legacy_and_equity_finalists(
     )
     for book, sheet_name, strategy_name, expected_reason in (
         (legacy_book, "All candidates", "legacy-finalist", "AB_NOT_EVALUATED_INSUFFICIENT_DATA"),
-        (equity_book, "All candidates", "equity-finalist", "LOT_GROUP_EQUITY_BLOCKED"),
+        (equity_book, "All candidates", "equity-finalist", None),
     ):
         sheet = book[sheet_name]
         headers = [cell.value for cell in sheet[1]]
@@ -3719,7 +3719,7 @@ def test_scope_timeframe_prevents_cross_timeframe_pareto_comparison() -> None:
     assert split_scope["finalist"].all()
 
 
-def test_stage_order_changes_survivors_and_keeps_first_elimination_trace() -> None:
+def test_fixed_stage_prefix_keeps_survivors_independent_of_submitted_order() -> None:
     failing_dominator = _selection_row(
         "a", dd5_proxy=Decimal("10"), capital_proxy=Decimal("1"), ab_return_a_30d_pct=Decimal("10"), ab_return_b_30d_pct=Decimal("4"),
         ab_win_rate_b_pct=Decimal("60"), ab_trade_rate_a_30d=Decimal("10"), ab_trade_rate_b_30d=Decimal("10"),
@@ -3742,10 +3742,10 @@ def test_stage_order_changes_survivors_and_keeps_first_elimination_trace() -> No
     second = run_selection(pd.DataFrame([failing_dominator, passing_dominated]), pareto_first).set_index("strategy_name")
 
     assert first.index[first["finalist"]].tolist() == ["b"]
-    assert second.index[second["finalist"]].tolist() == []
+    assert second.index[second["finalist"]].tolist() == ["b"]
     assert first.loc["a", "eliminated_by_ab_deterioration"]
     assert not first.loc["a", "eliminated_by_pareto_dd5_capital"]
-    assert second.loc["b", "eliminated_by_pareto_dd5_capital"]
+    assert not second.loc["b", "eliminated_by_pareto_dd5_capital"]
     assert not second.loc["b", "eliminated_by_ab_deterioration"]
     assert second.loc["a", "eliminated_by_ab_deterioration"]
     assert not second.loc["a", "eliminated_by_pareto_dd5_capital"]
@@ -3786,3 +3786,200 @@ def test_missing_pareto_objective_neither_dominates_nor_is_eliminated() -> None:
 
     assert result["finalist"].all()
     assert not result["eliminated_by_pareto_dd5_capital"].any()
+
+
+def test_performance_v2_fixed_prefix_and_new_config_defaults(tmp_path: Path) -> None:
+    config = load_selection_config(_config(tmp_path / "config.performance.json"))
+    assert config.lot_full_dd5_multiplier == Decimal("1.10")
+    assert config.lot_full_dd_multiplier == Decimal("1.10")
+    assert config.hard_dd_pct == Decimal("23")
+    assert config.hard_pnl30_floor_pct == Decimal("4")
+    assert config.ab_win_rate_floor_pct == Decimal("55")
+    assert config.ab_completed_cycles == 25
+    assert config.top5_share_pct == Decimal("80")
+
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "filter_best_trade_dependency", "enabled": True, "scope": "pair_side"},
+        {"id": "ab_deterioration", "enabled": True, "scope": "pair_side"},
+        {"id": "filter_hard_cutoffs", "enabled": True, "scope": "pair_side"},
+        {"id": "filter_lot_variant_redundancy", "enabled": True, "scope": "pair_side_timeframe"},
+        {"id": "filter_equity_regime", "enabled": False, "scope": "pair_side"},
+    ]})
+    assert [stage.id for stage in selection_module.effective_selection_stages(request, config)][:5] == [
+        "filter_equity_regime", "filter_lot_variant_redundancy", "filter_hard_cutoffs",
+        "ab_deterioration", "filter_best_trade_dependency",
+    ]
+
+
+def test_enabled_time_consistency_is_retired_but_disabled_legacy_entry_is_inert() -> None:
+    with pytest.raises(PerformanceV2SelectionError, match="RETIRED_STAGE"):
+        parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+            {"id": "filter_time_consistency", "enabled": True, "scope": "pair_side"},
+        ]})
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "filter_time_consistency", "enabled": False, "scope": "pair_side"},
+    ]})
+    result = run_selection(pd.DataFrame([_selection_row(
+        "candidate", positive_quarter_status="FAIL", positive_quarter_count=0,
+        positive_quarter_available_count=4,
+    )]), request)
+    assert result.loc[0, "finalist"]
+    assert not result.loc[0, "eliminated_by_filter_time_consistency"]
+
+
+def test_lot_variant_filter_compares_equal_and_income_by_four_conditions() -> None:
+    equal = _lot_variant_row(
+        "equal", 1, lots=("1", "1"), initial_balance=100, max_drawdown_pct=Decimal("10"),
+        pnl_30d_pct=Decimal("30"), ab_return_b_30d_pct=Decimal("4"),
+    )
+    income = _lot_variant_row(
+        "income", 2, lots=("0.5", "1.5"), initial_balance=100, max_drawdown_pct=Decimal("10"),
+        pnl_30d_pct=Decimal("40"), ab_return_b_30d_pct=Decimal("5"),
+    )
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "filter_lot_variant_redundancy", "enabled": True, "scope": "pair_side_timeframe"},
+    ]})
+    result = run_selection(pd.DataFrame([equal, income]), request).set_index("strategy_name")
+    assert result.loc["income", "finalist"]
+    assert not result.loc["equal", "finalist"]
+    assert result.loc["equal", "elimination_reason"].startswith("LOT_VARIANT_")
+    assert result.loc["equal", "lot_variant_representative_strategy_id"] == 2
+
+
+@pytest.mark.parametrize("values", [
+    {"max_drawdown_pct": Decimal("24"), "pnl_30d_pct": Decimal("71")},
+    {"max_drawdown_pct": Decimal("10"), "pnl_30d_pct": Decimal("3")},
+    {"max_drawdown_pct": Decimal("10"), "pnl_30d_pct": Decimal("7"), "history_days": 45,
+     "reliable_completed_cycle_count": 25, "ab_return_b_30d_pct": Decimal("7")},
+])
+def test_hard_cutoffs_record_independent_triggered_rules(values: dict[str, object]) -> None:
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "filter_hard_cutoffs", "enabled": True, "scope": "pair_side"},
+    ]})
+    row = _selection_row("candidate", **values)
+    if values.get("history_days"):
+        row["ab_return_a_30d_pct"] = Decimal("10")
+    result = run_selection(pd.DataFrame([row]), request).iloc[0]
+    assert not result["finalist"]
+    assert result["eliminated_by_filter_hard_cutoffs"]
+    assert str(result["elimination_reason"]).startswith("FILTER_HARD_CUTOFFS")
+
+
+@pytest.mark.parametrize(("facts", "excluded"), [
+    ({"max_drawdown_pct": Decimal("23"), "pnl_30d_pct": Decimal("60")}, False),
+    ({"max_drawdown_pct": Decimal("24"), "pnl_30d_pct": Decimal("72")}, False),
+    ({"max_drawdown_pct": Decimal("24"), "pnl_30d_pct": None}, False),
+    ({"max_drawdown_pct": Decimal("10"), "pnl_30d_pct": Decimal("4")}, True),
+    ({"max_drawdown_pct": Decimal("10"), "pnl_30d_pct": Decimal("7.5"),
+      "ab_return_b_30d_pct": Decimal("7.5"), "history_days": 45,
+      "reliable_completed_cycle_count": 25}, False),
+    ({"max_drawdown_pct": Decimal("10"), "pnl_30d_pct": Decimal("7.49"),
+      "ab_return_b_30d_pct": Decimal("7.49"), "history_days": 45,
+      "reliable_completed_cycle_count": 25}, True),
+    ({"max_drawdown_pct": Decimal("10"), "pnl_30d_pct": Decimal("7.49"),
+      "ab_return_b_30d_pct": None, "history_days": 45,
+      "reliable_completed_cycle_count": 25}, False),
+])
+def test_hard_cutoff_strict_and_inclusive_boundaries(facts: dict[str, object], excluded: bool) -> None:
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "filter_hard_cutoffs", "enabled": True, "scope": "pair_side"},
+    ]})
+    result = run_selection(pd.DataFrame([_selection_row("candidate", **facts)]), request).iloc[0]
+    assert bool(result["eliminated_by_filter_hard_cutoffs"]) is excluded
+
+
+def test_hard_cutoff_reason_is_deterministic_json_with_values_and_applicability() -> None:
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "filter_hard_cutoffs", "enabled": True, "scope": "pair_side"},
+    ]})
+    result = run_selection(pd.DataFrame([_selection_row(
+        "candidate", max_drawdown_pct=Decimal("24"), pnl_30d_pct=Decimal("3"),
+        history_days=44, reliable_completed_cycle_count=24,
+    )]), request).iloc[0]
+
+    prefix, encoded = str(result["elimination_reason"]).split(":", 1)
+    evidence = json.loads(encoded)
+    assert prefix == "FILTER_HARD_CUTOFFS"
+    assert evidence["triggered"] == ["DD_PROFIT_GUARD", "PNL30_FLOOR"]
+    assert evidence["values"]["full_dd_pct"] == "24"
+    assert evidence["values"]["full_pnl30_pct"] == "3"
+    assert evidence["missing"] == ["b_pnl30_pct"]
+    assert evidence["applicability"]["dd_profit_guard"] is True
+    assert evidence["applicability"]["dual_ratio"] == {
+        "b_pnl30_known": False, "cycle_gate": False, "full_pnl30_known": True,
+        "history_gate": False, "positive_full_dd": True,
+    }
+
+
+def test_hard_cutoff_ratio_requires_reliable_completed_cycles() -> None:
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "filter_hard_cutoffs", "enabled": True, "scope": "pair_side"},
+    ]})
+    result = run_selection(pd.DataFrame([_selection_row(
+        "candidate", max_drawdown_pct=Decimal("10"), pnl_30d_pct=Decimal("7"),
+        ab_return_b_30d_pct=Decimal("7"), history_days=45,
+        reliable_completed_cycle_count=25, completed_cycles_reliable=False,
+    )]), request).iloc[0]
+    assert result["finalist"]
+    assert not result["eliminated_by_filter_hard_cutoffs"]
+
+
+def test_ab_deterioration_uses_independent_floor_branch_without_a_or_trade_rate() -> None:
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "ab_deterioration", "enabled": True, "scope": "pair_side"},
+    ]})
+    result = run_selection(pd.DataFrame([_selection_row(
+        "candidate", ab_return_b_30d_pct=Decimal("4"), ab_return_a_30d_pct=None,
+        ab_b_completed_cycle_count=None, ab_win_rate_b_pct=None,
+    )]), request).iloc[0]
+    assert not result["finalist"]
+    assert "B_PNL30_FLOOR" in result["elimination_reason"]
+
+
+def test_top_five_replaces_legacy_best_trade_rule_and_exports_evidence(tmp_path: Path) -> None:
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "filter_best_trade_dependency", "enabled": True, "scope": "pair_side"},
+    ]})
+    result = run_selection(pd.DataFrame([_selection_row(
+        "candidate", history_days=45, completed_profitable_cycle_count=25,
+        completed_cycle_net_pnl=Decimal("100"), top5_pnl=Decimal("81"),
+        top5_share_pct=Decimal("81"), top5_reliable=True,
+    )]), request)
+    assert not result.loc[0, "finalist"]
+    assert "TOP5_SHARE" in result.loc[0, "elimination_reason"]
+    path = write_selection_workbook(result, tmp_path / "top5.xlsx", request)
+    headers = [cell.value for cell in load_workbook(path, data_only=True)["All candidates"][1]]
+    assert {"Top 5 share, %", "Completed net PnL", "PnL after top 5"}.issubset(headers)
+
+
+def test_loader_uses_closed_cycles_for_b_gate_and_ignores_zero_and_commission(tmp_path: Path) -> None:
+    connection = _candidate_db(tmp_path)
+    result_id = int(connection.execute("select result_id from strategy_results").fetchone()[0])
+    actions = []
+    for offset in range(25):
+        opened = datetime(2026, 1, 17, tzinfo=UTC) + timedelta(hours=offset)
+        closed = opened + timedelta(minutes=1)
+        pnl = Decimal("1") if offset < 20 else Decimal("-1") if offset < 24 else Decimal("0")
+        actions.extend([
+            (result_id, 10 + offset * 2, opened, "BTCUSDT", 1, "opened", 1, 1, "long", 0, 0, 100, None),
+            (result_id, 11 + offset * 2, closed, "BTCUSDT", 1, "closed", 1, 0, "", pnl, 999, 100, None),
+        ])
+    actions.extend([
+        (result_id, 100, datetime(2026, 1, 30, tzinfo=UTC), "BTCUSDT", 1, "opened", 1, 1, "long", 0, 0, 100, None),
+        (result_id, 101, datetime(2026, 1, 30, 0, 1, tzinfo=UTC), "BTCUSDT", 1, "decreased", 1, Decimal(".5"), "long", 0, 0, 100, None),
+    ])
+    connection.executemany(
+        "insert into strategy_actions (result_id, action_index, timestamp_utc, symbol, order_id, action, size, post_size, post_side, pnl, fee, balance, raw_action_json) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        actions,
+    )
+    row = load_selection_candidates(
+        connection, parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []}),
+    ).iloc[0]
+    connection.close()
+
+    assert row["completed_cycles_reliable"]
+    assert row["ab_completed_cycle_count"] == 25
+    assert row["ab_win_rate_b_pct"] == Decimal(20) * 100 / 24
+    assert row["completed_profitable_cycle_count"] == 21
+    assert row["completed_cycle_net_pnl"] == Decimal("26")
+    assert row["top5_pnl"] == Decimal("14")
