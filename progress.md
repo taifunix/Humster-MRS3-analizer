@@ -1,5 +1,31 @@
 # MRS3 — current verification
 
+## Heavy DB closeout (2026-10-01)
+
+The current branch removes full-batch private optimizer preparation from ordinary
+PerformanceDB ADD/REPLACE imports.  The first Stage 1 action explicitly prepares
+only current `FINALIST` inputs with the configured worker count capped at 16;
+campaign launch stays fail-closed until that work is READY.  Native `SINGLE_MODE`
+now finishes without hidden inbox creation, so one explicit Verify creates the
+metadata inbox and is enabled during the transitional `RUNNING/COMMITTED` handoff
+without a Panel restart.  Import progress stays live in memory between durable
+start and terminal snapshots.
+
+Focused verification passed: optimizer 39; importer 111; Panel PerformanceDB
+134 with 4 Windows symlink skips; retest 68 with 1 Windows skip; static UI 149;
+core inbox/fast-runner handoff 118; fresh handoff 55; registry/retest 27; and
+explicit finalist preparation 8.  A first full repository diagnostic exposed a
+gate-to-lease Campaign race; a minimal retry covers the exact short window and
+Verify is single-flight.  The targeted race test passed ten repeated runs, and
+the full repository re-run passed **5,671**, with **9 Windows symlink skips**,
+in 1,612.73 seconds.  Independent Claude Opus 5/high final re-review returned
+`CODE_REVIEW_PASS`.  Temporary C: test files were removed.  Commit and merge
+are next.
+
+Source import/merge, materialization, broad analysis, schema/index migration
+and unprofiled PerformanceDB work are deferred to
+[the next-plan ledger](docs/superpowers/plans/2026-10-01-deferred-heavy-db-follow-ups.md).
+
 ## PerformanceDB continuation and import digest (2026-09-30, 18:33 local)
 
 The one-off recovery received independent `CODE_REVIEW_PASS` after a pending-WAL

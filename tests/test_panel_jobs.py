@@ -191,6 +191,55 @@ def test_registry_volatile_sync_guards_progress_and_rejects_invalid_states(tmp_p
         registry.volatile_sync("missing", {"state": "RUNNING"})
 
 
+def test_registry_volatile_sync_ignores_same_phase_progress_regression(tmp_path):
+    registry = PanelJobRegistry(tmp_path / "jobs.json")
+    job = registry.submit("strategies.performance.v2.import", {}, "monotonic")
+    registry.transition(job["job_id"], "RUNNING", phase="PARSING")
+
+    registry.volatile_sync(
+        job["job_id"],
+        {"state": "RUNNING", "phase": "PARSING", "progress": {"current": 136, "total": 2070, "unit": "reports"}},
+    )
+    registry.volatile_sync(
+        job["job_id"],
+        {"state": "RUNNING", "phase": "PARSING", "progress": {"current": 119, "total": 2070, "unit": "reports"}},
+    )
+
+    assert registry.get(job["job_id"])["progress"]["current"] == 136
+
+
+def test_registry_coalesces_one_hundred_live_updates_until_terminal_checkpoint(tmp_path, monkeypatch):
+    path = tmp_path / "jobs.json"
+    registry = PanelJobRegistry(path)
+    job = registry.submit("strategies.performance.v2.import", {}, "coalesced", job_id="coalesced")
+    registry.transition(job["job_id"], "RUNNING", phase="PARSING")
+    replacements = []
+    real_replace = panel_jobs_module.os.replace
+    monkeypatch.setattr(
+        panel_jobs_module.os,
+        "replace",
+        lambda source, destination: (replacements.append(destination), real_replace(source, destination))[1],
+    )
+
+    for current in range(1, 101):
+        registry.volatile_sync(
+            job["job_id"],
+            {"state": "RUNNING", "phase": "PARSING", "progress": {"current": current, "total": 100, "unit": "reports"}},
+        )
+
+    assert replacements == []
+    assert registry.get(job["job_id"])["progress"]["current"] == 100
+    registry.sync(
+        job["job_id"],
+        {"state": "COMMITTED", "phase": "COMMITTED", "progress": {"current": 100, "total": 100, "unit": "reports"}},
+    )
+
+    assert replacements == [path]
+    restored = PanelJobRegistry(path)
+    assert restored.get(job["job_id"])["state"] == "COMMITTED"
+    assert restored.get(job["job_id"])["progress"]["current"] == 100
+
+
 def test_registry_public_list_hides_verified_report_filenames(tmp_path):
     registry = PanelJobRegistry(tmp_path / "jobs.json")
     job = registry.submit("strategies.tester.native.start", {}, "public")

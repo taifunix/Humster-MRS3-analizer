@@ -1234,7 +1234,7 @@ def test_normal_tester_jobs_default_to_single_mode_without_metadata() -> None:
     assert "job.request?.mode" not in single_mode.group(1)
     assert "const committed = singleMode && job.state === 'COMMITTED';" in render
     assert "const ready = committed && job.inbox_ready === true;" in render
-    assert "inboxVerifyV2.disabled = !committed || importAllowed;" in render
+    assert "inboxVerifyV2.disabled = !verifiable || importAllowed;" in render
 
 
 def test_shortlist_active_selection_uses_ready_after_filters_without_http() -> None:
@@ -2049,6 +2049,16 @@ def test_normal_recovery_uses_created_date_and_suitable_job_priority() -> None:
     assert "testerJobs.find((job) => !testerIsTerminal(job))" not in recovery
 
 
+def test_completed_single_mode_handoff_is_verifiable_before_target_cleanup() -> None:
+    js = _read("app.js")
+    render = js.split("const renderTester = (job) =>", 1)[1].split("const pollTester", 1)[0]
+
+    assert "const verifiable = committed || (singleMode && job.state === 'RUNNING' && stage === 'COMMITTED'" in render
+    assert "testerCommitted = committed;" in render
+    assert "testerVerifiable = verifiable;" in render
+    assert "!verifiable || importAllowed" in render
+
+
 def test_single_mode_retry_shows_recovery_progress_and_avoids_pending_as_failed() -> None:
     js = _read("app.js")
 
@@ -2081,7 +2091,7 @@ def test_inbox_verify_does_not_fail_silently() -> None:
     js = _read("app.js")
     handler = js.split("inboxVerifyV2?.addEventListener", 1)[1].split("importStartV2?.addEventListener", 1)[0]
 
-    assert "if (!testerJobId || !testerCommitted || normalVerifyInFlight) {" in handler
+    assert "if (!testerJobId || !(testerCommitted || testerVerifiable) || normalVerifyInFlight) {" in handler
     assert "committed tester job" in handler
     assert "verified inbox" in handler
     assert "method: 'POST'" in handler
@@ -2370,13 +2380,14 @@ def test_portfolio_screen_exposes_server_backed_launch_form() -> None:
         'id="portfolio-profile-aggressive"', 'id="portfolio-profile-balanced"',
         'id="portfolio-profile-conservative"', 'id="portfolio-bank-available-aggressive"',
         'id="portfolio-candidates-aggressive"',
-        'id="portfolio-run"', 'id="portfolio-new-calculation"',
+        'id="portfolio-prepare-finalists"', 'id="portfolio-run"', 'id="portfolio-new-calculation"',
     ):
         assert control in html
     assert "loadPortfolioScreen" in js
     assert "'/api/v2/portfolio/readiness'" in js
     assert "'/api/v2/portfolio/jobs/active'" in js
     assert "'/api/v2/portfolio/campaigns'" in js
+    assert "'/api/v2/portfolio/finalist-inputs'" in js
 
 
 def test_portfolio_profiles_have_balanced_default_optional_bank_and_disabled_actions() -> None:
@@ -2411,6 +2422,8 @@ def test_portfolio_profiles_have_balanced_default_optional_bank_and_disabled_act
     assert "Пусто — без ограничения." in launch_card
     assert 'id="portfolio-run"' in launch_card
     assert 'id="portfolio-new-calculation"' in launch_card
+    assert 'id="portfolio-prepare-finalists"' in launch_card
+    assert launch_card.index('id="portfolio-prepare-finalists"') < launch_card.index('id="portfolio-run"') < launch_card.index('id="portfolio-new-calculation"')
     assert "const profilesValid = profiles.length > 0" in portfolio
     assert "runButton.disabled = state.locked || !launch.valid;" in js
     assert "#portfolio-launch-card .button:disabled {" in css
@@ -2431,6 +2444,24 @@ def test_portfolio_readiness_is_compact_and_stage1_only() -> None:
     assert "...portfolioValues(readiness?.stage2?.blockers)" not in portfolio
     assert "blockers.hidden = reasons.length === 0" in portfolio
     assert "blockers.replaceChildren()" in portfolio
+
+
+def test_portfolio_finalist_preparation_controls_are_explicit_and_disable_the_row_while_running() -> None:
+    html = _read("index.html")
+    js = _read("app.js")
+    launch_card = html.split('id="portfolio-launch-card"', 1)[1].split("</article>", 1)[0]
+    portfolio = js.split("function loadPortfolioScreen", 1)[1].split("function loadPortfolioSettings", 1)[0]
+
+    assert launch_card.index('id="portfolio-prepare-finalists"') < launch_card.index('id="portfolio-run"') < launch_card.index('id="portfolio-new-calculation"')
+    assert "'/api/v2/portfolio/finalist-inputs'" in portfolio
+    assert "preparationState === 'PREPARING'" in portfolio
+    assert "prepareButton.disabled = state.locked" in portfolio
+    assert "newButton.disabled = preparationState === 'PREPARING'" in portfolio
+    assert "preparationState === 'READY' ? 'Готово'" in portfolio
+    assert "preparationState === 'ERROR' ? 'Повторить'" in portfolio
+    assert "if (!result.job_id)" in portfolio
+    assert "renderReadiness(await requestJson('/api/v2/portfolio/readiness'))" in portfolio
+    assert "setLocked(false);" in portfolio
 
 
 def test_portfolio_settings_shows_editable_profile_risk_policy() -> None:

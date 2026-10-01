@@ -36,10 +36,9 @@ through v7 before that marker upgrade. Old executables reject v8 using their
 existing schema gate. Test this with the actual pre-change store module.
 
 `PreparedOptimizerInput.to_json()` and its canonical digest contract do not
-change. Both persistence sites use one shared encoder:
-
-- `performance_v2_import._persist_phase8_prepared`;
-- `performance_v2_optimizer.prepare_current_optimizer_inputs`.
+change. Prepared data is persisted only by the explicit finalist-scoped
+`performance_v2_optimizer.prepare_current_optimizer_inputs` path; import stores
+the typed source facts and does not write a prepared artifact.
 
 The existing v7 table-rebuild migration copies payload strings opaquely.
 The offline copier transforms them using the same codec. Fixture/raw SQL

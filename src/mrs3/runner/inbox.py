@@ -10,7 +10,11 @@ import tempfile
 from typing import Mapping
 
 from .config import RunnerConfig
-from .results import WizardResult, extract_html_strategy_name as _extract_html_strategy_name
+from .results import (
+    WizardResult,
+    extract_html_strategy_name as _extract_html_strategy_name,
+    extract_html_strategy_settings_source,
+)
 
 MAX_INBOX_CAPTURE_WORKERS = 16
 
@@ -59,6 +63,18 @@ def extract_html_strategy_name(path: Path) -> str:
     if name is None:
         raise InboxCaptureError("HTML report has no embedded strategy name")
     return name
+
+
+def _read_html_report(path: Path) -> tuple[bytes, str]:
+    try:
+        report_bytes = path.read_bytes()
+        settings = extract_html_strategy_settings_source(report_bytes.decode("utf-8"))
+    except (OSError, UnicodeDecodeError):
+        settings = None
+        report_bytes = b""
+    if not isinstance(settings, Mapping) or "name" not in settings:
+        raise InboxCaptureError("HTML report has no embedded strategy name")
+    return report_bytes, str(settings["name"])
 
 
 def _atomic_bytes(target: Path, data: bytes) -> bytes:
@@ -161,8 +177,8 @@ def capture_verified_inbox(
             report_path = report_paths.get(name)
             if report_path is None or not report_path.is_file():
                 raise InboxCaptureError(f"HTML report is missing for {name}")
-            report_bytes = report_path.read_bytes()
-            if extract_html_strategy_name(report_path) != name:
+            report_bytes, report_name = _read_html_report(report_path)
+            if report_name != name:
                 raise InboxCaptureError(f"HTML strategy name differs for {name}")
             source = plan.strategy_source / f"{name}.json"
             if not source.is_file():
@@ -293,7 +309,7 @@ def capture_run_snapshot_inbox(
             if strategy.get("name") != name or not isinstance(exchange_name, str) or not exchange_name.strip():
                 raise InboxCaptureError("RUNS snapshot strategy is invalid")
             report_path = reports[name]
-            if not report_path.is_file() or extract_html_strategy_name(report_path) != name:
+            if not report_path.is_file():
                 raise InboxCaptureError("RUNS HTML report does not match snapshot")
             if strategy_paths is not None:
                 source = Path(strategy_paths.get(name, ""))
@@ -307,7 +323,9 @@ def capture_run_snapshot_inbox(
                 if run_mode == "SINGLE_MODE":
                     raise InboxCaptureError("SINGLE_MODE strategy source is required")
                 strategy_bytes = _atomic_bytes(strategy_path, strategy_bytes)
-            report_bytes = report_path.read_bytes()
+            report_bytes, report_name = _read_html_report(report_path)
+            if report_name != name:
+                raise InboxCaptureError("RUNS HTML report does not match snapshot")
             strategy_id = sha256(_canonical_json(strategy)).hexdigest()
             report_hash = sha256(report_bytes).hexdigest()
             return {

@@ -923,3 +923,19 @@ repeats the same preflight before creating a job and returns the safe actual
 count and limit on rejection. The guard remains a technical protection against
 unbounded memory and runtime; it is not a target number of portfolios and must
 not fail only after finalist series have been loaded.
+
+## Explicit FINALIST preparation amendment (2026-10-01)
+
+The Stage 1 button row has this fixed order: `Prepare finalist data`,
+`Calculate variants`, `New calculation`. Preparation is an explicit server job;
+it is never started by import, readiness, or campaign creation. The browser
+sends neither result IDs nor a worker count. The server resolves the exact
+current `FINALIST` result IDs, uses the existing `duckdb_import.workers` limit,
+and checks the same revision/version/digest predicate used by the strict reader
+before reporting READY.
+
+Readiness exposes `NEEDS_PREPARATION`, `PREPARING`, `READY`, or `ERROR` for the
+current finalist set. Until READY, Calculate is disabled. During PREPARING all
+three Stage 1 actions are disabled. Campaign creation repeats the READY check;
+it never fills the prepared-input cache implicitly. A replaced current result
+therefore cannot borrow the prior revision's prepared data.

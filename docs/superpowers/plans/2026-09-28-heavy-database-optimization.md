@@ -1,10 +1,14 @@
 # План оптимизации тяжелых процессов БД
 
-**Версия:** R5, source R4 `PLAN_APPROVED`; учтены fetched upstream changes.
+**Версия:** R6 closeout, source R5 `PLAN_APPROVED`; учтены fetched upstream changes.
 **Дата / implementation baseline:** 2026-09-28 / `origin/main@8f59c2c`, DuckDB `1.5.5`.
 **Ветка:** `perf/heavy-db-optimization`, worktree `.worktrees/heavy-db-optimization`.
-**Статус:** R5 `PLAN_APPROVED`, независимый Claude Opus 5/high, 2026-09-28;
-user authorization на внедрение получена; T1 accepted after `CODE_REVIEW_PASS`.
+**Статус:** R6 closeout reviewed: мелкие подтверждённые хвосты закрыты в этой ветке;
+Source/materialization и прочие дорогие/profile-gated работы перенесены в
+[отдельный deferred plan](2026-10-01-deferred-heavy-db-follow-ups.md).
+R5 `PLAN_APPROVED`, независимый Claude Opus 5/high, 2026-09-28; user
+authorization на внедрение получена. Final re-review: Claude Opus 5/high
+`CODE_REVIEW_PASS`, 2026-10-01; full suite 5,671 passed, 9 Windows skips.
 
 **Goal:** исправить подтвержденные дефекты и уменьшить время/память цепочки
 HTML → Source DB → materialization → analysis → PerformanceDB → selection/export.
@@ -20,6 +24,32 @@ Runtime меняется только в этой ветке; рабочие Б�
 `safe_to_delete` явно отложен и не блокирует остальные задачи.
 Новая схема, постоянный cache/service, зависимости и универсальный connection pool
 не требуются. Legacy v3/v4 runtime не переносится и не переписывается этим планом.
+
+## R6: граница закрытия ветки
+
+В этой ветке завершены только уже начатые и проверяемые хвосты PerformanceDB:
+
+- [x] `IMP-02e / OPT-01e`: обычный ADD/REPLACE import больше не строит private
+  `optimizer_prepared_inputs` для всего входного набора. Подготовка запускается
+  явной первой кнопкой Stage 1 и сервер сам берёт текущие `FINALIST`; browser не
+  передаёт IDs или worker count. Для 2,070 отчётов это убирает из import ранее
+  измеренные 963.364 s Phase 8, оставляя ту же строгую проверку уже для десятков
+  финалистов. Реализация использует единственный configured
+  `duckdb_import.workers`, capped at 16, и bounded thread pool только для pure
+  CPU preparation; DB writer и digest/current-result recheck остаются прежними.
+- [x] `INBOX-EXPLICIT-01`: native `SINGLE_MODE` завершает проверку отчётов без
+  скрытого inbox capture. Existing **Verify** создаёт один metadata inbox,
+  доступна уже при transitional `RUNNING/COMMITTED` snapshot и не требует
+  перезапуска Panel. Valid inbox текущей job переиспользуется; foreign inbox
+  отклоняется. Один capture читает bytes каждого HTML один раз.
+- [x] `PANEL-JOURNAL-01a`: live `RUNNING` progress PerformanceDB import
+  коалесцируется в памяти; durable journal получает start и terminal snapshot.
+  Same-phase stale counter не может уменьшить видимый progress.
+
+Никакая новая работа по Source import/merge, materialization, broad analysis,
+schema/index migration или full-corpus profile здесь больше не разрешена.
+Оставшиеся пункты ниже помечены `DEFERRED` и являются входом следующей ветки,
+а не незавершённой работой этого closeout.
 
 ## Приоритет и зависимости
 
@@ -180,22 +210,22 @@ registered relation0,0473s. Последний опыт доказывает ц�
 
 ## 3. Source import и merge
 
-- [ ] **SRC-01 — parallel W6.** `source_v6_importer.py`, `source_v6_storage.py`.
+- [ ] **SRC-01 — parallel W6 (DEFERRED).** `source_v6_importer.py`, `source_v6_storage.py`.
   После закрытия writer использовать существующий `verify_published_identity_parallel`
   на той же staging DB. Explicit caller control сохраняет standalone reducer proof;
   нельзя глобально отключить checks. Verifier failure запрещает публикацию.
   Manifest, payload identity, quarantine и hashes совпадают при разных workers.
   Full import: **5–15%**, **15–30%** только если profile покажет dominant serial tail.
-- [ ] **SRC-02 — overlap persistence.** Пакетно готовить/писать только multi-fragment
+- [ ] **SRC-02 — overlap persistence (DEFERRED).** Пакетно готовить/писать только multi-fragment
   resolutions через имеющиеся helpers. Singleton с пустыми requests уже не делает
   DB calls. Приемка: те же reasons, manifest/hashes, bounded memory, no partial publish.
-- [ ] **SRC-03 — streaming hash merge.** `source_v6_merge.py:_content_identity`.
+- [ ] **SRC-03 — streaming hash merge (DEFERRED).** `source_v6_merge.py:_content_identity`.
   Заменить `read_bytes()` ограниченными chunks с теми же именами, length prefixes,
   absent markers. Все пять preflight/execute checks сохранить; проверить byte-for-byte
   digest equivalence и изменяющиеся DB/WAL/TMP. Не подменять hash размером/mtime.
   Merge: **0–15%**, основной эффект — память. Metadata reuse / fewer scans с возможными
   **10–30%** — отдельная будущая гипотеза с доказанным immutable/recheck contract.
-- [ ] **SRC-04 — optional ownership memory.** После profile проверить chunked/native
+- [ ] **SRC-04 — optional ownership memory (DEFERRED).** После profile проверить chunked/native
   generation вместо полного списка day rows плюс pandas copy
   (`source_v6_merge.py:301`, `source_v6_storage.py:1074,1454`). Exact ownership/counts/order.
   Гипотеза: peak RSS **−20–40%**, время этапа **−0–10%**.
@@ -211,7 +241,7 @@ proof и legacy empty evidence отложены; параллельная тек
 
 ## 4. Materialization и analysis
 
-- [ ] **MAT-01 — общая подготовка A/B.** `source_v6_materializer.py` и metric helpers.
+- [ ] **MAT-01 — общая подготовка A/B (DEFERRED).** `source_v6_materializer.py` и metric helpers.
   Point decode уже выполняется один раз; переиспользовать seam/cycle/series preparation
   в полном и B14day окне. Не заменять B простым срезом готовых A metrics.
   Приемка: exact values/witnesses, carry-in/open-tail, quiet-tail, window boundaries
@@ -225,11 +255,11 @@ proof и legacy empty evidence отложены; параллельная тек
   failure test proves running readers finish before the error returns. Worker/
   materializer 21 passed, related analysis 9 passed; independent Opus 5/high
   `CODE_REVIEW_PASS` round 2. No calculation-speed claim.
-- [ ] **MAT-03 — process-local read connection.** `source_v6_materializer.py`,
+- [ ] **MAT-03 — process-local read connection (DEFERRED).** `source_v6_materializer.py`,
   `source_v6_storage.py:decode_fragment_slice`. Небольшие batches на connection либо
   один RO connection на worker. Покрыть initializer/restart/reopen/close и snapshot
   identity; connection не пересекает границы процессов. Без общего pool.
-- [ ] **ANA-01 — bulk publication.** `source_v6_analysis_fresh.py:_publish`.
+- [ ] **ANA-01 residual — bounded relation writer (DEFERRED).** `source_v6_analysis_fresh.py:_publish`.
   Явная transaction и bounded registered relation/INSERT SELECT по существующему
   паттерну. Сравнить с transaction executemany; не держать второй полный JSON-list.
   Exact canonical JSON, без float coercion, те же digests и logical order, atomic rename.
@@ -251,13 +281,13 @@ scope добавление scope workers не ускоряет последов�
 
 ## 5. Performance import, migration, equity publication
 
-- [ ] **IMP-01 — ограничить срок жизни parsed data.** `performance_v2_import.py`.
+- [ ] **IMP-01 — ограничить срок жизни parsed data (DEFERRED).** `performance_v2_import.py`.
   Bounded chunks/process parsing → compact prepared chunks/private staging → один
   deterministic publisher. Ограничить не только futures, но и накопленные результаты.
   Перенести чистую CPU/IO подготовку до открытия writer; при reopen повторить current
   IDs, typed dedup, revision/stale/concurrent checks. Не публиковать частичные batches.
   Приемка: exact ADD/REPLACE outcomes, metadata/actions/equity/rejections, failure cleanup.
-- [ ] **IMP-02 — batch metadata.** Заменить SQL в циклах пакетными reads/writes;
+- [ ] **IMP-02 residual — batch metadata (DEFERRED).** Заменить SQL в циклах пакетными reads/writes;
   schema metadata получить один раз на текущем validated connection. Phase8 preparation
   вынести из долгой writer-секции лишь с сохранением окончательных IDs и Decimal(38,12).
   T13a narrow slice: five child deletes for the admitted replacement set;
@@ -311,15 +341,15 @@ scope добавление scope workers не ускоряет последов�
   and [ADR-0049](../../decisions/0049-performance-v2-optional-commission-evidence.md).
   It removes the missing tester-fee metadata blocker for `SINGLE_MODE` and
   collections. It does not attribute the long import tail or claim import speed.
-- [ ] **IMP-03 — общий HTML inventory.** `performance_v2_html.py`, `performance.py`.
+- [ ] **IMP-03 — общий HTML inventory (DEFERRED).** `performance_v2_html.py`, `performance.py`.
   Переиспользовать decode/raw-markup inventory current-header gate и общего parser.
   Не убирать required/duplicate header, size/action limits и source order checks.
   **5–20% parser CPU**, включено в **10–30% полного Performance import**, не дополнительно.
-- [ ] **MIG-01 — v4→v5 typed backfill.** `performance_v2_store.py`.
+- [ ] **MIG-01 — v4→v5 typed backfill (DEFERRED).** `performance_v2_store.py`.
   Bounded JSON decode и set-based UPDATE внутри migration transaction вместо полного
   fetchall и запроса на action/result. Exact nullable/malformed facts, revision и rollback.
   Не делать eager optimizer rebuild истории. Большая однократная migration: **40–80%**.
-- [ ] **EQ-01 — batch metadata/revisions и UPSERT.** `performance_v2_equity_cache.py:596`.
+- [ ] **EQ-01 — batch metadata/revisions и UPSERT (DEFERRED).** `performance_v2_equity_cache.py:596`.
   Сейчас metadata читается per item. Проверить все result revisions пакетно до записи
   и сохранить equality recheck каждого result в publication snapshot. Использовать
   существующую batch transaction, без nested transaction. Exact facts/invalidation.
@@ -393,10 +423,10 @@ fill вправе читать aggregates даже при готовых window 
 
 ## 7. Selection, history, optimizer, RETEST
 
-- [ ] **SEL-01 — action aggregates.** `performance_v2_selection.py`.
+- [ ] **SEL-01 — action aggregates (DEFERRED).** `performance_v2_selection.py`.
   Общий scan/relation только с сохранением разных side/open predicates трех агрегатов.
   Fixtures: side flip, carry-in, partial close, exact facts/candidates/ties. Cold load **10–30%**.
-- [ ] **SEL-02 — warm validation.** `panel.py`, `performance_v2_selection.py`.
+- [ ] **SEL-02 — warm validation (DEFERRED).** `panel.py`, `performance_v2_selection.py`.
   Объединить readiness/version/facts reads в одном snapshot. Не заменять содержимое/
   revisions TTL/mtime; REPLACE может сохранить result_id. Warm LRU preview **5–20%**.
 - [x] **DEC-01 — history replay.** `performance_v2_selection_review.py`.
@@ -407,11 +437,11 @@ fill вправе читать aggregates даже при готовых window 
   T7 accepted after independent Opus 5/high R2 `CODE_REVIEW_PASS`: 66 module tests;
   2/102-run SQL statements 8/308 before versus 4 after; fixed 102-run replay
   warm median 0.393356 s versus 0.018067 s (95.4% stage-only reduction).
-- [ ] **OPT-01 — строгие batch reads.** `performance_v2_optimizer.py`, после COR-01.
+- [ ] **OPT-01 residual — строгие batch reads (DEFERRED).** `performance_v2_optimizer.py`, после COR-01.
   Batch writer rechecks и один digest immutable source object в пределах request/snapshot/
   revision. Между snapshot/revision проверки не переиспользовать. Strict payload validation
   и candidate ordering обязательны; metadata-only trust contract не вводится. **15–40%**.
-- [ ] **RET-01 — global freeze orders.** `performance_v2_finalist_retest.py`.
+- [ ] **RET-01 — global freeze orders (DEFERRED).** `performance_v2_finalist_retest.py`.
   Один bulk query orders, тот же frozen ordering, missing/duplicate behavior.
   Normal `performance_v2_retest.py` уже читает orders пакетно. Global preparation **10–30%**;
   ordinary preparation **0–5%**. Время реального tester сюда не входит.
@@ -423,11 +453,11 @@ fill вправе читать aggregates даже при готовых window 
 
 ## 8. Низкие приоритеты и приемка
 
-- [ ] XLSX writer: **0–10%** сверх уже реализованных single-save/style reuse. После
+- [ ] XLSX writer (DEFERRED): **0–10%** сверх уже реализованных single-save/style reuse. После
   полного snapshot read закрывать RO connection до генерации workbook, если profile
   подтвердит пользу для времени занятости БД. Это не ускорение openpyxl само по себе.
-- [ ] Review import: **0–10%** только после profile. Integrity checks сохранить.
-- [ ] Legacy: **0–15%** полного подтвержденного workload как гипотеза; сначала измерить
+- [ ] Review import (DEFERRED): **0–10%** только после profile. Integrity checks сохранить.
+- [ ] Legacy (DEFERRED): **0–15%** полного подтвержденного workload как гипотеза; сначала измерить
   full prepared retention, replacement deletes, существующие validation boundaries.
   v3/v4 writer stage **20–60%** — лишь условная гипотеза отдельной работы по собственной
   spec и реальному report path; v4 требует соседний v3 codec.

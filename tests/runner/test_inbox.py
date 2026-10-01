@@ -315,6 +315,48 @@ def test_single_mode_inbox_keeps_report_as_configured_filename_only(tmp_path: Pa
     assert not (inbox / "reports").exists()
 
 
+def test_single_mode_inbox_reads_each_report_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    config = _config(tmp_path)
+    report = tmp_path / "my_test_runs" / "run.html"
+    report.parent.mkdir()
+    strategy = {"name": "MRS3 Demo", "exchange": {"name": "Bybit"}, "basic": {"symbol": "ONUSDT", "time_frame": "1h"}}
+    payload = json.dumps(strategy, sort_keys=True, separators=(",", ":")).encode()
+    report.write_bytes(b"<pre>" + payload + b"</pre>")
+    strategy_path = tmp_path / "strategy.json"
+    strategy_path.write_bytes(payload)
+    report_reads = 0
+    original_read_bytes = Path.read_bytes
+    original_read_text = Path.read_text
+
+    def track_bytes(path: Path, *args: object, **kwargs: object) -> bytes:
+        nonlocal report_reads
+        if path == report:
+            report_reads += 1
+        return original_read_bytes(path, *args, **kwargs)
+
+    def reject_text(path: Path, *args: object, **kwargs: object) -> str:
+        if path == report:
+            raise AssertionError("capture must decode the bytes it already read")
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_bytes", track_bytes)
+    monkeypatch.setattr(Path, "read_text", reject_text)
+    capture_run_snapshot_inbox(
+        config,
+        "single-read-once",
+        {"MRS3 Demo": strategy},
+        {"MRS3 Demo": report},
+        tester_config_bytes=config.tester_config.read_bytes(),
+        provenance={"analysis_run_id": "a" * 64, "generation_manifest_sha256": "b" * 64, "strategy_json_sha256": {"MRS3 Demo.json": sha256(payload).hexdigest()}},
+        test_start="2026-08-01",
+        test_end="2026-08-18",
+        run_mode="SINGLE_MODE",
+        strategy_paths={"MRS3 Demo": strategy_path},
+    )
+
+    assert report_reads == 1
+
+
 def test_single_mode_capture_keeps_config_hash_without_usable_commission(tmp_path: Path) -> None:
     config = _config(tmp_path)
     config.tester_config.write_bytes(b"not-json")

@@ -196,6 +196,11 @@ def extract_html_strategy_settings(path: Path) -> dict[str, object] | None:
         source = path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
         return None
+    return extract_html_strategy_settings_source(source)
+
+
+def extract_html_strategy_settings_source(source: str) -> dict[str, object] | None:
+    """Extract the single embedded strategy settings object from decoded HTML."""
     candidates: list[dict[str, object]] = []
     for raw in re.findall(r"<pre\b[^>]*>(.*?)</pre\s*>", source, flags=re.IGNORECASE | re.DOTALL):
         try:

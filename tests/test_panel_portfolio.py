@@ -32,6 +32,7 @@ from mrs3.panel_portfolio import (
     _safe_cell,
     _snapshot_bytes,
     _PortfolioProgressReporter,
+    _duckdb_import_workers,
     _stage2_material,
     _weighted_entry_order_percentages,
     _weighted_payload_pairs,
@@ -40,6 +41,7 @@ from mrs3.panel_portfolio import (
 from mrs3.panel_jobs import PanelJobError, PanelJobRegistry
 from mrs3.config import DuckDBImportSettings
 from mrs3.performance_v2_store import PerformanceV2StoreError
+from mrs3.performance_v2_optimizer import OptimizerIntegrityError
 from mrs3.portfolio.config import WEIGHTED_SEARCH_DEFAULTS, PortfolioConfigError, migrate_portfolio_config_document
 from mrs3.portfolio.adapter import (
     CAMPAIGN_CONTRACT_VERSION,
@@ -1308,7 +1310,7 @@ def test_campaign_freezes_private_weighted_rows_without_public_series_aliases(mo
     assert "weighted_input_rows" not in public_job
 
 
-def test_campaign_prepares_exact_production_finalist_result_ids_before_strict_read(
+def test_campaign_does_not_prepare_production_finalists_implicitly(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
     import mrs3.panel_portfolio as panel_portfolio_module
@@ -1316,11 +1318,6 @@ def test_campaign_prepares_exact_production_finalist_result_ids_before_strict_re
     path = tmp_path / "portfolio_optimizer.local.json"
     digest = _write_config(path)
     (tmp_path / "config.local.json").write_text(json.dumps({"duckdb_import": {"workers": 3}}), encoding="utf-8")
-    metadata_rows = [
-        {"result_id": 22},
-        {"result_id": 11},
-        {"result_id": 22},
-    ]
     full_rows = [
         _finalist(strategy_id=8, result_id=22),
         _finalist(strategy_id=7, result_id=11),
@@ -1330,7 +1327,7 @@ def test_campaign_prepares_exact_production_finalist_result_ids_before_strict_re
 
     def production_reader(database, pairs, include_series=True):
         reader_calls.append((database, tuple(pairs), include_series))
-        return metadata_rows if not include_series else full_rows
+        return full_rows
 
     def preparer(database, result_ids, *, workers):
         preparation_calls.append((database, tuple(result_ids), workers))
@@ -1358,14 +1355,11 @@ def test_campaign_prepares_exact_production_finalist_result_ids_before_strict_re
 
     assert result["status"] == "QUEUED"
     expected_pairs = (("BTCUSDT", "LONG"), ("BTCUSDT", "SHORT"))
-    assert reader_calls == [
-        (tmp_path / "performance.duckdb", expected_pairs, False),
-        (tmp_path / "performance.duckdb", expected_pairs, True),
-    ]
-    assert preparation_calls == [(tmp_path / "performance.duckdb", (22, 11), 3)]
+    assert reader_calls == [(tmp_path / "performance.duckdb", expected_pairs, True)]
+    assert preparation_calls == []
 
 
-def test_campaign_rejects_invalid_production_metadata_result_id_before_preparation(
+def test_campaign_does_not_request_production_metadata_before_strict_read(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
     import mrs3.panel_portfolio as panel_portfolio_module
@@ -1375,7 +1369,8 @@ def test_campaign_rejects_invalid_production_metadata_result_id_before_preparati
     preparation_calls: list[tuple[object, ...]] = []
 
     def production_reader(_database, _pairs, include_series=True):
-        return [{"result_id": True}] if not include_series else []
+        assert include_series is True
+        return [_finalist()]
 
     def preparer(*args, **kwargs):
         preparation_calls.append((*args, *kwargs.values()))
@@ -1387,42 +1382,133 @@ def test_campaign_rejects_invalid_production_metadata_result_id_before_preparati
         optimizer_input_preparer=preparer,
     )
 
-    with pytest.raises(PortfolioPanelError) as error:
-        service.submit_campaign({
-            "pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}],
-            "profiles": [{"profile_id": "BALANCED", "bank_available_usdt": "10000", "max_candidates": 1}],
-            "expected_config_digest": digest,
-        })
+    result = service.submit_campaign({
+        "pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}],
+        "profiles": [{"profile_id": "BALANCED", "bank_available_usdt": "10000", "max_candidates": 1}],
+        "expected_config_digest": digest,
+    })
 
-    assert error.value.code == "PORTFOLIO_FINALISTS_UNAVAILABLE"
+    assert result["status"] == "QUEUED"
     assert preparation_calls == []
 
 
-def test_production_preparation_lock_failure_is_a_typed_snapshot_error(
+def test_snapshot_does_not_call_preparer_after_explicit_preparation_contract(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
     import mrs3.panel_portfolio as panel_portfolio_module
 
     path = tmp_path / "portfolio_optimizer.local.json"
     _write_config(path)
-    monkeypatch.setattr(
-        panel_portfolio_module,
-        "read_current_finalists",
-        lambda *_args, **_kwargs: [{"result_id": 11}],
-    )
+    monkeypatch.setattr(panel_portfolio_module, "read_current_finalists", lambda *_args, **_kwargs: [_finalist()])
 
     def locked(*_args, **_kwargs):
         raise PerformanceV2StoreError("writer lock busy")
 
     service = PortfolioPanelService(tmp_path, path, optimizer_input_preparer=locked)
-    with pytest.raises(PortfolioPanelError) as error:
-        service._snapshot_finalists(
-            _config(),
-            {"pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 1}]},
-        )
+    finalists, _weighted = service._snapshot_finalists(
+        _config(),
+        {"pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 1}]},
+    )
 
-    assert error.value.code == "PORTFOLIO_FINALISTS_UNAVAILABLE"
-    assert error.value.status == 422
+    assert [row["result_id"] for row in finalists] == [11]
+
+
+def test_finalist_preparation_rejects_duplicate_request_and_active_performance_import(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    path = tmp_path / "portfolio_optimizer.local.json"
+    _write_config(path)
+    database = tmp_path / "performance.duckdb"
+    database.touch()
+
+    class IdleThread:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr("mrs3.panel_portfolio.threading.Thread", IdleThread)
+    service = PortfolioPanelService(tmp_path, path)
+    monkeypatch.setattr(service, "_current_finalist_metadata", lambda *_args, **_kwargs: (database, ["BTCUSDT|LONG"], {"BTCUSDT|LONG": 1}, (11,)))
+    monkeypatch.setattr(service, "_prepared_finalists_state", lambda *_args, **_kwargs: {"state": "NEEDS_PREPARATION", "required": 1, "ready": 0})
+
+    first = service.prepare_finalist_inputs({})
+    with pytest.raises(PortfolioPanelError) as duplicate:
+        service.prepare_finalist_inputs({})
+    assert duplicate.value.code == "PORTFOLIO_JOB_BUSY"
+    assert [job["kind"] for job in service.registry.list()] == ["portfolio.prepare_finalists"]
+
+    service.registry.cancel(first["job_id"])
+    service.registry.submit("strategies.performance.v2.import", {}, "performance-import", ("performance_import",))
+    with pytest.raises(PortfolioPanelError) as importing:
+        service.prepare_finalist_inputs({})
+    assert importing.value.code == "PORTFOLIO_JOB_BUSY"
+
+
+def test_finalist_preparation_discards_job_when_runtime_reservation_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    path = tmp_path / "portfolio_optimizer.local.json"
+    _write_config(path)
+    service = PortfolioPanelService(tmp_path, path)
+    monkeypatch.setattr(service, "_current_finalist_metadata", lambda *_args, **_kwargs: (tmp_path / "performance.duckdb", ["BTCUSDT|LONG"], {"BTCUSDT|LONG": 1}, (11,)))
+    monkeypatch.setattr(service, "_prepared_finalists_state", lambda *_args, **_kwargs: {"state": "NEEDS_PREPARATION", "required": 1, "ready": 0})
+    monkeypatch.setattr(service.registry, "reserve_runtime", lambda *_args, **_kwargs: (_ for _ in ()).throw(PanelJobError("RUNTIME_UNAVAILABLE")))
+
+    with pytest.raises(PortfolioPanelError) as failed:
+        service.prepare_finalist_inputs({})
+
+    assert failed.value.code == "RUNTIME_UNAVAILABLE"
+    assert not [job for job in service.registry.list() if job["kind"] == "portfolio.prepare_finalists" and job["state"] not in {"COMMITTED", "CANCELLED", "FAILED"}]
+
+
+def test_finalist_preparation_rejects_client_scope_and_invalid_production_result_id(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    path = tmp_path / "portfolio_optimizer.local.json"
+    _write_config(path)
+    with duckdb.connect(str(tmp_path / "performance.duckdb")) as connection:
+        connection.execute("create table selection_runs(symbol varchar, side varchar)")
+        connection.execute("insert into selection_runs values ('BTCUSDT', 'LONG')")
+
+    service = PortfolioPanelService(tmp_path, path)
+    with pytest.raises(PortfolioPanelError) as invalid_payload:
+        service.prepare_finalist_inputs({"result_ids": [11]})
+    assert invalid_payload.value.code == "PORTFOLIO_FINALIST_PREPARATION_INVALID"
+
+    monkeypatch.setattr(
+        service,
+        "finalists_reader",
+        lambda *_args, **_kwargs: ({"symbol": "BTCUSDT", "side": "LONG", "result_id": True},),
+    )
+    with pytest.raises(PortfolioPanelError) as invalid_id:
+        service.prepare_finalist_inputs({})
+    assert invalid_id.value.code == "PORTFOLIO_FINALISTS_UNAVAILABLE"
+
+
+@pytest.mark.parametrize("contents", [None, b"{"])
+def test_finalist_preparation_rejects_unready_settings(tmp_path: Path, contents: bytes | None) -> None:
+    path = tmp_path / "portfolio_optimizer.local.json"
+    if contents is not None:
+        path.write_bytes(contents)
+
+    with pytest.raises(PortfolioPanelError) as unready:
+        PortfolioPanelService(tmp_path, path).prepare_finalist_inputs({})
+
+    assert unready.value.code == "CONFIG_INVALID"
+    assert unready.value.status == 422
+
+
+def test_prepared_finalist_state_reports_corruption_as_error(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(
+        "mrs3.panel_portfolio.read_prepared_optimizer_inputs",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OptimizerIntegrityError("prepared input is stale")),
+    )
+
+    assert PortfolioPanelService._prepared_finalists_state(tmp_path / "performance.duckdb", (11,)) == {
+        "state": "ERROR", "required": 1, "ready": 0,
+    }
 
 
 def test_finalist_reader_wiring_controls_production_preparation(
@@ -1438,7 +1524,13 @@ def test_finalist_reader_wiring_controls_production_preparation(
     assert custom_service._uses_production_finalists_reader is False
 
 
-def test_default_snapshot_prepares_only_current_finalist_artifacts(tmp_path: Path) -> None:
+def test_finalist_preparation_uses_shared_import_worker_setting(tmp_path: Path) -> None:
+    assert _duckdb_import_workers(tmp_path) == DuckDBImportSettings().workers
+    (tmp_path / "config.local.json").write_text(json.dumps({"duckdb_import": {"workers": 3}}), encoding="utf-8")
+    assert _duckdb_import_workers(tmp_path) == 3
+
+
+def test_explicit_preparation_builds_only_current_finalist_artifacts(tmp_path: Path) -> None:
     from datetime import datetime, timezone
     from tests.test_performance_v2_selection import _candidate_db
     from tests.test_portfolio_input import _add_review
@@ -1476,7 +1568,25 @@ def test_default_snapshot_prepares_only_current_finalist_artifacts(tmp_path: Pat
         connection.close()
     (tmp_path / "strategy_performance.duckdb").replace(database)
 
-    service = PortfolioPanelService(tmp_path, path)
+    (tmp_path / "config.local.json").write_text(json.dumps({"duckdb_import": {"workers": 2}}), encoding="utf-8")
+    calls: list[tuple[Path, tuple[int, ...], int]] = []
+
+    def prepare(database_path, result_ids, *, workers):
+        from mrs3.performance_v2_optimizer import prepare_current_optimizer_inputs
+
+        calls.append((Path(database_path), tuple(result_ids), workers))
+        return prepare_current_optimizer_inputs(str(database_path), result_ids, workers=workers)
+
+    service = PortfolioPanelService(tmp_path, path, optimizer_input_preparer=prepare)
+    before = service.readiness()
+    assert before["preparation"]["state"] == "NEEDS_PREPARATION"
+    assert "FINALIST_INPUTS_NOT_READY" in before["stage1"]["blockers"]
+    preparation = service.prepare_finalist_inputs({})
+    assert _wait_stage1(service, preparation)["status"] == "SUCCEEDED"
+    assert calls == [(database, (result_id,), 2)]
+    after = service.readiness()
+    assert after["preparation"]["state"] == "READY"
+    assert after["stage1"]["enabled"] is True
     finalists, weighted_rows = service._snapshot_finalists(
         _config(),
         {"pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}]},
@@ -1484,10 +1594,46 @@ def test_default_snapshot_prepares_only_current_finalist_artifacts(tmp_path: Pat
 
     assert [row["result_id"] for row in finalists] == [result_id]
     assert len(weighted_rows) == 1
+    from mrs3.performance_v2_optimizer import read_prepared_optimizer_inputs, source_digest
+
+    prepared = read_prepared_optimizer_inputs(str(database), (result_id,))
+    assert prepared[0].availability.available and prepared[0].prepared is not None
     with duckdb.connect(str(database), read_only=True) as connection:
-        assert connection.execute(
-            "select result_id from optimizer_prepared_inputs order by result_id"
-        ).fetchall() == [(result_id,)]
+        row = connection.execute(
+            "select result_id, source_digest, prepared_json from optimizer_prepared_inputs order by result_id"
+        ).fetchone()
+    assert row[0] == result_id
+    assert row[1] == source_digest(prepared[0].source)
+    assert row[2].startswith("mrs3-zlib-v1:")
+    assert read_prepared_optimizer_inputs(str(database), (result_id,)) == prepared
+
+
+def test_finalist_preparation_cancellation_finishes_after_atomic_preparer(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    path = tmp_path / "portfolio_optimizer.local.json"
+    _write_config(path)
+    database = tmp_path / "performance.duckdb"
+    entered, release = threading.Event(), threading.Event()
+
+    def preparer(*_args, **_kwargs):
+        entered.set()
+        assert release.wait(timeout=3)
+
+    service = PortfolioPanelService(tmp_path, path, optimizer_input_preparer=preparer)
+    monkeypatch.setattr(service, "_current_finalist_metadata", lambda *_args, **_kwargs: (database, ["BTCUSDT|LONG"], {"BTCUSDT|LONG": 1}, (11,)))
+    monkeypatch.setattr(service, "_prepared_finalists_state", lambda *_args, **_kwargs: {"state": "NEEDS_PREPARATION", "required": 1, "ready": 0})
+
+    result = service.prepare_finalist_inputs({})
+    assert entered.wait(timeout=3)
+    assert service.cancel(result["job_id"])["status"] == "CANCEL_REQUESTED"
+    release.set()
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline and service.job(result["job_id"])["status"] in {"QUEUED", "RUNNING", "CANCEL_REQUESTED"}:
+        time.sleep(0.01)
+
+    assert service.job(result["job_id"])["status"] == "CANCELLED"
+    assert not [job for job in service.registry.list() if job["kind"] == "portfolio.prepare_finalists" and job["state"] not in {"COMMITTED", "CANCELLED", "FAILED"}]
 
 
 def test_campaign_resolves_ordered_series_aliases_into_private_weighted_rows(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -2960,11 +3106,31 @@ def test_startup_migrates_scaled_legacy_campaigns_before_recovery(monkeypatch: p
         elif index < 10:
             registry.cancel(saved["job_id"])
 
+    missing_id = "campaign-" + "f" * 32
+    missing = registry.submit(
+        "portfolio.stage1", {"campaign_id": missing_id}, "preexisting-missing",
+        ("preexisting-missing",), job_id="preexisting-missing",
+    )
+    registry.transition(missing["job_id"], "RUNNING")
+    registry.sync(
+        missing["job_id"],
+        {"state": "COMMITTED", "phase": "COMMITTED"},
+        runtime={"campaign_snapshot": {
+            "schema": "portfolio-campaign-input-v1",
+            "campaign_id": missing_id,
+            "path": f".portfolio-results/{missing_id}/campaign-input.json.gz",
+            "sha256": "0" * 64,
+            "compressed_size": 1,
+            "uncompressed_size": 1,
+            "state": "available",
+        }},
+    )
+
     service = PortfolioPanelService(tmp_path, registry=registry)
     service.startup_recover()
 
     persisted = json.loads(path.read_text(encoding="utf-8"))
-    assert len(persisted) == 14
+    assert len(persisted) == 15
     assert not (path.with_name(".panel-jobs.snapshot-migration.bak")).exists()
     assert path.stat().st_size < 256 * 1024
     for job_id, _value in jobs:
@@ -2978,6 +3144,7 @@ def test_startup_migrates_scaled_legacy_campaigns_before_recovery(monkeypatch: p
             assert service._hydrate_campaign(record, runtime, allow_terminal=True, expected_campaign_id=descriptor["campaign_id"])["campaign_id"] == descriptor["campaign_id"]
         else:
             assert "campaign" not in runtime or set(runtime["campaign"]) <= {"campaign_id", "input_digest", "config_digest"}
+    assert persisted["preexisting-missing"]["runtime"]["campaign_snapshot"]["state"] == "available"
 
     restarted = PanelJobRegistry(path, capacity=20, recover_on_load=False)
     PortfolioPanelService(tmp_path, registry=restarted).startup_recover()
@@ -3019,12 +3186,12 @@ def test_startup_migration_fault_restores_journal_and_retries_one_fixed_snapshot
     verify = service._verify_migrated_registry
     calls = 0
 
-    def fail_once() -> None:
+    def fail_once(migrated_job_ids) -> None:
         nonlocal calls
         calls += 1
         if calls == 1:
             raise OSError("injected verification fault")
-        verify()
+        verify(migrated_job_ids)
 
     monkeypatch.setattr(service, "_verify_migrated_registry", fail_once)
     service.startup_recover()

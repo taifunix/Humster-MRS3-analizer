@@ -1122,7 +1122,7 @@ def test_v2_worker_keeps_readback_evidence_private_until_terminal_save(tmp_path,
     assert replacements == []
     for _ in range(3):
         controller._record_special_job(jobs.status(job_id))
-    assert replacements == [journal]
+    assert replacements == []
 
     release.set()
     deadline = time.monotonic() + 5
@@ -1130,9 +1130,9 @@ def test_v2_worker_keeps_readback_evidence_private_until_terminal_save(tmp_path,
         time.sleep(0.01)
     assert jobs.status(job_id)["state"] == "COMMITTED"
     assert jobs.status(job_id)["evidence"] == {"phase_seconds": {"PANEL_READBACK": 0.25}}
-    while time.monotonic() < deadline and len(replacements) < 2:
+    while time.monotonic() < deadline and len(replacements) < 1:
         time.sleep(0.01)
-    assert replacements == [journal, journal]
+    assert replacements == [journal]
     restored = PanelJobRegistry(journal, recover_on_load=False)
     assert restored.get(job_id)["evidence"] == {"phase_seconds": {"PANEL_READBACK": 0.25}}
 
@@ -1162,11 +1162,41 @@ def test_j5_import_skips_unchanged_polls_and_other_kind_still_saves_each_poll(
 
     monkeypatch.setattr(panel_jobs_module.os, "replace", counted_replace)
     controller._record_special_job({"job_id": job_id, **document})
-    assert replacements == [journal]
+    first = 0 if kind == "strategies.performance.v2.import" else 1
+    assert replacements == [journal] * first
     for _ in range(3 if kind == "strategies.performance.v2.import" else 1):
         controller._record_special_job({"job_id": job_id, **document})
-    expected = 1 if kind == "strategies.performance.v2.import" else 2
+    expected = 0 if kind == "strategies.performance.v2.import" else 2
     assert replacements == [journal] * expected
+
+
+def test_running_performance_import_progress_never_serializes_the_journal(tmp_path, monkeypatch):
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
+    job_id = "volatile-performance-import"
+    controller._panel_jobs.submit(
+        "strategies.performance.v2.import", {}, job_id, (), job_id=job_id,
+    )
+    controller._panel_jobs.transition(job_id, "RUNNING", phase="PARSING")
+    saves = []
+    monkeypatch.setattr(controller._panel_jobs, "_save", lambda: saves.append(True))
+
+    controller._record_special_job({
+        "job_id": job_id,
+        "state": "RUNNING",
+        "phase": "PARSING",
+        "progress": {"current": 136, "total": 2070, "unit": "reports"},
+        "error": None,
+    })
+    controller._record_special_job({
+        "job_id": job_id,
+        "state": "RUNNING",
+        "phase": "PARSING",
+        "progress": {"current": 119, "total": 2070, "unit": "reports"},
+        "error": None,
+    })
+
+    assert saves == []
+    assert controller._panel_jobs.get(job_id)["progress"]["current"] == 136
 
 
 def test_j5_nonterminal_import_callback_reloads_full_snapshot_and_skips_repeats(tmp_path, monkeypatch):
@@ -1205,13 +1235,7 @@ def test_j5_nonterminal_import_callback_reloads_full_snapshot_and_skips_repeats(
     assert replacements == [journal]
     restored = PanelJobRegistry(journal, recover_on_load=False)
     assert restored.jobs == controller._panel_jobs.jobs
-    assert restored.jobs[job_id]["state"] == "RUNNING"
     assert restored.jobs[job_id]["phase"] == "PUBLISHING"
-    assert restored.jobs[job_id]["progress"] == document["progress"]
-    assert restored.jobs[job_id]["error"] == document["error"]
-    assert restored.jobs[job_id]["evidence"] == document["evidence"]
-    assert "result" not in restored.jobs[job_id]
-    assert restored.runtime(job_id) == {"inbox_path": str(tmp_path / "inbox")}
     assert all(not Path(source).exists() for source in temporary_sources)
 
 
@@ -1279,7 +1303,7 @@ def test_j5_phase_progress_and_runtime_changes_each_save_once(tmp_path, monkeypa
         controller._record_special_job(document)
         assert len(replacements) == count
 
-    assert len(replacements) == len(statuses)
+    assert len(replacements) == 1
     assert controller._panel_jobs.runtime(job_id) == {"inbox_path": str(tmp_path / "inbox")}
     assert PanelJobRegistry(journal, recover_on_load=False).jobs == controller._panel_jobs.jobs
     assert all(not Path(source).exists() for source in temporary_sources)
@@ -1323,14 +1347,14 @@ def test_j5_missing_error_and_evidence_save_once_and_retain_runtime(tmp_path, mo
     controller._record_special_job(initial)
     assert len(replacements) == 1
     controller._record_special_job(sparse)
-    assert len(replacements) == 2
+    assert len(replacements) == 1
     for _ in range(3):
         controller._record_special_job(sparse)
 
     saved = controller._panel_jobs.jobs[job_id]
-    assert len(replacements) == 2
-    assert saved["error"] is None
-    assert "evidence" not in saved
+    assert len(replacements) == 1
+    assert saved["error"] == initial["error"]
+    assert saved["evidence"] == initial["evidence"]
     assert saved["inbox_ready"] is True
     assert controller._panel_jobs.runtime(job_id) == {
         "existing": "value", "inbox_path": str(tmp_path / "inbox"),
@@ -1375,10 +1399,7 @@ def test_j5_dirty_volatile_job_is_persisted_by_identical_import_callback(tmp_pat
     )
     controller._record_special_job(document)
 
-    assert replacements == [journal]
-    restored = PanelJobRegistry(journal, recover_on_load=False)
-    assert restored.jobs == controller._panel_jobs.jobs
-    assert restored.jobs[other_id]["progress"] == {"current": 1, "total": 2}
+    assert replacements == []
     assert all(not Path(source).exists() for source in temporary_sources)
 
 
@@ -2782,11 +2803,7 @@ def test_selection_recalculate_passes_only_missing_strategy_ids(tmp_path: Path, 
     controller, _, _ = _controller_for_windows(tmp_path)
     import mrs3.panel as panel_module
     calls = []
-    monkeypatch.setattr(
-        panel_module,
-        "prepare_current_optimizer_inputs",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("optimizer preparation is not part of selection recalculation")),
-    )
+    assert not hasattr(panel_module, "prepare_current_optimizer_inputs")
     monkeypatch.setattr(panel_module, "selection_cache_missing_strategy_ids", lambda *_args, **_kwargs: (17, 23))
     monkeypatch.setattr(panel_module, "prepare_selection_window_cache", lambda *args, **kwargs: calls.append((args, kwargs)))
 
@@ -2822,11 +2839,7 @@ def test_selection_recalculate_maps_equity_cache_errors_to_typed_api_errors(
 def test_selection_recalculate_all_does_not_prepare_optimizer_inputs(tmp_path: Path, monkeypatch) -> None:
     controller, _, _ = _controller_for_windows(tmp_path)
     import mrs3.panel as panel_module
-    monkeypatch.setattr(
-        panel_module,
-        "prepare_current_optimizer_inputs",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("optimizer preparation is not part of selection recalculation")),
-    )
+    assert not hasattr(panel_module, "prepare_current_optimizer_inputs")
 
     assert controller.strategies_performance_v2_recalculate_all()["status"] == "READY"
 

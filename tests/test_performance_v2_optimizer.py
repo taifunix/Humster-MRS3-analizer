@@ -380,6 +380,18 @@ def test_empty_result_id_scope_does_not_prepare_or_write(tmp_path: Path) -> None
         assert connection.execute("select count(*) from optimizer_prepared_inputs").fetchone() == (0,)
 
 
+def test_strict_missing_prepared_input_does_not_materialize_source_rows(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from tests.test_performance_v2_selection import _candidate_db
+
+    connection = _candidate_db(tmp_path)
+    result_id = int(connection.execute("select current_result_id from strategies").fetchone()[0])
+    connection.close()
+
+    monkeypatch.setattr(optimizer_module, "_source_rows", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("source rows must stay unread")))
+    with pytest.raises(OptimizerIntegrityError, match="prepared input is missing"):
+        read_prepared_optimizer_inputs(str(tmp_path / "strategy_performance.duckdb"), [result_id])
+
+
 def _typed_candidate_database(tmp_path: Path, *, two_results: bool = False) -> tuple[Path, tuple[int, ...]]:
     from tests.test_performance_v2_selection import _candidate_db
 

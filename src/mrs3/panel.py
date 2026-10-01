@@ -226,7 +226,6 @@ from .performance_v2_store import (
     require_performance_v2_readable,
 )
 from .performance_v2_equity_cache import EquitySourceChangedError
-from .performance_v2_optimizer import prepare_current_optimizer_inputs
 from .performance_v2_selection import (
     EquityCacheSchemaInvalidError,
     EquitySchemaUpgradeRequiredError,
@@ -1647,6 +1646,25 @@ class PanelController:
         if names != set(expected):
             raise ValueError("metadata inbox is incomplete: strategy names do not match")
 
+    def _owned_single_mode_inbox(self, inbox_root: Path, job_id: str) -> Path | None:
+        inbox = (inbox_root / job_id).resolve()
+        if inbox.parent != inbox_root:
+            return None
+        manifest_path = inbox / "inbox_manifest.json"
+        if not manifest_path.is_file() or manifest_path.is_symlink():
+            return None
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return None
+        if not isinstance(manifest, Mapping) or manifest.get("batch_id") != job_id:
+            raise ValueError("existing tester inbox belongs to another job")
+        try:
+            self._validate_metadata_inbox(inbox)
+        except ValueError:
+            return None
+        return inbox
+
     @staticmethod
     def _optional_string(payload: Mapping[str, object], name: str) -> str:
         value = payload.get(name)
@@ -1874,6 +1892,9 @@ class PanelController:
     def portfolio_submit_campaign(self, payload: Mapping[str, object]) -> dict[str, object]:
         return self._portfolio_service.submit_campaign(payload)
 
+    def portfolio_prepare_finalist_inputs(self, payload: Mapping[str, object]) -> dict[str, object]:
+        return self._portfolio_service.prepare_finalist_inputs(payload)
+
     def portfolio_active_job(self) -> dict[str, object] | None:
         return self._portfolio_service.active_or_job()
 
@@ -1990,6 +2011,8 @@ class PanelController:
         inbox = document.get("inbox_path")
         if isinstance(inbox, str) and inbox:
             runtime["inbox_path"] = inbox
+            if document.get("mode") == "SINGLE_MODE":
+                runtime["mode"] = "SINGLE_MODE"
         public = {key: value for key, value in document.items() if key in {"state", "phase", "progress", "error", "evidence"}}
         try:
             tracked = self._panel_jobs._peek(job_id)
@@ -2084,6 +2107,14 @@ class PanelController:
                 self._collection_import_claim_ids.discard(job_id)
         try:
             performance_import = tracked.get("kind") == "strategies.performance.v2.import"
+            if (
+                performance_import
+                and document.get("state") == "RUNNING"
+                and not runtime
+                and "inbox_ready" not in public
+            ):
+                self._panel_jobs.volatile_sync(job_id, public, expected=tracked)
+                return
             terminal_performance = (
                 performance_import
                 and document.get("state") in {"COMMITTED", "FAILED"}
@@ -3561,11 +3592,33 @@ class PanelController:
                 "inbox_path": str(self._report_collection().verify(job_id)),
                 **self._report_collection().status(),
             }
+        if (
+            tracked.get("kind") in {"strategies.tester.start", "strategies.tester.retry"}
+            and tracked.get("state") == "COMMITTED"
+        ):
+            inbox = self._owned_single_mode_inbox(inbox_root, job_id)
+            if inbox is not None:
+                runtime.update({
+                    "inbox_path": str(inbox),
+                    "mode": "SINGLE_MODE",
+                    "performance_v2_import_verified": True,
+                })
+                self._panel_jobs.sync(
+                    job_id,
+                    {"state": "COMMITTED", "phase": "COMMITTED", "inbox_ready": True},
+                    runtime=runtime,
+                )
+                self._strategy_batch_inboxes[job_id] = inbox
+                return self._panel_jobs.get(job_id)
         is_retest_native = (
             tracked.get("kind") == "strategies.tester.native.start"
             and (tracked.get("retest") is True or runtime.get("retest") is True)
         )
-        if is_retest_native and tracked.get("state") == "COMMITTED":
+        if (
+            is_retest_native
+            and tracked.get("state") == "COMMITTED"
+            and (tracked.get("inbox_ready") is True or runtime.get("inbox_ready") is True)
+        ):
             raw_inbox = runtime.get("inbox_path")
             try:
                 if (
@@ -3656,7 +3709,11 @@ class PanelController:
             )
             service.mark_inbox_ready(job_id, inbox)
             self._strategy_batch_inboxes[job_id] = inbox
-            runtime = {"inbox_path": str(inbox), "performance_v2_import_verified": True}
+            runtime = {
+                "inbox_path": str(inbox),
+                "mode": "SINGLE_MODE",
+                "performance_v2_import_verified": True,
+            }
             state = self._panel_jobs.get(job_id)["state"]
             if state == "FAILED":
                 self._panel_jobs.recover_running(job_id)
@@ -8699,7 +8756,8 @@ class _PanelHandler(BaseHTTPRequestHandler):
         fresh_generation = endpoint == "/api/v2/strategies/fresh/generate"
         performance_v2_windows_endpoint = endpoint == "/api/v2/strategies/performance-v2/windows"
         performance_v2_selection_endpoint = endpoint == "/api/v2/strategies/performance-v2/selection"
-        portfolio_route = endpoint == "/api/v2/portfolio/campaigns" or bool(re.fullmatch(r"/api/v2/portfolio/jobs/[^/]+/cancel", endpoint)) or bool(re.fullmatch(r"/api/v2/portfolio/campaigns/[^/]+/tester-submissions", endpoint))
+        portfolio_preparation_route = endpoint == "/api/v2/portfolio/finalist-inputs"
+        portfolio_route = portfolio_preparation_route or endpoint == "/api/v2/portfolio/campaigns" or bool(re.fullmatch(r"/api/v2/portfolio/jobs/[^/]+/cancel", endpoint)) or bool(re.fullmatch(r"/api/v2/portfolio/campaigns/[^/]+/tester-submissions", endpoint))
         portfolio_cancel_route = bool(re.fullmatch(r"/api/v2/portfolio/jobs/[^/]+/cancel", endpoint))
         portfolio_submission_route = bool(re.fullmatch(r"/api/v2/portfolio/campaigns/[^/]+/tester-submissions", endpoint))
         if bulk_retest_endpoint is None and endpoint not in {"/api/start", "/api/browse", "/api/duckdb-import/settings", "/api/duckdb-import/preflight", "/api/duckdb-import/start", "/api/duckdb-import/cancel", "/api/duckdb-import/migrate", "/api/duckdb-direct/coverage", "/api/duckdb-direct/preflight", "/api/duckdb-direct/start", "/api/duckdb-direct/cancel", "/api/analysis/library", "/api/analysis/initialize", "/api/analysis/rerun", "/api/analysis/compare", "/api/analysis/export", "/api/analysis/shortlist", "/api/analysis/filter-export", "/api/analysis/strategies", "/api/source-v6/preflight", "/api/source-v6/start", "/api/source-v6/fresh/multiscope/start", "/api/source-v6/fresh/multiscope/analysis/start", "/api/source-v6/cancel", "/api/source-v6/merge", "/api/v2/panel/restart", "/api/v2/settings/validate", "/api/v2/settings/save", "/api/v2/settings/analysis-profile", "/api/v2/jobs", "/api/v2/strategies/tester/verify-inbox", "/api/v2/strategies/tester/report-collection/clear", "/api/v2/testing/local/fill", "/api/v2/testing/local/start", "/api/v2/testing/local/stop", "/api/v2/testing/screener/fill", "/api/v2/testing/screener/start", "/api/v2/testing/screener/stop", "/api/v2/testing/screener/evaluate", "/api/v2/testing/remote/check-paths", "/api/v2/testing/remote/prepare", "/api/v2/testing/remote/fill", "/api/v2/testing/remote/start", "/api/v2/testing/remote/stop", "/api/v2/source/local/import/preflight", "/api/v2/source/local/import/start", "/api/v2/source/local/merge/preflight", "/api/v2/source/local/merge/start", "/api/v2/source/local/cancel", "/api/v2/source/remote/start", "/api/v2/source/remote/cancel", "/api/v2/surfaces/preflight", "/api/v2/surfaces/select", "/api/v2/surfaces/publish", "/api/v2/surfaces/publish/start", "/api/v2/strategies/fresh/analyze", "/api/v2/strategies/fresh/generate", "/api/v2/strategies/fresh/runs", "/api/v2/strategies/fresh/shortlist", "/api/v2/strategies/fresh/open", "/api/v2/strategies/performance-v2/windows", "/api/v2/strategies/performance-v2/selection", "/api/v2/strategies/performance-v2/selection-preview", "/api/v2/strategies/performance-v2/selection-cache-status", "/api/v2/strategies/performance-v2/recalculate", "/api/v2/strategies/performance-v2/recalculate-all", "/api/v2/strategies/performance-v2/selection-review-import", "/api/v2/strategies/performance-v2/retest-tags-import", "/api/v2/strategies/performance-v2/retest/start", "/api/v2/strategies/performance-v2/retest/import"} and not portfolio_route:
@@ -8763,6 +8821,7 @@ class _PanelHandler(BaseHTTPRequestHandler):
             document = json.loads(self.rfile.read(length).decode("utf-8"))
             if not isinstance(document, dict):
                 raise ValueError("JSON body must be an object")
+            portfolio_preparation_match = endpoint == "/api/v2/portfolio/finalist-inputs"
             portfolio_campaign_match = endpoint == "/api/v2/portfolio/campaigns"
             portfolio_cancel_match = re.fullmatch(r"/api/v2/portfolio/jobs/([^/]+)/cancel", endpoint)
             portfolio_submission_match = re.fullmatch(r"/api/v2/portfolio/campaigns/([^/]+)/tester-submissions", endpoint)
@@ -8783,7 +8842,9 @@ class _PanelHandler(BaseHTTPRequestHandler):
                     else "strategies.performance.v2.retest.import",
                     "request": document,
                 }
-            if portfolio_campaign_match:
+            if portfolio_preparation_match:
+                result = self.server.controller.portfolio_prepare_finalist_inputs(document)
+            elif portfolio_campaign_match:
                 result = self.server.controller.portfolio_submit_campaign(document)
             elif portfolio_cancel_match:
                 result = self.server.controller.portfolio_cancel(portfolio_cancel_match.group(1))
@@ -9029,7 +9090,7 @@ class _PanelHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(data)
             return
-        accepted = portfolio_cancel_route or portfolio_submission_route or endpoint in {"/api/start", "/api/duckdb-import/start", "/api/duckdb-direct/start", "/api/analysis/rerun", "/api/analysis/strategies", "/api/source-v6/analysis/start", "/api/source-v6/fresh/multiscope/start", "/api/source-v6/fresh/multiscope/analysis/start", "/api/v2/jobs", "/api/v2/surfaces/publish/start", "/api/v2/strategies/performance-v2/retest/start", "/api/v2/strategies/performance-v2/retest/import", "/api/v2/strategies/performance-v2/finalist-retest/start", "/api/v2/strategies/performance-v2/finalist-retest/import", "/api/v2/portfolio/campaigns"}
+        accepted = portfolio_preparation_route or portfolio_cancel_route or portfolio_submission_route or endpoint in {"/api/start", "/api/duckdb-import/start", "/api/duckdb-direct/start", "/api/analysis/rerun", "/api/analysis/strategies", "/api/source-v6/analysis/start", "/api/source-v6/fresh/multiscope/start", "/api/source-v6/fresh/multiscope/analysis/start", "/api/v2/jobs", "/api/v2/surfaces/publish/start", "/api/v2/strategies/performance-v2/retest/start", "/api/v2/strategies/performance-v2/retest/import", "/api/v2/strategies/performance-v2/finalist-retest/start", "/api/v2/strategies/performance-v2/finalist-retest/import", "/api/v2/portfolio/campaigns"}
         self._json(202 if accepted else 200, result)
 
     def do_PATCH(self) -> None:

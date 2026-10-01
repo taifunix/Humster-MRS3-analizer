@@ -38,13 +38,6 @@ from .performance_v2_store import (
     require_performance_v2,
     PerformanceV2WriterLock,
 )
-from .performance_v2_optimizer import (
-    OptimizerSourceInput,
-    PREPARATION_VERSION,
-    encode_prepared_storage,
-    prepare_optimizer_input,
-    source_digest,
-)
 
 
 class PerformanceV2ImportError(RuntimeError):
@@ -77,7 +70,7 @@ _RESULT_VALUE_FIELDS = (
     "effective_end_utc", "warmup_hours", "excluded_trade_count", "exclusion_reason",
 )
 _TIMED_PHASES = (
-    "PUBLISH_ADMISSION", "PUBLISH_ROWS", "PUBLISH_CHILD_READBACK", "PUBLISH_PHASE8",
+    "PUBLISH_ADMISSION", "PUBLISH_ROWS", "PUBLISH_CHILD_READBACK",
     "PUBLISH_FINALIZE", "COMMIT", "FAILURE_ARTIFACTS", "POST_COMMIT_REPLACEMENT_READBACK",
     "CONNECTION_CLOSE", "STAGING_CLEANUP", "PUBLISHING_THROUGH_CLEANUP_TOTAL",
     "UNACCOUNTED", "AUDIT_WRITE", "WRITER_LOCK_RELEASE", "PANEL_READBACK",
@@ -180,7 +173,7 @@ class _PhaseTimes:
                 if total is not None:
                     values["PUBLISHING_THROUGH_CLEANUP_TOTAL"] = total
                     component_names = {
-                        "PUBLISH_ADMISSION", "PUBLISH_ROWS", "PUBLISH_CHILD_READBACK", "PUBLISH_PHASE8",
+                        "PUBLISH_ADMISSION", "PUBLISH_ROWS", "PUBLISH_CHILD_READBACK",
                         "PUBLISH_FINALIZE", "COMMIT", "FAILURE_ARTIFACTS",
                         "POST_COMMIT_REPLACEMENT_READBACK", "CONNECTION_CLOSE", "STAGING_CLEANUP",
                     }
@@ -559,97 +552,6 @@ def _phase8_sizing_facts(settings: Mapping[str, object]) -> tuple[object | None,
         decimal(basic, "balance_percentage_long"),
         decimal(basic, "risk_long"),
         decimal(basic, "max_balance"),
-    )
-
-
-def _phase8_db_decimal(value: object) -> Decimal:
-    # Core action/equity and initial-balance values feed NOT NULL columns;
-    # optional price/cost facts alone may remain None when over-scale.
-    if not isinstance(value, Decimal):
-        raise PerformanceV2ImportError("phase8 source decimal is invalid")
-    try:
-        return value.quantize(Decimal("0.000000000001"), rounding=ROUND_HALF_UP)
-    except InvalidOperation as error:
-        raise PerformanceV2ImportError("phase8 source decimal is invalid") from error
-
-
-def _phase8_source_input(
-    *,
-    result_id: int,
-    strategy_id: int,
-    entry: PreparedV2Entry,
-    report: ParsedPerformanceV2Report,
-    result_values: Mapping[str, object],
-    sizing_facts: tuple[object | None, ...],
-) -> OptimizerSourceInput:
-    actions = tuple(
-        {
-            "action_index": action.action_index, "timestamp_utc": action.timestamp_utc,
-            "symbol": action.symbol, "order_id": action.order_id, "action": action.action,
-            "size": _phase8_db_decimal(action.size), "post_size": _phase8_db_decimal(action.post_size),
-            "post_side": action.post_side, "pnl": _phase8_db_decimal(action.pnl),
-            "fee": _phase8_db_decimal(action.fee), "balance": _phase8_db_decimal(action.balance),
-            "price": _phase8_decimal(action.price),
-            "cost": _phase8_decimal(action.cost),
-        }
-        for action in report.actions
-    )
-    equity = tuple(
-        {"sample_index": sample_index, "timestamp_utc": timestamp, "equity": _phase8_db_decimal(equity_value)}
-        for sample_index, ((timestamp, _wallet), (_equity_timestamp, equity_value)) in enumerate(
-            zip(report.wallet_series, report.equity_series, strict=True)
-        )
-    )
-    if set(result_values) != set(_RESULT_VALUE_FIELDS) or len(sizing_facts) != 6:
-        raise PerformanceV2ImportError("phase8 source result values are incomplete")
-    report_start = result_values["report_start_utc"]
-    report_end = result_values["report_end_utc"]
-    initial_balance = result_values["initial_balance"]
-    imported_at = result_values["imported_at_utc"]
-    effective_start = result_values["effective_start_utc"]
-    effective_end = result_values["effective_end_utc"]
-    if not isinstance(imported_at, datetime):
-        raise PerformanceV2ImportError("phase8 source revision timestamp is invalid")
-    return OptimizerSourceInput(
-        source_document_version="performance-v2",
-        result_id=result_id,
-        strategy_id=strategy_id,
-        symbol=entry.identity.symbol,
-        side=entry.identity.side,
-        revision_timestamp_utc=imported_at,
-        report_start_utc=report_start,
-        report_end_utc=report_end,
-        effective_start_utc=effective_start or report_start,
-        effective_end_utc=effective_end or report_end,
-        initial_balance=_phase8_db_decimal(initial_balance),
-        sizing_use_upnl=sizing_facts[0],
-        sizing_use_frozen_balance=sizing_facts[1],
-        sizing_use_fix=sizing_facts[2],
-        sizing_balance_percentage_long=sizing_facts[3],
-        sizing_risk_long=sizing_facts[4],
-        sizing_max_balance=sizing_facts[5],
-        actions=actions,
-        equity=equity,
-    )
-
-
-def _persist_phase8_prepared(
-    connection: duckdb.DuckDBPyConnection,
-    source: OptimizerSourceInput,
-    prepared_at_utc: datetime,
-) -> None:
-    availability, prepared = prepare_optimizer_input(source, preparation_version=PREPARATION_VERSION)
-    digest = prepared.source_digest if prepared is not None else source_digest(source)
-    prepared_json = encode_prepared_storage(prepared.to_json()) if prepared is not None else None
-    connection.execute(
-        """insert into optimizer_prepared_inputs
-           (result_id, preparation_version, source_digest, availability_status,
-            unavailable_reason, prepared_json, prepared_at_utc)
-           values (?, ?, ?, ?, ?, ?, ?)""",
-        [
-            source.result_id, PREPARATION_VERSION, digest, availability.status,
-            availability.reason, prepared_json, prepared_at_utc,
-        ],
     )
 
 
@@ -1715,7 +1617,6 @@ def _publish(
         replacement_strategy_ids: list[int] = []
         result_files: dict[str, tuple[str, str, int, int, int, str]] = {}
         written_results: list[tuple[int, int, int]] = []
-        written_phase8: list[tuple[int, int, PreparedV2Entry, ParsedPerformanceV2Report, Mapping[str, object], tuple[object | None, ...]]] = []
         status_priority = {"REJECTED": 0, "SKIPPED": 1, "IMPORTED": 2, "REPLACED": 2}
         published_plateaus = {
             (entry.analysis_run_id, order.plateau_id)
@@ -1845,7 +1746,6 @@ def _publish(
             if previous is None or status_priority[status] >= status_priority[previous[5].split(":", 1)[0]]:
                 result_files[record[1]] = record
             written_results.append((result_id, len(report.actions), len(report.equity_series)))
-            written_phase8.append((result_id, strategy_id, entry, report, values, sizing_facts))
             imported += 1
 
         _update_replacement_timestamps(connection, replacement_strategy_ids, now)
@@ -1874,19 +1774,6 @@ def _publish(
         _verify_child_counts(connection, tuple(written_results))
         if phase_times is not None:
             phase_times.end("PUBLISH_CHILD_READBACK")
-            phase_times.begin("PUBLISH_PHASE8")
-        for result_id, strategy_id, entry, report, values, sizing_facts in written_phase8:
-            source = _phase8_source_input(
-                result_id=result_id,
-                strategy_id=strategy_id,
-                entry=entry,
-                report=report,
-                result_values=values,
-                sizing_facts=sizing_facts,
-            )
-            _persist_phase8_prepared(connection, source, now)
-        if phase_times is not None:
-            phase_times.end("PUBLISH_PHASE8")
             phase_times.begin("PUBLISH_FINALIZE")
         # RETEST is removed only after all replacement readbacks pass.  Since
         # this remains in the same transaction, any later failure preserves

@@ -11,7 +11,7 @@ import os
 from pathlib import Path
 import re
 import shutil
-from threading import Event, RLock, Thread
+from threading import Event, Lock, RLock, Thread
 import time
 from typing import Callable, Mapping
 from urllib.parse import unquote, urlparse
@@ -28,7 +28,7 @@ from .runner.http import TesterHttpClient
 from .runner.inbox import InboxCaptureError, capture_run_snapshot_inbox
 from .runner.monitor import BatchCompletion, BatchRetryExhausted, monitor_controlled_batch
 from .runner.process import start_bot as _start_bot, stop_bot as _stop_bot
-from .runner.results import extract_html_strategy_settings
+from .runner.results import extract_html_strategy_settings, extract_html_strategy_settings_source
 from .runner.workflow import _wait_for_exact_batch
 from .locking import TesterTargetLock
 
@@ -78,6 +78,7 @@ class _Job:
     cleanup_pending: bool = False
     report_baseline: dict[str, tuple[int, int, ...]] = field(default_factory=dict)
     verified_report_evidence: dict[str, tuple[int, int]] = field(default_factory=dict)
+    tester_config_bytes: bytes | None = None
     checkpoint_valid: bool = True
 
 
@@ -249,6 +250,15 @@ def _safe_name(value: object) -> str:
     return value
 
 
+def _strategy_json_path(source: Path, name: str) -> Path:
+    safe_name = _safe_name(name)
+    root = source.resolve()
+    candidate = (root / f"{safe_name}.json").resolve()
+    if candidate.parent != root or candidate.name != f"{safe_name}.json":
+        raise FastStrategyTestError("strategy source path is unsafe")
+    return candidate
+
+
 def _safe_error_message(error: BaseException) -> str:
     message = str(error).strip() or type(error).__name__
     message = re.sub(r"(?i)(?:[A-Za-z]:[\\/]|/)[^\s,;]+", "<path>", message)
@@ -283,11 +293,20 @@ def _report_period_matches(source: str, start: str, end: str) -> bool:
     return re.search(pattern, text, flags=re.IGNORECASE) is not None
 
 
-def _report_matches_run(report: Path, settings: Mapping[str, object], expected: Mapping[str, object], start: str, end: str) -> bool:
-    try:
-        source = report.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError):
-        return False
+def _report_matches_run(
+    report: Path,
+    settings: Mapping[str, object],
+    expected: Mapping[str, object],
+    start: str,
+    end: str,
+    *,
+    source: str | None = None,
+) -> bool:
+    if source is None:
+        try:
+            source = report.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            return False
     start_day = date.fromisoformat(start).strftime("%d.%m.%Y")
     end_day = date.fromisoformat(end).strftime("%d.%m.%Y")
     start_forms = rf"(?:{re.escape(start)}|{re.escape(start_day)})"
@@ -322,6 +341,39 @@ def _report_matches_run(report: Path, settings: Mapping[str, object], expected: 
     return True
 
 
+def _inspect_native_report(
+    candidate: tuple[Path, int, int],
+    expected_settings: Mapping[str, Mapping[str, object]],
+    start: str,
+    end: str,
+) -> tuple[str, Path, int] | None:
+    report, modified, size = candidate
+    try:
+        before = report.stat()
+        if report.is_symlink() or not report.is_file() or (before.st_mtime_ns, before.st_size) != (modified, size):
+            return None
+        source = report.read_text(encoding="utf-8")
+        after = report.stat()
+    except (OSError, UnicodeDecodeError):
+        return None
+    if (after.st_mtime_ns, after.st_size) != (modified, size):
+        return None
+    settings = extract_html_strategy_settings_source(source)
+    name = settings.get("name") if isinstance(settings, Mapping) else None
+    expected = expected_settings.get(name) if isinstance(name, str) else None
+    if (
+        not isinstance(name, str)
+        or name not in expected_settings
+        or not isinstance(expected, Mapping)
+        or not _has_current_performance_v2_layout(source)
+        or not _report_matches_run(
+            report, settings, expected, start, end, source=source
+        )
+    ):
+        return None
+    return name, report, modified
+
+
 class LocalFastStrategyTestService:
     """Run READY strategies in direct, bounded tester chunks."""
 
@@ -348,6 +400,7 @@ class LocalFastStrategyTestService:
         self.single_mode = single_mode
         self.tester_config_template = Path(tester_config_template) if tester_config_template is not None else mrs3_tester_config_template()
         self._lock = RLock()
+        self._inbox_capture_lock = Lock()
         self._jobs: dict[str, _Job] = {}
 
     @staticmethod
@@ -663,15 +716,6 @@ class LocalFastStrategyTestService:
                 self._set_phase(job, "FAILED", current=len(job.verified_reports), failed=len(job.failed_names))
             if not (final_phase == "COMMITTED" and job.single_mode):
                 self._write_manifest(job)
-            if final_phase == "COMMITTED" and job.single_mode:
-                # A complete native run owns the handoff.  The inbox contains
-                # metadata only; source JSON/HTML stay at their exact owners.
-                self._set_phase(job, "INBOX_CREATION", current=len(job.verified_reports), failed=0)
-                self._write_manifest(job)
-                self.capture_inbox(job.job_id)
-                job.state = "COMMITTED"
-                self._set_phase(job, "INBOX_READY", inbox_ready=True, current=len(job.verified_reports), failed=0)
-                self._write_manifest(job)
             job.state = (
                 "CANCELLED"
                 if final_phase == "CANCELLED"
@@ -918,7 +962,7 @@ class LocalFastStrategyTestService:
                         continue
                     report = report_dir / filename
                     try:
-                        expected_settings = json.loads((manifest.strategy_source / f"{name}.json").read_text(encoding="utf-8"))
+                        expected_settings = json.loads(_strategy_json_path(manifest.strategy_source, name).read_text(encoding="utf-8"))
                     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
                         continue
                     settings = extract_html_strategy_settings(report) if report.is_file() and not report.is_symlink() else None
@@ -965,7 +1009,28 @@ class LocalFastStrategyTestService:
             attempt_counts = {name: int(attempts.get(name, 0)) for name in expected}
         except (FastStrategyTestError, ValueError, OSError, TypeError):
             return None
-        if tuple(expected_document) != expected or report_dir != self.config.report_dir.resolve() or set(verified) != set(expected):
+        if tuple(expected_document) != expected or report_dir != self.config.report_dir.resolve():
+            return None
+        if (
+            document.get("mode") == "SINGLE_MODE"
+            and document.get("phase") == "RUNNING"
+            and not failed
+            and set(verified) != set(expected)
+        ):
+            try:
+                expected_settings = {
+                    name: json.loads(_strategy_json_path(manifest.strategy_source, name).read_text(encoding="utf-8"))
+                    for name in expected
+                }
+                recovered = self._native_reports(
+                    report_dir, set(expected), expected_settings=expected_settings, start=start, end=end,
+                )
+            except (FastStrategyTestError, KeyError, OSError, TypeError, UnicodeDecodeError, ValueError):
+                return None
+            if set(recovered) != set(expected):
+                return None
+            verified = {name: report.name for name, report in recovered.items()}
+        if set(verified) != set(expected):
             return None
         verified_reports: dict[str, str] = {}
         for name in expected:
@@ -985,6 +1050,14 @@ class LocalFastStrategyTestService:
         )
 
     def capture_inbox(self, job_id: str, *, force_single_mode: bool = False) -> Path:
+        if not self._inbox_capture_lock.acquire(blocking=False):
+            raise FastStrategyTestError("inbox verification is already running")
+        try:
+            return self._capture_inbox(job_id, force_single_mode=force_single_mode)
+        finally:
+            self._inbox_capture_lock.release()
+
+    def _capture_inbox(self, job_id: str, *, force_single_mode: bool = False) -> Path:
         with self._lock:
             job = self._jobs.get(job_id)
         if job is None:
@@ -1007,7 +1080,7 @@ class LocalFastStrategyTestService:
         reports: dict[str, Path] = {}
         for name in job.expected_names:
             try:
-                strategy = json.loads((job.manifest.strategy_source / f"{name}.json").read_text(encoding="utf-8"))
+                strategy = json.loads(_strategy_json_path(job.manifest.strategy_source, name).read_text(encoding="utf-8"))
             except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
                 raise FastStrategyTestError(f"strategy JSON is unavailable for {name}") from error
             if not isinstance(strategy, Mapping):
@@ -1020,14 +1093,18 @@ class LocalFastStrategyTestService:
                 job_id,
                 snapshots,
                 reports,
-                tester_config_bytes=self.config.tester_config.read_bytes(),
+                tester_config_bytes=(
+                    job.tester_config_bytes
+                    if job.tester_config_bytes is not None
+                    else (job.runtime_config or self.config).tester_config.read_bytes()
+                ),
                 provenance=job.manifest.provenance,
                 test_start=job.start_date,
                 test_end=job.end_date,
                 run_mode="SINGLE_MODE" if job.single_mode else "FAST",
                 workers=min(16, self.config.max_parallel_submissions),
                 strategy_paths={
-                    name: job.manifest.strategy_source / f"{name}.json"
+                    name: _strategy_json_path(job.manifest.strategy_source, name)
                     for name in job.expected_names
                 } if job.single_mode else None,
                 replace_existing=job.single_mode,
@@ -1074,7 +1151,7 @@ class LocalFastStrategyTestService:
             expected_settings: dict[str, Mapping[str, object]] = {}
             for name in failed:
                 try:
-                    value = json.loads((source_job.manifest.strategy_source / f"{name}.json").read_text(encoding="utf-8"))
+                    value = json.loads(_strategy_json_path(source_job.manifest.strategy_source, name).read_text(encoding="utf-8"))
                 except (OSError, UnicodeDecodeError, json.JSONDecodeError):
                     continue
                 if isinstance(value, Mapping):
@@ -1138,10 +1215,6 @@ class LocalFastStrategyTestService:
             }
             self._jobs[identifier] = job
             if not failed:
-                if job.single_mode:
-                    job.phase = "INBOX_CREATION"
-                    self._write_manifest(job)
-                    self.capture_inbox(job.job_id)
                 job.phase = "COMMITTED"
                 job.state = "COMMITTED"
                 job.target_finalized = True
@@ -1236,7 +1309,7 @@ class LocalSingleModeStrategyTestService(LocalFastStrategyTestService):
             or end is None
         ):
             raise FastStrategyTestError("native report validation settings are unavailable")
-        found: dict[str, Path] = {}
+        candidates: list[tuple[Path, int, int]] = []
         for report in sorted(report_dir.glob("*.html"), key=lambda path: path.name):
             if report.is_symlink() or not report.is_file():
                 continue
@@ -1246,20 +1319,16 @@ class LocalSingleModeStrategyTestService(LocalFastStrategyTestService):
                 previous = baseline.get(report.name) if baseline is not None else None
                 if previous is not None and previous[:2] == (modified, stat.st_size):
                     continue
-                source = report.read_text(encoding="utf-8")
             except (OSError, UnicodeDecodeError):
                 continue
-            settings = extract_html_strategy_settings(report)
-            name = settings.get("name") if isinstance(settings, Mapping) else None
-            if (
-                not isinstance(name, str)
-                or name not in expected
-                or not _has_current_performance_v2_layout(source)
-            ):
+            candidates.append((report, modified, stat.st_size))
+
+        found: dict[str, Path] = {}
+        for candidate in candidates:
+            item = _inspect_native_report(candidate, expected_settings, start, end)
+            if item is None:
                 continue
-            expected_for_name = expected_settings[name]
-            if not isinstance(settings, Mapping) or not _report_matches_run(report, settings, expected_for_name, start, end):
-                continue
+            name, report, modified = item
             previous = found.get(name)
             if previous is None or (modified, report.name) > (previous.stat().st_mtime_ns, previous.name):
                 found[name] = report
@@ -1450,7 +1519,7 @@ class LocalSingleModeStrategyTestService(LocalFastStrategyTestService):
             expected_settings: dict[str, Mapping[str, object]] = {}
             for name in names:
                 try:
-                    value = json.loads((job.manifest.strategy_source / f"{name}.json").read_text(encoding="utf-8"))
+                    value = json.loads(_strategy_json_path(job.manifest.strategy_source, name).read_text(encoding="utf-8"))
                 except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
                     raise FastStrategyTestError(f"expected strategy settings are unavailable for {name}") from error
                 if not isinstance(value, Mapping):
@@ -1485,6 +1554,7 @@ class LocalSingleModeStrategyTestService(LocalFastStrategyTestService):
             initial_balance=job.initial_balance,
             template_path=self.tester_config_template,
         )
+        job.tester_config_bytes = config.tester_config.read_bytes()
         batches = [
             job.run_names[index : index + config.strategy_batch_size]
             for index in range(0, len(job.run_names), config.strategy_batch_size)
@@ -1527,12 +1597,7 @@ class LocalSingleModeStrategyTestService(LocalFastStrategyTestService):
                 "native SINGLE_MODE reports missing after retries: " + ", ".join(incomplete)
             )
         _clear_directory(job.strategy_dir, expected=self.config.bot_root / "settings_strategy")
-        job.phase = "INBOX_CREATION"
-        self._write_manifest(job)
-        self.capture_inbox(job.job_id)
         job.state = "COMMITTED"
-        job.phase = "INBOX_READY"
-        self._write_manifest(job)
         job.phase = "COMMITTED"
         self._write_manifest(job)
         self._set_progress(job, current=len(job.verified_reports), active=0, failed=0)

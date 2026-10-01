@@ -844,7 +844,7 @@ def test_single_mode_verify_routes_through_existing_performance_inbox_button(tmp
     job = controller._panel_jobs.submit(
         "strategies.tester.start", {"mode": "SINGLE_MODE"}, "single", ("strategies.tester",), job_id="single-job"
     )
-    controller._panel_jobs.transition(job["job_id"], "RUNNING")
+    controller._panel_jobs.transition(job["job_id"], "RUNNING", phase="COMMITTED")
     monkeypatch.setattr("mrs3.panel.RunnerConfig.from_json", lambda _path: SimpleNamespace(inbox_root=tmp_path / "inbox"))
     def forbidden_full_validation(_inbox: Path) -> None:
         raise AssertionError("verify must defer full validation to the v2 importer")
@@ -869,6 +869,77 @@ def test_single_mode_verify_routes_through_existing_performance_inbox_button(tmp
     assert result["state"] == "COMMITTED"
     assert result["inbox_ready"] is True
     assert controller._panel_jobs.runtime("single-job")["inbox_path"] == str(inbox)
+
+
+def test_single_mode_repeated_verify_reuses_the_verified_inbox(tmp_path: Path, monkeypatch) -> None:
+    config = tmp_path / "config.local.json"
+    config.write_text("{}", encoding="utf-8")
+    inbox_root = tmp_path / "inbox"
+    inbox = inbox_root / "single-job"
+    inbox.mkdir(parents=True)
+    (inbox / "inbox_manifest.json").write_text(json.dumps({"batch_id": "single-job"}), encoding="utf-8")
+    controller = PanelController(tmp_path, config, analysis_config_loader=lambda _: AlgorithmConfig.defaults())
+    job = controller._panel_jobs.submit(
+        "strategies.tester.start", {"mode": "SINGLE_MODE"}, "single", ("strategies.tester",), job_id="single-job"
+    )
+    controller._panel_jobs.transition(job["job_id"], "RUNNING")
+    controller._panel_jobs.sync(
+        job["job_id"],
+        {"state": "COMMITTED", "phase": "COMMITTED", "inbox_ready": True},
+        runtime={"inbox_path": str(inbox), "mode": "SINGLE_MODE", "performance_v2_import_verified": False},
+    )
+    monkeypatch.setattr("mrs3.panel.RunnerConfig.from_json", lambda _path: SimpleNamespace(inbox_root=inbox_root))
+    validated: list[Path] = []
+    monkeypatch.setattr(controller, "_validate_metadata_inbox", validated.append)
+    monkeypatch.setattr(
+        controller, "_single_mode_strategy_test", lambda: pytest.fail("verified inbox must not be rebuilt")
+    )
+
+    result = controller.strategies_tester_verify_inbox("single-job")
+
+    assert result["state"] == "COMMITTED"
+    assert result["inbox_ready"] is True
+    assert validated == [inbox.resolve()]
+    assert controller._panel_jobs.runtime("single-job")["performance_v2_import_verified"] is True
+
+
+def test_single_mode_verify_rejects_an_inbox_owned_by_another_job(tmp_path: Path, monkeypatch) -> None:
+    config = tmp_path / "config.local.json"
+    config.write_text("{}", encoding="utf-8")
+    inbox_root = tmp_path / "inbox"
+    inbox = inbox_root / "single-job"
+    inbox.mkdir(parents=True)
+    (inbox / "inbox_manifest.json").write_text(json.dumps({"batch_id": "other-job"}), encoding="utf-8")
+    controller = PanelController(tmp_path, config, analysis_config_loader=lambda _: AlgorithmConfig.defaults())
+    job = controller._panel_jobs.submit(
+        "strategies.tester.start", {"mode": "SINGLE_MODE"}, "single", ("strategies.tester",), job_id="single-job"
+    )
+    controller._panel_jobs.transition(job["job_id"], "RUNNING")
+    controller._panel_jobs.sync(
+        job["job_id"],
+        {"state": "COMMITTED", "phase": "COMMITTED", "inbox_ready": True},
+        runtime={"inbox_path": str(inbox), "mode": "SINGLE_MODE", "performance_v2_import_verified": True},
+    )
+    monkeypatch.setattr("mrs3.panel.RunnerConfig.from_json", lambda _path: SimpleNamespace(inbox_root=inbox_root))
+    captured: list[str] = []
+
+    class SingleModeService:
+        def capture_inbox(self, job_id: str) -> Path:
+            captured.append(job_id)
+            return inbox
+
+        def mark_inbox_ready(self, job_id: str, path: Path) -> None:
+            assert job_id == "single-job" and path == inbox
+
+        def status(self, job_id: str) -> dict[str, object]:
+            return {"job_id": job_id, "state": "COMMITTED", "phase": "COMMITTED", "evidence": {}, "progress": {}, "inbox_path": str(inbox)}
+
+    monkeypatch.setattr(controller, "_single_mode_strategy_test", lambda: SingleModeService())
+
+    with pytest.raises(ValueError, match="belongs to another job"):
+        controller.strategies_tester_verify_inbox("single-job")
+
+    assert captured == []
 
 
 def test_pre_v2_native_tester_job_rebuilds_its_metadata_inbox(tmp_path: Path, monkeypatch) -> None:
@@ -901,6 +972,39 @@ def test_pre_v2_native_tester_job_rebuilds_its_metadata_inbox(tmp_path: Path, mo
     result = controller.strategies_tester_verify_inbox("native-job")
 
     assert result["state"] == "COMMITTED"
+    assert result["inbox_ready"] is True
+
+
+def test_committed_retest_without_inbox_uses_explicit_capture(tmp_path: Path, monkeypatch) -> None:
+    config = tmp_path / "config.local.json"
+    config.write_text("{}", encoding="utf-8")
+    inbox = tmp_path / "inbox" / "retest-job"
+    inbox.mkdir(parents=True)
+    controller = PanelController(tmp_path, config, analysis_config_loader=lambda _: AlgorithmConfig.defaults())
+    job = controller._panel_jobs.submit(
+        "strategies.tester.native.start", {"retest": True}, "native", ("strategies.tester",), job_id="retest-job"
+    )
+    controller._panel_jobs.transition(job["job_id"], "RUNNING")
+    controller._panel_jobs.sync(job["job_id"], {"state": "COMMITTED", "phase": "COMMITTED"}, runtime={"retest": True})
+    monkeypatch.setattr("mrs3.panel.RunnerConfig.from_json", lambda _path: SimpleNamespace(inbox_root=tmp_path / "inbox"))
+    captured: list[tuple[str, bool]] = []
+
+    class SingleModeService:
+        def capture_inbox(self, job_id: str, *, force_single_mode: bool = False) -> Path:
+            captured.append((job_id, force_single_mode))
+            return inbox
+
+        def mark_inbox_ready(self, job_id: str, path: Path) -> None:
+            assert job_id == "retest-job" and path == inbox
+
+        def status(self, job_id: str) -> dict[str, object]:
+            return {"job_id": job_id, "state": "COMMITTED", "phase": "COMMITTED", "evidence": {}, "progress": {}, "inbox_path": str(inbox)}
+
+    monkeypatch.setattr(controller, "_single_mode_strategy_test", lambda: SingleModeService())
+
+    result = controller.strategies_tester_verify_inbox("retest-job")
+
+    assert captured == [("retest-job", True)]
     assert result["inbox_ready"] is True
 
 

@@ -65,18 +65,17 @@ finite decimal strings and UTC timestamps before use.
 ```text
 current tester report
   -> existing Performance parser
-  -> typed actions/equity + typed optional Phase 8 facts
-  -> existing WS1.1 cycle/source-base preparation
-  -> one revision-bound prepared artifact
+  -> typed actions/equity + typed optional facts
+  -> PerformanceDB import
+  -> explicit Portfolio Stage 1 FINALIST preparation
+  -> one revision-bound prepared artifact per requested finalist
   -> Portfolio Optimizer combines current artifacts on its common grid
 ```
 
-New ADD/REPLACE imports write typed facts and the prepared artifact in the same
-transaction as the current result. REPLACE preserves `result_id`, clears the
-previous prepared row first and never inherits facts from the previous report.
-Import remains successful when preparation is `UNAVAILABLE`; the status and
-reason are persisted and Portfolio Optimizer continues to fail closed for the
-dependent calculation.
+ADD/REPLACE imports write typed facts only. ADD leaves the cache absent;
+REPLACE preserves `result_id`, deletes its stale cache row in the same
+transaction and never inherits facts from the previous report. Existing valid
+cache rows are not migrated, purged or rebuilt in bulk.
 
 ## Migration and compatibility
 
@@ -91,18 +90,13 @@ normal writer lock before enforcing the current v5 schema gate. Import never
 initializes an absent, zero-byte, bare, or foreign database target.
 
 Migration does not eagerly rebuild every historical result. Performance
-selection recalculation remains a separate incremental cache operation and
-never prepares optimizer artifacts. A portfolio campaign first metadata-reads
-its exact current `FINALIST` result IDs, prepares only missing or stale
-artifacts for that finite set with the configured `duckdb_import.workers`, and
-then performs the strict full read. Subsequent campaigns reuse an artifact only
-when its source digest and preparation version match. Schema v5 does not accept
-stale v4 values through an implicit JSON fallback.
-
-ADD/REPLACE builds the new result's optimizer source directly from the already
-normalized parsed report and persisted parent values. It does not reread the
-new action/equity rows one result at a time. Child-row verification uses one
-grouped query per child table and treats an absent group as a zero count.
+selection recalculation never prepares optimizer artifacts. The explicit
+Portfolio Stage 1 action metadata-reads exact current `FINALIST` result IDs and
+prepares only missing or stale artifacts for that finite set with the configured
+`duckdb_import.workers`; it then verifies the same strict reader contract used
+by Stage 1. The browser supplies neither IDs nor worker count. Subsequent
+actions reuse an artifact only when its source digest and preparation version
+match; no implicit JSON fallback exists.
 
 Older report/inbox inputs remain accepted. Existing consumers that do not need
 Phase 8 fields retain their behavior. A v5 database remains fail-closed to code
@@ -117,8 +111,9 @@ that only understands an older schema version.
   actions, ordered equity, effective period and preparation version.
 - Missing, invalid, carry-in or non-attributable data remains explicit UNKNOWN;
   no zero/default substitution is allowed.
-- One writer transaction owns migration/import/prepared replacement. Readers do
-  not observe a typed result paired with an artifact from another revision.
+- Import and lazy preparation share the PerformanceDB writer lock. A lazy
+  writer rechecks current membership and source digest inside that lock before
+  publishing; readers do not observe an artifact from another revision.
 - A/B deterioration, A/B PnL/30, four equal time windows and `Positive windows`
   retain their current calculation and XLSX contracts.
 
@@ -189,4 +184,5 @@ and must not leak into public API/Members/XLSX payloads.
 - [Weighted Portfolio Search WS1.1](2026-09-14-portfolio-optimizer-weighted-search.md)
 - [Phase 8 plan](../superpowers/plans/2026-09-12-portfolio-optimizer-weighted-search-discussion.md)
 - [ADR-0037](../decisions/0037-performance-v2-optimizer-prepared-inputs.md)
+- [ADR-0051](../decisions/0051-explicit-finalist-input-preparation.md)
 - [Phase 8 acceptance evidence](../superpowers/plans/2026-09-17-performance-v2-optimizer-prepared-inputs-evidence.md)

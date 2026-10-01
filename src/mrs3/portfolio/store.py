@@ -735,8 +735,13 @@ class PortfolioStore:
                     raise
                 except duckdb.Error:
                     pass
-                if not PortfolioDBLease(self.path).lock_path.exists() or time.monotonic() >= deadline:
+                if time.monotonic() >= deadline:
                     raise error
+                try:
+                    return self._publish(publish)
+                except PortfolioStoreError as retry_error:
+                    if retry_error.code != "LOCK_BUSY":
+                        raise
                 time.sleep(0.01)
 
     def save_campaign_snapshot(self, snapshot_id: str, campaign_id: str, canonical_digest: str, content: Any) -> str:

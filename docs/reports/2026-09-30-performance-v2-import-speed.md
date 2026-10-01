@@ -115,7 +115,76 @@ faster. Prefer bounded CPU preparation or larger set-based SQL after the phase
 evidence; consider concurrent writer connections only with an explicit atomic
 publication design. See [DuckDB concurrency](https://duckdb.org/docs/current/connect/concurrency).
 
-### Evidence required before the index decision
+## Verified compact-database cutover (2026-09-30)
+
+The live PerformanceDB was rebuilt from schema v6 into the schema-v8 compact
+prepared-payload format and cut over at the canonical path. The database
+instance ID and every normalized table, constraint, index and sequence were
+preserved; only the reviewed schema marker/commission-nullability/storage-codec
+changes were admitted.
+
+| Evidence | Result |
+| --- | ---: |
+| Old file size | 43,546,324,992 bytes |
+| Deleted v6 SHA-256 | `78d6eb1f7eafc1b9bef5bc88637a526132bf83af0f8c26025783ac3a7b96ba19` |
+| Live compact file size | 18,201,718,784 bytes |
+| File reduction | 58.2% |
+| Strategies / results / prepared rows | 23,887 / 23,887 / 23,887 |
+| Actions / equity rows | 14,753,892 / 112,188,510 |
+| Decoded prepared UTF-8 | 18,083,324,749 bytes |
+| Encoded prepared storage | 3,366,475,413 bytes |
+| Compact SHA-256 | `adab2caea9242ffc3b48be1bc64ff6f8c7f14570116adc90af59cf620a4399c3` |
+
+The verifier compared every non-floating table by its enforced primary key and
+every non-key value, routed `selection_results` through the signed-zero-aware
+Python comparator, decoded and compared every prepared payload, checked public
+reader output, then repeated source/candidate stat, WAL and SHA checks. The
+copied D: candidate passed a separate schema/count/public-reader smoke before
+the live rename. The old 43.55-GB file and temporary C: candidate files were removed
+only after live schema-v8 smoke passed. The active database now occupies the
+canonical `data/performance-v2/strategy_performance.duckdb` path.
+No v6 database artifact remains in the project data or backup directories;
+recovery to v6 would require a full re-import or an external backup.
+
+## Verified 2,070-report import (2026-10-01)
+
+The listing source was corrected to `input/bybit_tradfi_liquidity.xlsx`; it
+covers all six symbols in the batch. The retried ADD import committed all 2,070
+reports with zero skipped or rejected rows. The parser used 30 worker processes
+and reached 2,070/2,070 without a progress regression. The database grew from
+18,201,718,784 to 19,393,163,264 bytes and now contains 25,957 strategies and
+results, 57,115 orders and 3,112 plateaus.
+
+The first complete phase evidence moves the main priority from parsing to
+Phase 8 preparation:
+
+| Phase | Elapsed |
+| --- | ---: |
+| `PUBLISH_ADMISSION` | 1.372 s |
+| `PUBLISH_ROWS` | 242.858 s |
+| `PUBLISH_CHILD_READBACK` | 0.129 s |
+| `PUBLISH_PHASE8` | 963.364 s |
+| `PUBLISH_FINALIZE` | 0.003 s |
+| `COMMIT` | 45.777 s |
+| Publication through cleanup | 1,254.552 s |
+
+Phase 8 alone consumed 76.8% of the measured publication interval. Its current
+serial loop rebuilds optimizer source objects, prepares the optimizer input,
+creates canonical JSON, compresses and base64-encodes it, hashes it, then issues
+one SQL insert for every result. Peak private memory reached about 12.5 GiB
+because all parsed reports and transient Phase 8 representations coexist.
+
+OPT-01e therefore requires exclusive substep attribution before selecting
+serial batching, threads or processes. Exact stored rows, digest branches,
+ordering and the single transaction remain frozen. A mechanism is retained only
+when the whole publication median improves without moving the cost into
+`PUBLISH_ROWS` or `COMMIT`; the final Phase 8 target is at least 20% below the
+accepted reproducible baseline. Independent plan review returned
+`PLAN_APPROVED` for revision v4. The operator-started all-pairs cache
+recalculation remains active, so importer edits, tests and benchmarks wait for
+its terminal status.
+
+## Evidence required before the index decision
 
 Collect `PUBLISH_ADMISSION`, `PUBLISH_ROWS`, `PUBLISH_CHILD_READBACK`,
 `PUBLISH_PHASE8`, `PUBLISH_FINALIZE`, `COMMIT`, `CONNECTION_CLOSE`, cleanup and

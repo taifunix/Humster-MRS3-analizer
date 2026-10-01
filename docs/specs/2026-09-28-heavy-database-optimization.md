@@ -1,6 +1,6 @@
 # Heavy database process optimization
 
-**Status:** Active implementation contract; user authorized on 2026-09-28.
+**Status:** R6 closeout contract; implementation awaits final branch review.
 **Baseline:** freshly fetched `origin/main` at `8f59c2c`.
 **Evidence:** [audit](../reports/2026-09-28-heavy-database-processes-audit.md),
 [implementation plan](../superpowers/plans/2026-09-28-heavy-database-optimization.md).
@@ -38,6 +38,11 @@ rehearsal/cutover requirements. It is now the user's maintenance priority.
 Source final compacted-payload proof and legacy empty-import deletion evidence
 remain deferred by the user. Historical standalone v3/v4 importers are unchanged
 unless separately specified and verified on their actual report path.
+
+The closeout does not start Source import/merge, materialization, broad analysis,
+schema/index migration or a new full-corpus profile. Those follow-ups are listed
+without implementation authorization in
+[the deferred plan](../superpowers/plans/2026-10-01-deferred-heavy-db-follow-ups.md).
 
 ## Inputs and outputs
 
@@ -97,6 +102,60 @@ specified by [CHECK & RETEST](2026-09-03-performance-v2-retest-workflow.md):
 traces the stages after the final parsed report. Existing records have no stage
 timings, so neither production latency nor a delivered speed gain is inferred.
 Window/equity-cache calculation is separate from this import.
+
+### Explicit MRS3 tester inbox handoff
+
+A completed ordinary `SINGLE_MODE` tester job ends after its reports have been
+validated; it does not create a metadata inbox in the tester worker. The
+operator's existing **Verify** action is the sole inbox-capture trigger. This
+removes the automatic capture followed by the same explicit capture, while
+retaining the explicit verification gate before a PerformanceDB import.
+
+During the short tester-target cleanup, the public snapshot can be
+`RUNNING` with phase `COMMITTED`. When all reports are present and none failed,
+that is a verifiable handoff: the Panel enables **Verify** without a Panel
+restart. Verify may recover the tracked job from `RUNNING` to `COMMITTED`, but
+only after it creates the metadata inbox and records `inbox_ready=true`.
+
+One inbox capture reads the exact bytes of each HTML report once, decodes those
+same bytes for the embedded strategy-name check, then hashes them. The existing
+bounded thread count remains the only capture concurrency control. The report
+name check, byte hash, source JSON validation, Output containment, reparse
+checks, atomic manifest write, cleanup on error and import-time source recheck
+remain mandatory. No HTML is copied into the metadata inbox.
+
+Acceptance: a successful single-mode test has no inbox before Verify; Verify
+works for a complete `RUNNING/COMMITTED` handoff and produces the same valid
+metadata inbox; capture makes one report-body read per report; partial,
+malformed and untrusted inputs remain rejected.
+
+Measurement on 2026-10-01 used a frozen copy of `report_current_v2.html`:
+96 reports, each padded to 512 KiB (50,331,648 bytes total), and the existing
+16-worker cap. Five alternating warm samples modeled the prior automatic
+capture plus operator Verify as two name-read/hash capture passes, then ran the
+new one-capture path. The old model median was 0.207058 s and 384 full report
+body reads; the new median was 0.127958 s and 96 reads: 38.2% lower wall time.
+All five new manifests had the same SHA-256
+`501ae00f8d43603cfff284859f5466c49027b49658b83868c8a8cf4903acc7d8`.
+This measures only the post-scan handoff; native report validation and import
+remain separate stages.
+
+### Panel progress journal hot path
+
+`strategies.performance.v2.import` progress is live process state and is not a
+restart checkpoint: after a Panel restart the atomic import is either still
+uncommitted or already represented by its terminal result.  Persist the job
+start and one terminal `COMMITTED`/`FAILED` snapshot, but keep intermediate
+`RUNNING` phase/progress updates in the registry memory.  A same-phase update
+with the same unit and total must never lower `progress.current`; a stale HTTP
+request cannot move the visible counter backwards.  Phase changes retain their
+existing counters and ordering.
+
+Acceptance: repeated `RUNNING` updates do not rewrite `.panel-jobs.json`, a
+stale `136 -> 119` update remains at 136, terminal result/error/evidence is
+written durably once, and restart recovery retains the existing interrupted-job
+behavior.  This removes full-journal serialization from polling; it does not
+change import data, transaction boundaries or failure handling.
 
 T13a batches replacement child deletion after all admission decisions are
 resolved in the existing publication transaction. Derive distinct result IDs
@@ -475,6 +534,37 @@ Acceptance: a strategy file read after validation fails before this change and
 is not attempted after it; the existing typed identity result remains equal.
 This is removal of one read and JSON parse per report, without a whole-import
 speed claim.
+
+## OPT-01e: defer optimizer preparation to FINALIST Stage 1
+
+The 2,070-report observation spent 963.364 seconds of 1,254.552 seconds of
+publication in eager `PUBLISH_PHASE8`. That observation is context only, not a
+benchmark baseline. Prepared optimizer inputs are a private, optional cache;
+Portfolio Stage 1 consumes only current `FINALIST` results.
+
+ADD and REPLACE publish all existing typed facts, actions, equity, current
+links and import evidence, but do not create `optimizer_prepared_inputs` rows.
+REPLACE deletes the row for its exact replaced `result_id` in its existing
+writer-lock transaction, regardless of FINALIST status. There is no migration,
+bulk purge or new setting. Valid legacy rows remain reusable.
+
+The only preparation trigger is the explicit first button in Portfolio
+Optimizer's Stage 1 card. The server resolves exact current FINALIST result
+IDs; it never accepts browser-supplied IDs or a worker count. It uses the
+existing `duckdb_import.workers` setting, the existing cross-process writer
+lock, and rechecks current membership and source digests before writing. A
+shared strict validity check is used by readiness, the launch gate and the
+prepared-input reader. Missing, stale, unavailable or malformed rows block
+Stage 1 without a fallback.
+
+No import/runtime edit, test or benchmark may start while an all-pairs cache
+job has live workers. Acceptance compares a clean pre-change revision and the
+candidate on the same frozen 1,063-report corpus: at least three fresh C-drive
+databases per revision, identical process-tree RSS sampling, exact surviving
+fact/current-link hashes, and an intentionally empty prepared table after a
+fresh import. The candidate must have lower total and publication times in
+every run and no higher process-tree RSS. The median publication reduction
+target is 60 percent.
 
 ## CALC-01a: one flat timeline per cold selection result
 

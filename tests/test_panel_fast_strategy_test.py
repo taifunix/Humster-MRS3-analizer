@@ -380,15 +380,6 @@ def test_native_reports_skips_unchanged_batch_baseline_before_reading(tmp_path: 
         return original_read_text(path, *args, **kwargs)
 
     monkeypatch.setattr(Path, "read_text", track_read)
-    parsed: list[Path] = []
-    original_extract = fast_strategy_module.extract_html_strategy_settings
-
-    def track_extract(path: Path) -> dict[str, object] | None:
-        parsed.append(path)
-        return original_extract(path)
-
-    monkeypatch.setattr(fast_strategy_module, "extract_html_strategy_settings", track_extract)
-
     found = LocalSingleModeStrategyTestService._native_reports(
         report_dir,
         {"S0"},
@@ -400,9 +391,7 @@ def test_native_reports_skips_unchanged_batch_baseline_before_reading(tmp_path: 
 
     assert found == {"S0": current}
     assert prior not in reads
-    assert current in reads
-    assert prior not in parsed
-    assert current in parsed
+    assert reads.count(current) == 1
 
 
 def test_single_mode_reload_uses_checkpoint_without_reading_prior_reports(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1083,6 +1072,107 @@ def test_fast_test_captures_complete_manifest_after_service_restart(tmp_path: Pa
     assert inbox_manifest["expected_strategy_names"] == list(names)
 
 
+def test_single_mode_captures_finished_reports_after_panel_restart(tmp_path: Path) -> None:
+    manifest, names = _generation(tmp_path, 1)
+    config = _config(tmp_path)
+    config.report_dir.mkdir(parents=True)
+    report = config.report_dir / f"{names[0]}.html"
+    report.write_text(
+        CURRENT_REPORT.read_text(encoding="utf-8")
+        .replace('"name":"MRS3 Current v2"', f'"name":"{names[0]}"', 1)
+        .replace('"symbol":"ONUSDT"', '"symbol":"BTCUSDT"', 1),
+        encoding="utf-8",
+    )
+    (config.report_dir / "tester_manifest.json").write_text(json.dumps({
+        "job_id": "single-restart-inbox",
+        "mode": "SINGLE_MODE",
+        "phase": "RUNNING",
+        "generation_manifest_path": str(manifest),
+        "expected_names": list(names),
+        "start_date": "2026-01-01",
+        "end_date": "2026-01-09",
+        "attempt_counts": {names[0]: 1},
+        "verified_reports": {},
+        "failed_names": [],
+    }), encoding="utf-8")
+
+    inbox = LocalSingleModeStrategyTestService(config).capture_inbox("single-restart-inbox")
+    inbox_manifest = json.loads((inbox / "inbox_manifest.json").read_text(encoding="utf-8"))
+
+    assert inbox_manifest["expected_strategy_names"] == list(names)
+
+
+@pytest.mark.parametrize(
+    "manifest_change",
+    (
+        {"failed_names": ["S0"]},
+        {"phase": "FAILED"},
+        {"expected_names": ["../S0"]},
+    ),
+)
+def test_single_mode_restart_rejects_unfinished_or_untrusted_manifest(
+    tmp_path: Path, manifest_change: dict[str, object]
+) -> None:
+    manifest, names = _generation(tmp_path, 1)
+    config = _config(tmp_path)
+    config.report_dir.mkdir(parents=True)
+    report = config.report_dir / f"{names[0]}.html"
+    report.write_text(
+        CURRENT_REPORT.read_text(encoding="utf-8")
+        .replace('"name":"MRS3 Current v2"', f'"name":"{names[0]}"', 1)
+        .replace('"symbol":"ONUSDT"', '"symbol":"BTCUSDT"', 1),
+        encoding="utf-8",
+    )
+    saved = {
+        "job_id": "single-restart-rejected",
+        "mode": "SINGLE_MODE",
+        "phase": "RUNNING",
+        "generation_manifest_path": str(manifest),
+        "expected_names": list(names),
+        "start_date": "2026-01-01",
+        "end_date": "2026-01-09",
+        "attempt_counts": {names[0]: 1},
+        "verified_reports": {},
+        "failed_names": [],
+        **manifest_change,
+    }
+    (config.report_dir / "tester_manifest.json").write_text(json.dumps(saved), encoding="utf-8")
+
+    with pytest.raises(FastStrategyTestError, match="no completed reports"):
+        LocalSingleModeStrategyTestService(config).capture_inbox("single-restart-rejected")
+
+    assert not (config.inbox_root / "single-restart-rejected").exists()
+
+
+def test_single_mode_restart_rejects_partial_reports(tmp_path: Path) -> None:
+    manifest, names = _generation(tmp_path, 2)
+    config = _config(tmp_path)
+    config.report_dir.mkdir(parents=True)
+    (config.report_dir / f"{names[0]}.html").write_text(
+        CURRENT_REPORT.read_text(encoding="utf-8")
+        .replace('"name":"MRS3 Current v2"', f'"name":"{names[0]}"', 1)
+        .replace('"symbol":"ONUSDT"', '"symbol":"BTCUSDT"', 1),
+        encoding="utf-8",
+    )
+    (config.report_dir / "tester_manifest.json").write_text(json.dumps({
+        "job_id": "single-restart-partial",
+        "mode": "SINGLE_MODE",
+        "phase": "RUNNING",
+        "generation_manifest_path": str(manifest),
+        "expected_names": list(names),
+        "start_date": "2026-01-01",
+        "end_date": "2026-01-09",
+        "attempt_counts": {name: 1 for name in names},
+        "verified_reports": {},
+        "failed_names": [],
+    }), encoding="utf-8")
+
+    with pytest.raises(FastStrategyTestError, match="no completed reports"):
+        LocalSingleModeStrategyTestService(config).capture_inbox("single-restart-partial")
+
+    assert not (config.inbox_root / "single-restart-partial").exists()
+
+
 def test_fast_test_rejects_malformed_plateau_diagnostics(tmp_path: Path) -> None:
     manifest, _ = _generation(tmp_path, 1)
     document = json.loads(manifest.read_text(encoding="utf-8"))
@@ -1170,7 +1260,7 @@ def test_fast_retry_accepts_matching_manual_report_without_starting_bot(tmp_path
     assert not list(config.strategy_dir.glob("*.json"))
 
 
-def test_single_mode_retry_with_all_reports_creates_and_publishes_inbox(tmp_path: Path) -> None:
+def test_single_mode_retry_with_all_reports_waits_for_explicit_inbox_verification(tmp_path: Path) -> None:
     manifest, _ = _generation(tmp_path, 2)
     config = _config(tmp_path)
     updates: list[dict[str, object]] = []
@@ -1210,17 +1300,41 @@ def test_single_mode_retry_with_all_reports_creates_and_publishes_inbox(tmp_path
     status = service.retry("single-source", job_id="single-retry")
 
     assert status["state"] == "COMMITTED"
-    assert status["inbox_ready"] is True
-    assert Path(str(status["inbox_path"]), "inbox_manifest.json").is_file()
+    assert status["inbox_ready"] is False
+    assert "inbox_path" not in status
+    assert not (config.inbox_root / "single-retry").exists()
     assert updates[-1]["progress"]["current"] == 2
-    assert updates[-1]["inbox_ready"] is True
 
-    reloaded = LocalSingleModeStrategyTestService(config)
-    inbox = reloaded.capture_inbox("single-retry")
-    reloaded.mark_inbox_ready("single-retry", inbox)
-    restored = reloaded.status("single-retry")
+    inbox = service.capture_inbox("single-retry")
+    service.mark_inbox_ready("single-retry", inbox)
+    restored = service.status("single-retry")
+    assert Path(str(restored["inbox_path"]), "inbox_manifest.json").is_file()
     assert restored["progress"]["current"] == 2
     assert restored["progress"]["total"] == 2
+
+
+def test_single_mode_capture_uses_the_saved_tester_config_snapshot(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    manifest_path, names = _generation(tmp_path, 1)
+    config = _config(tmp_path)
+    service = LocalSingleModeStrategyTestService(config)
+    manifest = fast_strategy_module.validate_strategy_manifest(manifest_path)
+    job = fast_strategy_module._Job(
+        "saved-config", manifest_path, manifest, names, names, "2026-08-01", "2026-08-31",
+        config.report_dir, config.strategy_dir, single_mode=True,
+        verified_reports={names[0]: f"{names[0]}.html"}, tester_config_bytes=b'{"saved":true}',
+    )
+    service._jobs[job.job_id] = job
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        fast_strategy_module,
+        "capture_run_snapshot_inbox",
+        lambda *_args, **kwargs: captured.update(kwargs) or config.inbox_root / job.job_id,
+    )
+    config.tester_config.write_text('{"current":true}', encoding="utf-8")
+
+    service.capture_inbox(job.job_id)
+
+    assert captured["tester_config_bytes"] == b'{"saved":true}'
 
 
 def test_fast_retry_indexes_only_unverified_reports_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

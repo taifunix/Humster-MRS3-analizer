@@ -45,7 +45,12 @@ from .portfolio.config import (
     migrate_portfolio_config_document,
 )
 from .config import load_duckdb_import_settings
-from .performance_v2_optimizer import prepare_current_optimizer_inputs
+from .performance_v2_optimizer import (
+    MissingPreparedOptimizerInput,
+    OptimizerIntegrityError,
+    prepare_current_optimizer_inputs,
+    read_prepared_optimizer_inputs,
+)
 from .portfolio.input import apply_finalist_cutoff, read_current_finalists
 from .portfolio.adapter import (
     CAMPAIGN_CONTRACT_VERSION,
@@ -66,6 +71,9 @@ STAGES = (
     "PUBLISH_RESULTS",
 )
 STAGE2_STAGES = ("PREPARE", "FILL_PREBUILT", "START", "READBACK")
+FINALIST_PREPARATION_STAGES = ("PREPARE_FINALISTS",)
+_PORTFOLIO_JOB_KINDS = frozenset({"portfolio.prepare_finalists", "portfolio.stage1", "portfolio.stage2"})
+_FINALIST_PREPARATION_BLOCKING_KINDS = _PORTFOLIO_JOB_KINDS | frozenset({"strategies.performance.v2.import"})
 _TERMINAL = frozenset({"COMMITTED", "CANCELLED", "FAILED"})
 _SNAPSHOT_SCHEMA = "portfolio-campaign-input-v1"
 _SNAPSHOT_NAME = "campaign-input.json.gz"
@@ -866,8 +874,8 @@ def _validate_frozen_campaign(campaign: Any) -> None:
         raise PortfolioPanelError(error.code, error.code, status=422) from error
 
 
-def _portfolio_search_workers(root: Path) -> int:
-    """Read the existing importer width; it is scheduling-only campaign input."""
+def _duckdb_import_workers(root: Path) -> int:
+    """Read the shared import worker setting."""
     return load_duckdb_import_settings(root / "config.local.json").workers
 
 
@@ -1172,7 +1180,7 @@ class PortfolioPanelService:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
 
-    def _migrate_legacy_campaigns_locked(self) -> bool | None:
+    def _migrate_legacy_campaigns_locked(self) -> set[str] | None:
         """Move legacy embedded inputs out of the journal before recovery."""
         candidates: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
         journal_bytes = self.registry.journal.read_bytes() if self.registry.journal.exists() else b""
@@ -1203,7 +1211,7 @@ class PortfolioPanelService:
             compressed_total += len(compressed)
             candidates.append((job_id, job, repaired))
         if not candidates and not has_active_embedded:
-            return False
+            return set()
         try:
             free = shutil.disk_usage(self.registry.journal.parent).free
         except OSError:
@@ -1212,9 +1220,9 @@ class PortfolioPanelService:
         if free < required:
             return None
         if not candidates:
-            return False
+            return set()
         self._ensure_snapshot_migration_backup(journal_bytes)
-        migrated = False
+        migrated: set[str] = set()
         for job_id, original_job, campaign in candidates:
             runtime = original_job.get("runtime")
             if not isinstance(runtime, Mapping):
@@ -1232,16 +1240,17 @@ class PortfolioPanelService:
                         compact_runtime.pop(key, None)
                     job_copy["runtime"] = compact_runtime
                 self.registry.jobs[job_id] = job_copy
-                migrated = True
+                migrated.add(job_id)
             except (PortfolioPanelError, OSError, TypeError, ValueError, OverflowError):
                 continue
         return migrated
 
-    def _verify_migrated_registry(self) -> None:
+    def _verify_migrated_registry(self, migrated_job_ids: set[str]) -> None:
         persisted = self.registry._load()
         if set(persisted) != set(self.registry.jobs):
             raise OSError("snapshot migration changed job IDs")
-        for job_id, job in persisted.items():
+        for job_id in migrated_job_ids:
+            job = persisted[job_id]
             if not self.registry._valid_saved_job(job):
                 raise OSError("snapshot migration produced an invalid job")
             runtime = job.get("runtime") if isinstance(job.get("runtime"), Mapping) else {}
@@ -1264,12 +1273,12 @@ class PortfolioPanelService:
                     retry = self._migrate_legacy_campaigns_locked()
                     if retry is None:
                         return
-                    migrated = migrated or retry
+                    migrated.update(retry)
                 if migrated:
                     self.registry._save()
                 for job_id in tuple(self.registry.jobs):
                     self._cleanup_terminal_snapshot(job_id)
-                self._verify_migrated_registry()
+                self._verify_migrated_registry(migrated)
                 if backup.exists():
                     try:
                         backup.unlink()
@@ -1353,6 +1362,64 @@ class PortfolioPanelService:
         path = Path(str(value))
         return (root / path).resolve() if not path.is_absolute() else path.resolve()
 
+    def _current_finalist_metadata(
+        self, document: Mapping[str, Any], *, require_result_ids: bool = False,
+    ) -> tuple[Path, list[str], dict[str, int], tuple[int, ...]]:
+        inputs = document.get("inputs") if isinstance(document.get("inputs"), Mapping) else {}
+        database = self._path_from_config(self.root, inputs.get("performance_db", ""))
+        if not database.is_file():
+            raise PortfolioPanelError("PERFORMANCE_DB_UNAVAILABLE", "performance database is unavailable", status=422)
+        with duckdb.connect(str(database), read_only=True) as connection:
+            pair_rows = connection.execute("select distinct symbol, side from selection_runs order by symbol, side").fetchall()
+        pair_keys = tuple(
+            (str(symbol).strip().upper(), str(side).strip().upper())
+            for symbol, side in pair_rows
+            if str(side).strip().upper() in {"LONG", "SHORT"}
+        )
+        rows = _invoke(self.finalists_reader, database, pair_keys, False)
+        finalists: dict[str, int] = {}
+        result_ids: list[int] = []
+        for index, row in enumerate(rows or ()):
+            symbol = row.get("symbol") if isinstance(row, Mapping) else None
+            side = row.get("side") if isinstance(row, Mapping) else None
+            if not isinstance(symbol, str) or not isinstance(side, str) or side.strip().upper() not in {"LONG", "SHORT"}:
+                continue
+            pair = f"{symbol.strip().upper()}|{side.strip().upper()}"
+            finalists[pair] = finalists.get(pair, 0) + 1
+            result_id = row.get("result_id") if isinstance(row, Mapping) else None
+            if require_result_ids and type(result_id) is not int:
+                raise PortfolioPanelError(
+                    "PORTFOLIO_FINALISTS_UNAVAILABLE",
+                    f"portfolio finalist metadata result_id is invalid at row {index}",
+                    status=422,
+                )
+            if type(result_id) is int:
+                result_ids.append(result_id)
+        return database, sorted(finalists), finalists, tuple(dict.fromkeys(result_ids))
+
+    @staticmethod
+    def _prepared_finalists_state(database: Path, result_ids: Sequence[int]) -> dict[str, Any]:
+        required = len(result_ids)
+        if not required:
+            return {"state": "READY", "required": 0, "ready": 0}
+        try:
+            prepared = read_prepared_optimizer_inputs(str(database), result_ids)
+        except MissingPreparedOptimizerInput:
+            return {"state": "NEEDS_PREPARATION", "required": required, "ready": 0}
+        except OptimizerIntegrityError:
+            return {"state": "ERROR", "required": required, "ready": 0}
+        available = sum(1 for item in prepared if item.availability.available)
+        if available == required:
+            return {"state": "READY", "required": required, "ready": available}
+        return {"state": "ERROR", "required": required, "ready": available}
+
+    def _latest_finalist_preparation_failed(self) -> bool:
+        jobs = [
+            saved for saved in self.registry.list()
+            if saved.get("kind") == "portfolio.prepare_finalists" and saved.get("state") in {"FAILED", "CANCELLED"}
+        ]
+        return bool(jobs and max(jobs, key=lambda saved: str(saved.get("created_at_utc") or "")).get("state") == "FAILED")
+
     def readiness(self) -> dict[str, Any]:
         with self._lock:
             try:
@@ -1372,6 +1439,7 @@ class PortfolioPanelService:
         stage1: list[str] = []
         pairs: list[str] = []
         finalists: dict[str, int] = {}
+        preparation = {"state": "NEEDS_PREPARATION", "required": 0, "ready": 0}
         if state != "READY":
             stage1.append(f"SETTINGS_{state}")
         if state == "READY" and document is not None:
@@ -1381,20 +1449,20 @@ class PortfolioPanelService:
                 stage1.append("PERFORMANCE_DB_UNAVAILABLE")
             else:
                 try:
-                    with duckdb.connect(str(database), read_only=True) as connection:
-                        pair_rows = connection.execute("select distinct symbol, side from selection_runs order by symbol, side").fetchall()
-                    pair_keys = tuple((str(symbol).strip().upper(), str(side).strip().upper()) for symbol, side in pair_rows if str(side).strip().upper() in {"LONG", "SHORT"})
-                    # Readiness only needs current finalist metadata.  Keep
-                    # large action/equity series out of this hot path.
-                    rows = _invoke(self.finalists_reader, database, pair_keys, False)
-                    for row in rows:
-                        symbol = row.get("symbol") if isinstance(row, Mapping) else None
-                        side = row.get("side") if isinstance(row, Mapping) else None
-                        if not isinstance(symbol, str) or not isinstance(side, str) or side.strip().upper() not in {"LONG", "SHORT"}:
-                            continue
-                        pair = f"{symbol.strip().upper()}|{side.strip().upper()}"
-                        finalists[pair] = finalists.get(pair, 0) + 1
-                    pairs = sorted(finalists)
+                    database, pairs, finalists, result_ids = self._current_finalist_metadata(
+                        document, require_result_ids=self._uses_production_finalists_reader,
+                    )
+                    active = self.active_job()
+                    if active is not None and active.get("kind") == "FINALIST_PREPARATION":
+                        preparation = {"state": "PREPARING", "required": len(result_ids), "ready": 0}
+                    elif self._uses_production_finalists_reader:
+                        preparation = self._prepared_finalists_state(database, result_ids)
+                    else:
+                        preparation = {"state": "READY", "required": len(result_ids), "ready": len(result_ids)}
+                    if pairs and preparation["state"] != "READY":
+                        if preparation["state"] == "NEEDS_PREPARATION" and self._latest_finalist_preparation_failed():
+                            preparation = {**preparation, "state": "ERROR"}
+                        stage1.append("FINALIST_INPUTS_NOT_READY")
                 except Exception:
                     pairs = []
                     finalists = {}
@@ -1414,6 +1482,7 @@ class PortfolioPanelService:
             "config_digest": config_digest,
             "available_pairs": pairs,
             "current_finalists": finalists,
+            "preparation": preparation,
         }
 
     def _snapshot_finalists(self, document: Mapping[str, Any], launch: Mapping[str, Any]) -> tuple[tuple[dict[str, Any], ...], tuple[dict[str, Any], ...]]:
@@ -1426,25 +1495,6 @@ class PortfolioPanelService:
             if maximum > 0
         )
         try:
-            # Campaign snapshots retain the finalist evidence needed by search.
-            if self._uses_production_finalists_reader:
-                metadata_rows = _invoke(self.finalists_reader, database, pairs, False)
-                metadata_result_ids: list[int] = []
-                for index, row in enumerate(metadata_rows or ()):
-                    if not isinstance(row, Mapping) or type(row.get("result_id")) is not int:
-                        raise PortfolioPanelError(
-                            "PORTFOLIO_FINALISTS_UNAVAILABLE",
-                            f"portfolio finalist metadata result_id is invalid at row {index}",
-                            status=422,
-                        )
-                    metadata_result_ids.append(row["result_id"])
-                result_ids = tuple(dict.fromkeys(metadata_result_ids))
-                if result_ids:
-                    self.optimizer_input_preparer(
-                        database,
-                        result_ids,
-                        workers=_portfolio_search_workers(self.root),
-                    )
             loaded = _invoke(self.finalists_reader, database, pairs, True)
             finalists_list = []
             weighted_input_rows = []
@@ -1534,7 +1584,7 @@ class PortfolioPanelService:
         from .portfolio.adapter import run_portfolio_adapter
 
         try:
-            adapter_kwargs = {"workspace_root": self.root, "workers": _portfolio_search_workers(self.root)}
+            adapter_kwargs = {"workspace_root": self.root, "workers": _duckdb_import_workers(self.root)}
             if progress_callback is not None:
                 adapter_kwargs["progress_callback"] = progress_callback
             result = run_portfolio_adapter(selected, campaign, **adapter_kwargs)
@@ -1674,7 +1724,7 @@ class PortfolioPanelService:
     def _project_orphan(self, saved: Mapping[str, Any]) -> dict[str, Any]:
         """Release a persisted nonterminal job after its worker has disappeared."""
         job_id = saved.get("job_id")
-        if saved.get("kind") not in {"portfolio.stage1", "portfolio.stage2"} or not isinstance(job_id, str) or saved.get("state") not in {"QUEUED", "RUNNING", "CANCELLING"} or job_id in self._threads:
+        if saved.get("kind") not in _PORTFOLIO_JOB_KINDS or not isinstance(job_id, str) or saved.get("state") not in {"QUEUED", "RUNNING", "CANCELLING"} or job_id in self._threads:
             return dict(saved)
         projected = {**saved, "state": "FAILED", "phase": "FAILED", "error": {"code": "INTERRUPTED"}}
         try:
@@ -1706,6 +1756,7 @@ class PortfolioPanelService:
 
     def _public_job(self, saved: Mapping[str, Any], runtime: Mapping[str, Any] | None = None) -> dict[str, Any]:
         runtime = runtime or {}
+        preparation = saved.get("kind") == "portfolio.prepare_finalists"
         stage2 = saved.get("kind") == "portfolio.stage2"
         campaign = runtime.get("campaign") if isinstance(runtime.get("campaign"), Mapping) else {}
         if not campaign and isinstance(runtime.get("campaign_snapshot"), Mapping):
@@ -1715,7 +1766,7 @@ class PortfolioPanelService:
             campaign = {"campaign_id": binding.get("campaign_id"), "input_digest": binding.get("input_digest"), "config_digest": binding.get("config_digest")}
         state = self._project_state(saved)
         completed = int(runtime.get("completed_stages", 0) or 0)
-        stage_names = STAGE2_STAGES if stage2 else STAGES
+        stage_names = FINALIST_PREPARATION_STAGES if preparation else (STAGE2_STAGES if stage2 else STAGES)
         if state == "SUCCEEDED":
             completed = len(stage_names)
         stage: dict[str, Any] = {"index": min(completed, len(stage_names) - 1), "name": stage_names[min(completed, len(stage_names) - 1)], "status": "SUCCEEDED" if state == "SUCCEEDED" else ("RUNNING" if state in {"RUNNING", "CANCEL_REQUESTED"} else state), "completed": int(runtime.get("stage_completed", 0) or 0)}
@@ -1755,7 +1806,9 @@ class PortfolioPanelService:
         live_progress = self._progress_reporter.snapshot(str(saved.get("job_id")))
         persisted_progress = runtime.get("optimizer_progress")
         progress = live_progress or (dict(persisted_progress) if isinstance(persisted_progress, Mapping) else None)
-        result = {"job_id": saved.get("job_id"), "campaign_id": campaign.get("campaign_id"), "kind": "TESTER_SUBMISSION" if stage2 else "STAGE1_CALCULATION", "status": state, "stage": stage, "overall_percent": overall, "counters": _plain(runtime.get("counters", {})), "progress": _plain(progress) if progress is not None else None, "diagnostics": diagnostics, "journal": journal, "input_digest": campaign.get("input_digest"), "config_digest": frozen_digest, "settings_changed_since_freeze": bool(frozen_digest and current_digest != frozen_digest), "created_at": saved.get("created_at_utc"), "started_at": runtime.get("started_at"), "finished_at": runtime.get("finished_at")}
+        result = {"job_id": saved.get("job_id"), "campaign_id": campaign.get("campaign_id"), "kind": "FINALIST_PREPARATION" if preparation else ("TESTER_SUBMISSION" if stage2 else "STAGE1_CALCULATION"), "status": state, "stage": stage, "overall_percent": overall, "counters": _plain(runtime.get("counters", {})), "progress": _plain(progress) if progress is not None else None, "diagnostics": diagnostics, "journal": journal, "input_digest": campaign.get("input_digest"), "config_digest": frozen_digest, "settings_changed_since_freeze": bool(frozen_digest and current_digest != frozen_digest), "created_at": saved.get("created_at_utc"), "started_at": runtime.get("started_at"), "finished_at": runtime.get("finished_at")}
+        if preparation:
+            result["preparation"] = _plain(runtime.get("preparation", {}))
         if stage2 and state == "SUCCEEDED" and isinstance(runtime.get("stage2_result"), Mapping):
             result["result"] = _plain(runtime["stage2_result"])
         return result
@@ -1774,7 +1827,7 @@ class PortfolioPanelService:
         if not isinstance(saved, Mapping):
             raise PortfolioPanelError("PORTFOLIO_JOB_RUNTIME_UNAVAILABLE", "portfolio job runtime is unavailable", status=500)
         saved = self._project_orphan(saved)
-        if saved.get("kind") not in {"portfolio.stage1", "portfolio.stage2"}:
+        if saved.get("kind") not in _PORTFOLIO_JOB_KINDS:
             raise PortfolioPanelError("PORTFOLIO_JOB_NOT_FOUND", "job is not available", status=404)
         try:
             runtime = self.registry.runtime(job_id)
@@ -1790,7 +1843,7 @@ class PortfolioPanelService:
         except (PanelJobError, KeyError, OSError, TypeError, ValueError) as error:
             raise PortfolioPanelError("PORTFOLIO_JOB_RUNTIME_UNAVAILABLE", "portfolio job runtime is unavailable", status=500) from error
         for saved in jobs:
-            if saved.get("kind") not in {"portfolio.stage1", "portfolio.stage2"}:
+            if saved.get("kind") not in _PORTFOLIO_JOB_KINDS:
                 continue
             saved = self._project_orphan(saved)
             if saved.get("state") in _TERMINAL:
@@ -1803,6 +1856,103 @@ class PortfolioPanelService:
                 raise PortfolioPanelError("PORTFOLIO_JOB_RUNTIME_UNAVAILABLE", "portfolio job runtime is unavailable", status=500)
             return self._public_job(saved, runtime)
         return None
+
+    def prepare_finalist_inputs(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        """Start the only explicit optimizer-input preparation path."""
+        if set(payload):
+            raise PortfolioPanelError("PORTFOLIO_FINALIST_PREPARATION_INVALID", "finalist preparation request is invalid", status=422)
+        _config, raw, document = self._config()
+        database, _pairs, finalists, result_ids = self._current_finalist_metadata(document, require_result_ids=True)
+        if not result_ids:
+            raise PortfolioPanelError("PORTFOLIO_FINALISTS_UNAVAILABLE", "current finalists are unavailable", status=422)
+        preparation = self._prepared_finalists_state(database, result_ids)
+        if preparation["state"] == "READY":
+            return {"status": "READY", "preparation": preparation}
+        with self._lock, self.registry.lock:
+            if any(saved.get("kind") in _FINALIST_PREPARATION_BLOCKING_KINDS and saved.get("state") not in _TERMINAL for saved in self.registry.list()):
+                raise PortfolioPanelError("PORTFOLIO_JOB_BUSY", "portfolio optimizer is busy", status=409)
+            try:
+                saved = self.registry.submit(
+                    "portfolio.prepare_finalists", {}, "portfolio:prepare-finalists", ("portfolio_optimizer",),
+                )
+            except PanelJobError as error:
+                code = "PORTFOLIO_JOB_BUSY" if error.code in {"RESOURCE_BUSY", "JOB_CAPACITY_EXHAUSTED"} else error.code
+                raise PortfolioPanelError(code, "portfolio optimizer is busy" if code == "PORTFOLIO_JOB_BUSY" else code, status=409 if code == "PORTFOLIO_JOB_BUSY" else 400) from error
+            try:
+                self.registry.reserve_runtime(
+                    saved["job_id"], "preparation", {**preparation, "finalists": len(finalists)},
+                )
+            except PanelJobError as error:
+                self.registry.discard_queued(saved["job_id"])
+                code = "PORTFOLIO_JOB_BUSY" if error.code in {"RESOURCE_BUSY", "JOB_CAPACITY_EXHAUSTED"} else error.code
+                raise PortfolioPanelError(code, "portfolio optimizer is busy" if code == "PORTFOLIO_JOB_BUSY" else code, status=409 if code == "PORTFOLIO_JOB_BUSY" else 400) from error
+            event = threading.Event()
+            self._cancel_events[saved["job_id"]] = event
+            try:
+                worker = threading.Thread(
+                    target=self._run_finalist_preparation,
+                    args=(saved["job_id"],),
+                    name="mrs3-portfolio-finalists",
+                    daemon=True,
+                )
+                self._threads[saved["job_id"]] = worker
+                worker.start()
+            except BaseException as error:
+                self._threads.pop(saved["job_id"], None)
+                self._cancel_events.pop(saved["job_id"], None)
+                self.registry.discard_queued(saved["job_id"])
+                raise PortfolioPanelError("PORTFOLIO_JOB_START_FAILED", "portfolio job could not start", status=503) from error
+        return {"job_id": saved["job_id"], "status": "QUEUED", "preparation": preparation, "config_digest": _digest(raw)}
+
+    def _run_finalist_preparation(self, job_id: str) -> None:
+        try:
+            if self._cancelled(job_id):
+                raise asyncio.CancelledError
+            self.registry.transition(job_id, "RUNNING", phase=FINALIST_PREPARATION_STAGES[0])
+            self._sync_runtime(job_id, started_at=_now(), stage_index=0, completed_stages=0)
+            _config, _raw, document = self._config()
+            database, _pairs, finalists, result_ids = self._current_finalist_metadata(document, require_result_ids=True)
+            self._sync_runtime(job_id, preparation={"state": "PREPARING", "required": len(result_ids), "ready": 0, "finalists": len(finalists)})
+            self._append_journal(job_id, stage=FINALIST_PREPARATION_STAGES[0], severity="INFO", code="PREPARING", text="preparing current finalist inputs")
+            self.optimizer_input_preparer(database, result_ids, workers=_duckdb_import_workers(self.root))
+            if self._cancelled(job_id):
+                raise asyncio.CancelledError
+            preparation = self._prepared_finalists_state(database, result_ids)
+            if preparation["state"] != "READY":
+                raise PortfolioPanelError("FINALIST_INPUTS_NOT_READY", "finalist inputs could not be prepared", status=422)
+            self._append_journal(job_id, stage=FINALIST_PREPARATION_STAGES[0], severity="INFO", code="COMPLETED", text="current finalist inputs prepared")
+            runtime = self.registry.runtime(job_id)
+            self.registry.sync(
+                job_id,
+                {"state": "COMMITTED", "phase": "COMMITTED", "result": preparation},
+                runtime={**runtime, "preparation": preparation, "finished_at": _now(), "completed_stages": 1, "stage_completed": 1, "stage_total": 1, "stage_percent": 100},
+            )
+        except asyncio.CancelledError:
+            try:
+                saved = self.registry.get(job_id)
+                if saved["state"] in {"QUEUED", "RUNNING"}:
+                    saved = self.registry.cancel(job_id)
+                runtime = self.registry.runtime(job_id)
+                self.registry.sync(job_id, {"state": "CANCELLED", "phase": "CANCELLED"}, runtime={**runtime, "finished_at": _now()})
+            except PanelJobError:
+                pass
+        except BaseException as error:
+            try:
+                saved = self.registry.get(job_id)
+                if saved["state"] not in _TERMINAL:
+                    self.registry.transition(job_id, "FAILED", phase="FAILED")
+                code = error.code if isinstance(error, PortfolioPanelError) else "PORTFOLIO_FINALIST_PREPARATION_FAILED"
+                runtime = self.registry.runtime(job_id)
+                self.registry.sync(
+                    job_id,
+                    {"state": "FAILED", "phase": "FAILED", "error": {"code": code}},
+                    runtime={**runtime, "finished_at": _now(), "diagnostics": [{"severity": "ERROR", "code": code, "message": _redact_text(str(error))}]},
+                )
+            except PanelJobError:
+                pass
+        finally:
+            self._cancel_events.pop(job_id, None)
+            self._threads.pop(job_id, None)
 
     def submit_campaign(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         with self._lock, self.registry.lock:
@@ -3568,7 +3718,7 @@ class PortfolioPanelService:
             raise PortfolioPanelError(code, "job is not available" if code == "PORTFOLIO_JOB_NOT_FOUND" else "portfolio job runtime is unavailable", status=404 if code == "PORTFOLIO_JOB_NOT_FOUND" else 500) from error
         except (OSError, TypeError, ValueError) as error:
             raise PortfolioPanelError("PORTFOLIO_JOB_RUNTIME_UNAVAILABLE", "portfolio job runtime is unavailable", status=500) from error
-        if saved.get("kind") not in {"portfolio.stage1", "portfolio.stage2"}:
+        if saved.get("kind") not in _PORTFOLIO_JOB_KINDS:
             raise PortfolioPanelError("PORTFOLIO_JOB_NOT_FOUND", "job is not available", status=404)
         if saved["state"] in _TERMINAL:
             raise PortfolioPanelError("PORTFOLIO_JOB_TERMINAL", "job is terminal", status=409)

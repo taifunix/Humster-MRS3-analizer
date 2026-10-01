@@ -1893,6 +1893,7 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
   let testerRetryTimer = 0;
   let testerRetryable = false;
   let testerCommitted = false;
+  let testerVerifiable = false;
   let normalInboxReady = false;
   let normalImportAuthorized = false;
   let authorizedTesterJobId = '';
@@ -2211,7 +2212,7 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
     if (inboxVerifyV2) {
       if (collectionActionBusy) inboxVerifyV2.disabled = true;
       else {
-        const ordinaryReady = testerCommitted;
+        const ordinaryReady = testerCommitted || testerVerifiable;
         const collectionReady = collectionIsActive() && collectionCommittedPacks > 0;
         inboxVerifyV2.disabled = normalVerifyInFlight || Boolean(normalImportAuthorized && authorizedTesterJobId)
           || (collectionIsActive() ? collectionActivePacks > 0 || !collectionReady : !ordinaryReady);
@@ -2285,6 +2286,8 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
         ? `${stage} · reports ${checked}/${total}`
         : `${stage} · reports ${checked}/${total}`;
     const committed = singleMode && job.state === 'COMMITTED';
+    const verifiable = committed || (singleMode && job.state === 'RUNNING' && stage === 'COMMITTED'
+      && total > 0 && checked === total && failed === 0);
     const ready = committed && job.inbox_ready === true;
     normalInboxReady = ready;
     if (testerIsTerminal(job) && !committed && job.job_id === testerJobId) {
@@ -2294,6 +2297,7 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
     const importAllowed = normalImportAuthorized && authorizedTesterJobId === (collectionIsActive() ? testerCollectionId : testerJobId)
       && (collectionImportReady() || ready);
     testerCommitted = committed;
+    testerVerifiable = verifiable;
     if (testerText) testerText.textContent = detail;
     if (testerStatus) {
       const error = job.error?.code ? ` ${job.error.code}: ${job.error.message || ''}` : '';
@@ -2306,17 +2310,19 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
     if (inboxVerifyV2) {
       const collectionReady = collectionIsActive() && collectionCommittedPacks > 0;
       if (collectionActionBusy) inboxVerifyV2.disabled = true;
-      else if (!collectionIsActive()) inboxVerifyV2.disabled = !committed || importAllowed;
+      else if (!collectionIsActive()) inboxVerifyV2.disabled = !verifiable || importAllowed;
       else inboxVerifyV2.disabled = importAllowed || normalVerifyInFlight || collectionActivePacks > 0 || !collectionReady;
     }
     if (importStartV2) importStartV2.disabled = collectionActionBusy || !importAllowed;
     if (importStatusV2 && !importJobV2) importStatusV2.textContent = ready
       ? `Performance v2: ${importAllowed ? 'CHECKED · import enabled.' : 'CHECK REQUIRED · press Проверить to verify the committed inbox.'}`
-      : 'Performance v2: waiting for a committed tester inbox.';
+      : verifiable
+        ? 'Performance v2: reports complete · press Проверить to recover and verify the inbox.'
+        : 'Performance v2: waiting for completed tester reports.';
     const badge = testerCard?.querySelector('summary .state-badge');
     if (badge) {
       badge.className = `state-badge ${importAllowed ? 'state-ready' : 'state-pending'}`;
-      badge.textContent = importAllowed ? 'CHECKED' : (committed ? 'CHECK REQUIRED' : 'WAITING');
+      badge.textContent = importAllowed ? 'CHECKED' : (verifiable ? 'CHECK REQUIRED' : 'WAITING');
     }
   };
   const pollTester = async () => {
@@ -2355,6 +2361,7 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
     authorizedTesterJobId = '';
     normalVerifyEpoch += 1;
     testerCommitted = false;
+    testerVerifiable = false;
     const collectReports = testerCollectReports?.checked === true;
     const collectionActionLease = collectReports ? collectionCoordinator.begin('start') : null;
     if (collectReports && !collectionActionLease) return;
@@ -2540,7 +2547,7 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
     const collectionId = collectionIsActive() ? testerCollectionId : '';
     const collectionReady = Boolean(collectionId) && collectionCommittedPacks > 0;
     if (!collectionId) {
-      if (!testerJobId || !testerCommitted || normalVerifyInFlight) {
+      if (!testerJobId || !(testerCommitted || testerVerifiable) || normalVerifyInFlight) {
         if (importStatusV2) importStatusV2.textContent = 'CHECK REQUIRED: a committed tester job is required before Проверить.';
         return;
       }
@@ -2569,7 +2576,7 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
       } else if (verified?.state !== 'COMMITTED' || verified?.inbox_ready !== true) throw new Error('verified inbox is not ready');
       // Ordinary stale-check remains: verifyEpoch !== normalVerifyEpoch || verifyJobId !== testerJobId || !testerCommitted
       if (verifyEpoch !== normalVerifyEpoch || verifyJobId !== (collectionIsActive() ? testerCollectionId : testerJobId)
-        || (collectionIsActive() ? !collectionReady : !testerCommitted)
+        || (collectionIsActive() ? !collectionReady : !(testerCommitted || testerVerifiable))
         || (collectionActionLease && !collectionCoordinator.isCurrent(collectionActionLease))) return;
       const authorize = () => {
         normalImportAuthorized = true;
@@ -3910,6 +3917,7 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
       const state = { pairRows: [], readiness: null, configDigest: null, activeJobId: '', job: null, poller: 0, initialized: true, locked: false, renderedJobId: '', renderedPercent: 0, renderedSubstage: '', progressAnchor: 0, progressBaseElapsed: 0, heartbeatAnchor: 0, heartbeatBaseAge: 0, settingsChanged: false, refreshPromise: null };
       const portfolioJobEndpoint = '/api/v2/portfolio/jobs/';
       const query = (selector) => document.querySelector(selector);
+      const prepareButton = query('#portfolio-prepare-finalists');
       const runButton = query('#portfolio-run');
       const newButton = query('#portfolio-new-calculation');
       const cancelButton = query('#portfolio-cancel');
@@ -4016,16 +4024,19 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
         const form = query('#portfolio-launch-form');
         form?.querySelectorAll('input').forEach((input) => { input.disabled = locked; });
         const fieldsets = form?.querySelectorAll('fieldset'); fieldsets?.forEach((fieldset) => { fieldset.disabled = locked; });
+        if (prepareButton) prepareButton.disabled = locked || state.readiness?.preparation?.state === 'READY';
         runButton.disabled = locked || !(state.readiness?.stage1?.enabled === true);
         setBadge('#portfolio-lock-badge', locked ? 'FROZEN' : 'EDITABLE', locked ? 'pending' : 'ready');
         updateControls();
       };
       const updateControls = () => {
         const launch = portfolioLaunchForm();
+        const preparationState = state.readiness?.preparation?.state;
         if (formStatus && !state.locked) formStatus.textContent = launch.valid ? 'Кампания готова к фиксации.' : (launch.invalidPairLimits.length ? `Лимит превышает доступное число финалистов: ${launch.invalidPairLimits.join(', ')}.` : 'Заполните обязательные поля и исправьте недопустимые лимиты.');
         if (runButton) runButton.disabled = state.locked || !launch.valid;
         const jobTerminal = terminal(state.job);
-        if (newButton) newButton.disabled = !state.locked || !jobTerminal;
+        if (prepareButton) { prepareButton.textContent = preparationState === 'READY' ? 'Готово' : (preparationState === 'ERROR' ? 'Повторить' : 'Подготовить данные финалистов'); prepareButton.disabled = state.locked || preparationState === 'READY' || preparationState === 'PREPARING'; }
+        if (newButton) newButton.disabled = preparationState === 'PREPARING' || !state.locked || !jobTerminal;
         if (cancelButton) cancelButton.disabled = !state.activeJobId || jobTerminal || ['CANCEL_REQUESTED', 'CANCELLING'].includes(statusOf(state.job));
       };
       const renderJournal = (job) => {
@@ -4228,7 +4239,14 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
         try {
           const payload = await requestJson(`${portfolioJobEndpoint}${encodeURIComponent(state.activeJobId)}`);
           const job = payload.job || payload; if (job?.job_id) state.activeJobId = job.job_id; renderJob(job);
-          if (terminal(job)) { window.clearInterval(state.poller); state.poller = 0; updateControls(); }
+          if (terminal(job)) {
+            window.clearInterval(state.poller); state.poller = 0;
+            if (job?.kind === 'FINALIST_PREPARATION') {
+              state.activeJobId = ''; state.job = null; renderJob(null); setLocked(false);
+              try { renderReadiness(await requestJson('/api/v2/portfolio/readiness')); } catch (_) { /* next refresh retains the server state. */ }
+            }
+            updateControls();
+          }
         } catch (_) { /* requestJson exposes the safe error while polling remains server-only. */ }
       };
       const startPortfolioPolling = () => { window.clearInterval(state.poller); state.poller = window.setInterval(pollPortfolioJob, 1000); pollPortfolioJob(); };
@@ -4242,6 +4260,26 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
         state.refreshPromise = Promise.allSettled([requestJson('/api/v2/portfolio/readiness'), recoverPortfolioJob()]).then(([readiness]) => { if (readiness.status === 'fulfilled') renderReadiness(readiness.value); }).finally(() => { state.refreshPromise = null; });
         return state.refreshPromise;
       };
+      prepareButton?.addEventListener('click', async () => {
+        if (prepareButton.disabled) return;
+        setLocked(true);
+        if (formStatus) formStatus.textContent = 'Подготавливаются данные текущих FINALIST…';
+        try {
+          const result = await requestJson('/api/v2/portfolio/finalist-inputs', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+          if (!result.job_id) {
+            renderReadiness(await requestJson('/api/v2/portfolio/readiness'));
+            setLocked(false);
+            if (formStatus) formStatus.textContent = 'Данные текущих FINALIST уже подготовлены.';
+            return;
+          }
+          state.activeJobId = result.job_id;
+          renderJob({ job_id: state.activeJobId, kind: 'FINALIST_PREPARATION', status: result.status || 'QUEUED' });
+          startPortfolioPolling();
+        } catch (error) {
+          setLocked(false);
+          if (formStatus) formStatus.textContent = portfolioErrorMessage(error);
+        }
+      });
       runButton?.addEventListener('click', async () => {
         const launch = portfolioLaunchForm();
         if (!launch.valid) { if (formStatus) formStatus.textContent = 'Перед расчётом устраните блокировки входных данных и формы.'; updateControls(); return; }

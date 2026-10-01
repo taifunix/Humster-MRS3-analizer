@@ -260,7 +260,7 @@ def test_native_single_mode_rejects_unchanged_preexisting_report(tmp_path: Path)
     assert found == {}
 
 
-def test_native_single_mode_installs_each_batch_before_one_native_run_and_creates_inbox(tmp_path: Path) -> None:
+def test_native_single_mode_installs_each_batch_before_one_native_run_and_requires_explicit_inbox_verification(tmp_path: Path) -> None:
     manifest, names = _generation(tmp_path, 3)
     config = replace(_runner_config(tmp_path), poll_interval_seconds=0.001, batch_timeout_seconds=2, stall_timeout_seconds=2)
     old_report = config.report_dir / "unowned.html"
@@ -318,7 +318,8 @@ def test_native_single_mode_installs_each_batch_before_one_native_run_and_create
     status = _wait_terminal(service, str(started["job_id"]))
 
     assert status["state"] == "COMMITTED", status
-    assert status["inbox_ready"] is True
+    assert status["inbox_ready"] is False
+    assert "inbox_path" not in status
     tester_config = json.loads(config.tester_config.read_text(encoding="utf-8"))
     assert tester_config == {
         "MakerFee": "0.00001",
@@ -333,7 +334,10 @@ def test_native_single_mode_installs_each_batch_before_one_native_run_and_create
     ]
     assert events.count("run") == 2
     assert all("wizard" not in str(event).casefold() for event in events)
-    assert (Path(status["inbox_path"]) / "inbox_manifest.json").is_file()
+    assert not (config.inbox_root / "native-order").exists()
+    inbox = service.capture_inbox("native-order")
+    service.mark_inbox_ready("native-order", inbox)
+    assert (inbox / "inbox_manifest.json").is_file()
     assert old_report.read_text(encoding="utf-8") == "keep"
 
 
@@ -777,7 +781,7 @@ def test_v2_rejects_external_strategy_for_direct_inbox(tmp_path: Path) -> None:
         )
 
 
-def test_single_mode_auto_captures_metadata_inbox_and_marks_ready(tmp_path: Path) -> None:
+def test_single_mode_requires_explicit_metadata_inbox_verification(tmp_path: Path) -> None:
     manifest, names = _generation(tmp_path)
     config = replace(_runner_config(tmp_path), poll_interval_seconds=0.001, batch_timeout_seconds=2, stall_timeout_seconds=2)
 
@@ -819,8 +823,11 @@ def test_single_mode_auto_captures_metadata_inbox_and_marks_ready(tmp_path: Path
 
     assert status["state"] == "COMMITTED", status
     assert status["mode"] == "SINGLE_MODE"
-    assert status["inbox_ready"] is True
-    inbox = Path(status["inbox_path"])
+    assert status["inbox_ready"] is False
+    assert "inbox_path" not in status
+    assert not (config.inbox_root / "single-ready").exists()
+    inbox = service.capture_inbox("single-ready")
+    service.mark_inbox_ready("single-ready", inbox)
     assert (inbox / "inbox_manifest.json").is_file()
     assert not (inbox / "strategies").exists()
     assert (config.report_dir / "A.html").is_file()

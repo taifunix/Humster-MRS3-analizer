@@ -22,7 +22,6 @@ from mrs3.performance_v2_import import (
 )
 from mrs3.performance_v2_html import parse_current_performance_v2_html
 from mrs3.performance_v2_input import PerformanceV2InputError, read_performance_v2_inbox
-from mrs3.performance_v2_optimizer import decode_prepared_storage, read_prepared_optimizer_inputs, source_digest
 from mrs3.performance_v2_store import (
     PerformanceV2Config,
     PerformanceV2StoreError,
@@ -321,25 +320,13 @@ def test_import_timing_clock_failure_keeps_publication_behavior(tmp_path: Path, 
     assert "phases" not in audit
 
 
-def test_import_phase8_failure_keeps_rollback_and_partial_timing(tmp_path: Path, monkeypatch) -> None:
+def test_import_add_does_not_create_optimizer_prepared_inputs(tmp_path: Path) -> None:
     request, _ = _request(tmp_path)
 
-    def fail_preparation(*_args, **_kwargs):
-        raise PerformanceV2ImportError("injected phase8 failure")
-
-    monkeypatch.setattr(import_module, "_persist_phase8_prepared", fail_preparation)
-    with pytest.raises(PerformanceV2ImportError, match="^injected phase8 failure$"):
-        import_performance_v2(request)
+    assert import_performance_v2(request).imported_count == 1
 
     with duckdb.connect(str(performance_v2_database_path(request.config)), read_only=True) as connection:
-        for table in ("strategies", "strategy_results", "strategy_actions", "strategy_equity",
-                      "optimizer_prepared_inputs", "import_runs", "import_files"):
-            assert connection.execute(f"select count(*) from {table}").fetchone() == (0,), table
-    audit = json.loads((request.config.database_root / "import_audit.v2.json").read_text(encoding="utf-8"))
-    assert audit["schema_version"] == 2
-    assert audit["error"] == "injected phase8 failure"
-    assert audit["phases"]["PUBLISH_PHASE8"] >= 0
-    assert "COMMIT" not in audit["phases"]
+        assert connection.execute("select count(*) from optimizer_prepared_inputs").fetchone() == (0,)
 
 
 def test_import_rejects_manifest_mutation_before_reader_without_db_mutation(tmp_path: Path) -> None:
@@ -397,29 +384,6 @@ def _report_with_source_metadata() -> bytes:
     ):
         source = source.replace(old, new, 1)
     return source
-
-
-def _report_with_available_prepared_input() -> bytes:
-    source = FIXTURE.read_bytes()
-    source = source.replace(
-        b'"use_upnl":true}',
-        b'"use_upnl":true,"use_frozen_balance":true}',
-        1,
-    ).replace(
-        b'"use_short":false}',
-        b'"use_short":false,"use_fix":false,"balance_percentage_long":100,"risk_long":1,"max_balance":0}',
-        1,
-    )
-    return source.replace(
-        b"<th>Action</th><th>Fee</th>",
-        b"<th>Action</th><th>Price</th><th>Cost</th><th>Fee</th>",
-    ).replace(
-        b"<td>opened</td><td>0.05</td>",
-        b"<td>opened</td><td>1.2300</td><td>4.5600</td><td>0.05</td>",
-    ).replace(
-        b"<td>closed</td><td>0.05</td>",
-        b"<td>closed</td><td>1.2300</td><td>4.5600</td><td>0.05</td>",
-    )
 
 
 def test_append_rows_uses_duckdb_native_dataframe_append() -> None:
@@ -604,76 +568,6 @@ def test_replace_timestamp_updates_use_scalar_and_bounded_batch_shapes() -> None
     ]
     assert raw.execute("select count(*) from strategies where updated_at_utc = ?", [now]).fetchone() == (1025,)
     raw.close()
-
-
-def test_phase8_source_input_uses_normalized_report_and_persisted_value_inputs(tmp_path: Path) -> None:
-    request, _ = _request(tmp_path)
-    prepared = read_performance_v2_inbox(request.inbox, request.report_root)
-    raw = parse_current_performance_v2_html(FIXTURE.read_bytes(), request.config)
-    normalized, failures = import_module._prepare_listing_ranges(request, prepared, (raw,))
-    assert not failures and normalized[0] is not None
-    report = normalized[0]
-    entry = prepared.entries[0]
-    now = datetime(2026, 1, 10, tzinfo=timezone.utc)
-    result_values = import_module._result_values(entry, report, prepared.commission_contract, now)  # type: ignore[arg-type]
-
-    source = import_module._phase8_source_input(
-        result_id=71,
-        strategy_id=31,
-        entry=entry,
-        report=report,
-        result_values=result_values,
-        sizing_facts=import_module._phase8_sizing_facts(report.settings),
-    )
-
-    assert source.result_id == 71
-    assert source.strategy_id == 31
-    assert source.symbol == entry.identity.symbol
-    assert source.revision_timestamp_utc == now
-    assert source.actions and source.equity
-    assert set(result_values) == set(import_module._RESULT_VALUE_FIELDS)
-
-
-def test_import_add_prepared_input_passes_strict_canonical_readback(tmp_path: Path) -> None:
-    request, _ = _request(tmp_path)
-    _rewrite_report(request, _report_with_available_prepared_input())
-
-    assert import_performance_v2(request).imported_count == 1
-    target = performance_v2_database_path(request.config)
-    with duckdb.connect(str(target), read_only=True) as connection:
-        result_id, stored_digest = connection.execute(
-            "select result_id, source_digest from optimizer_prepared_inputs"
-        ).fetchone()
-    readback = read_prepared_optimizer_inputs(str(target), [result_id])[0]
-    assert readback.prepared is not None
-    assert stored_digest == source_digest(readback.source)
-
-
-def test_import_replace_prepared_input_passes_strict_canonical_readback(tmp_path: Path) -> None:
-    request, _ = _request(tmp_path)
-    _rewrite_report(request, _report_with_available_prepared_input())
-    assert import_performance_v2(request).imported_count == 1
-    target = performance_v2_database_path(request.config)
-    with duckdb.connect(str(target), read_only=True) as connection:
-        strategy_id, result_id = connection.execute(
-            "select strategy_id, current_result_id from strategies where strategy_name = 'alpha'"
-        ).fetchone()
-
-    changed = _report_with_available_prepared_input().replace(b"1009.9", b"1019.9")
-    _rewrite_report(request, changed)
-    replacement = PerformanceV2ImportRequest(
-        request.inbox, request.report_root, request.config, mode="REPLACE",
-        replacement_strategy_ids={"alpha": strategy_id}, expected_current_result_ids={"alpha": result_id},
-        listing_dates_path=request.listing_dates_path,
-    )
-
-    assert import_performance_v2(replacement).imported_count == 1
-    readback = read_prepared_optimizer_inputs(str(target), [result_id])[0]
-    assert readback.prepared is not None
-    with duckdb.connect(str(target), read_only=True) as connection:
-        assert connection.execute(
-            "select source_digest from optimizer_prepared_inputs where result_id = ?", [result_id]
-        ).fetchone() == (source_digest(readback.source),)
 
 
 def test_child_readback_uses_two_grouped_queries_and_zero_fills_missing_groups() -> None:
@@ -867,7 +761,7 @@ def test_split_writer_frames_preserve_full_database_rows_and_digests(
             ))
     assert snapshots[0] == snapshots[1] == snapshots[2]
     actions, equity, prepared_rows, files = snapshots[0]
-    assert len(actions) == 2 and len(equity) == 3 and len(prepared_rows) == len(files) == 1
+    assert len(actions) == 2 and len(equity) == 3 and not prepared_rows and len(files) == 1
     assert actions[0][12:14] == (None, None)
     assert actions[1][12:14] == (
         Decimal("-29.769149208742"), Decimal("123456789.123456789012")
@@ -919,7 +813,7 @@ def test_import_persists_allowlisted_source_metadata_and_existing_action_slot(tm
     assert "must-not-save" not in metadata
 
 
-def test_import_persists_phase8_typed_facts_and_one_prepared_status(tmp_path: Path) -> None:
+def test_import_persists_typed_facts_without_preparing_optimizer_input(tmp_path: Path) -> None:
     request, _ = _request(tmp_path)
 
     assert import_performance_v2(request).imported_count == 1
@@ -929,81 +823,13 @@ def test_import_persists_phase8_typed_facts_and_one_prepared_status(tmp_path: Pa
                from strategy_results r join strategy_actions a on a.result_id = r.result_id
                order by a.action_index limit 1"""
         ).fetchone()
-        prepared = connection.execute(
-            """select availability_status, unavailable_reason, preparation_version,
-                      source_digest, prepared_json
-                 from optimizer_prepared_inputs where result_id = ?""",
-            [result_id],
-        ).fetchone()
+        prepared_count = connection.execute(
+            "select count(*) from optimizer_prepared_inputs where result_id = ?", [result_id]
+        ).fetchone()[0]
 
     assert action_price is None and action_cost is None
     assert sizing is True
-    assert prepared[0:3] == ("UNAVAILABLE", "MISSING_TYPED_FACTS", "5")
-    assert isinstance(prepared[3], str) and len(prepared[3]) == 64
-    assert prepared[4] is None
-
-
-@pytest.mark.parametrize(
-    "overrides, reason, expected_calls",
-    [({}, None, 1), ({"sizing_use_upnl": None}, "MISSING_TYPED_FACTS", 2),
-     ({"sizing_use_fix": True}, "UNSUPPORTED_SIZING", 2)],
-)
-def test_phase8_reuses_available_digest_without_changing_payload(
-    tmp_path: Path, monkeypatch, overrides, reason, expected_calls,
-) -> None:
-    import mrs3.performance_v2_optimizer as optimizer_module
-    from tests.test_performance_v2_optimizer import _source, _typed_candidate_database
-
-    database, (result_id,) = _typed_candidate_database(tmp_path)
-    source = _source(result_id=result_id, **overrides)
-    before = source.to_document()
-    expected_digest = source_digest(source)
-    availability, prepared = optimizer_module.prepare_optimizer_input(source)
-    expected_json = prepared.to_json() if prepared is not None else None
-    assert availability.reason == reason
-    calls = []
-
-    def counted(value):
-        calls.append(value)
-        return source_digest(value)
-
-    monkeypatch.setattr(import_module, "source_digest", counted)
-    monkeypatch.setattr(optimizer_module, "source_digest", counted)
-    with duckdb.connect(str(database)) as connection:
-        import_module._persist_phase8_prepared(connection, source, source.revision_timestamp_utc)
-        status, stored_reason, digest, payload = connection.execute(
-            "select availability_status, unavailable_reason, source_digest, prepared_json "
-            "from optimizer_prepared_inputs where result_id = ?", [result_id],
-        ).fetchone()
-
-    assert len(calls) == expected_calls
-    assert (status, stored_reason) == (availability.status, reason)
-    assert digest == expected_digest
-    assert source.to_document() == before
-    if prepared is None:
-        assert payload is None
-    else:
-        decoded = decode_prepared_storage(payload)
-        assert decoded.encode("utf-8") == expected_json.encode("utf-8")
-        assert digest == prepared.source_digest == json.loads(decoded)["source_digest"]
-
-
-def test_import_persists_available_prepared_artifact_and_digest(tmp_path: Path) -> None:
-    request, _ = _request(tmp_path)
-    _rewrite_report(request, _report_with_available_prepared_input())
-
-    assert import_performance_v2(request).imported_count == 1
-    with duckdb.connect(str(performance_v2_database_path(request.config)), read_only=True) as connection:
-        result_id, status, reason, digest, payload = connection.execute(
-            "select result_id, availability_status, unavailable_reason, source_digest, prepared_json from optimizer_prepared_inputs"
-        ).fetchone()
-
-    assert (status, reason) == ("AVAILABLE", None)
-    assert isinstance(digest, str) and len(digest) == 64
-    assert isinstance(payload, str) and payload.startswith("mrs3-zlib-v1:")
-    readback = read_prepared_optimizer_inputs(str(performance_v2_database_path(request.config)), [result_id])
-    assert readback[0].prepared is not None
-    assert decode_prepared_storage(payload) == readback[0].prepared.to_json()
+    assert prepared_count == 0
 
 
 def test_over_scale_price_keeps_exact_raw_provenance_when_typed_value_is_null(tmp_path: Path) -> None:
@@ -1014,25 +840,19 @@ def test_over_scale_price_keeps_exact_raw_provenance_when_typed_value_is_null(tm
 
     assert import_performance_v2(request).imported_count == 1
     with duckdb.connect(str(performance_v2_database_path(request.config)), read_only=True) as connection:
-        result_id, typed_price, typed_cost, raw_action, status, reason, stored_digest = connection.execute(
-            """select a.result_id, a.price, a.cost, a.raw_action_json, p.availability_status, p.unavailable_reason,
-                        p.source_digest
-                 from strategy_actions a
-                 join optimizer_prepared_inputs p on p.result_id = a.result_id
-                order by a.action_index limit 1"""
+        result_id, typed_price, typed_cost, raw_action = connection.execute(
+            """select result_id, price, cost, raw_action_json
+                 from strategy_actions order by action_index limit 1"""
         ).fetchone()
+        prepared_count = connection.execute(
+            "select count(*) from optimizer_prepared_inputs where result_id = ?", [result_id]
+        ).fetchone()[0]
 
     assert typed_price is None
     assert typed_cost is None
     assert json.loads(raw_action)["price"] == "1.2345678901234"
     assert json.loads(raw_action)["cost"] == "4.5678901234567"
-    assert (status, reason) == ("UNAVAILABLE", "MISSING_TYPED_FACTS")
-    readback = read_prepared_optimizer_inputs(
-        str(performance_v2_database_path(request.config)), [result_id]
-    )[0]
-    assert stored_digest == source_digest(readback.source)
-    assert readback.source.to_document()["actions"][0].get("price") is None
-    assert readback.source.to_document()["actions"][0].get("cost") is None
+    assert prepared_count == 0
 
 
 def test_source_metadata_keeps_invalid_field_evidence_with_legacy_exchange_setting() -> None:
@@ -2487,6 +2307,13 @@ def test_replace_batches_child_deletes_for_admitted_results(tmp_path: Path, admi
             ) values (?, 'gamma-source', 'test-v1', '{\"state\":\"GROWING\"}', 'gamma-digest', now())""",
             [current["gamma"]],
         )
+        connection.executemany(
+            """insert into optimizer_prepared_inputs (
+                result_id, preparation_version, source_digest, availability_status,
+                unavailable_reason, prepared_json, prepared_at_utc
+            ) values (?, 'test-v1', ?, 'UNAVAILABLE', 'MISSING_TYPED_FACTS', null, now())""",
+            [[current[name], f"{name}-digest"] for name in ("alpha", "beta", "gamma")],
+        )
     with duckdb.connect(str(target), read_only=True) as connection:
         before = {
             name: {
@@ -2574,11 +2401,13 @@ def test_replace_batches_child_deletes_for_admitted_results(tmp_path: Path, admi
             }
             for name in ("alpha", "beta", "gamma")
         }
+        assert connection.execute("select count(*) from optimizer_prepared_inputs").fetchone() == (3 - admitted_count,)
     for name in ("beta", "gamma")[admitted_count - 1:]:
         assert after[name] == before[name]
     for name in ("alpha", "beta")[:admitted_count]:
         assert after[name]["strategy_actions"] == before[name]["strategy_actions"]
         assert after[name]["strategy_equity"] == before[name]["strategy_equity"]
+        assert after[name]["optimizer_prepared_inputs"] == []
 
 
 def test_import_request_rejects_absolute_listing_dates_path(tmp_path: Path) -> None:

@@ -41,16 +41,18 @@ class PanelJobRegistry:
     def _load(self) -> dict[str, dict]:
         try:
             data = json.loads(self.journal.read_text(encoding="utf-8"))
-            if not isinstance(data, dict):
-                return {}
-            loaded = {
-                job_id: job for job_id, job in data.items()
-                if isinstance(job_id, str) and self._valid_saved_job(job)
-            }
-            self._journal_dirty = len(loaded) != len(data)
-            return loaded
         except (OSError, json.JSONDecodeError):
+            self._journal_dirty = False
             return {}
+        if not isinstance(data, dict):
+            self._journal_dirty = False
+            return {}
+        loaded = {
+            job_id: job for job_id, job in data.items()
+            if isinstance(job_id, str) and self._valid_saved_job(job)
+        }
+        self._journal_dirty = len(loaded) != len(data)
+        return loaded
 
     def _save(self) -> None:
         self._journal_dirty = True
@@ -178,11 +180,23 @@ class PanelJobRegistry:
                     raise PanelJobError("INVALID_REQUEST")
                 job["state"] = state
             phase = status.get("phase")
+            same_phase = not isinstance(phase, str) or phase == job.get("phase")
             if isinstance(phase, str) and phase.strip() and len(phase) <= 128:
                 job["phase"] = phase
             progress = status.get("progress")
             if isinstance(progress, dict):
-                job["progress"] = dict(progress)
+                previous = job.get("progress")
+                regressed = (
+                    same_phase
+                    and isinstance(previous, dict)
+                    and previous.get("total") == progress.get("total")
+                    and previous.get("unit") == progress.get("unit")
+                    and type(previous.get("current")) is int
+                    and type(progress.get("current")) is int
+                    and progress["current"] < previous["current"]
+                )
+                if not regressed:
+                    job["progress"] = dict(progress)
             if "error" in status:
                 error = status["error"]
                 if error is None or isinstance(error, dict):

@@ -38,6 +38,10 @@ class OptimizerIntegrityError(ValueError):
     """A malformed or identity-inconsistent optimizer input/artifact."""
 
 
+class MissingPreparedOptimizerInput(OptimizerIntegrityError):
+    """A requested current result has not been explicitly prepared yet."""
+
+
 class OptimizerUnavailableError(RuntimeError):
     """An expected evidence or size condition, safe to persist as unavailable."""
 
@@ -664,7 +668,7 @@ def _prepare_current_worker(source: OptimizerSourceInput) -> PreparedCurrentResu
 
 def prepare_current_optimizer_inputs(database: str, result_ids: Sequence[int], *, workers: int = 1) -> tuple[PreparedCurrentResult, ...]:
     """Prepare current rows using a closed read snapshot and one writer batch."""
-    from concurrent.futures import ProcessPoolExecutor
+    from concurrent.futures import ThreadPoolExecutor
     import duckdb
     from .performance_v2_store import PerformanceV2WriterLock, require_performance_v2
 
@@ -715,7 +719,7 @@ def prepare_current_optimizer_inputs(database: str, result_ids: Sequence[int], *
     if workers == 1 or len(sources_to_build) <= 1:
         built = tuple(_prepare_current_worker(source) for source in sources_to_build)
     else:
-        with ProcessPoolExecutor(max_workers=min(workers, len(sources_to_build))) as executor:
+        with ThreadPoolExecutor(max_workers=min(workers, 16, len(sources_to_build))) as executor:
             built = tuple(executor.map(_prepare_current_worker, sources_to_build))
     built_by_id = {item.source.result_id: item for item in built}
     all_results = tuple(reusable.get(source.result_id) or built_by_id[source.result_id] for source in sources)
@@ -776,8 +780,6 @@ def _read_prepared_optimizer_inputs(
     requested = tuple(dict.fromkeys(int(item) for item in result_ids))
     if not requested:
         return ()
-    sources = _source_rows(connection, requested)
-    by_id = {source.result_id: source for source in sources}
     placeholders = ",".join("?" for _ in requested)
     rows = connection.execute(
         f"""select result_id, preparation_version, source_digest,
@@ -786,12 +788,16 @@ def _read_prepared_optimizer_inputs(
         list(requested),
     ).fetchall()
     by_prepared = {int(row[0]): row for row in rows}
+    if any(result_id not in by_prepared for result_id in requested):
+        raise MissingPreparedOptimizerInput("prepared input is missing for requested result")
+    sources = _source_rows(connection, requested)
+    by_id = {source.result_id: source for source in sources}
     result: list[PreparedCurrentResult] = []
     for result_id in requested:
         source = by_id.get(result_id)
         row = by_prepared.get(result_id)
         if source is None or row is None:
-            raise OptimizerIntegrityError("prepared input is missing for requested result")
+            raise MissingPreparedOptimizerInput("prepared input is missing for requested result")
         digest = source_digest(source)
         if row[1] != PREPARATION_VERSION or row[2] != digest:
             raise OptimizerIntegrityError("prepared input is stale")
@@ -916,7 +922,7 @@ def decode_prepared_input(payload: str | bytes | Mapping[str, Any], *, result_id
 __all__ = [
     "EXPECTED_UNAVAILABILITY_REASONS", "MISSING_TYPED_FACTS", "PREPARATION_VERSION",
     "PREPARED_MAX_BYTES", "PREPARED_SCHEMA_VERSION", "PREPARED_TOO_LARGE",
-    "UNSUPPORTED_SIZING", "OptimizerAction", "OptimizerEquityPoint",
+    "UNSUPPORTED_SIZING", "MissingPreparedOptimizerInput", "OptimizerAction", "OptimizerEquityPoint",
     "OptimizerIntegrityError", "OptimizerSourceInput", "OptimizerUnavailableError",
     "PreparedAvailability", "PreparedOptimizerInput", "build_prepared_input",
     "canonical_decimal", "canonical_json", "canonical_timestamp", "decode_prepared_input",
