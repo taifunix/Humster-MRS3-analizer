@@ -1,5 +1,45 @@
 # MRS3 — current verification
 
+## Performance v2 window boundary correction (2026-10-02)
+
+The shared A/B/Full window calculation now selects PnL boundaries from
+full-close action `Balance`, using recorded initial balance before the first
+trade. A trade already open at the requested start is excluded through its
+first full close; an unfinished trade at the end is excluded. DD continues to
+use observed equity and remains nullable when observations are insufficient.
+The importer sets `report_start_utc=max(reported_start_utc, listing_date_utc
++ 120 hours)` and excludes trades that opened before it; Full and A use this
+effective start. When trimmed actions retain the tester's raw Balance scale,
+the calculation offsets Balance and observed equity by one constant so the
+first retained pre-action balance equals stored initial capital. No source
+rows are rewritten. Balance-based return can differ from action-PnL import
+summary if the tester's Balance contains other adjustments.
+The calculation cache advances from `performance-window-v2.2` to `v2.3`;
+old cached rows remain but do not satisfy current reads. Recalculation of
+selection windows is required; no source reimport or tester run is required.
+
+Read-only replay of BMNR IDs 191, 192, 307, 392, 407 and 408 independently
+matched the corrected A/B/Full PnL and DD against action Balance and recorded
+equity. Their previously collapsed B windows now each contain 4-6 full closes.
+For 392, Full PnL changes from cached 29.460992% to 22.382630%, consistent
+with the source report's rounded 22.38%.
+Read-only warm-up examples 433-436 independently matched rebased Full PnL
+(17.616531%, 39.432921%, 34.144307%, 37.209190%) and DD
+(23.008923%, 16.783762%, 24.415455%, 23.191729%).
+
+Combined `test_performance_v2_windows.py`, `test_performance_v2_selection.py`,
+`test_panel_performance_v2.py`, `test_panel_performance_v2_export.py`, and the
+focused portfolio Balance adapter and canonical field tests passed **408**,
+with **4 Windows symlink skips**, in 220.72 seconds from `.venv` with a
+task-specific C: TEMP directory. A later focused `decreased` full-close and
+warm-up rebase run passed 2 tests.
+The portfolio module's broader existing snapshot suite has 27 unrelated
+`UNKNOWN_DECIMAL_FIELD: ab_decline_cap_pct` failures in canonical serialization;
+the new Balance adapter and canonical field checks pass. Independent Claude
+Opus 5/high re-review returned `CODE_REVIEW_PASS` after fail-closed handling,
+warm-up rebasing, full `decreased` closes, and cache round-trip checks were
+added. Scoped commit is next. The production database has not been modified.
+
 ## Performance v2 fixed filter sequence (2026-10-01)
 
 In branch `feat/performance-v2-filter-sequence`, screen `4. Pareto and filters`

@@ -14,6 +14,7 @@ from mrs3.performance_v2_selection import (
     parse_selection_request,
     prepare_selection_window_cache,
 )
+from mrs3 import performance_v2_windows as window_module
 from mrs3.panel_portfolio import _plain
 from mrs3.portfolio import input as portfolio_input
 from mrs3.portfolio import reports as portfolio_reports
@@ -850,6 +851,40 @@ def test_series_keep_source_ordinals_per_result_identity(tmp_path: Path) -> None
     action_groups = snapshot.payload["actions"].items
     assert len(action_groups) == 2
     assert all([row["source_ordinal"] for row in group["items"].items] == [0, 1, 2] for group in action_groups)
+
+
+def test_portfolio_series_passes_close_balances_to_shared_window_calculation() -> None:
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    end = start + timedelta(days=2)
+    series = portfolio_input._SourceSeries(
+        1, start, end, Decimal("100"),
+        (
+            {"action_index": 0, "timestamp_utc": start, "action": "opened", "post_size": 1,
+             "pnl": 0, "fee": 0, "balance": 100},
+            {"action_index": 1, "timestamp_utc": end, "action": "closed", "post_size": 0,
+             "pnl": 10, "fee": 0, "balance": 110},
+        ),
+        (),
+    )
+    actions, equity = portfolio_input._series_for_calculation(series)
+    window = window_module._calculate(
+        1, start, end, window_module.METRICS_VERSION,
+        start, end, actions, equity, initial_balance=series.initial_balance,
+    )
+
+    assert window.availability_status == "AVAILABLE"
+    assert window.return_pct == Decimal("10")
+    assert window.max_drawdown_pct is None
+
+
+def test_portfolio_snapshot_canonicalizes_initial_and_action_balances() -> None:
+    record = portfolio_input._canonical_record(
+        {"initial_balance": Decimal("100"), "balance": Decimal("110")}
+    )
+    assert record["initial_balance"].type_tag == "money"
+    assert record["initial_balance"].value.value == Decimal("100")
+    assert record["balance"].type_tag == "money"
+    assert record["balance"].value.value == Decimal("110")
 
 
 def test_old_snapshot_replays_after_source_mutation_and_new_digest(tmp_path: Path) -> None:

@@ -160,25 +160,80 @@ Actions are ordered by `(timestamp_utc, action_index)`.
 
 ## Arbitrary safe windows
 
+### Close-balance boundary correction (2026-10-02)
+
+The same rule applies to Window A, Window B and the full report.  Inputs are
+the recorded initial balance, actions ordered by `(timestamp_utc, action_index)`
+with their post-action `Balance` and `Post Size`, and observed equity samples.
+No HTML is read during selection and no intratrade equity is synthesized.
+Import sets `report_start_utc` to the effective start, which is no earlier than
+the configured listing date plus 120 hours. It excludes complete trades that
+opened before that time. Selection starts Full and A at this effective start,
+and B ends at the report end with its configured lookback.
+
+When import removed earlier actions, the first retained `action_index` is
+nonzero and retained `Balance` and equity observations still use the original
+tester scale. Reconstruct the balance just before the first retained `opened`
+action as its recorded `Balance + fee` (that action has zero PnL). Apply one
+constant offset so that pre-action balance equals stored `initial_balance`,
+and apply the same offset to observed equity. This preserves every observed
+increment while excluding pre-listing and warm-up balance changes. If the
+first retained action cannot establish that anchor, the window is unavailable.
+Action-Balance growth may differ from an import summary rebuilt from action
+PnL and fees when the tester's Balance contains other adjustments.
+
+For an inclusive UTC request `[start, end]`, determine position state from
+actions strictly before `start`.  If flat, carry the `Balance` of the latest
+full close strictly before `start` to the start boundary; before the first
+trade, carry the recorded initial balance instead.  A full close exactly at
+`start` is inside the window and contributes to its result.  If the position
+was open before `start`, the first full close in `[start, end]` establishes the
+baseline and its spanning trade is excluded.  The endpoint is the last full
+close no later than `end`; a close exactly at `end` is included.  An unfinished
+position after that close contributes neither PnL nor realized trade metrics.
+An action with `post_size=0` and kind `closed` or `decreased` is a full close.
+Equal-time actions retain `action_index` order.  A selected close lacking a
+finite `Balance`, or a nonpositive baseline Balance, makes the window
+unavailable; an older close is not substituted.
+No completed trade after the baseline also makes the window unavailable.
+
+Growth and PnL use endpoint `Balance / baseline Balance` and the existing
+calendar normalization.  Fees, completed trips, trade count and Win Rate use
+only actions of the same included completed trips.  A trade spanning the A/B
+split may be excluded from both A and B while included in Full: `A + B` need
+not equal Full.  Partial report-coverage handling retains its existing rule.
+
+Drawdown remains based on observed equity, seeded by the known flat baseline
+Balance.  A nonempty included interval with no observed equity sample has
+nullable DD, not zero DD; a nonpositive anchor also gives nullable DD.  With
+at least one subsequent observed sample and a positive anchor, DD is computed
+from those observations and may legitimately be zero.  Nullable DD does not
+make otherwise available PnL unavailable.  The recorded initial `100/100`
+sample is a valid flat baseline before the first action.  No value from an
+excluded spanning or unfinished trade enters DD.
+
+The cache calculation version must advance when this correction is deployed.
+Reads use only the exact current version; old-version rows remain stored but
+are ignored.  Panel selection remains cache-only and reports incomplete until
+the existing recalculation action prepares the new version.  This causes a
+one-time cold-cache recalculation, with no source-report import or retest.
+Acceptance requires synthetic boundary/cache/consumer tests plus a read-only
+replay for BMNR result IDs 191, 192, 307, 392, 407 and 408; their B windows
+must no longer collapse when complete close balances are present.
+
 The user selects independent Window A and Window B, each with arbitrary start
 and end timestamps. Windows may overlap, nest or be disjoint.
 
-For each requested boundary independently:
-
-- keep it when the position is flat there;
-- move an open start forward to the first subsequent flat state;
-- move an open end backward to the preceding flat state;
-- never expand beyond the requested interval.
-
-The result records requested and effective timestamps and both shifts. No
-valid non-empty flat interval yields `WINDOW_UNAVAILABLE`; insufficient days
-or realised trades yields `INSUFFICIENT_DATA`.
+The close-balance rule above selects the effective boundaries and included
+trips. The result records requested and effective timestamps and both shifts.
+No eligible completed trip yields `WINDOW_UNAVAILABLE`; insufficient days or
+realised trades yields `INSUFFICIENT_DATA`.
 
 ## UPNL-relative metrics
 
 Tester runs use `use_upnl=true`, so absolute PnL, drawdown and fee amounts are
-audit values, not comparison objectives. At flat boundaries let `W0` and `W1`
-be wallet values and `days` be effective elapsed days:
+audit values, not comparison objectives. At selected boundaries let `W0` and
+`W1` be action Balances and `days` be effective elapsed days:
 
 ```text
 return_pct = (W1 / W0 - 1) * 100
@@ -189,10 +244,10 @@ return_dd_ratio = return_pct / max_drawdown_pct
 fees_pct = fees / W0 * 100
 ```
 
-PnL comes from the wallet curve so fees and funding remain included. Profit
-Factor uses all realising `decreased` and `closed` actions. Trade count and Win
-Rate use reconstructed round trips so partial fills/closures do not inflate
-strategy decisions. Holding and time-in-market use the same position episodes.
+PnL comes from recorded Balance so fees and funding remain included. Profit
+Factor uses realising `decreased` and `closed` actions in the included completed
+trips. Trade count and Win Rate use those same trips so partial fills/closures
+do not inflate strategy decisions. Holding and time-in-market use them too.
 
 Both windows are calculated by the same function. Signed return metrics use
 differences for A/B deterioration; positive dimensionless metrics may use
@@ -201,7 +256,7 @@ ratios.
 ## Window cache
 
 `window_metrics` caches only requested windows, never every possible interval.
-Its identity is `(result_id, requested_start, requested_end)`. It stores the
+Its identity is `(result_id, requested_start, requested_end, metrics_version)`. It stores the
 requested/effective boundaries, relative metrics, availability status and
 calculation timestamp. Replacing a result deletes its dependent cache.
 

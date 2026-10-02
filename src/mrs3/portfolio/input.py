@@ -177,6 +177,7 @@ class _SourceSeries:
     result_id: int
     report_start_utc: datetime
     report_end_utc: datetime
+    initial_balance: Decimal | None
     actions: tuple[Mapping[str, Any], ...]
     equity: tuple[Mapping[str, Any], ...]
 
@@ -298,6 +299,7 @@ def _series_for_calculation(series: _SourceSeries) -> tuple[tuple[_Action, ...],
             _to_decimal(row["post_size"]),
             _to_decimal(row["pnl"]),
             _to_decimal(row["fee"]),
+            None if row.get("balance") is None else _to_decimal(row["balance"]),
         )
         for row in series.actions
     )
@@ -894,6 +896,7 @@ def read_performance_snapshot(
                     result_id,
                     _utc(result["report_start_utc"]),
                     _utc(result["report_end_utc"]),
+                    None if result.get("initial_balance") is None else _to_decimal(result["initial_balance"]),
                     tuple(row for row in action_rows if int(row["result_id"]) == result_id),
                     tuple(row for row in equity_rows if int(row["result_id"]) == result_id),
                 )
@@ -918,6 +921,7 @@ def read_performance_snapshot(
                     series.report_end_utc,
                     actions,
                     equity,
+                    initial_balance=series.initial_balance,
                 )
         _refresh_candidate_metrics(candidates, metrics, selection_config)
 

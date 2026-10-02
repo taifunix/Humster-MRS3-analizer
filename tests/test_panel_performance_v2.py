@@ -1777,7 +1777,8 @@ def test_v2_catalog_and_windows_http_are_typed_and_repeatable(tmp_path: Path) ->
         assert status == 200
         assert first["result_id"] == result_id
         assert first["report_start_utc"] == "2026-01-01T00:00:00Z"
-        assert first["window_a"]["availability_status"] == "UNAVAILABLE"
+        assert first["window_a"]["availability_status"] == "AVAILABLE"
+        assert first["window_a"]["return_pct"] == "10.000000000000"
         status, second = _http_json(connection, "POST", "/api/v2/strategies/performance-v2/windows", payload)
         assert status == 200 and second == first
         connection.close()
@@ -3276,7 +3277,8 @@ def test_v2_current_result_switch_does_not_reuse_r1_window_cache(tmp_path: Path)
     }
     r1 = controller.performance_v2_windows(payload)
     assert r1["result_id"] == r1_id
-    assert r1["window_a"]["availability_status"] == "UNAVAILABLE"
+    assert r1["window_a"]["availability_status"] == "AVAILABLE"
+    assert r1["window_a"]["return_pct"] == "10.000000000000"
 
     with duckdb.connect(str(database)) as connection:
         cached_r1 = connection.execute("select * from window_metrics where result_id = ?", [r1_id]).fetchall()
@@ -3332,4 +3334,4 @@ def test_v2_current_result_switch_does_not_reuse_r1_window_cache(tmp_path: Path)
     r2 = controller.performance_v2_windows(payload)
     assert r2["result_id"] == r2_id != r1_id
     assert r2["window_a"]["availability_status"] == "AVAILABLE"
-    assert r2["window_a"]["return_pct"] == "19.047619047619"
+    assert r2["window_a"]["return_pct"] == "25.000000000000"

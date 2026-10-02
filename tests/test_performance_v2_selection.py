@@ -196,7 +196,7 @@ def test_v21_cache_rows_are_stale_for_v22_selection_readiness(tmp_path: Path) ->
     prepare_selection_window_cache(database, request, SelectionConfig(), workers=1)
     with duckdb.connect(str(database)) as check:
         check.execute("update window_metrics set metrics_version = 'performance-window-v2.1'")
-        assert METRICS_VERSION == "performance-window-v2.2"
+        assert METRICS_VERSION == "performance-window-v2.3"
         assert selection_cache_status(check, request, SelectionConfig()) == {"total": 1, "missing": 1, "ready": False}
 
 
@@ -1147,12 +1147,16 @@ def _selection_job_inputs(tmp_path: Path) -> tuple[Path, int, datetime, datetime
     return database, int(result_id), report_start, report_end
 
 
-def test_selection_window_job_shares_one_flat_timeline_in_requested_order(tmp_path: Path, monkeypatch) -> None:
+def test_selection_window_job_skips_unused_flat_timeline_in_requested_order(tmp_path: Path, monkeypatch) -> None:
     database, result_id, report_start, report_end = _selection_job_inputs(tmp_path)
     with duckdb.connect(str(database), read_only=True) as connection:
         source = selection_module._load_source(connection, result_id)
+        initial_balance = windows_module._load_initial_balance(connection, result_id)
     windows = _selection_windows(report_start, report_end, SelectionConfig(ab_final_days=5))
-    expected = tuple(_calculate(result_id, start, end, METRICS_VERSION, *source) for start, end in windows)
+    expected = tuple(
+        _calculate(result_id, start, end, METRICS_VERSION, *source, initial_balance=initial_balance)
+        for start, end in windows
+    )
     original_calculate = selection_module._calculate
     original_flat = windows_module._flat_samples
     load_calls = 0
@@ -1186,34 +1190,38 @@ def test_selection_window_job_shares_one_flat_timeline_in_requested_order(tmp_pa
     result = selection_module._selection_window_job(str(database), result_id, report_start, report_end, 5)
 
     assert result.metrics == expected
-    assert load_calls == flat_calls == 1
+    assert load_calls == 1 and flat_calls == 0
     assert len(calculate_flat_values) == len(windows) == 7
-    assert all(value is flat_values[0] for value in calculate_flat_values)
+    assert all(value is None for value in calculate_flat_values)
     assert ordered_flags == [True] * 7
-    assert flat_values[0] == original_flat(source[3], source[2])
 
     reversed_windows = tuple(reversed(windows))
     monkeypatch.setattr(selection_module, "_selection_windows", lambda *_args: reversed_windows)
     reversed_result = selection_module._selection_window_job(str(database), result_id, report_start, report_end, 5)
     reversed_expected = tuple(
-        _calculate(result_id, start, end, METRICS_VERSION, *source) for start, end in reversed_windows
+        _calculate(result_id, start, end, METRICS_VERSION, *source, initial_balance=initial_balance)
+        for start, end in reversed_windows
     )
 
     assert reversed_result.metrics == reversed_expected
-    assert load_calls == flat_calls == 2
-    assert all(value is flat_values[1] for value in calculate_flat_values[7:])
+    assert load_calls == 2 and flat_calls == 0
+    assert all(value is None for value in calculate_flat_values[7:])
     assert ordered_flags == [True] * 14
-    assert flat_values[0] is not flat_values[1]
+    assert flat_values == []
 
 
-def test_selection_window_job_calculates_only_missing_windows_with_one_flat_timeline(
+def test_selection_window_job_calculates_only_missing_windows_without_flat_timeline(
     tmp_path: Path, monkeypatch,
 ) -> None:
     database, result_id, report_start, report_end = _selection_job_inputs(tmp_path)
     with duckdb.connect(str(database), read_only=True) as connection:
         source = selection_module._load_source(connection, result_id)
+        initial_balance = windows_module._load_initial_balance(connection, result_id)
     windows = _selection_windows(report_start, report_end, SelectionConfig(ab_final_days=5))
-    expected = tuple(_calculate(result_id, start, end, METRICS_VERSION, *source) for start, end in windows)
+    expected = tuple(
+        _calculate(result_id, start, end, METRICS_VERSION, *source, initial_balance=initial_balance)
+        for start, end in windows
+    )
     cached = tuple(metric if index in {1, 4} else None for index, metric in enumerate(expected))
     original_calculate = selection_module._calculate
     original_flat = windows_module._flat_samples
@@ -1237,16 +1245,20 @@ def test_selection_window_job_calculates_only_missing_windows_with_one_flat_time
 
     assert result.metrics == expected
     assert len(calculated) == len(windows) - 2 == 5
-    assert len(flat_values) == 1
-    assert all(flat is flat_values[0] and ordered is True for _args, flat, ordered in calculated)
+    assert flat_values == []
+    assert all(flat is None and ordered is True for _args, flat, ordered in calculated)
 
 
 def test_selection_window_job_fully_cached_does_no_source_or_flat_work(tmp_path: Path, monkeypatch) -> None:
     database, result_id, report_start, report_end = _selection_job_inputs(tmp_path)
     with duckdb.connect(str(database), read_only=True) as connection:
         source = selection_module._load_source(connection, result_id)
+        initial_balance = windows_module._load_initial_balance(connection, result_id)
     windows = _selection_windows(report_start, report_end, SelectionConfig(ab_final_days=5))
-    cached = tuple(_calculate(result_id, start, end, METRICS_VERSION, *source) for start, end in windows)
+    cached = tuple(
+        _calculate(result_id, start, end, METRICS_VERSION, *source, initial_balance=initial_balance)
+        for start, end in windows
+    )
     monkeypatch.setattr(selection_module, "_cached_many", lambda *_args: cached)
     monkeypatch.setattr(selection_module, "_load_source", lambda *_args: pytest.fail("cached result loaded source"))
     monkeypatch.setattr(
@@ -1268,12 +1280,16 @@ def test_selection_window_job_all_out_of_range_prepares_at_most_one_flat_timelin
     database, result_id, report_start, report_end = _selection_job_inputs(tmp_path)
     with duckdb.connect(str(database), read_only=True) as connection:
         original_source = selection_module._load_source(connection, result_id)
+        initial_balance = windows_module._load_initial_balance(connection, result_id)
     equity = () if equity_index is None else (original_source[3][equity_index],)
     source = (*original_source[:3], equity)
     outside_start = report_start - timedelta(days=31)
     outside_end = report_start - timedelta(days=1)
     windows = _selection_windows(outside_start, outside_end, SelectionConfig(ab_final_days=5))
-    expected = tuple(_calculate(result_id, start, end, METRICS_VERSION, *source) for start, end in windows)
+    expected = tuple(
+        _calculate(result_id, start, end, METRICS_VERSION, *source, initial_balance=initial_balance)
+        for start, end in windows
+    )
     original_flat = windows_module._flat_samples
     load_calls = 0
     flat_calls = 0
@@ -1300,18 +1316,22 @@ def test_selection_window_job_all_out_of_range_prepares_at_most_one_flat_timelin
     assert flat_calls <= 1
 
 
-def test_selection_window_job_mixed_out_of_range_and_available_reuses_one_flat_tuple(
+def test_selection_window_job_mixed_out_of_range_and_available_skips_flat_tuple(
     tmp_path: Path, monkeypatch,
 ) -> None:
     database, result_id, report_start, report_end = _selection_job_inputs(tmp_path)
     with duckdb.connect(str(database), read_only=True) as connection:
         source = selection_module._load_source(connection, result_id)
+        initial_balance = windows_module._load_initial_balance(connection, result_id)
     windows = (
         (report_start - timedelta(days=2), report_start - timedelta(days=1)),
         (report_start, report_end),
         (report_end + timedelta(days=1), report_end + timedelta(days=2)),
     )
-    expected = tuple(_calculate(result_id, start, end, METRICS_VERSION, *source) for start, end in windows)
+    expected = tuple(
+        _calculate(result_id, start, end, METRICS_VERSION, *source, initial_balance=initial_balance)
+        for start, end in windows
+    )
     original_calculate = selection_module._calculate
     original_flat = windows_module._flat_samples
     flat_values: list[tuple[datetime, ...]] = []
@@ -1334,9 +1354,9 @@ def test_selection_window_job_mixed_out_of_range_and_available_reuses_one_flat_t
     result = selection_module._selection_window_job(str(database), result_id, report_start, report_end, 5)
 
     assert result.metrics == expected
-    assert len(flat_values) == 1
+    assert flat_values == []
     assert len(calculate_flat_values) == len(windows) == 3
-    assert all(value is flat_values[0] for value in calculate_flat_values)
+    assert all(value is None for value in calculate_flat_values)
     assert result.metrics[0].unavailable_reason == "OUT_OF_RANGE"
     assert result.metrics[1].availability_status == "AVAILABLE"
     assert result.metrics[2].unavailable_reason == "OUT_OF_RANGE"
@@ -2440,9 +2460,10 @@ def test_loader_derives_proxy_holding_and_order_plateau_counts(tmp_path: Path) -
     assert row["ab_pnl_change_30d_pct"] is None
     assert row["trades_30d"] == Decimal("1")
     assert row["total_pnl_pct"] == Decimal("10")
-    assert row["positive_quarter_status"] == "UNAVAILABLE"
-    assert pd.isna(row["positive_quarter_count"])
-    assert pd.isna(row["positive_quarter_available_count"])
+    # Consistency requires two positive windows even when only one is available.
+    assert row["positive_quarter_status"] == "FAIL"
+    assert row["positive_quarter_count"] == 1
+    assert row["positive_quarter_available_count"] == 1
     assert row["best_trade_profit_share_pct"] == 100
     assert row["pnl_without_best_trade"] == 0
     assert row["pnl_without_best_trade_pct"] == 0

@@ -12,7 +12,7 @@ from mrs3.performance_v2_store import initialize_performance_v2
 from mrs3.performance_v2_windows import (
     METRICS_VERSION,
     _Action,
-    _calculate,
+    _calculate as _engine_calculate,
     _Equity,
     _round_trips,
     _persist,
@@ -24,6 +24,13 @@ from mrs3.performance_v2_windows import (
 )
 
 UTC = timezone.utc
+
+
+def _calculate(*args, **kwargs):
+    # Historical synthetic fixtures intentionally exercise the old helper path.
+    if "initial_balance" not in kwargs:
+        kwargs.setdefault("legacy_equity_boundaries", True)
+    return _engine_calculate(*args, **kwargs)
 
 
 def _typed_source() -> tuple[datetime, datetime, tuple[_Action, ...], tuple[_Equity, ...]]:
@@ -599,8 +606,8 @@ def test_boundaries_move_inward_independently_and_never_expand(tmp_path) -> None
             datetime(2026, 1, 5, tzinfo=UTC),
         )
         assert window.availability_status == "AVAILABLE"
-        assert window.effective_start_utc == datetime(2026, 1, 3, tzinfo=UTC)
-        assert window.effective_end_utc == datetime(2026, 1, 5, tzinfo=UTC)
+        assert window.effective_start_utc == datetime(2026, 1, 1, tzinfo=UTC)
+        assert window.effective_end_utc == datetime(2026, 1, 4, 12, tzinfo=UTC)
 
         clipped = get_or_calculate_window(
             connection,
@@ -608,8 +615,8 @@ def test_boundaries_move_inward_independently_and_never_expand(tmp_path) -> None
             datetime(2026, 1, 1, 12, tzinfo=UTC),
             datetime(2026, 1, 3, 12, tzinfo=UTC),
         )
-        assert clipped.effective_start_utc == datetime(2026, 1, 3, tzinfo=UTC)
-        assert clipped.effective_end_utc == datetime(2026, 1, 3, tzinfo=UTC)
+        assert clipped.availability_status == "UNAVAILABLE"
+        assert clipped.unavailable_reason == "NO_TRADES"
     finally:
         connection.close()
 
@@ -631,7 +638,8 @@ def test_overlapping_nested_and_disjoint_pair_is_independently_cached(tmp_path) 
             ("2026-01-01T00:00:00Z", "2026-01-05T00:00:00Z"),
             ("2026-01-02T00:00:00Z", "2026-01-03T00:00:00Z"),
         )
-        assert nested[0].effective_start_utc <= nested[1].effective_start_utc
+        assert nested[0].availability_status == "AVAILABLE"
+        assert nested[1].unavailable_reason == "NO_TRADES"
         disjoint = get_or_calculate_window_pair(
             connection,
             result_id,
@@ -639,7 +647,7 @@ def test_overlapping_nested_and_disjoint_pair_is_independently_cached(tmp_path) 
             ("2026-01-04T00:00:00Z", "2026-01-05T00:00:00Z"),
         )
         assert disjoint[0].availability_status == "UNAVAILABLE"
-        assert disjoint[1].availability_status == "UNAVAILABLE"
+        assert disjoint[1].availability_status == "AVAILABLE"
     finally:
         connection.close()
 
@@ -680,8 +688,8 @@ def test_equity_quality_source_read_is_bounded_and_keeps_exact_source_counts(tmp
     ("start", "end", "reason"),
     [
         ("2025-01-01T00:00:00Z", "2025-01-02T00:00:00Z", "OUT_OF_RANGE"),
-        ("2026-01-01T00:00:00Z", "2026-01-02T06:00:00Z", "NO_FLAT_END"),
-        ("2026-01-03T00:00:00Z", "2026-01-03T00:00:00Z", "COLLAPSED"),
+        ("2026-01-01T00:00:00Z", "2026-01-02T06:00:00Z", "NO_TRADES"),
+        ("2026-01-03T00:00:00Z", "2026-01-03T00:00:00Z", "NO_TRADES"),
     ],
 )
 def test_unavailable_outcomes_are_cacheable(tmp_path, start, end, reason) -> None:
@@ -716,7 +724,7 @@ def test_no_flat_start_is_typed_and_four_timestamp_pair_form_is_supported(tmp_pa
     try:
         connection.execute("update strategy_actions set post_size = 1 where result_id = ?", [result_id])
         unavailable = get_or_calculate_window(connection, result_id, "2026-01-01", "2026-01-05")
-        assert unavailable.unavailable_reason == "NO_FLAT_START"
+        assert unavailable.unavailable_reason == "NO_TRADES"
         pair = get_or_calculate_window_pair(
             connection,
             result_id,
@@ -725,7 +733,7 @@ def test_no_flat_start_is_typed_and_four_timestamp_pair_form_is_supported(tmp_pa
             "2026-01-01",
             "2026-01-05",
         )
-        assert pair[0].unavailable_reason == pair[1].unavailable_reason == "NO_FLAT_START"
+        assert pair[0].unavailable_reason == pair[1].unavailable_reason == "NO_TRADES"
     finally:
         connection.close()
 
@@ -738,7 +746,7 @@ def test_upnl_metrics_are_scale_invariant_and_partial_fills_form_round_trips(tmp
         cached = get_or_calculate_window(first_connection, first_id, "2026-01-01", "2026-01-05")
         second = get_or_calculate_window(second_connection, second_id, "2026-01-01", "2026-01-05")
         assert first == cached
-        assert first.trade_count == second.trade_count == 1
+        assert first.trade_count == second.trade_count == 2
         assert first.growth_factor == second.growth_factor
         assert first.return_pct == second.return_pct
         assert first.max_drawdown_pct == second.max_drawdown_pct
@@ -754,10 +762,10 @@ def test_upnl_metrics_are_scale_invariant_and_partial_fills_form_round_trips(tmp
 @pytest.mark.parametrize(
     ("window_a", "window_b", "expected_flat"),
     [
-        (("2026-01-01", "2026-01-05"), ("2026-01-02", "2026-01-05"), 2),
+        (("2026-01-01", "2026-01-05"), ("2026-01-02", "2026-01-05"), 0),
         (("2026-01-06", "2026-01-07"), ("2026-01-08", "2026-01-09"), 0),
-        (("2026-01-01", "2026-01-05"), ("2026-01-06", "2026-01-07"), 1),
-        (("2026-01-06", "2026-01-07"), ("2026-01-01", "2026-01-05"), 1),
+        (("2026-01-01", "2026-01-05"), ("2026-01-06", "2026-01-07"), 0),
+        (("2026-01-06", "2026-01-07"), ("2026-01-01", "2026-01-05"), 0),
     ],
 )
 def test_pair_distinct_cold_windows_reuse_source_without_changing_calculation_work(
@@ -932,14 +940,14 @@ def test_pair_source_reuse_is_limited_to_one_public_call(tmp_path, monkeypatch) 
         assert all(row[0] is not None for row in calculated_at_rows(candidate_connection, candidate_result_id))
         assert {key: counts[key] - before_second[key] for key in counts} == {
             "source": 1,
-            "flat": 2,
+            "flat": 0,
             "calculate": 2,
             "persist": 2,
             "cached": 4,
         }
         assert counts["source"] == 2
         assert all(
-            second.growth_factor != first.growth_factor and second.fees_pct != first.fees_pct
+            second.growth_factor == first.growth_factor and second.fees_pct != first.fees_pct
             for first, second in zip(candidate_first, candidate_second)
         )
     finally:
@@ -1029,14 +1037,14 @@ def test_pair_cache_matrix_keeps_scalar_work_independent(tmp_path, monkeypatch, 
     try:
         if cache_case == "duplicate_cold":
             observed = get_or_calculate_window_pair(connection, result_id, window_a, window_a)
-            expected = {"source": 1, "flat": 1, "calculate": 1, "persist": 1, "cached": 3}
+            expected = {"source": 1, "flat": 0, "calculate": 1, "persist": 1, "cached": 3}
             assert observed[0] == observed[1]
             assert connection.execute("select count(*) from window_metrics").fetchone() == (1,)
         else:
             observed = get_or_calculate_window_pair(connection, result_id, window_a, window_b)
             expected = {
-                "a_cached": {"source": 1, "flat": 1, "calculate": 1, "persist": 1, "cached": 3},
-                "b_cached": {"source": 1, "flat": 1, "calculate": 1, "persist": 1, "cached": 3},
+                "a_cached": {"source": 1, "flat": 0, "calculate": 1, "persist": 1, "cached": 3},
+                "b_cached": {"source": 1, "flat": 0, "calculate": 1, "persist": 1, "cached": 3},
                 "both_cached": {"source": 0, "flat": 0, "calculate": 0, "persist": 0, "cached": 2},
             }[cache_case]
             assert observed[0].availability_status == observed[1].availability_status == "AVAILABLE"
@@ -1088,11 +1096,173 @@ def test_flat_start_boundary_close_is_excluded_from_window_facts(tmp_path) -> No
     connection, result_id = _db(tmp_path)
     try:
         window = get_or_calculate_window(connection, result_id, "2026-01-01", "2026-01-05")
-        assert window.effective_start_utc == datetime(2026, 1, 3, tzinfo=UTC)
-        assert window.trade_count == 1
-        assert window.holding_seconds == Decimal("43200.000000000000")
+        assert window.effective_start_utc == datetime(2026, 1, 1, tzinfo=UTC)
+        assert window.trade_count == 2
+        assert window.holding_seconds == Decimal("216000.000000000000")
     finally:
         connection.close()
+
+
+def test_full_window_uses_initial_and_close_balances_for_pnl_boundaries(tmp_path) -> None:
+    connection, result_id = _db(tmp_path)
+    try:
+        window = get_or_calculate_window(connection, result_id, "2026-01-01", "2026-01-05")
+
+        assert window.availability_status == "AVAILABLE"
+        assert window.effective_start_utc == datetime(2026, 1, 1, tzinfo=UTC)
+        assert window.effective_end_utc == datetime(2026, 1, 4, 12, tzinfo=UTC)
+        assert window.return_pct == Decimal("12.00")
+        assert window.trade_count == 2
+        assert window.fees_pct == Decimal("4.2")
+    finally:
+        connection.close()
+
+
+def test_window_uses_pre_start_close_balance_and_excludes_spanning_trade(tmp_path) -> None:
+    connection, result_id = _db(tmp_path)
+    try:
+        flat = get_or_calculate_window(connection, result_id, "2026-01-03T12:00:00Z", "2026-01-05")
+        spanning = get_or_calculate_window(connection, result_id, "2026-01-02", "2026-01-05")
+
+        assert flat.effective_start_utc == datetime(2026, 1, 3, 12, tzinfo=UTC)
+        assert flat.effective_end_utc == datetime(2026, 1, 4, 12, tzinfo=UTC)
+        assert flat.return_pct == Decimal("1.818181818182")
+        assert flat.trade_count == 1
+        assert spanning.effective_start_utc == datetime(2026, 1, 3, tzinfo=UTC)
+        assert spanning.return_pct == flat.return_pct
+        assert spanning.trade_count == 1
+    finally:
+        connection.close()
+
+
+def test_exact_start_end_close_ties_and_missing_balance_fail_closed() -> None:
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    end = start + timedelta(days=1)
+    actions = (
+        _Action(0, start, "opened", Decimal("1"), Decimal("0"), Decimal("0"), Decimal("100")),
+        _Action(1, end, "closed", Decimal("0"), Decimal("2"), Decimal("0"), Decimal("102")),
+    )
+    equity = (_Equity(0, start, Decimal("100"), Decimal("100")), _Equity(1, end, Decimal("102"), Decimal("102")))
+    exact = _calculate(1, start, end, METRICS_VERSION, start, end, actions, equity, initial_balance=Decimal("100"))
+    missing = _calculate(
+        1, start, end, METRICS_VERSION, start, end,
+        (actions[0], replace(actions[1], balance=None)), equity, initial_balance=Decimal("100"),
+    )
+
+    assert exact.availability_status == "AVAILABLE"
+    assert exact.effective_start_utc == start
+    assert exact.effective_end_utc == end
+    assert exact.return_pct == Decimal("2")
+    assert exact.trade_count == 1
+    assert missing.unavailable_reason == "MISSING_BALANCE"
+
+
+def test_no_observed_equity_and_nonpositive_anchor_keep_dd_nullable(tmp_path) -> None:
+    connection, result_id = _db(tmp_path)
+    try:
+        connection.execute("delete from strategy_equity where result_id = ?", [result_id])
+        no_equity = get_or_calculate_window(connection, result_id, "2026-01-01", "2026-01-05")
+        connection.execute("update strategy_results set initial_balance = 0 where result_id = ?", [result_id])
+        zero_anchor = get_or_calculate_window(
+            connection, result_id, "2026-01-01", "2026-01-05", calculator_version="test-zero-anchor"
+        )
+
+        assert no_equity.availability_status == "AVAILABLE"
+        assert no_equity.max_drawdown_pct is None
+        assert zero_anchor.availability_status == "UNAVAILABLE"
+        assert zero_anchor.unavailable_reason == "MISSING_BALANCE"
+        assert zero_anchor.max_drawdown_pct is None
+        assert zero_anchor.return_pct is None
+    finally:
+        connection.close()
+
+
+def test_current_metrics_version_ignores_old_cache_rows(tmp_path) -> None:
+    connection, result_id = _db(tmp_path)
+    try:
+        old = get_or_calculate_window(
+            connection, result_id, "2026-01-01", "2026-01-05", calculator_version="performance-window-v2.2"
+        )
+        current = get_or_calculate_window(connection, result_id, "2026-01-01", "2026-01-05")
+
+        assert old.metrics_version == "performance-window-v2.2"
+        assert current.metrics_version == METRICS_VERSION == "performance-window-v2.3"
+        assert connection.execute("select count(*) from window_metrics").fetchone() == (2,)
+    finally:
+        connection.close()
+
+
+def test_missing_balances_never_select_legacy_mode_implicitly() -> None:
+    start, end, actions, equity = _typed_source()
+    result = _engine_calculate(1, start, end, METRICS_VERSION, start, end, actions, equity)
+    assert result.unavailable_reason == "MISSING_BALANCE"
+
+
+def test_exact_start_close_collapsed_result_round_trips_cache(tmp_path) -> None:
+    connection, result_id = _db(tmp_path)
+    try:
+        connection.execute("delete from strategy_actions where result_id = ? and action_index not in (0, 3)", [result_id])
+        connection.execute(
+            "update strategy_actions set timestamp_utc = ? where result_id = ? and action_index = 3",
+            [datetime(2026, 1, 1, tzinfo=UTC), result_id],
+        )
+        first = get_or_calculate_window(connection, result_id, "2026-01-01", "2026-01-01")
+        second = get_or_calculate_window(connection, result_id, "2026-01-01", "2026-01-01")
+        assert first == second
+        assert first.unavailable_reason == "COLLAPSED"
+    finally:
+        connection.close()
+
+
+def test_missing_selected_close_balance_round_trips_cache(tmp_path, monkeypatch) -> None:
+    connection, result_id = _db(tmp_path)
+    try:
+        source = windows_module._load_source(connection, result_id)
+        actions = tuple(replace(item, balance=None) if item.index == 5 else item for item in source[2])
+        monkeypatch.setattr(windows_module, "_load_source", lambda *_args: (*source[:2], actions, source[3]))
+        first = get_or_calculate_window(connection, result_id, "2026-01-01", "2026-01-05")
+        second = get_or_calculate_window(connection, result_id, "2026-01-01", "2026-01-05")
+        assert first == second
+        assert first.unavailable_reason == "MISSING_BALANCE"
+    finally:
+        connection.close()
+
+
+def test_warmup_trimmed_raw_balances_rebase_to_stored_initial_capital() -> None:
+    start = datetime(2026, 1, 6, tzinfo=UTC)  # listing plus five days
+    opened = start + timedelta(days=1)
+    closed = start + timedelta(days=2)
+    actions = (
+        _Action(6, opened, "opened", Decimal("1"), Decimal(0), Decimal("0.1"), Decimal("94.9")),
+        _Action(7, closed, "closed", Decimal(0), Decimal("10"), Decimal(0), Decimal("104.9")),
+    )
+    equity = (
+        _Equity(0, opened + timedelta(hours=1), Decimal("94.9"), Decimal("85")),
+        _Equity(1, closed, Decimal("104.9"), Decimal("104.9")),
+    )
+    window = _engine_calculate(
+        1, start, closed, METRICS_VERSION, start, closed,
+        actions, equity, initial_balance=Decimal("100"),
+    )
+    assert window.availability_status == "AVAILABLE"
+    assert window.return_pct == Decimal("9.9")
+    assert window.max_drawdown_pct == Decimal("10")
+    assert window.trade_count == 1
+
+
+def test_full_decrease_to_zero_is_a_completed_trade() -> None:
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    end = start + timedelta(days=1)
+    actions = (
+        _Action(0, start, "opened", Decimal(1), Decimal(0), Decimal(0), Decimal(100)),
+        _Action(1, end, "decreased", Decimal(0), Decimal(5), Decimal(0), Decimal(105)),
+    )
+    window = _engine_calculate(
+        1, start, end, METRICS_VERSION, start, end,
+        actions, (), initial_balance=Decimal(100),
+    )
+    assert window.return_pct == Decimal(5)
+    assert window.trade_count == 1
 
 
 def test_partial_close_then_increase_stays_one_position_episode() -> None:

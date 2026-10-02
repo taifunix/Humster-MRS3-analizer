@@ -14,7 +14,7 @@ import duckdb
 from .performance_v2_equity_quality import EquitySample
 
 
-METRICS_VERSION = "performance-window-v2.2"
+METRICS_VERSION = "performance-window-v2.3"
 _TIMESTAMP = attrgetter("timestamp")
 
 
@@ -132,6 +132,7 @@ class _Action:
     post_size: Decimal
     pnl: Decimal
     fee: Decimal
+    balance: Decimal | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -265,9 +266,13 @@ def _load_source(
     report_start, report_end = _utc(result[0]), _utc(result[1])
     # Selection's ordered boundary search relies on both timestamp/index orders.
     actions = tuple(
-        _Action(int(row[0]), _utc(row[1]), str(row[2]).casefold(), _decimal(row[3], "post_size"), _decimal(row[4], "pnl"), _decimal(row[5], "fee"))
+        _Action(
+            int(row[0]), _utc(row[1]), str(row[2]).casefold(), _decimal(row[3], "post_size"),
+            _decimal(row[4], "pnl"), _decimal(row[5], "fee"),
+            None if row[6] is None else _decimal(row[6], "balance"),
+        )
         for row in connection.execute(
-            "select action_index, timestamp_utc, action, post_size, pnl, fee "
+            "select action_index, timestamp_utc, action, post_size, pnl, fee, balance "
             "from strategy_actions where result_id = ? order by timestamp_utc, action_index",
             [result_id],
         ).fetchall()
@@ -281,6 +286,15 @@ def _load_source(
         ).fetchall()
     )
     return report_start, report_end, actions, equity
+
+
+def _load_initial_balance(connection: duckdb.DuckDBPyConnection, result_id: int) -> Decimal | None:
+    row = connection.execute(
+        "select initial_balance from strategy_results where result_id = ?", [result_id]
+    ).fetchone()
+    if row is None or row[0] is None:
+        return None
+    return _decimal(row[0], "initial_balance")
 
 
 def _load_equity_samples_for_quality(
@@ -362,7 +376,9 @@ def _flat_samples(equity: tuple[_Equity, ...], actions: tuple[_Action, ...]) -> 
     return tuple(flat)
 
 
-def _round_trips(actions: tuple[_Action, ...]) -> tuple[_RoundTrip, ...]:
+def _round_trips(
+    actions: tuple[_Action, ...], *, full_close_only: bool = False,
+) -> tuple[_RoundTrip, ...]:
     trips: list[_RoundTrip] = []
     current: _RoundTrip | None = None
     for action in actions:
@@ -374,7 +390,8 @@ def _round_trips(actions: tuple[_Action, ...]) -> tuple[_RoundTrip, ...]:
             if current is None:
                 current = _RoundTrip([], [])
             current.realisations.append(action)
-        if current is not None and action.post_size == 0:
+        is_full_close = action.kind in {"closed", "decreased"} and action.post_size == 0
+        if current is not None and (is_full_close or (not full_close_only and action.post_size == 0)):
             if current.realisations:
                 trips.append(current)
             current = None
@@ -395,9 +412,149 @@ def _calculate(
     *,
     flat_samples: tuple[datetime, ...] | None = None,
     ordered_source: bool = False,
+    initial_balance: Decimal | None = None,
+    legacy_equity_boundaries: bool = False,
 ) -> WindowMetrics:
-    if end < report_start or start > report_end or end < start or not equity:
+    if end < report_start or start > report_end or end < start:
         return WindowMetrics.unavailable(result_id, start, end, "OUT_OF_RANGE", version)
+
+    # Legacy equity boundaries are explicit for historical synthetic fixtures;
+    # production callers cannot silently stamp old semantics as v2.3.
+    close_balance_mode = initial_balance is not None or any(item.balance is not None for item in actions)
+    if not close_balance_mode and not legacy_equity_boundaries:
+        return WindowMetrics.unavailable(result_id, start, end, "MISSING_BALANCE", version)
+    if close_balance_mode:
+        window_start = max(start, report_start)
+        window_end = min(end, report_end)
+        ordered_actions = actions if ordered_source else tuple(sorted(actions, key=lambda item: (item.timestamp, item.index)))
+        ordered_equity = equity if ordered_source else tuple(sorted(equity, key=lambda item: (item.timestamp, item.index)))
+        balance_offset = Decimal(0)
+        if ordered_actions and ordered_actions[0].index > 0:
+            first = ordered_actions[0]
+            if initial_balance is None or first.kind != "opened" or first.pnl != 0 or first.balance is None:
+                return WindowMetrics.unavailable(result_id, start, end, "MISSING_BALANCE", version)
+            # Import retains source action ordinals and raw Balances after
+            # excluding pre-listing/warm-up trades. Rebase the observed path
+            # to the stored initial capital without changing its increments.
+            balance_offset = initial_balance - (first.balance + first.fee)
+        full_closes = tuple(
+            item for item in ordered_actions
+            if item.kind in {"closed", "decreased"} and item.post_size == 0
+        )
+        prior = tuple(item for item in ordered_actions if item.timestamp < window_start)
+        flat_before_start = not prior or prior[-1].post_size == 0
+        baseline_time = window_start
+        baseline_key = (window_start, -1)
+        if flat_before_start:
+            previous_close = next(
+                (item for item in reversed(full_closes) if item.timestamp < window_start), None
+            )
+            if previous_close is None:
+                baseline_balance = initial_balance
+            elif previous_close.balance is None:
+                baseline_balance = None
+            else:
+                baseline_balance = previous_close.balance + balance_offset
+            if baseline_balance is None or baseline_balance <= 0:
+                return WindowMetrics.unavailable(result_id, start, end, "MISSING_BALANCE", version)
+            candidates = tuple(item for item in full_closes if item.timestamp >= window_start and item.timestamp <= window_end)
+        else:
+            spanning_close = next(
+                (item for item in full_closes if window_start <= item.timestamp <= window_end), None
+            )
+            if spanning_close is None:
+                return WindowMetrics.unavailable(result_id, start, end, "NO_FLAT_START", version)
+            baseline_time = spanning_close.timestamp
+            baseline_key = (spanning_close.timestamp, spanning_close.index)
+            baseline_balance = spanning_close.balance + balance_offset if spanning_close.balance is not None else None
+            if baseline_balance is None or baseline_balance <= 0:
+                return WindowMetrics.unavailable(result_id, start, end, "MISSING_BALANCE", version)
+            candidates = tuple(
+                item for item in full_closes
+                if (item.timestamp, item.index) > baseline_key and item.timestamp <= window_end
+            )
+        if not candidates:
+            return WindowMetrics.unavailable(result_id, start, end, "NO_TRADES", version)
+        endpoint = candidates[-1]
+        endpoint_balance = endpoint.balance + balance_offset if endpoint.balance is not None else None
+        if endpoint_balance is None:
+            return WindowMetrics.unavailable(result_id, start, end, "MISSING_BALANCE", version)
+        effective_end = endpoint.timestamp
+        if baseline_time >= effective_end:
+            return WindowMetrics(
+                result_id, start, end, version, baseline_time, effective_end, "UNAVAILABLE", "COLLAPSED",
+                None, None, None, None, None, None, None, None, None, None,
+            )
+        if flat_before_start:
+            scoped_actions = tuple(
+                item for item in ordered_actions
+                if item.timestamp >= window_start and (item.timestamp, item.index) <= (endpoint.timestamp, endpoint.index)
+            )
+        else:
+            scoped_actions = tuple(
+                item for item in ordered_actions
+                if (item.timestamp, item.index) > baseline_key
+                and (item.timestamp, item.index) <= (endpoint.timestamp, endpoint.index)
+            )
+        trips = tuple(
+            trip for trip in _round_trips(scoped_actions, full_close_only=True)
+            if trip.entries and trip.realisations
+        )
+        if not trips:
+            return WindowMetrics.unavailable(result_id, start, end, "NO_TRADES", version)
+
+        baseline = baseline_balance
+        final = endpoint_balance
+        if baseline == 0:
+            growth = return_pct = daily_log = daily_growth = return_dd = fees_pct = None
+        else:
+            growth = final / baseline
+            return_pct = (growth - 1) * 100
+            days = Decimal(str((effective_end - baseline_time).total_seconds())) / Decimal("86400")
+            daily_log = growth.ln() / days if growth > 0 and days > 0 else None
+            daily_growth = (daily_log.exp() - 1) * 100 if daily_log is not None else None
+            included_indices = {item.index for trip in trips for item in (*trip.entries, *trip.realisations)}
+            fees_pct = sum((item.fee for item in scoped_actions if item.index in included_indices), Decimal(0)) / baseline * 100
+            return_dd = None
+
+        observed = tuple(
+            item for item in ordered_equity
+            if baseline_time < item.timestamp <= effective_end
+        )
+        max_drawdown_pct: Decimal | None = None
+        if baseline > 0 and observed:
+            peak = baseline
+            max_drawdown_pct = Decimal(0)
+            for sample in observed:
+                equity_value = sample.equity + balance_offset
+                peak = max(peak, equity_value)
+                if peak > 0:
+                    max_drawdown_pct = max(max_drawdown_pct, (peak - equity_value) / peak * 100)
+            if max_drawdown_pct != 0 and return_pct is not None:
+                return_dd = return_pct / max_drawdown_pct
+
+        realising = tuple(item for trip in trips for item in trip.realisations)
+        gross_profit = sum((item.pnl for item in realising if item.pnl > 0), Decimal(0))
+        gross_loss = -sum((item.pnl for item in realising if item.pnl < 0), Decimal(0))
+        profit_factor = gross_profit / gross_loss if gross_loss else None
+        wins = sum(sum((item.pnl for item in trip.realisations), Decimal(0)) > 0 for trip in trips)
+        losses = sum(sum((item.pnl for item in trip.realisations), Decimal(0)) < 0 for trip in trips)
+        win_rate = Decimal(wins) / Decimal(wins + losses) * 100 if wins + losses else None
+        holding = sum(
+            (trip.realisations[-1].timestamp - trip.entries[0].timestamp).total_seconds()
+            for trip in trips
+        )
+        duration = Decimal(str((effective_end - baseline_time).total_seconds()))
+        holding_seconds = Decimal(str(max(holding, 0)))
+        time_in_market = holding_seconds / duration * 100 if duration > 0 else None
+        return WindowMetrics(
+            result_id, start, end, version, baseline_time, effective_end, "AVAILABLE", None,
+            growth, return_pct, daily_log, daily_growth, max_drawdown_pct, return_dd,
+            fees_pct, profit_factor, len(trips), win_rate, holding_seconds, time_in_market,
+        )
+
+    if not equity:
+        return WindowMetrics.unavailable(result_id, start, end, "NO_EQUITY", version)
     flat = _flat_samples(equity, actions) if flat_samples is None else flat_samples
     if ordered_source:
         start_index = bisect_left(flat, start)
@@ -573,7 +730,11 @@ def _get_or_calculate_window(
             source_holder.append(source)
     else:
         source = source_holder[0]
-    metrics = _calculate(result_id, start, end, version, *source)
+    initial_balance = _load_initial_balance(connection, result_id)
+    metrics = _calculate(
+        result_id, start, end, version, *source,
+        initial_balance=initial_balance, ordered_source=True,
+    )
     _persist(connection, metrics)
     persisted = _cached(connection, result_id, start, end, version)
     return metrics if persisted is None else persisted
