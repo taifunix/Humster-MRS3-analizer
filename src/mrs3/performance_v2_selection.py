@@ -163,6 +163,13 @@ class SelectionConfig:
     researched_dd5_rel: Decimal = Decimal("0.25")
     researched_dd_abs: Decimal = Decimal("1")
     researched_dd_rel: Decimal = Decimal("0.25")
+    researched_stage3_near_b_abs: Decimal = Decimal("1.5")
+    researched_stage3_near_b_rel: Decimal = Decimal("0.10")
+    researched_stage3_near_dd5_abs: Decimal = Decimal("3")
+    researched_stage3_near_dd5_rel: Decimal = Decimal("0.25")
+    researched_stage3_near_dd_abs: Decimal = Decimal("0.75")
+    researched_stage3_near_dd_rel: Decimal = Decimal("0.10")
+    researched_stage3_near_points_ratio: Decimal = Decimal("0.20")
     researched_points_mean_ratio: Decimal = Decimal("0.40")
     researched_points_same_floor_ratio: Decimal = Decimal("0.40")
     researched_points_cross_floor_ratio: Decimal = Decimal("0.30")
@@ -435,6 +442,13 @@ def load_selection_config(path: Path) -> SelectionConfig:
         researched_dd5_rel=ratio("researched_dd5_rel", "0.25"),
         researched_dd_abs=positive("researched_dd_abs", "1"),
         researched_dd_rel=ratio("researched_dd_rel", "0.25"),
+        researched_stage3_near_b_abs=positive("researched_stage3_near_b_abs", "1.5"),
+        researched_stage3_near_b_rel=ratio("researched_stage3_near_b_rel", "0.10"),
+        researched_stage3_near_dd5_abs=positive("researched_stage3_near_dd5_abs", "3"),
+        researched_stage3_near_dd5_rel=ratio("researched_stage3_near_dd5_rel", "0.25"),
+        researched_stage3_near_dd_abs=positive("researched_stage3_near_dd_abs", "0.75"),
+        researched_stage3_near_dd_rel=ratio("researched_stage3_near_dd_rel", "0.10"),
+        researched_stage3_near_points_ratio=ratio("researched_stage3_near_points_ratio", "0.20"),
         researched_points_mean_ratio=ratio("researched_points_mean_ratio", "0.40"),
         researched_points_same_floor_ratio=ratio("researched_points_same_floor_ratio", "0.40"),
         researched_points_cross_floor_ratio=ratio("researched_points_cross_floor_ratio", "0.30"),
@@ -2232,9 +2246,29 @@ def _research_stage3(rows: list[_ResearchRow], config: SelectionConfig) -> dict[
             trials = []
             protections_seen: list[str] = []
             for candidate in retained:
-                if candidate.b is None or candidate.dd5 is None or candidate.dd is None or candidate.b < lower.b or candidate.dd5 < lower.dd5 or candidate.dd > lower.dd:
+                if candidate.b is None or candidate.dd5 is None or candidate.dd is None or candidate.b < lower.b:
+                    continue
+                near_duplicate = (
+                    candidate.group[2] != lower.group[2]
+                    and candidate.group[3] == lower.group[3]
+                    and candidate.shift is not None and candidate.shift == lower.shift
+                    and bool(candidate.points) and len(candidate.points) == len(lower.points)
+                    and all(point >= 0 for point in (*candidate.points, *lower.points))
+                    and all(
+                        abs(candidate_point - lower_point)
+                        <= config.researched_stage3_near_points_ratio * max(candidate_point, lower_point)
+                        for candidate_point, lower_point in zip(candidate.points, lower.points)
+                    )
+                    and candidate.b - lower.b > max(config.researched_stage3_near_b_abs, config.researched_stage3_near_b_rel * abs(lower.b))
+                    and candidate.dd5 - lower.dd5 > max(config.researched_stage3_near_dd5_abs, config.researched_stage3_near_dd5_rel * abs(lower.dd5))
+                    and candidate.dd - lower.dd <= min(config.researched_stage3_near_dd_abs, config.researched_stage3_near_dd_rel * lower.dd)
+                )
+                if not near_duplicate and (candidate.dd5 < lower.dd5 or candidate.dd > lower.dd):
                     continue
                 wins = [name for name, old, new, absolute, relative, higher in (("B", lower.b, candidate.b, config.researched_b_abs, config.researched_b_rel, True), ("DD5", lower.dd5, candidate.dd5, config.researched_dd5_abs, config.researched_dd5_rel, True), ("DD", lower.dd, candidate.dd, config.researched_dd_abs, config.researched_dd_rel, False)) if (new - old if higher else old - new) > _research_threshold(old, new, absolute, relative)]
+                near_reason = len(wins) < 2 and near_duplicate
+                if near_reason:
+                    wins = ["B", "DD5"]
                 if len(wins) < 2:
                     continue
                 points = _research_points_advantage(lower.points, candidate.points, config.researched_points_mean_ratio) and min(lower.points) >= config.researched_points_cross_floor_ratio * min(candidate.points)
@@ -2249,10 +2283,11 @@ def _research_stage3(rows: list[_ResearchRow], config: SelectionConfig) -> dict[
                 if protections:
                     protections_seen.extend(protections)
                     continue
-                trials.append((candidate, wins))
+                trials.append((candidate, wins, near_reason))
             if trials:
-                candidate, wins = max(trials, key=lambda pair: (len(pair[1]), -pair[0].dd, pair[0].dd5, pair[0].b, pair[0].group[3], -pair[0].id))
-                decisions[lower.id] = _ResearchDecision("DROP", ", ".join(wins), candidate.id)
+                candidate, wins, near_reason = max(trials, key=lambda pair: (len(pair[1]), -pair[0].dd, pair[0].dd5, pair[0].b, pair[0].group[3], -pair[0].id))
+                reason = ("NEAR:" if near_reason else "") + ", ".join(wins)
+                decisions[lower.id] = _ResearchDecision("DROP", reason, candidate.id)
             else:
                 reason_order = ("Points", "Hold-95", "Hold-M")
                 decisions[lower.id] = _ResearchDecision(

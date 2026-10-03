@@ -30,6 +30,13 @@ RESEARCHED_DEFAULTS = {
     "researched_dd5_rel": "0.25",
     "researched_dd_abs": "1",
     "researched_dd_rel": "0.25",
+    "researched_stage3_near_b_abs": "1.5",
+    "researched_stage3_near_b_rel": "0.10",
+    "researched_stage3_near_dd5_abs": "3",
+    "researched_stage3_near_dd5_rel": "0.25",
+    "researched_stage3_near_dd_abs": "0.75",
+    "researched_stage3_near_dd_rel": "0.10",
+    "researched_stage3_near_points_ratio": "0.20",
     "researched_points_mean_ratio": "0.40",
     "researched_points_same_floor_ratio": "0.40",
     "researched_points_cross_floor_ratio": "0.30",
@@ -361,6 +368,45 @@ def test_structural_stage3_requires_two_material_wins_and_keeps_ord4() -> None:
     result = run_selection(rows, request, SelectionConfig(lot_variant_redundancy_enabled=False)).set_index("strategy_id")
     assert bool(result.loc[1, "eliminated_by_pair_side_stage_3"])
     assert not bool(result.loc[4, "eliminated_by_pair_side_stage_3"])
+
+
+def test_stage3_removes_near_duplicate_across_timeframes_with_small_dd_loss() -> None:
+    request = _structural_request("pair_side_stage_3", "pair_side")
+    rows = pd.DataFrame([
+        {**_structural_row(17132, 40, b=Decimal("18.4491625611"), dd5=Decimal("18.5849113963"),
+                           dd=Decimal("6.651169967"), points=(5,), p95=1295, median=65),
+         "timeframe": "4h"},
+        {**_structural_row(17067, 40, b=Decimal("20.4170647305"), dd5=Decimal("23.6996158893"),
+                           dd=Decimal("7.248966503"), points=(5,), p95=1097, median=121),
+         "timeframe": "3h"},
+    ])
+    result = run_selection(rows, request, SelectionConfig(lot_variant_redundancy_enabled=False)).set_index("strategy_id")
+    assert bool(result.loc[17132, "eliminated_by_pair_side_stage_3"])
+    assert result.loc[17132, "auto_analog_of_strategy_id"] == 17067
+    assert result.loc[17132, "elimination_reason"] == "PAIR_SIDE_STAGE_3;NEAR:B, DD5"
+
+    too_much_dd = rows.copy()
+    too_much_dd.loc[too_much_dd.strategy_id == 17067, "max_drawdown_pct"] = Decimal("7.5")
+    result = run_selection(too_much_dd, request, SelectionConfig(lot_variant_redundancy_enabled=False)).set_index("strategy_id")
+    assert not bool(result.loc[17132, "eliminated_by_pair_side_stage_3"])
+
+    too_different_points = rows.copy()
+    too_different_points.loc[too_different_points.strategy_id == 17132, "order_1_plateau_point_count"] = 7
+    result = run_selection(too_different_points, request, SelectionConfig(lot_variant_redundancy_enabled=False)).set_index("strategy_id")
+    assert not bool(result.loc[17132, "eliminated_by_pair_side_stage_3"])
+
+    for invalid_points in (None, -5):
+        invalid = rows.copy()
+        invalid["order_1_plateau_point_count"] = invalid_points
+        result = run_selection(invalid, request, SelectionConfig(lot_variant_redundancy_enabled=False)).set_index("strategy_id")
+        assert not bool(result.loc[17132, "eliminated_by_pair_side_stage_3"])
+
+    mismatched = rows.copy()
+    mismatched["order_count"] = 2
+    mismatched["order_2_open_ma_len"] = 4
+    mismatched.loc[mismatched.strategy_id == 17132, "order_2_plateau_point_count"] = 5
+    result = run_selection(mismatched, request, SelectionConfig(lot_variant_redundancy_enabled=False)).set_index("strategy_id")
+    assert not bool(result.loc[17132, "eliminated_by_pair_side_stage_3"])
 
 
 def test_panel_xlsx_reuses_reason_and_analog_columns_for_researched_stages(tmp_path: Path) -> None:

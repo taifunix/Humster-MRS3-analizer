@@ -1,5 +1,18 @@
 # MRS3 — current verification
 
+## Performance v2 stage 9 near-duplicate tolerance (2026-10-03)
+
+Stage 9 now has a narrow cross-TF near-duplicate rule for equal ORD count and
+first Shift, with aligned Points within 20%, material B and DD5 gains and DD
+loss capped by both 0.75 percentage points and 10% of the current DD. The
+existing Points/Hold protections remain; the seven near-rule limits are
+editable in Performance v2 Settings. A read-only replay of the latest AALUSDT
+LONG snapshot changed stage-9 survivors from 21 to 20: only 17132 additionally
+drops, with analog 17067 and reason `PAIR_SIDE_STAGE_3;NEAR:B, DD5`. Focused
+selection tests: 228 passed; static UI: 153 passed; JavaScript syntax and
+scoped diff checks passed. Independent re-review returned `CODE_REVIEW_PASS`.
+Contract: `docs/specs/2026-10-02-performance-v2-researched-filters.md`.
+
 ## Performance v2 preview counters (2026-10-03)
 
 The selection catalog now chooses an available pair and side when the filter

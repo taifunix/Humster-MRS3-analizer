@@ -3385,7 +3385,7 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
       pair_side_pnl_upper_half: `Внутри пары и стороны независимо исключает DD5/30 ниже ${selectionConfigNumber(config, 'researched_pnl_dd5_ratio', .5)}× и B/30 ниже ${selectionConfigNumber(config, 'researched_pnl_b_ratio', .6)}× медианы верхней половины. Пропуски проходят.`,
       structural_stage_1: `Внутри ТФ и ORD ищет сохранённую замену с тем же или большим Shift; учитывает B/30, DD5/30, DD, средние Points и Open MA, Close MA и защиту Hold.`,
       structural_stage_2: `Внутри ТФ сравнивает 1–3ORD с конструкциями не младше по ORD и Shift; существенные преимущества и Hold защищают текущую стратегию.`,
-      pair_side_stage_3: `Внутри пары и стороны между ТФ исключает при существенном выигрыше замены по двум из B/30, DD5/30, DD без ухудшения третьего. Points и Hold защищают.`,
+      pair_side_stage_3: `Внутри пары и стороны между ТФ исключает при существенном выигрыше замены по двум из B/30, DD5/30, DD без ухудшения третьего. Для близких конструкций допускает небольшое ухудшение DD при выигрыше по B и DD5. Points и Hold защищают.`,
     };
     for (const [stageId, text] of Object.entries(help)) {
       const node = document.querySelector(`[data-selection-stage="${stageId}"] small`);
@@ -3849,6 +3849,13 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
     ['researched_dd5_rel', '7–9 · DD5, доля', 'Относительный порог от большего модуля.'],
     ['researched_dd_abs', '7–9 · DD, п.п.', 'Абсолютный порог существенной разницы.'],
     ['researched_dd_rel', '7–9 · DD, доля', 'Относительный порог от большего модуля.'],
+    ['researched_stage3_near_b_abs', '9 · близкие, B п.п.', 'Минимальный выигрыш по B/30.'],
+    ['researched_stage3_near_b_rel', '9 · близкие, B доля', 'Минимальный выигрыш по B относительно сравниваемой стратегии.'],
+    ['researched_stage3_near_dd5_abs', '9 · близкие, DD5', 'Минимальный выигрыш по DD5/30 в единицах колонки.'],
+    ['researched_stage3_near_dd5_rel', '9 · близкие, DD5 доля', 'Минимальный выигрыш по DD5 относительно сравниваемой стратегии.'],
+    ['researched_stage3_near_dd_abs', '9 · близкие, DD п.п.', 'Максимально допустимое ухудшение DD.'],
+    ['researched_stage3_near_dd_rel', '9 · близкие, DD доля', 'Максимально допустимое ухудшение DD относительно сравниваемой стратегии.'],
+    ['researched_stage3_near_points_ratio', '9 · близкие, Points доля', 'Максимальное различие числа точек каждого ордера.'],
     ['researched_points_mean_ratio', '7–9 · Points, доля среднего', 'Преимущество среднего числа точек.'],
     ['researched_points_same_floor_ratio', '7 · Points, минимум каждого', 'Доля точек замены в каждом ордере той же конструкции.'],
     ['researched_points_cross_floor_ratio', '8–9 · Points, минимум слабого', 'Доля точек слабейшего ордера замены.'],
