@@ -42,6 +42,35 @@ def _request(
     return response.status, json.loads(response.read().decode("utf-8"))
 
 
+def test_researched_selection_settings_save_is_validated_and_conflict_safe(panel_http) -> None:
+    root, _, connection = panel_http
+    path = root / "config.performance.json"
+    path.write_text(json.dumps({"unified_performance_v2": {"finalist_selection": {"untouched": 7}}}), encoding="utf-8")
+    endpoint = "/api/v2/strategies/performance-v2/selection-settings"
+    status, current = _request(connection, "GET", endpoint)
+    assert status == 200
+    assert current["settings"]["researched_pnl_dd5_ratio"] == "0.50"
+    before = path.read_bytes()
+    status, _ = _request(connection, "POST", endpoint, {"digest": current["digest"], "changes": {"researched_pnl_dd5_ratio": "NaN"}})
+    assert status == 400
+    assert path.read_bytes() == before
+    status, _ = _request(connection, "POST", endpoint, {"digest": current["digest"], "changes": {"database_root": "other"}})
+    assert status == 400
+    assert path.read_bytes() == before
+    status, _ = _request(connection, "POST", endpoint, {"digest": current["digest"], "changes": {"researched_pnl_dd5_ratio": 0.55}})
+    assert status == 400
+    assert path.read_bytes() == before
+    status, updated = _request(connection, "POST", endpoint, {"digest": current["digest"], "changes": {"researched_pnl_dd5_ratio": "0.55"}})
+    assert status == 200
+    assert updated["settings"]["researched_pnl_dd5_ratio"] == "0.55"
+    assert json.loads(path.read_text(encoding="utf-8"))["unified_performance_v2"]["finalist_selection"]["untouched"] == 7
+    assert json.loads(path.read_text(encoding="utf-8"))["unified_performance_v2"]["finalist_selection"]["researched_pnl_dd5_ratio"] == "0.55"
+    saved = path.read_bytes()
+    status, _ = _request(connection, "POST", endpoint, {"digest": current["digest"], "changes": {"researched_pnl_dd5_ratio": "0.60"}})
+    assert status == 409
+    assert path.read_bytes() == saved
+
+
 @pytest.fixture
 def panel_http(tmp_path: Path):
     config = tmp_path / "config.local.json"

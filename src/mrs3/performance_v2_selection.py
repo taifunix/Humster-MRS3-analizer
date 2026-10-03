@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP, localcontext
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from colorsys import hls_to_rgb
@@ -36,6 +36,10 @@ from .audit import write_audit_workbook
 StageScope = Literal["pair_side", "pair_side_timeframe"]
 
 _STAGE_IDS = frozenset((
+    "pair_side_pnl_upper_half",
+    "structural_stage_1",
+    "structural_stage_2",
+    "pair_side_stage_3",
     "filter_lot_variant_redundancy",
     "filter_holding_outlier",
     "filter_low_trades",
@@ -151,6 +155,23 @@ class SelectionConfig:
     best_trade_min_profitable_trades: int = 4
     shift_near_tie_min_advantage_bp: int = 10
     lot_variant_redundancy_enabled: bool = True
+    researched_pnl_dd5_ratio: Decimal = Decimal("0.50")
+    researched_pnl_b_ratio: Decimal = Decimal("0.60")
+    researched_b_abs: Decimal = Decimal("2")
+    researched_b_rel: Decimal = Decimal("0.25")
+    researched_dd5_abs: Decimal = Decimal("3")
+    researched_dd5_rel: Decimal = Decimal("0.25")
+    researched_dd_abs: Decimal = Decimal("1")
+    researched_dd_rel: Decimal = Decimal("0.25")
+    researched_points_mean_ratio: Decimal = Decimal("0.40")
+    researched_points_same_floor_ratio: Decimal = Decimal("0.40")
+    researched_points_cross_floor_ratio: Decimal = Decimal("0.30")
+    researched_points_single_best_ratio: Decimal = Decimal("0.10")
+    researched_open_ma_delta: Decimal = Decimal("2.6")
+    researched_close_ma_delta: Decimal = Decimal("3")
+    researched_hold_p95_ratio: Decimal = Decimal("0.20")
+    researched_hold_median_ratio: Decimal = Decimal("0.30")
+    researched_hold_p95_veto_ratio: Decimal = Decimal("0.15")
 
     @property
     def ab_min_completed_cycles(self) -> int:
@@ -232,6 +253,10 @@ def parse_selection_request(
             raise _error("LOT_VARIANT_STAGE_SCOPE")
         if stage_id == "filter_equity_regime" and scope != "pair_side":
             raise _error("EQUITY_REGIME_STAGE_SCOPE")
+        if stage_id in {"pair_side_pnl_upper_half", "pair_side_stage_3"} and scope != "pair_side":
+            raise _error("STAGE_SCOPE")
+        if stage_id in {"structural_stage_1", "structural_stage_2"} and scope != "pair_side_timeframe":
+            raise _error("STAGE_SCOPE")
         seen.add(stage_id)
         parsed.append(SelectionStage(stage_id, enabled, scope, min_shift_pct, pnl_tolerance_pct, top_n, method))
     if any(stage.id == "rank_robust_top_n" for stage in parsed) and parsed[-1].id != "rank_robust_top_n":
@@ -370,6 +395,8 @@ def load_selection_config(path: Path) -> SelectionConfig:
     lot_variant_enabled = selected.get("lot_variant_redundancy_enabled", True)
     if not isinstance(lot_variant_enabled, bool):
         raise _error("INVALID_CONFIG_lot_variant_redundancy_enabled")
+    ratio = lambda name, default: _bounded_decimal_inclusive(setting(name, default), name, Decimal(0), Decimal(1))
+    positive = lambda name, default: _positive_decimal(setting(name, default), name)
     return SelectionConfig(
         ab_final_days=final_days,
         ab_return_floor_pct=_nonnegative_decimal(setting("ab_return_floor_pct", 4), "ab_return_floor_pct"),
@@ -400,6 +427,23 @@ def load_selection_config(path: Path) -> SelectionConfig:
         best_trade_min_profitable_trades=_positive_int(best_trade_min, "best_trade_min_profitable_trades"),
         shift_near_tie_min_advantage_bp=_positive_int(shift_advantage, "shift_near_tie_min_advantage_bp"),
         lot_variant_redundancy_enabled=lot_variant_enabled,
+        researched_pnl_dd5_ratio=ratio("researched_pnl_dd5_ratio", "0.50"),
+        researched_pnl_b_ratio=ratio("researched_pnl_b_ratio", "0.60"),
+        researched_b_abs=positive("researched_b_abs", "2"),
+        researched_b_rel=ratio("researched_b_rel", "0.25"),
+        researched_dd5_abs=positive("researched_dd5_abs", "3"),
+        researched_dd5_rel=ratio("researched_dd5_rel", "0.25"),
+        researched_dd_abs=positive("researched_dd_abs", "1"),
+        researched_dd_rel=ratio("researched_dd_rel", "0.25"),
+        researched_points_mean_ratio=ratio("researched_points_mean_ratio", "0.40"),
+        researched_points_same_floor_ratio=ratio("researched_points_same_floor_ratio", "0.40"),
+        researched_points_cross_floor_ratio=ratio("researched_points_cross_floor_ratio", "0.30"),
+        researched_points_single_best_ratio=ratio("researched_points_single_best_ratio", "0.10"),
+        researched_open_ma_delta=positive("researched_open_ma_delta", "2.6"),
+        researched_close_ma_delta=positive("researched_close_ma_delta", "3"),
+        researched_hold_p95_ratio=ratio("researched_hold_p95_ratio", "0.20"),
+        researched_hold_median_ratio=ratio("researched_hold_median_ratio", "0.30"),
+        researched_hold_p95_veto_ratio=ratio("researched_hold_p95_veto_ratio", "0.15"),
     )
 
 
@@ -1732,6 +1776,7 @@ def _equity_workbook_values(cached: object) -> dict[str, object]:
 _FIXED_PREFIX = (
     "filter_equity_regime", "filter_lot_variant_redundancy", "filter_hard_cutoffs",
     "ab_deterioration", "filter_best_trade_dependency",
+    "pair_side_pnl_upper_half", "structural_stage_1", "structural_stage_2", "pair_side_stage_3",
 )
 
 
@@ -1749,7 +1794,488 @@ def effective_selection_stages(
 
 
 def _scope_groups(frame: pd.DataFrame, scope: StageScope):
-    return frame.groupby([] if scope == "pair_side" else ["timeframe"], dropna=False, sort=False) if scope != "pair_side" else [(None, frame)]
+    keys = [name for name in ("symbol", "side") if name in frame]
+    if scope == "pair_side_timeframe" and "timeframe" in frame:
+        keys.append("timeframe")
+    return frame.groupby(keys, dropna=False, sort=False) if keys else [(None, frame)]
+
+
+def _upper_half_reasons(group: pd.DataFrame, config: SelectionConfig) -> dict[object, str]:
+    """Return independent full/DD5 and B gate evidence by input index."""
+
+    # The Panel already passes only survivors; spreadsheet prefilter markers
+    # are not part of its input contract.
+    failures: dict[object, list[str]] = {}
+    for column, ratio in (
+        ("dd5_proxy", config.researched_pnl_dd5_ratio),
+        ("ab_return_b_30d_pct", config.researched_pnl_b_ratio),
+    ):
+        if column not in group:
+            continue
+        values = [value for value in (_research_decimal(item) for item in group[column]) if value is not None]
+        if not values:
+            continue
+        values.sort(reverse=True)
+        top = values[: (len(values) + 1) // 2]
+        midpoint = len(top) // 2
+        reference = top[midpoint] if len(top) % 2 else (top[midpoint - 1] + top[midpoint]) / Decimal(2)
+        if reference <= 0:
+            continue
+        threshold = ratio * reference
+        for index, value in group[column].items():
+            parsed = _research_decimal(value)
+            if parsed is not None and parsed < threshold:
+                failures.setdefault(index, []).append("DD5" if column == "dd5_proxy" else "B")
+    return {index: "+".join(names) for index, names in failures.items()}
+
+
+def _upper_half_eliminated(group: pd.DataFrame, config: SelectionConfig) -> list[object]:
+    return list(_upper_half_reasons(group, config))
+
+
+_RESEARCH_B = "ab_return_b_30d_pct"
+_RESEARCH_DD5 = "dd5_proxy"
+_RESEARCH_DD = "max_drawdown_pct"
+_RESEARCH_HOLD_P95 = "holding_p95_minutes"
+_RESEARCH_HOLD_M = "holding_median_minutes"
+
+
+@dataclass(frozen=True, slots=True)
+class _ResearchDecision:
+    final: str
+    reason: str
+    replacement_id: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _ResearchRow:
+    id: int
+    group: tuple[str, str, str, int]
+    shift: Decimal | None
+    complete: bool
+    b: Decimal | None
+    dd5: Decimal | None
+    dd: Decimal | None
+    points: tuple[Decimal, ...]
+    ma: tuple[Decimal, ...]
+    close: Decimal | None
+    p95: Decimal | None
+    median: Decimal | None
+    source_yes: bool = True
+
+
+def _research_decimal(value: object) -> Decimal | None:
+    if value is None or isinstance(value, (bool, str, date, datetime, time)):
+        return None
+    if not isinstance(value, (int, float, Decimal, np.integer, np.floating)):
+        return None
+    try:
+        result = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    return result if result.is_finite() else None
+
+
+def _research_shift(value: object) -> Decimal | None:
+    return _research_decimal(value)
+
+
+def _research_text(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    value = value.replace("\u00a0", " ").strip()
+    return value.casefold() if value else None
+
+
+def _research_sid(value: object) -> int:
+    return int(value) if not isinstance(value, (bool, np.bool_)) and isinstance(value, (int, np.integer)) and int(value) > 0 else 0
+
+
+def _research_vector(row: pd.Series, prefix: str, count: int) -> tuple[Decimal, ...] | None:
+    values = []
+    for order in range(1, count + 1):
+        value = _research_decimal(row.get(f"order_{order}_{prefix}"))
+        if value is None or value < 0:
+            return None
+        values.append(value)
+    return tuple(values)
+
+
+def _research_row(row: pd.Series, *, allow_ord4: bool = False, stage3_mode: bool = False) -> _ResearchRow:
+    strategy_id = row.get("strategy_id")
+    order_count = row.get("order_count")
+    # Existing selection input is normally validated upstream.  Structural
+    # stages fail open for malformed rows so one bad research field cannot
+    # remove a finalist.  Valid IDs remain the audit/replacement key.
+    valid_sid = _research_sid(strategy_id) > 0
+    valid_ord = not isinstance(order_count, (bool, np.bool_)) and isinstance(order_count, (int, np.integer))
+    sid = int(strategy_id) if valid_sid else 0
+    count = int(order_count) if valid_ord else 0
+    text = tuple(_research_text(row.get(column)) or "" for column in ("symbol", "side", "timeframe"))
+    complete = 1 <= count <= (4 if allow_ord4 else 3)
+    points = _research_vector(row, "plateau_point_count", count) if complete else ()
+    ma = _research_vector(row, "open_ma_len", count) if complete else ()
+    b, dd5, dd, close = map(_research_decimal, (
+        row.get(_RESEARCH_B), row.get(_RESEARCH_DD5), row.get(_RESEARCH_DD), row.get("close_ma_len"),
+    ))
+    # DD and hold durations are non-negative measures.  Negative values are
+    # invalid core evidence and therefore retain the row without replacing.
+    if dd is not None and dd < 0:
+        dd = None
+    p95 = _research_decimal(row.get(_RESEARCH_HOLD_P95))
+    median = _research_decimal(row.get(_RESEARCH_HOLD_M))
+    if p95 is not None and p95 < 0:
+        p95 = None
+    if median is not None and median < 0:
+        median = None
+    if stage3_mode:
+        complete = complete and points is not None and all(value is not None for value in (b, dd5, dd, p95, median))
+        if not complete:
+            points, ma = (), ()
+        elif ma is None:
+            ma = ()
+    elif complete and (points is None or ma is None or any(value is None for value in (b, dd5, dd, close))):
+        complete = False
+    return _ResearchRow(
+        sid,
+        (*text, count),
+        _research_shift(row.get("first_shift_bp")), complete, b, dd5, dd, points or (), ma or (), close,
+        p95, median, True,
+    )
+
+
+def _research_threshold(old: Decimal, new: Decimal, absolute: Decimal, relative: Decimal) -> Decimal:
+    return max(absolute, relative * max(abs(old), abs(new)))
+
+
+def _research_mean(values: tuple[Decimal, ...]) -> Decimal:
+    if not values:
+        raise _error("RESEARCHED_EMPTY_VECTOR")
+    return sum(values, Decimal(0)) / Decimal(len(values))
+
+
+def _research_points_advantage(old: tuple[Decimal, ...], new: tuple[Decimal, ...], ratio: Decimal) -> bool:
+    # Compare means by cross-multiplication: division rounding can turn an
+    # exact 40% boundary into a false strict advantage (workbook ID 18880).
+    old_scaled = sum(old, Decimal(0)) * len(new)
+    new_scaled = sum(new, Decimal(0)) * len(old)
+    return old_scaled - new_scaled > ratio * max(old_scaled, new_scaled)
+
+
+def _research_mean_delta_exceeds(higher: tuple[Decimal, ...], lower: tuple[Decimal, ...], delta: Decimal) -> bool:
+    return (sum(higher, Decimal(0)) * len(lower) - sum(lower, Decimal(0)) * len(higher)
+            > delta * len(higher) * len(lower))
+
+
+def _research_material_advantages(lower: _ResearchRow, candidate: _ResearchRow, config: SelectionConfig, *, cross: bool = False) -> tuple[str, ...]:
+    values = (("B", lower.b, candidate.b, config.researched_b_abs, config.researched_b_rel, True),
+              ("DD5", lower.dd5, candidate.dd5, config.researched_dd5_abs, config.researched_dd5_rel, True),
+              ("DD", lower.dd, candidate.dd, config.researched_dd_abs, config.researched_dd_rel, False))
+    found: list[str] = []
+    for name, old, new, absolute, relative, higher in values:
+        if old is None or new is None:
+            continue
+        advantage = old - new if higher else new - old
+        if advantage > _research_threshold(old, new, absolute, relative):
+            found.append(name)
+    if lower.points and candidate.points:
+        floor = config.researched_points_cross_floor_ratio if cross else config.researched_points_same_floor_ratio
+        points = _research_points_advantage(lower.points, candidate.points, config.researched_points_mean_ratio)
+        points &= min(lower.points) >= floor * min(candidate.points)
+        if not cross:
+            points &= len(lower.points) == len(candidate.points) and all(
+                old_value >= config.researched_points_same_floor_ratio * new_value
+                for old_value, new_value in zip(lower.points, candidate.points)
+            )
+        elif lower.group[3] == 1 and candidate.group[3] > 1:
+            points &= lower.points[0] >= (Decimal(1) + config.researched_points_single_best_ratio) * max(candidate.points)
+        if points:
+            found.append("Points")
+    if lower.ma and candidate.ma and _research_mean_delta_exceeds(candidate.ma, lower.ma, config.researched_open_ma_delta):
+        found.append("MA")
+    if lower.close is not None and candidate.close is not None and candidate.close - lower.close >= config.researched_close_ma_delta:
+        found.append("Close")
+    return tuple(found)
+
+
+def _research_cross_metric_wins(
+    loser: _ResearchRow, candidate: _ResearchRow, config: SelectionConfig,
+) -> tuple[str, ...]:
+    """Core metrics on which the candidate beats the current row in stage 8."""
+    if not loser.complete or not candidate.complete:
+        return ()
+    found: list[str] = []
+    for name, old, new, absolute, relative, higher in (
+        ("B", loser.b, candidate.b, config.researched_b_abs, config.researched_b_rel, True),
+        ("DD5", loser.dd5, candidate.dd5, config.researched_dd5_abs, config.researched_dd5_rel, True),
+        ("DD", loser.dd, candidate.dd, config.researched_dd_abs, config.researched_dd_rel, False),
+    ):
+        if old is None or new is None:
+            continue
+        advantage = new - old if higher else old - new
+        if advantage > _research_threshold(old, new, absolute, relative):
+            found.append(name)
+    if loser.points and candidate.points:
+        if (
+            _research_points_advantage(candidate.points, loser.points, config.researched_points_mean_ratio)
+            and min(candidate.points) >= config.researched_points_cross_floor_ratio * min(loser.points)
+        ):
+            found.append("Points")
+    return tuple(found)
+
+
+def _research_cross_protection(
+    loser: _ResearchRow, candidate: _ResearchRow, config: SelectionConfig,
+) -> tuple[str, ...]:
+    """Current-row protection against one eligible cross-ORD replacement."""
+    reasons = list(_research_cross_metric_wins(candidate, loser, config))
+    if (
+        loser.group[3] == 1 and candidate.group[3] > 1 and "Points" in reasons
+        and loser.points[0] < (Decimal(1) + config.researched_points_single_best_ratio) * max(candidate.points)
+    ):
+        reasons.remove("Points")
+    if candidate.ma and loser.ma and _research_mean_delta_exceeds(candidate.ma, loser.ma, config.researched_open_ma_delta):
+        reasons.append("MA")
+    if candidate.close is not None and loser.close is not None and candidate.close - loser.close >= config.researched_close_ma_delta:
+        reasons.append("Close")
+    if reasons:
+        return tuple(reasons)
+    p95 = _research_hold_status(candidate.p95, loser.p95, config.researched_hold_p95_ratio)
+    median = _research_hold_status(candidate.median, loser.median, config.researched_hold_median_ratio)
+    p95_worse = (
+        candidate.p95 is not None and loser.p95 is not None
+        and loser.p95 - candidate.p95 > config.researched_hold_p95_veto_ratio * candidate.p95
+    )
+    hold_reasons: list[str] = []
+    if p95 == "ADVANTAGE":
+        hold_reasons.append("Hold-95")
+    elif p95 == "INVALID":
+        hold_reasons.append("HOLD_P95_INVALID")
+    if median == "ADVANTAGE" and not p95_worse:
+        hold_reasons.append("Hold-M")
+    elif median == "INVALID" and not p95_worse:
+        hold_reasons.append("HOLD_M_INVALID")
+    return tuple(hold_reasons)
+
+
+def _research_hold_status(candidate: Decimal | None, lower: Decimal | None, ratio: Decimal) -> str:
+    if candidate is None or lower is None:
+        return "INVALID"
+    return "ADVANTAGE" if candidate - lower > ratio * candidate else "PASS"
+
+
+def _research_compare(lower: _ResearchRow, candidate: _ResearchRow, config: SelectionConfig) -> _ResearchDecision:
+    protected = _research_material_advantages(lower, candidate, config)
+    if protected:
+        return _ResearchDecision("KEEP", ", ".join(protected))
+    p95 = _research_hold_status(candidate.p95, lower.p95, config.researched_hold_p95_ratio)
+    median = _research_hold_status(candidate.median, lower.median, config.researched_hold_median_ratio)
+    p95_worse = (
+        candidate.p95 is not None and lower.p95 is not None
+        and lower.p95 - candidate.p95 > config.researched_hold_p95_veto_ratio * candidate.p95
+    )
+    if p95 == "PASS" and (median == "PASS" or p95_worse):
+        return _ResearchDecision("DROP", "HOLD_P95_WORSE_VETO" if p95_worse and median != "PASS" else "STRUCTURAL_REDUNDANCY", candidate.id)
+    reason = "HOLD_P95_INVALID" if p95 == "INVALID" else "HOLD_M_INVALID" if median == "INVALID" else "HOLD_P95_ADVANTAGE" if p95 == "ADVANTAGE" else "HOLD_M_ADVANTAGE"
+    return _ResearchDecision("RESCUE", reason, candidate.id)
+
+
+def _research_stage1(rows: list[_ResearchRow], config: SelectionConfig) -> dict[int, _ResearchDecision]:
+    decisions: dict[int, _ResearchDecision] = {}
+    for row in rows:
+        if not row.source_yes:
+            decisions[row.id] = _ResearchDecision("KEEP", "SOURCE_PREFILTER")
+        elif row.shift is None:
+            decisions[row.id] = _ResearchDecision("KEEP", "INVALID_SHIFT")
+        elif not 1 <= row.group[3] <= 3:
+            decisions[row.id] = _ResearchDecision("KEEP", "OUT_OF_SCOPE_ORD")
+        elif not row.complete:
+            decisions[row.id] = _ResearchDecision("KEEP", "CORE_INVALID")
+    groups: dict[tuple[str, str, str, int], list[_ResearchRow]] = {}
+    for row in rows:
+        if row.source_yes and row.complete and row.shift is not None and 1 <= row.group[3] <= 3:
+            groups.setdefault(row.group, []).append(row)
+    for group in groups.values():
+        by_id = {row.id: row for row in group}
+        edges: dict[int, set[int]] = {row.id: set() for row in group}
+        raw: dict[tuple[int, int], _ResearchDecision] = {}
+        for lower in group:
+            for candidate in group:
+                if candidate.id == lower.id or candidate.shift < lower.shift:
+                    continue
+                trial = _research_compare(lower, candidate, config)
+                if trial.final == "DROP":
+                    raw[(lower.id, candidate.id)] = trial
+        coverage = {row.id: 0 for row in group}
+        for _, target in raw:
+            coverage[target] += 1
+        def quality(row: _ResearchRow) -> tuple[object, ...]:
+            dd = row.dd if row.dd is not None else Decimal("Infinity")
+            close = row.close if row.close is not None else Decimal("Infinity")
+            p95 = row.p95 if row.p95 is not None else Decimal("Infinity")
+            median = row.median if row.median is not None else Decimal("Infinity")
+            dd5 = row.dd5 if row.dd5 is not None else Decimal("-Infinity")
+            b = row.b if row.b is not None else Decimal("-Infinity")
+            return (row.shift, -dd, _research_mean(row.points), -_research_mean(row.ma), -close, -p95, -median, dd5, b, -row.id)
+        evidence: dict[tuple[int, int], _ResearchDecision] = {}
+        for (loser, target), trial in raw.items():
+            if (target, loser) in raw and (quality(by_id[target])[0], coverage[target], *quality(by_id[target])[1:]) <= (quality(by_id[loser])[0], coverage[loser], *quality(by_id[loser])[1:]):
+                continue
+            edges[loser].add(target); evidence[(loser, target)] = trial
+        selected: set[int] = set(); remaining = set(edges)
+        while remaining:
+            dropped = {sid for sid in remaining if edges[sid] & selected}
+            for sid in dropped:
+                target = max(edges[sid] & selected, key=lambda item: quality(by_id[item]))
+                decisions[sid] = evidence[(sid, target)]
+            remaining -= dropped
+            if not remaining:
+                break
+            sinks = {sid for sid in remaining if not edges[sid] & remaining}
+            if not sinks:
+                sinks = {max(remaining, key=lambda sid: quality(by_id[sid]))}
+            selected.update(sinks); remaining -= sinks
+        for row in group:
+            if row.id not in selected:
+                continue
+            candidates = sorted((candidate for candidate in group if candidate.id in selected and candidate.id != row.id and candidate.shift >= row.shift), key=quality, reverse=True)
+            rescue = next((trial for candidate in candidates if (trial := _research_compare(row, candidate, config)).final == "RESCUE"), None)
+            if rescue is not None:
+                decisions[row.id] = rescue
+                continue
+            advantages = {
+                name for candidate in candidates
+                for name in _research_material_advantages(row, candidate, config)
+            }
+            ordered = ", ".join(name for name in ("B", "DD5", "DD", "Points", "MA", "Close") if name in advantages)
+            lost_target = bool(edges[row.id]) and not bool(edges[row.id] & selected)
+            decisions[row.id] = _ResearchDecision(
+                "KEEP", "REPLACEMENT_DROPPED" if lost_target else (ordered or "NO_SUITABLE_HIGHER_SHIFT")
+            )
+    return decisions
+
+
+def _research_stage2(rows: list[_ResearchRow], config: SelectionConfig) -> dict[int, _ResearchDecision]:
+    decisions = {
+        row.id: _ResearchDecision("KEEP", "SOURCE_PREFILTER" if not row.source_yes else ("4ORD" if row.group[3] == 4 else "NO_REPLACEMENT"))
+        for row in rows
+    }
+    members = [row for row in rows if row.id > 0 and row.source_yes and row.complete and row.shift is not None and row.group[3] in {1, 2, 3}]
+    groups: dict[tuple[str, str, str], list[_ResearchRow]] = {}
+    for row in members:
+        groups.setdefault(row.group[:3], []).append(row)
+    for group in groups.values():
+        edges: dict[int, set[int]] = {row.id: set() for row in group}; evidence: dict[tuple[int, int], _ResearchDecision] = {}; by_id = {row.id: row for row in group}
+        for lower in group:
+            for candidate in group:
+                if candidate.id == lower.id or candidate.group[3] < lower.group[3] or candidate.shift < lower.shift or (candidate.group[3] == lower.group[3] and candidate.shift == lower.shift):
+                    continue
+                if _research_cross_protection(lower, candidate, config):
+                    continue
+                p95 = _research_hold_status(candidate.p95, lower.p95, config.researched_hold_p95_ratio); median = _research_hold_status(candidate.median, lower.median, config.researched_hold_median_ratio)
+                p95_worse = candidate.p95 is not None and lower.p95 is not None and lower.p95 - candidate.p95 > config.researched_hold_p95_veto_ratio * candidate.p95
+                if p95 == "PASS" and (median == "PASS" or p95_worse):
+                    wins = list(_research_cross_metric_wins(lower, candidate, config))
+                    if _research_mean_delta_exceeds(lower.ma, candidate.ma, config.researched_open_ma_delta):
+                        wins.append("MA")
+                    if lower.close is not None and candidate.close is not None and lower.close - candidate.close >= config.researched_close_ma_delta:
+                        wins.append("Close")
+                    edges[lower.id].add(candidate.id)
+                    evidence[(lower.id, candidate.id)] = _ResearchDecision("DROP", ", ".join(wins) or "ORD/Shift", candidate.id)
+        remaining = set(edges); retained: set[int] = set()
+        while remaining:
+            sinks = {sid for sid in remaining if not edges[sid] & remaining}
+            if not sinks:
+                retained.update(remaining); break
+            retained.update(sinks); remaining -= sinks
+            dropped = {sid for sid in remaining if edges[sid] & retained}
+            for sid in dropped:
+                target = max(edges[sid] & retained, key=lambda item: (by_id[item].group[3], by_id[item].shift, -item))
+                decisions[sid] = evidence[(sid, target)]
+            remaining -= dropped
+        reason_order = ("B", "DD5", "DD", "Points", "MA", "Close", "Hold-95", "Hold-M", "HOLD_P95_INVALID", "HOLD_M_INVALID")
+        for row in group:
+            if row.id in retained:
+                reasons = {
+                    reason for candidate in group if candidate.id in retained and candidate.id != row.id
+                    and candidate.group[3] >= row.group[3] and candidate.shift is not None and row.shift is not None
+                    and candidate.shift >= row.shift
+                    and (candidate.group[3] > row.group[3] or candidate.shift > row.shift)
+                    for reason in _research_cross_protection(row, candidate, config)
+                }
+                decisions[row.id] = _ResearchDecision(
+                    "KEEP", ", ".join(reason for reason in reason_order if reason in reasons) or "NO_REPLACEMENT"
+                )
+    return decisions
+
+
+def _research_stage3(rows: list[_ResearchRow], config: SelectionConfig) -> dict[int, _ResearchDecision]:
+    decisions = {
+        row.id: _ResearchDecision(
+            "KEEP", "SOURCE_PREFILTER" if not row.source_yes else ("NO_REPLACEMENT" if row.complete else "CORE_INVALID")
+        ) for row in rows
+    }
+    groups: dict[tuple[str, str], list[_ResearchRow]] = {}
+    for row in rows:
+        if row.source_yes:
+            groups.setdefault(row.group[:2], []).append(row)
+    for group in groups.values():
+        retained: list[_ResearchRow] = []
+        def stage3_key(row: _ResearchRow) -> tuple[object, ...]:
+            b = row.b if row.b is not None else Decimal("-Infinity")
+            dd5 = row.dd5 if row.dd5 is not None else Decimal("-Infinity")
+            dd = row.dd if row.dd is not None else Decimal("Infinity")
+            return (-b, -dd5, dd, row.id)
+        for lower in sorted(group, key=stage3_key):
+            if not lower.complete or lower.b is None or lower.dd5 is None or lower.dd is None:
+                continue
+            trials = []
+            protections_seen: list[str] = []
+            for candidate in retained:
+                if candidate.b is None or candidate.dd5 is None or candidate.dd is None or candidate.b < lower.b or candidate.dd5 < lower.dd5 or candidate.dd > lower.dd:
+                    continue
+                wins = [name for name, old, new, absolute, relative, higher in (("B", lower.b, candidate.b, config.researched_b_abs, config.researched_b_rel, True), ("DD5", lower.dd5, candidate.dd5, config.researched_dd5_abs, config.researched_dd5_rel, True), ("DD", lower.dd, candidate.dd, config.researched_dd_abs, config.researched_dd_rel, False)) if (new - old if higher else old - new) > _research_threshold(old, new, absolute, relative)]
+                if len(wins) < 2:
+                    continue
+                points = _research_points_advantage(lower.points, candidate.points, config.researched_points_mean_ratio) and min(lower.points) >= config.researched_points_cross_floor_ratio * min(candidate.points)
+                if lower.group[3] == 1 and candidate.group[3] > 1:
+                    points &= lower.points[0] >= (Decimal(1) + config.researched_points_single_best_ratio) * max(candidate.points)
+                protections = ["Points"] if points else []
+                if candidate.p95 is not None and lower.p95 is not None and candidate.p95 - lower.p95 > config.researched_hold_p95_ratio * candidate.p95:
+                    protections.append("Hold-95")
+                p95_worse = candidate.p95 is not None and lower.p95 is not None and lower.p95 - candidate.p95 > config.researched_hold_p95_veto_ratio * candidate.p95
+                if not p95_worse and candidate.median is not None and lower.median is not None and candidate.median - lower.median > config.researched_hold_median_ratio * candidate.median:
+                    protections.append("Hold-M")
+                if protections:
+                    protections_seen.extend(protections)
+                    continue
+                trials.append((candidate, wins))
+            if trials:
+                candidate, wins = max(trials, key=lambda pair: (len(pair[1]), -pair[0].dd, pair[0].dd5, pair[0].b, pair[0].group[3], -pair[0].id))
+                decisions[lower.id] = _ResearchDecision("DROP", ", ".join(wins), candidate.id)
+            else:
+                reason_order = ("Points", "Hold-95", "Hold-M")
+                decisions[lower.id] = _ResearchDecision(
+                    "KEEP", ", ".join(reason for reason in reason_order if reason in set(protections_seen)) or "NO_REPLACEMENT"
+                )
+                retained.append(lower)
+    return decisions
+
+
+def _research_decisions(frame: pd.DataFrame, stage_id: str, config: SelectionConfig) -> dict[int, _ResearchDecision]:
+    ids = [_research_sid(value) for value in frame["strategy_id"]]
+    if any(sid == 0 for sid in ids) or len(set(ids)) != len(ids):
+        raise _error("RESEARCHED_INVALID_STRATEGY_ID")
+    allow_ord4 = stage_id == "pair_side_stage_3"
+    rows = [
+        _research_row(row, allow_ord4=allow_ord4, stage3_mode=allow_ord4)
+        for _, row in frame.iterrows()
+    ]
+    if stage_id == "structural_stage_1":
+        return _research_stage1(rows, config)
+    if stage_id == "structural_stage_2":
+        return _research_stage2(rows, config)
+    return _research_stage3(rows, config)
 
 
 def _hard_cutoff_evidence(row: pd.Series, config: SelectionConfig) -> tuple[bool, str | None]:
@@ -2118,6 +2644,50 @@ def run_selection(
                     result.loc[eliminated, "finalist"] = False
             if stage.id != _LOT_VARIANT_STAGE_ID or not implicit_lot_variant_stage:
                 stage_counts[stage.id] = {"enabled": True, "eliminated": int(result[column].sum()), "remaining": int(result["finalist"].sum())}
+            continue
+        if stage.id == "pair_side_pnl_upper_half":
+            survivors = result.loc[result["finalist"]]
+            eliminated: list[object] = []
+            upper_reasons: dict[object, str] = {}
+            for _, group in _scope_groups(survivors, stage.scope):
+                group_reasons = _upper_half_reasons(group, config)
+                eliminated.extend(group_reasons)
+                upper_reasons.update(group_reasons)
+            if eliminated:
+                result.loc[eliminated, column] = True
+                result.loc[eliminated, "finalist"] = False
+                result.loc[eliminated, "elimination_reason"] = [
+                    f"{stage.id.upper()};{upper_reasons[index]}" for index in eliminated
+                ]
+            stage_counts[stage.id] = {"enabled": True, "eliminated": int(result[column].sum()), "remaining": int(result["finalist"].sum())}
+            continue
+        if stage.id in {"structural_stage_1", "structural_stage_2", "pair_side_stage_3"}:
+            survivors = result.loc[result["finalist"]]
+            survivor_ids = [_research_sid(value) for value in survivors["strategy_id"]]
+            if 0 in survivor_ids or len(set(survivor_ids)) != len(survivor_ids):
+                raise _error("RESEARCHED_INVALID_STRATEGY_ID")
+            decisions: dict[int, _ResearchDecision] = {}
+            for _, group in _scope_groups(survivors, stage.scope):
+                decisions.update(_research_decisions(group, stage.id, config))
+            eliminated = [
+                index for index, row in survivors.iterrows()
+                if decisions.get(
+                    _research_sid(row.get("strategy_id")),
+                    _ResearchDecision("KEEP", "NO_REPLACEMENT"),
+                ).final == "DROP"
+            ]
+            if eliminated:
+                result.loc[eliminated, column] = True
+                result.loc[eliminated, "finalist"] = False
+                result.loc[eliminated, "elimination_reason"] = [
+                    f"{stage.id.upper()};{decisions[_research_sid(result.at[index, 'strategy_id'])].reason}"
+                    for index in eliminated
+                ]
+                for index in eliminated:
+                    replacement_id = decisions[_research_sid(result.at[index, "strategy_id"])].replacement_id
+                    if replacement_id is not None and decisions.get(_research_sid(replacement_id), _ResearchDecision(final="DROP", reason="INVALID_REPLACEMENT")).final in {"KEEP", "RESCUE"}:
+                        result.at[index, "auto_analog_of_strategy_id"] = replacement_id
+            stage_counts[stage.id] = {"enabled": True, "eliminated": int(result[column].sum()), "remaining": int(result["finalist"].sum())}
             continue
         if stage.id == "rank_robust_top_n":
             survivors = result.loc[result["finalist"]]
@@ -2495,7 +3065,8 @@ def write_selection_workbook(
         "points",
         "open_ma",
         *(equity_columns if equity_block_enabled else ()),
-        "auto_status", "auto_rank", *review_columns, "elimination_reason",
+        "auto_status", "auto_rank", *review_columns,
+        "elimination_reason",
     ]
     display = display.reindex(columns=column_order)
     display = display.rename(columns={

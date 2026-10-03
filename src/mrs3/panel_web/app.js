@@ -685,7 +685,7 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
     const id = window.location.hash.slice(1) || 'testing';
     showScreen(id);
     if (id === 'portfolio') loadPortfolioScreen();
-    if (id === 'settings') loadPortfolioSettings();
+    if (id === 'settings') { loadPortfolioSettings(); loadPerformanceV2SelectionSettings(); }
   }
 
   links.forEach((link) => link.addEventListener('click', () => showScreen(link.dataset.screenLink, true)));
@@ -3371,6 +3371,10 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
       filter_hard_cutoffs: `Exclude on OR: full DD > ${selectionConfigNumber(config, 'hard_dd_pct', 23)}% AND full PnL/30 < ${selectionConfigNumber(config, 'hard_dd_profit_multiplier', 3)}×DD; full PnL/30 ≤ ${selectionConfigNumber(config, 'hard_pnl30_floor_pct', 4)}%; or both ratios < ${selectionConfigNumber(config, 'hard_ratio', 0.75)} after ≥${selectionConfigNumber(config, 'hard_min_history_days', 45)} calendar days and ≥${selectionConfigNumber(config, 'hard_min_cycles', 25)} reliable cycles. Missing facts pass; published exclusions set User Status REJECTED.`,
       ab_deterioration: `Exclude on OR: B PnL/30 ≤ ${selectionConfigNumber(config, 'ab_return_floor_pct', 4)}%; A > 0 with B ≤ A/${selectionConfigNumber(config, 'ab_return_divisor', 10)} and B ≤ ${selectionConfigNumber(config, 'ab_decline_cap_pct', 15)}%; or ≥${selectionConfigNumber(config, 'ab_completed_cycles', 25)} completed B cycles with B Win Rate < ${selectionConfigNumber(config, 'ab_win_rate_floor_pct', 55)}%. B is the final ${selectionConfigNumber(config, 'ab_final_days', 14)} calendar days; values are percentages and closed cycles.`,
       filter_best_trade_dependency: `Legacy stage ID for top-five: exclude only when the five largest positive completed-cycle PnLs exceed ${selectionConfigNumber(config, 'top5_share_pct', 80)}% of positive completed net PnL after ≥${selectionConfigNumber(config, 'top5_min_history_days', 45)} calendar days and ≥${selectionConfigNumber(config, 'top5_min_profitable_cycles', 25)} profitable cycles. Equality passes; incomplete or nonpositive net is diagnostic.`,
+      pair_side_pnl_upper_half: `Внутри пары и стороны независимо исключает DD5/30 ниже ${selectionConfigNumber(config, 'researched_pnl_dd5_ratio', .5)}× и B/30 ниже ${selectionConfigNumber(config, 'researched_pnl_b_ratio', .6)}× медианы верхней половины. Пропуски проходят.`,
+      structural_stage_1: `Внутри ТФ и ORD ищет сохранённую замену с тем же или большим Shift; учитывает B/30, DD5/30, DD, средние Points и Open MA, Close MA и защиту Hold.`,
+      structural_stage_2: `Внутри ТФ сравнивает 1–3ORD с конструкциями не младше по ORD и Shift; существенные преимущества и Hold защищают текущую стратегию.`,
+      pair_side_stage_3: `Внутри пары и стороны между ТФ исключает при существенном выигрыше замены по двум из B/30, DD5/30, DD без ухудшения третьего. Points и Hold защищают.`,
     };
     for (const [stageId, text] of Object.entries(help)) {
       const node = document.querySelector(`[data-selection-stage="${stageId}"] small`);
@@ -3379,16 +3383,17 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
   };
   const fixedSelectionPrefix = new Set([
     'filter_equity_regime', 'filter_lot_variant_redundancy', 'filter_hard_cutoffs', 'ab_deterioration', 'filter_best_trade_dependency',
+    'pair_side_pnl_upper_half', 'structural_stage_1', 'structural_stage_2', 'pair_side_stage_3',
   ]);
   const defaultSelectionStageOrder = [
     'filter_equity_regime', 'filter_lot_variant_redundancy', 'filter_hard_cutoffs', 'ab_deterioration', 'filter_best_trade_dependency',
+    'pair_side_pnl_upper_half', 'structural_stage_1', 'structural_stage_2', 'pair_side_stage_3',
     'filter_holding_outlier', 'filter_low_trades', 'filter_min_shift', 'pareto_dd5_balanced', 'pareto_robust', 'pareto_shift_near_tie',
     'pareto_close_ma_near_tie',
   ];
   const defaultEnabledSelectionStages = new Set([
-    'filter_lot_variant_redundancy', 'filter_hard_cutoffs', 'filter_holding_outlier', 'ab_deterioration', 'filter_best_trade_dependency',
-    'pareto_dd5_balanced', 'pareto_robust',
-    'pareto_shift_near_tie',
+    'filter_lot_variant_redundancy', 'filter_hard_cutoffs', 'ab_deterioration', 'filter_best_trade_dependency',
+    'pair_side_pnl_upper_half', 'structural_stage_1', 'structural_stage_2', 'pair_side_stage_3',
   ]);
   if (selectionPreviewOrder) {
     const byId = Object.fromEntries([...selectionPreviewOrder.querySelectorAll('[data-selection-stage]')]
@@ -3445,7 +3450,9 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
     return [...orderedSelectionStages().map((stage) => ({
     id: stage.dataset.selectionStage,
     enabled: !!stage.querySelector('input[type="checkbox"]')?.checked,
-    scope: stage.querySelector('[data-selection-scope]')?.value || (stage.dataset.selectionStage === 'filter_equity_regime' ? 'pair_side' : undefined),
+    scope: stage.querySelector('[data-selection-scope]')?.value || (
+      ['filter_equity_regime', 'pair_side_pnl_upper_half', 'pair_side_stage_3'].includes(stage.dataset.selectionStage)
+        ? 'pair_side' : 'pair_side_timeframe'),
     ...(stage.querySelector('[data-selection-min-shift]') ? { min_shift_pct: stage.querySelector('[data-selection-min-shift]').value } : {}),
     ...(stage.querySelector('[data-selection-pnl-tolerance]') ? { pnl_tolerance_pct: stage.querySelector('[data-selection-pnl-tolerance]').value } : {}),
   })), {
@@ -3809,6 +3816,67 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
   });
 
   const settingsStatus = document.querySelector('#settings-status');
+  const researchedSettingsEndpoint = '/api/v2/strategies/performance-v2/selection-settings';
+  const researchedSettingFields = [
+    ['researched_pnl_dd5_ratio', '6 · DD5/30, доля', 'Доля медианы верхней половины; сейчас 0,50.'],
+    ['researched_pnl_b_ratio', '6 · B/30, доля', 'Независимая доля медианы верхней половины; сейчас 0,60.'],
+    ['researched_b_abs', '7–9 · B, п.п.', 'Абсолютный порог существенной разницы.'],
+    ['researched_b_rel', '7–9 · B, доля', 'Относительный порог от большего модуля.'],
+    ['researched_dd5_abs', '7–9 · DD5, единицы', 'Абсолютный порог существенной разницы.'],
+    ['researched_dd5_rel', '7–9 · DD5, доля', 'Относительный порог от большего модуля.'],
+    ['researched_dd_abs', '7–9 · DD, п.п.', 'Абсолютный порог существенной разницы.'],
+    ['researched_dd_rel', '7–9 · DD, доля', 'Относительный порог от большего модуля.'],
+    ['researched_points_mean_ratio', '7–9 · Points, доля среднего', 'Преимущество среднего числа точек.'],
+    ['researched_points_same_floor_ratio', '7 · Points, минимум каждого', 'Доля точек замены в каждом ордере той же конструкции.'],
+    ['researched_points_cross_floor_ratio', '8–9 · Points, минимум слабого', 'Доля точек слабейшего ордера замены.'],
+    ['researched_points_single_best_ratio', '8–9 · 1ORD, лучший ордер', 'Дополнительный перевес над лучшим ордером многоордерной замены.'],
+    ['researched_open_ma_delta', '7–8 · Open MA, среднее', 'Разница средних MA для защиты.'],
+    ['researched_close_ma_delta', '7–8 · Close MA', 'Разница Close MA для защиты.'],
+    ['researched_hold_p95_ratio', '7–9 · Hold p95, доля', 'Улучшение p95 относительно замены.'],
+    ['researched_hold_median_ratio', '7–9 · Hold M, доля', 'Улучшение медианы относительно замены.'],
+    ['researched_hold_p95_veto_ratio', '7–9 · Hold p95, запрет', 'Насколько p95 может быть хуже при защите по медиане.'],
+  ];
+  const researchedSettingsRoot = document.querySelector('#performance-v2-selection-settings-fields');
+  const researchedSettingsStatus = document.querySelector('#performance-v2-selection-settings-status');
+  let researchedSettingsDigest = '';
+  if (researchedSettingsRoot) researchedSettingsRoot.replaceChildren(...researchedSettingFields.map(([key, label, hint]) => {
+    const group = document.createElement('div'); group.className = 'field-group';
+    const caption = document.createElement('label'); caption.htmlFor = `performance-v2-setting-${key}`; caption.textContent = label;
+    const input = document.createElement('input'); input.id = caption.htmlFor; input.dataset.researchedSetting = key; input.type = 'text'; input.inputMode = 'decimal';
+    const help = document.createElement('small'); help.textContent = hint;
+    group.append(caption, input, help); return group;
+  }));
+  async function loadPerformanceV2SelectionSettings() {
+    if (!researchedSettingsRoot) return;
+    try {
+      const data = await requestJson(researchedSettingsEndpoint);
+      researchedSettingsDigest = data.digest;
+      for (const input of researchedSettingsRoot.querySelectorAll('[data-researched-setting]')) input.value = data.settings[input.dataset.researchedSetting] ?? '';
+      if (researchedSettingsStatus) researchedSettingsStatus.textContent = 'Настройки фильтров загружены.';
+    } catch (error) { if (researchedSettingsStatus) researchedSettingsStatus.textContent = `Не удалось загрузить настройки: ${error.message}`; }
+  }
+  document.querySelector('#performance-v2-selection-settings-reload')?.addEventListener('click', loadPerformanceV2SelectionSettings);
+  document.querySelector('#performance-v2-selection-settings-save')?.addEventListener('click', async () => {
+    if (!researchedSettingsDigest) await loadPerformanceV2SelectionSettings();
+    if (!researchedSettingsDigest) return;
+    const changes = Object.fromEntries([...researchedSettingsRoot.querySelectorAll('[data-researched-setting]')]
+      .map((input) => [input.dataset.researchedSetting, input.value.trim()])
+      .filter(([, value]) => value !== ''));
+    if (!Object.keys(changes).length) {
+      if (researchedSettingsStatus) researchedSettingsStatus.textContent = 'Нет заполненных значений для сохранения.';
+      return;
+    }
+    try {
+      const data = await remoteRequest(researchedSettingsEndpoint, { digest: researchedSettingsDigest, changes });
+      researchedSettingsDigest = data.digest;
+      if (researchedSettingsStatus) researchedSettingsStatus.textContent = 'Пороги сохранены; следующий расчёт использует новые значения.';
+      await loadPerformanceV2Catalog();
+    } catch (error) {
+      if (error.code === 'SELECTION_SETTINGS_STALE') await loadPerformanceV2SelectionSettings();
+      if (researchedSettingsStatus) researchedSettingsStatus.textContent = error.code === 'SELECTION_SETTINGS_STALE'
+        ? 'Настройки изменились в другом окне. Загружены актуальные значения.' : `Не удалось сохранить: ${error.message}`;
+    }
+  });
   const settingsPayload = () => ({ panel: {
     default_root: document.querySelector('#settings-default-root')?.value || 'static',
     path_defaults: {

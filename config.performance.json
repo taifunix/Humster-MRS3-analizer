@@ -25,7 +25,24 @@
       "top5_min_profitable_cycles": 25,
       "plateau_points_pareto_pnl_multiplier": 2,
       "shift_near_tie_min_advantage_bp": 10,
-      "lot_variant_redundancy_enabled": true
+      "lot_variant_redundancy_enabled": true,
+      "researched_pnl_dd5_ratio": 0.50,
+      "researched_pnl_b_ratio": 0.60,
+      "researched_b_abs": 2,
+      "researched_b_rel": 0.25,
+      "researched_dd5_abs": 3,
+      "researched_dd5_rel": 0.25,
+      "researched_dd_abs": 1,
+      "researched_dd_rel": 0.25,
+      "researched_points_mean_ratio": 0.40,
+      "researched_points_same_floor_ratio": 0.40,
+      "researched_points_cross_floor_ratio": 0.30,
+      "researched_points_single_best_ratio": 0.10,
+      "researched_open_ma_delta": 2.6,
+      "researched_close_ma_delta": 3,
+      "researched_hold_p95_ratio": 0.20,
+      "researched_hold_median_ratio": 0.30,
+      "researched_hold_p95_veto_ratio": 0.15
     }
   }
 }

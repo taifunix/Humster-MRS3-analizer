@@ -1,5 +1,31 @@
 # MRS3 — current verification
 
+## Performance v2 researched selection stages (2026-10-02)
+
+The six-pair FilterExp workbook was replayed against the Panel engine after
+excluding its 49 prior DD>23% rows. Independent DD5/B gates matched 1,854/
+1,842 known rows; stages 6/7/8/9 matched 1,844/1,507/270/224 row decisions,
+and replacement IDs matched 1,237/46/64 drops at structural stages 7/8/9.
+Twelve workbook rows have B=`N/A`: ten DD5-pass survivors remain outside later
+research sheets and are intentionally retained by the Panel missing-data rule;
+IDs 17421/17422 already fail DD5. A strict 40%
+Points equality rounding defect and a Hold-rescue analog guard were corrected
+before this zero-difference replay. These counts compare unchanged workbook
+values; current database A/B corrections can change live selection outcomes.
+
+Four fixed Panel stages 6–9 now apply the researched independent PnL gates,
+same-construction comparison, cross-construction comparison, and pair-side
+comparison. The standard XLSX retains its existing sheet and column layout:
+new exclusions use the existing reason and Auto Analog Of ID fields. The
+config and Panel Settings expose the key limits. Focused checks: 223 passed;
+existing selection checks: 230 passed (107 deselected). The unfiltered suite
+was stopped after 41% because one unrelated test ran for several minutes
+without output; no failure had appeared. JavaScript syntax and
+`git diff --check` passed. Independent re-review of the six-pair parity
+correction returned `CODE_REVIEW_PASS`.
+Contract:
+`docs/specs/2026-10-02-performance-v2-researched-filters.md`.
+
 ## Performance v2 window boundary correction (2026-10-02)
 
 The shared A/B/Full window calculation now selects PnL boundaries from

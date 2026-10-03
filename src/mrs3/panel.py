@@ -33,6 +33,15 @@ _LOGGER = logging.getLogger(__name__)
 _RETEST_INBOX_PATH_UNAVAILABLE = "committed RETEST inbox path is unavailable"
 _RETEST_INBOX_MANIFEST_UNAVAILABLE = "committed RETEST inbox manifest is unavailable"
 _RETEST_INBOX_UNAVAILABLE = frozenset({_RETEST_INBOX_PATH_UNAVAILABLE, _RETEST_INBOX_MANIFEST_UNAVAILABLE})
+_RESEARCHED_SELECTION_KEYS = (
+    "researched_pnl_dd5_ratio", "researched_pnl_b_ratio",
+    "researched_b_abs", "researched_b_rel", "researched_dd5_abs", "researched_dd5_rel",
+    "researched_dd_abs", "researched_dd_rel", "researched_points_mean_ratio",
+    "researched_points_same_floor_ratio", "researched_points_cross_floor_ratio",
+    "researched_points_single_best_ratio", "researched_open_ma_delta",
+    "researched_close_ma_delta", "researched_hold_p95_ratio",
+    "researched_hold_median_ratio", "researched_hold_p95_veto_ratio",
+)
 
 
 def _open_regular_artifact(path: Path) -> tuple[BinaryIO, int]:
@@ -1843,6 +1852,52 @@ class PanelController:
     def panel_settings_save(self, payload: Mapping[str, object]) -> dict[str, object]:
         with self._lock:
             return save_panel_settings(self.default_config, self.root, payload)
+
+    def performance_v2_selection_settings(self, payload: Mapping[str, object] | None = None) -> dict[str, object]:
+        path = self.default_config.with_name("config.performance.json")
+        with self._lock:
+            try:
+                original = path.read_bytes()
+                document = json.loads(original)
+                if not isinstance(document, dict) or not isinstance(document.get("unified_performance_v2"), dict):
+                    raise ValueError("invalid performance config")
+                current_digest = sha256(original).hexdigest()
+                if payload is not None:
+                    if set(payload) != {"digest", "changes"} or not isinstance(payload.get("digest"), str):
+                        raise PerformanceV2ApiError("SELECTION_SETTINGS_INVALID", status=400)
+                    changes = payload.get("changes")
+                    if not isinstance(changes, dict) or not changes or not set(changes) <= set(_RESEARCHED_SELECTION_KEYS):
+                        raise PerformanceV2ApiError("SELECTION_SETTINGS_INVALID", status=400)
+                    if payload["digest"] != current_digest:
+                        raise PerformanceV2ApiError("SELECTION_SETTINGS_STALE", status=409)
+                    selected = document["unified_performance_v2"].setdefault("finalist_selection", {})
+                    if not isinstance(selected, dict):
+                        raise ValueError("invalid finalist selection config")
+                    for key, value in changes.items():
+                        if not isinstance(value, str):
+                            raise PerformanceV2ApiError("SELECTION_SETTINGS_INVALID", status=400)
+                        selected[key] = value
+                    rendered = (json.dumps(document, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+                    with tempfile.NamedTemporaryFile(dir=path.parent, prefix=".performance-selection-", suffix=".json", delete=False) as temporary:
+                        temporary_path = Path(temporary.name)
+                        temporary.write(rendered)
+                        temporary.flush()
+                        os.fsync(temporary.fileno())
+                    try:
+                        load_selection_config(temporary_path)
+                        os.chmod(temporary_path, stat.S_IMODE(path.stat().st_mode))
+                        os.replace(temporary_path, path)
+                    finally:
+                        temporary_path.unlink(missing_ok=True)
+                    current_digest = sha256(rendered).hexdigest()
+                config = load_selection_config(path)
+                return {"digest": current_digest, "settings": {
+                    key: str(getattr(config, key)) for key in _RESEARCHED_SELECTION_KEYS
+                }}
+            except PerformanceV2ApiError:
+                raise
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError, PerformanceV2SelectionError, ValueError) as error:
+                raise PerformanceV2ApiError("SELECTION_SETTINGS_INVALID", status=400) from error
 
     def analysis_profile_get(self) -> dict[str, object]:
         with self._lock:
@@ -8484,6 +8539,15 @@ class _PanelHandler(BaseHTTPRequestHandler):
                 _LOGGER.exception("Performance v2 catalog failed")
                 self._json(500, {"error": {"code": "INTERNAL", "message": "Performance v2 catalog failed"}})
             return
+        if parsed.path == "/api/v2/strategies/performance-v2/selection-settings":
+            try:
+                self._json(200, self.server.controller.performance_v2_selection_settings())
+            except PerformanceV2ApiError as error:
+                self._json(error.status, {"error": {"code": error.code, "message": str(error)}})
+            except Exception:
+                _LOGGER.exception("Performance v2 selection settings failed")
+                self._json(500, {"error": {"code": "INTERNAL", "message": "Selection settings unavailable"}})
+            return
         if parsed.path == "/api/v2/surfaces/catalog":
             self._json(200, self.server.controller.surface_catalog())
             return
@@ -8772,7 +8836,7 @@ class _PanelHandler(BaseHTTPRequestHandler):
         portfolio_route = portfolio_preparation_route or endpoint == "/api/v2/portfolio/campaigns" or bool(re.fullmatch(r"/api/v2/portfolio/jobs/[^/]+/cancel", endpoint)) or bool(re.fullmatch(r"/api/v2/portfolio/campaigns/[^/]+/tester-submissions", endpoint))
         portfolio_cancel_route = bool(re.fullmatch(r"/api/v2/portfolio/jobs/[^/]+/cancel", endpoint))
         portfolio_submission_route = bool(re.fullmatch(r"/api/v2/portfolio/campaigns/[^/]+/tester-submissions", endpoint))
-        if bulk_retest_endpoint is None and endpoint not in {"/api/start", "/api/browse", "/api/duckdb-import/settings", "/api/duckdb-import/preflight", "/api/duckdb-import/start", "/api/duckdb-import/cancel", "/api/duckdb-import/migrate", "/api/duckdb-direct/coverage", "/api/duckdb-direct/preflight", "/api/duckdb-direct/start", "/api/duckdb-direct/cancel", "/api/analysis/library", "/api/analysis/initialize", "/api/analysis/rerun", "/api/analysis/compare", "/api/analysis/export", "/api/analysis/shortlist", "/api/analysis/filter-export", "/api/analysis/strategies", "/api/source-v6/preflight", "/api/source-v6/start", "/api/source-v6/fresh/multiscope/start", "/api/source-v6/fresh/multiscope/analysis/start", "/api/source-v6/cancel", "/api/source-v6/merge", "/api/v2/panel/restart", "/api/v2/settings/validate", "/api/v2/settings/save", "/api/v2/settings/analysis-profile", "/api/v2/jobs", "/api/v2/strategies/tester/verify-inbox", "/api/v2/strategies/tester/report-collection/clear", "/api/v2/testing/local/fill", "/api/v2/testing/local/start", "/api/v2/testing/local/stop", "/api/v2/testing/screener/fill", "/api/v2/testing/screener/start", "/api/v2/testing/screener/stop", "/api/v2/testing/screener/evaluate", "/api/v2/testing/remote/check-paths", "/api/v2/testing/remote/prepare", "/api/v2/testing/remote/fill", "/api/v2/testing/remote/start", "/api/v2/testing/remote/stop", "/api/v2/source/local/import/preflight", "/api/v2/source/local/import/start", "/api/v2/source/local/merge/preflight", "/api/v2/source/local/merge/start", "/api/v2/source/local/cancel", "/api/v2/source/remote/start", "/api/v2/source/remote/cancel", "/api/v2/surfaces/preflight", "/api/v2/surfaces/select", "/api/v2/surfaces/publish", "/api/v2/surfaces/publish/start", "/api/v2/strategies/fresh/analyze", "/api/v2/strategies/fresh/generate", "/api/v2/strategies/fresh/runs", "/api/v2/strategies/fresh/shortlist", "/api/v2/strategies/fresh/open", "/api/v2/strategies/performance-v2/windows", "/api/v2/strategies/performance-v2/selection", "/api/v2/strategies/performance-v2/selection-preview", "/api/v2/strategies/performance-v2/selection-cache-status", "/api/v2/strategies/performance-v2/recalculate", "/api/v2/strategies/performance-v2/recalculate-all", "/api/v2/strategies/performance-v2/selection-review-import", "/api/v2/strategies/performance-v2/retest-tags-import", "/api/v2/strategies/performance-v2/retest/start", "/api/v2/strategies/performance-v2/retest/import"} and not portfolio_route:
+        if bulk_retest_endpoint is None and endpoint != "/api/v2/strategies/performance-v2/selection-settings" and endpoint not in {"/api/start", "/api/browse", "/api/duckdb-import/settings", "/api/duckdb-import/preflight", "/api/duckdb-import/start", "/api/duckdb-import/cancel", "/api/duckdb-import/migrate", "/api/duckdb-direct/coverage", "/api/duckdb-direct/preflight", "/api/duckdb-direct/start", "/api/duckdb-direct/cancel", "/api/analysis/library", "/api/analysis/initialize", "/api/analysis/rerun", "/api/analysis/compare", "/api/analysis/export", "/api/analysis/shortlist", "/api/analysis/filter-export", "/api/analysis/strategies", "/api/source-v6/preflight", "/api/source-v6/start", "/api/source-v6/fresh/multiscope/start", "/api/source-v6/fresh/multiscope/analysis/start", "/api/source-v6/cancel", "/api/source-v6/merge", "/api/v2/panel/restart", "/api/v2/settings/validate", "/api/v2/settings/save", "/api/v2/settings/analysis-profile", "/api/v2/jobs", "/api/v2/strategies/tester/verify-inbox", "/api/v2/strategies/tester/report-collection/clear", "/api/v2/testing/local/fill", "/api/v2/testing/local/start", "/api/v2/testing/local/stop", "/api/v2/testing/screener/fill", "/api/v2/testing/screener/start", "/api/v2/testing/screener/stop", "/api/v2/testing/screener/evaluate", "/api/v2/testing/remote/check-paths", "/api/v2/testing/remote/prepare", "/api/v2/testing/remote/fill", "/api/v2/testing/remote/start", "/api/v2/testing/remote/stop", "/api/v2/source/local/import/preflight", "/api/v2/source/local/import/start", "/api/v2/source/local/merge/preflight", "/api/v2/source/local/merge/start", "/api/v2/source/local/cancel", "/api/v2/source/remote/start", "/api/v2/source/remote/cancel", "/api/v2/surfaces/preflight", "/api/v2/surfaces/select", "/api/v2/surfaces/publish", "/api/v2/surfaces/publish/start", "/api/v2/strategies/fresh/analyze", "/api/v2/strategies/fresh/generate", "/api/v2/strategies/fresh/runs", "/api/v2/strategies/fresh/shortlist", "/api/v2/strategies/fresh/open", "/api/v2/strategies/performance-v2/windows", "/api/v2/strategies/performance-v2/selection", "/api/v2/strategies/performance-v2/selection-preview", "/api/v2/strategies/performance-v2/selection-cache-status", "/api/v2/strategies/performance-v2/recalculate", "/api/v2/strategies/performance-v2/recalculate-all", "/api/v2/strategies/performance-v2/selection-review-import", "/api/v2/strategies/performance-v2/retest-tags-import", "/api/v2/strategies/performance-v2/retest/start", "/api/v2/strategies/performance-v2/retest/import"} and not portfolio_route:
             self._json(404, {"error": "not found"})
             return
         if endpoint in {"/api/v2/strategies/performance-v2/selection-review-import", "/api/v2/strategies/performance-v2/retest-tags-import"}:
@@ -8928,6 +8992,8 @@ class _PanelHandler(BaseHTTPRequestHandler):
                 result = self.server.controller.strategies_performance_v2_windows(document)
             elif endpoint == "/api/v2/strategies/performance-v2/selection":
                 result = self.server.controller.strategies_performance_v2_selection(document)
+            elif endpoint == "/api/v2/strategies/performance-v2/selection-settings":
+                result = self.server.controller.performance_v2_selection_settings(document)
             elif endpoint == "/api/v2/strategies/performance-v2/selection-preview":
                 result = self.server.controller.strategies_performance_v2_selection_preview(document)
             elif endpoint == "/api/v2/strategies/performance-v2/selection-cache-status":

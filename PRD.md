@@ -20,6 +20,14 @@ BASE 1ORD selection (`docs/specs/2026-08-24-base-1ord-selection.md`) implemented
 
 ## Текущий этап: v0.7 Source v6 fresh compact multi-scope — complete
 
+The Performance v2 fixed filter sequence is implemented and independently
+reviewed in local `main` (commit `eae54c0`): Equity, Lot variant, hard cutoffs,
+A/B deterioration and top-five concentration. The contract and evidence are
+listed in the implemented-feature table below. Researched pair-side PnL and
+structural stages 6–9 are implemented in the Panel under
+[their active contract](docs/specs/2026-10-02-performance-v2-researched-filters.md).
+The Panel export uses its existing sheets, reason and analog columns.
+
 PerformanceDB storage reduction is the current user-prioritized maintenance
 work: [contract](docs/specs/2026-09-30-performance-db-lossless-compaction.md),
 [measured investigation](docs/reports/2026-09-30-performance-db-storage.md).
