@@ -1,5 +1,19 @@
 # MRS3 — current verification
 
+## Performance v2 filter card layout (2026-10-03)
+
+The researched filters 6–9 now use the normal text columns; the final-ranking
+column rule is scoped to its own nested card. The template has exactly four
+fixed-filter `li` elements with direct `label.check` and one rank `div` with
+`.selection-rank-main > label.check`. For a reproducible layout probe, embed
+production `app.css` and those four `li` elements from `index.html` in a plain
+HTML document, append the rank shape, and read
+`getComputedStyle(card.querySelector('.check')).gridColumnStart` in headless
+Chrome. At 500/900/1440px, all four filters returned column 2; the rank card
+returned nested column 1. At 500px, each filter text area was 410px wide and
+document scroll width equaled the 500px viewport. No selection or cache logic
+changed.
+
 ## Performance v2 researched selection stages (2026-10-02)
 
 The six-pair FilterExp workbook was replayed against the Panel engine after
