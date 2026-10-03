@@ -36,6 +36,119 @@ def test_researched_filters_have_fixed_order_and_editable_settings() -> None:
         assert "data-selection-move" not in body, stage_id
 
 
+def test_selection_catalog_defaults_to_a_valid_scope_and_refreshes_counts() -> None:
+    js = _read("app.js")
+    sync_body = js.split("const syncPerformanceV2SelectionScope = () => {", 1)[1].split("\n  };", 1)[0]
+    script = """
+class FakeSelect {
+  constructor() { this.value = ''; this.options = []; }
+  replaceChildren(...items) { this.options = items; this.value = items[0]?.value || ''; }
+  append(item) { this.options.push(item); }
+}
+const Option = function (label, value) { this.label = label; this.value = value; };
+const performanceV2Strategies = [
+  {symbol: 'ABC', side: 'LONG'}, {symbol: 'XYZ', side: 'SHORT'}
+];
+const performanceV2SelectionPair = new FakeSelect();
+const performanceV2SelectionSide = new FakeSelect();
+const syncPerformanceV2SelectionScope = () => {SYNC_BODY
+};
+syncPerformanceV2SelectionScope();
+if (performanceV2SelectionPair.value !== 'ABC' || performanceV2SelectionSide.value !== 'LONG') throw new Error('Initial scope missing');
+performanceV2SelectionPair.value = 'XYZ';
+syncPerformanceV2SelectionScope();
+if (performanceV2SelectionSide.value !== 'SHORT') throw new Error('Side not selected after pair change');
+performanceV2Strategies.splice(0);
+syncPerformanceV2SelectionScope();
+if (performanceV2SelectionPair.value || performanceV2SelectionSide.value) throw new Error('Empty catalog scope must be blank');
+performanceV2Strategies.push({symbol: 'ABC', side: ''});
+syncPerformanceV2SelectionScope();
+if (performanceV2SelectionPair.value !== 'ABC' || performanceV2SelectionSide.value) throw new Error('Missing side must stay blank');
+""".replace("SYNC_BODY", sync_body)
+    completed = subprocess.run(("node", "-e", script), capture_output=True, text=True)
+    assert completed.returncode == 0, completed.stderr
+
+    catalog = js.split("const loadPerformanceV2Catalog = async", 1)[1].split("performanceV2WindowRefresh?.addEventListener", 1)[0]
+    reopen = js.split("performanceV2SelectionCard?.addEventListener('toggle'", 1)[1].split("performanceV2WindowAEntire?.addEventListener", 1)[0]
+    all_pairs = js.split("recalculateAllButton?.addEventListener('click'", 1)[1].split("selectionXlsButton?.addEventListener", 1)[0]
+    assert "scheduleSelectionPreview()" in catalog
+    assert "scheduleSelectionPreview()" in reopen
+    assert "scheduleSelectionPreview()" in all_pairs
+
+    preview_body = js.split("const refreshSelectionPreview = async () => {", 1)[1].split("\n  };", 1)[0]
+    preview_script = """
+let side = 'LONG';
+let requests = 0;
+let rendered = null;
+let selectionPreviewRevision = 0;
+const selectionPreviewStatus = {textContent: ''};
+const selectionPayload = () => ({symbol: 'ABC', side, stages: []});
+const renderSelectionCounts = (counts) => { rendered = counts; };
+let fetch = async (url) => {
+  if (url !== '/api/v2/strategies/performance-v2/selection-preview') throw new Error('Preview must stay read-only');
+  requests++;
+  return {ok: true, json: async () => ({stages: {structural_stage_1: {eliminated: 7, remaining: 3}}})};
+};
+const refreshSelectionPreview = async () => {PREVIEW_BODY
+};
+(async () => {
+  await refreshSelectionPreview();
+  if (requests !== 1 || rendered.structural_stage_1.eliminated !== 7) throw new Error('Counts not rendered');
+  side = '';
+  await refreshSelectionPreview();
+  if (requests !== 1 || !selectionPreviewStatus.textContent.includes('Выберите пару и сторону')) throw new Error('Missing scope not explained');
+  side = 'LONG';
+  fetch = async () => ({ok: false, json: async () => ({error: {message: 'failed'}})});
+  await refreshSelectionPreview();
+  if (Object.keys(rendered).length || !selectionPreviewStatus.textContent.includes('Счётчики не обновлены')) throw new Error('Failed preview retained stale counts');
+  const pending = [];
+  fetch = () => new Promise((resolve) => pending.push(resolve));
+  const stale = refreshSelectionPreview();
+  side = 'SHORT';
+  const current = refreshSelectionPreview();
+  pending[1]({ok: true, json: async () => ({stages: {current: {eliminated: 2}}})});
+  await current;
+  pending[0]({ok: true, json: async () => ({stages: {stale: {eliminated: 99}}})});
+  await stale;
+  if (rendered.current?.eliminated !== 2 || rendered.stale) throw new Error('Stale preview overwrote current scope');
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+""".replace("PREVIEW_BODY", preview_body)
+    completed = subprocess.run(("node", "-e", preview_script), capture_output=True, text=True)
+    assert completed.returncode == 0, completed.stderr
+
+    cache_body = js.split("const refreshSelectionCacheStatus = async () => {", 1)[1].split("\n  };", 1)[0]
+    cache_script = """
+let selectionCacheStatusRevision = 0;
+let selectionPreviewRevision = 1;
+const selectionPreviewStatus = {textContent: 'Счётчики обновлены.'};
+const selectionXlsButton = {disabled: true};
+const performanceV2SelectionPair = {value: 'ABC'};
+const performanceV2SelectionSide = {value: 'LONG'};
+const selectionPayload = () => ({symbol: 'ABC', side: 'LONG', stages: []});
+const pending = [];
+const fetch = () => new Promise((resolve) => pending.push(resolve));
+const refreshSelectionCacheStatus = async () => {CACHE_BODY
+};
+(async () => {
+  const ready = refreshSelectionCacheStatus();
+  pending[0]({ok: true, json: async () => ({ready: true, missing: 0, total: 10})});
+  await ready;
+  if (selectionPreviewStatus.textContent !== 'Счётчики обновлены.' || selectionXlsButton.disabled) throw new Error('Ready cache clobbered preview');
+  const old = refreshSelectionCacheStatus();
+  selectionPreviewRevision++;
+  pending[1]({ok: true, json: async () => ({ready: false, missing: 1, total: 10})});
+  await old;
+  if (selectionPreviewStatus.textContent !== 'Счётчики обновлены.') throw new Error('Stale incomplete cache clobbered preview');
+  const current = refreshSelectionCacheStatus();
+  pending[2]({ok: true, json: async () => ({ready: false, missing: 1, total: 10})});
+  await current;
+  if (!selectionPreviewStatus.textContent.includes('Требуется пересчёт')) throw new Error('Current incomplete cache hidden');
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+""".replace("CACHE_BODY", cache_body)
+    completed = subprocess.run(("node", "-e", cache_script), capture_output=True, text=True)
+    assert completed.returncode == 0, completed.stderr
+
+
 def test_selection_browser_payload_keeps_legacy_scope_defaults_and_rank() -> None:
     from mrs3.performance_v2_selection import parse_selection_request
 
@@ -686,7 +799,8 @@ def test_performance_v2_selection_preview_exposes_ordered_finalist_stages_withou
     assert "/api/v2/strategies/performance-v2/recalculate-all/progress" in js
     assert "всего ${result.total_pairs} пар" in js
     assert "обновлено ${result.planned_pairs}; без пересчёта ${result.ready_pairs}" in js
-    assert "if (!payload.symbol || !payload.side) return;" in js
+    assert "if (!payload.symbol || !payload.side) {" in js
+    assert "Выберите пару и сторону для расчёта счётчиков." in js
     strategies = html.split('id="strategies-dd5"', 1)[1].split('id="settings"', 1)[0]
     assert 'id="performance-v2-selection-card"' in strategies
     assert "4. Pareto and filters" in strategies

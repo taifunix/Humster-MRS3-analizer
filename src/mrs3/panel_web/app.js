@@ -3231,13 +3231,13 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
     const pairs = [...new Set(performanceV2Strategies.map((strategy) => strategy.symbol).filter(Boolean))].sort();
     performanceV2SelectionPair.replaceChildren(new Option('Выберите пару', ''));
     for (const pair of pairs) performanceV2SelectionPair.append(new Option(pair, pair));
-    performanceV2SelectionPair.value = pairs.includes(selectedPair) ? selectedPair : '';
+    performanceV2SelectionPair.value = pairs.includes(selectedPair) ? selectedPair : (pairs[0] || '');
     const sides = [...new Set(performanceV2Strategies
       .filter((strategy) => !performanceV2SelectionPair.value || strategy.symbol === performanceV2SelectionPair.value)
       .map((strategy) => strategy.side).filter(Boolean))].sort();
-    performanceV2SelectionSide.replaceChildren(new Option('Все стороны', ''));
+    performanceV2SelectionSide.replaceChildren(new Option('Выберите сторону', ''));
     for (const side of sides) performanceV2SelectionSide.append(new Option(side, side));
-    performanceV2SelectionSide.value = sides.includes(selectedSide) ? selectedSide : '';
+    performanceV2SelectionSide.value = sides.includes(selectedSide) ? selectedSide : (sides[0] || '');
   };
   const syncPerformanceV2WindowCatalog = () => {
     if (!performanceV2WindowSelect || !performanceV2WindowPair) return null;
@@ -3275,6 +3275,11 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
       updatePerformanceV2SelectionHelp(performanceV2SelectionConfig);
       performanceV2SelectionPairsWithRuns = new Set(Array.isArray(result.selection_pairs_with_runs) ? result.selection_pairs_with_runs : []);
       syncPerformanceV2SelectionScope();
+      if (performanceV2SelectionCard?.open) {
+        renderSelectionCounts({});
+        refreshSelectionCacheStatus();
+        scheduleSelectionPreview();
+      }
       const selectedStrategy = syncPerformanceV2WindowCatalog();
       if (selectedStrategy) {
         performanceV2SetWindowBounds(selectedStrategy);
@@ -3310,7 +3315,13 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
     if (performanceV2WindowCard.open && !performanceV2Strategies.length) loadPerformanceV2Catalog();
   });
   performanceV2SelectionCard?.addEventListener('toggle', () => {
-    if (performanceV2SelectionCard.open && !performanceV2Strategies.length) loadPerformanceV2Catalog();
+    if (!performanceV2SelectionCard.open) return;
+    if (!performanceV2Strategies.length) loadPerformanceV2Catalog();
+    else {
+      renderSelectionCounts({});
+      refreshSelectionCacheStatus();
+      scheduleSelectionPreview();
+    }
   });
   performanceV2WindowAEntire?.addEventListener('click', () => {
     const range = performanceV2ReportRange();
@@ -3435,7 +3446,7 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
       selectionPreviewBadge.classList.remove('state-pending');
       selectionPreviewBadge.classList.add('state-ready');
     }
-    if (selectionPreviewStatus) selectionPreviewStatus.textContent = 'Preview: изменения сохранены только на экране; расчёт не запускался.';
+    if (selectionPreviewStatus) selectionPreviewStatus.textContent = 'Обновляем счётчики для выбранной пары и стороны…';
     orderedSelectionStages().forEach((stage, index) => {
       if (index < fromIndex) return;
       const summary = stage.querySelector('.selection-stage-summary');
@@ -3471,6 +3482,7 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
   let selectionCacheStatusRevision = 0;
   const refreshSelectionCacheStatus = async () => {
     const revision = ++selectionCacheStatusRevision;
+    const previewRevision = selectionPreviewRevision;
     try {
       const payload = selectionPayload();
       const { symbol, side } = payload;
@@ -3485,9 +3497,8 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
       const cache = await response.json();
       if (revision !== selectionCacheStatusRevision || symbol !== performanceV2SelectionPair?.value || side !== performanceV2SelectionSide?.value) return;
       if (selectionXlsButton) selectionXlsButton.disabled = !cache.ready;
-      if (selectionPreviewStatus) selectionPreviewStatus.textContent = cache.ready
-        ? 'Пересчёт не требуется.'
-        : `Требуется пересчёт: ${cache.missing} из ${cache.total} стратегий без фактов.`;
+      if (!cache.ready && selectionPreviewStatus && previewRevision === selectionPreviewRevision) selectionPreviewStatus.textContent =
+        `Требуется пересчёт: ${cache.missing} из ${cache.total} стратегий без фактов.`;
     } catch (error) {
       if (revision !== selectionCacheStatusRevision) return;
       if (selectionXlsButton) selectionXlsButton.disabled = true;
@@ -3573,10 +3584,14 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
   });
   let selectionPreviewTimer = 0;
   const refreshSelectionPreview = async () => {
-    const revision = selectionPreviewRevision;
+    const revision = ++selectionPreviewRevision;
     try {
       const payload = selectionPayload();
-      if (!payload.symbol || !payload.side) return;
+      if (!payload.symbol || !payload.side) {
+        renderSelectionCounts({});
+        if (selectionPreviewStatus) selectionPreviewStatus.textContent = 'Выберите пару и сторону для расчёта счётчиков.';
+        return;
+      }
       if (selectionPreviewStatus) selectionPreviewStatus.textContent = 'Обновляем счётчики…';
       const response = await fetch('/api/v2/strategies/performance-v2/selection-preview', {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
@@ -3588,14 +3603,18 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
       if (selectionPreviewStatus) selectionPreviewStatus.textContent = 'Счётчики обновлены.';
     } catch (error) {
       if (revision !== selectionPreviewRevision) return;
+      renderSelectionCounts({});
       if (selectionPreviewStatus) selectionPreviewStatus.textContent = `Счётчики не обновлены: ${error.message || 'ошибка запроса'}`;
     }
   };
   const scheduleSelectionPreview = () => {
+    selectionPreviewRevision += 1;
     window.clearTimeout(selectionPreviewTimer);
     selectionPreviewTimer = window.setTimeout(() => { void refreshSelectionPreview(); }, 250);
   };
   document.querySelector('#performance-v2-selection-recalculate')?.addEventListener('click', async () => {
+    selectionPreviewRevision += 1;
+    renderSelectionCounts({});
     try {
       if (selectionPreviewStatus) selectionPreviewStatus.textContent = 'Пересчитываем факты…';
       const response = await fetch('/api/v2/strategies/performance-v2/recalculate', {
@@ -3605,6 +3624,7 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
       if (!response.ok) throw new Error((await response.json()).error?.message || 'recalculation failed');
       if (selectionPreviewStatus) selectionPreviewStatus.textContent = 'Факты пересчитаны; XLSX готовится быстро.';
       refreshSelectionCacheStatus();
+      scheduleSelectionPreview();
     } catch (error) {
       if (selectionPreviewStatus) selectionPreviewStatus.textContent = `Пересчёт не выполнен: ${error.message || 'ошибка запроса'}`;
     }
@@ -3658,6 +3678,8 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
   };
   if (recalculateAllButton) void pollRecalculateProgress();
   recalculateAllButton?.addEventListener('click', async () => {
+    selectionPreviewRevision += 1;
+    renderSelectionCounts({});
     recalculatePostPending = true;
     window.clearTimeout(recalculatePollTimer);
     recalculatePollTimer = 0;
@@ -3673,6 +3695,7 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
       recalculateGeneration++;
       showRecalculateProgress({ status: 'READY', ...result, planned_pairs: result.recalculated_pairs });
       refreshSelectionCacheStatus();
+      scheduleSelectionPreview();
     } catch (error) {
       recalculateGeneration++;
       if (recalculateProgress) { recalculateProgress.hidden = false; setRecalculateMessage(`Пересчёт не выполнен: ${error.message || 'ошибка запроса'}`); }

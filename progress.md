@@ -1,5 +1,20 @@
 # MRS3 — current verification
 
+## Performance v2 preview counters (2026-10-03)
+
+The selection catalog now chooses an available pair and side when the filter
+panel opens, including when the catalog was loaded earlier by the A/B card.
+The read-only preview then displays per-stage excluded and
+remaining counts for that scope. Both fact-recalculation buttons refresh the
+preview after their cache work completes. An empty scope shows a direct
+instruction; cache readiness no longer overwrites a successful preview
+message. Concurrent Preview requests are versioned, and errors clear old
+counts. `node --check` passed, 153 static UI tests passed, and the focused
+backend preview-count test passed. The UI test covers out-of-order responses,
+empty catalogs, missing sides, failed Preview, and cache-status timing. No
+selection snapshot or XLSX was created. Independent re-review returned
+`CODE_REVIEW_PASS`.
+
 ## Performance v2 filter card layout (2026-10-03)
 
 The researched filters 6–9 now use the normal text columns; the final-ranking
