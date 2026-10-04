@@ -201,6 +201,22 @@ and the available report interval formatted as `DD.MM-DD.MM`.  It never
 substitutes tester dates for that interval or presents source PnL as tested
 strategy PnL.  Tester date controls remain in the Tester batch card.
 
+## Tester status visibility (2026-10-04)
+
+Goal: make a blocked `Generate READY JSON` action and the live tester state
+visible in the same card. This does not change generation eligibility, scope
+selection, tester lifecycle, or backend contracts. Inputs are the existing
+tester job and shortlist states; outputs are the existing tester status text
+and the button's disabled appearance. The tester status must address
+`#tester-status`, independently of the report-collection status, and disabled
+buttons must look unavailable. A nonterminal tester job must explain that the
+Panel currently blocks READY JSON generation, without claiming that the bot
+process is running. A partial selection of READY scopes from one
+side remains valid under [Shortlist filters v2](2026-09-27-shortlist-filters-v2.md).
+Acceptance evidence: a focused UI regression checks the two status targets and
+disabled button style; the static UI suite and JavaScript syntax check pass.
+
+
 ## Invariants
 
 - Server remains loopback-only and retains Host validation.

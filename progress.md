@@ -1,5 +1,22 @@
 # MRS3 — current verification
 
+## READY JSON button diagnostic (2026-10-04)
+
+On the running static Panel, the operator selected 1386 LONG candidates but
+`Generate READY JSON` was disabled. The Panel API still reports tester job
+`e7e0550eb15749c28a15eb2b7eaecbfb` as `RUNNING / BOT_RUN`, 0/2418; no
+`hb_c.exe` process appeared in the visible process list. The `/fresh/batch`
+404 on reload only means there is no prior generated batch. The UI now writes
+tester job state and the explicit Generate gate reason to `#tester-status` and
+visually marks the disabled Generate button. The collection status remains
+independent. Static/fresh suites: 210 passed; JavaScript syntax and diff checks
+passed; independent Opus 5/high re-review returned `CODE_REVIEW_PASS`.
+The current Panel process has not been
+restarted, so the existing journal entry still blocks generation. Next: verify
+the rendered status after reloading the page, then reconcile the orphaned tester
+job through the existing safe restart/recovery path after confirming no tester
+process is active; do not edit the journal directly.
+
 ## Equity regime M3 read-only validation (2026-10-04)
 
 The full read-only pass verified 30,940 current results and 139,740,157 raw

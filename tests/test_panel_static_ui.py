@@ -11,6 +11,63 @@ def _read(name: str) -> str:
     return (PANEL_WEB / name).read_text(encoding="utf-8")
 
 
+def test_tester_status_binding_ignores_collection_status() -> None:
+    html, js = _read("index.html"), _read("app.js")
+    tester_card = html.split('id="tester-collection-status"', 1)[1].split("</details>", 1)[0]
+    assert html.count('id="tester-status"') == 1
+    assert 'id="tester-status"' in tester_card
+    assert html.index('id="tester-collection-status"') < html.index('id="tester-status"')
+    expression = re.search(r"const testerStatus = ([^;]+);", js)
+    assert expression is not None
+    script = f"""
+const assert = require('node:assert/strict');
+const collection = {{ id: 'tester-collection-status' }};
+const tester = {{ id: 'tester-status' }};
+const testerCard = {{ querySelector: (selector) => selector === '.card-status' ? collection : tester }};
+const document = {{ querySelector: (selector) => selector === '#tester-status' ? tester : null }};
+assert.equal({expression.group(1)}, tester);
+"""
+    subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
+    assert "#shortlist-generate:disabled {" in _read("app.css")
+
+
+def test_running_tester_explains_generate_gate_without_overwriting_collection() -> None:
+    js = _read("app.js")
+    start = js.index("  const renderTester = (job) => {")
+    end = js.index("\n  const pollTester", start)
+    script = r"""
+const assert = require('node:assert/strict');
+const vm = require('node:vm');
+const source = __RENDER_TESTER__;
+const testerStatus = { textContent: '' };
+const collectionStatus = { textContent: 'Collection: 2 packs' };
+const context = {
+  testerStatus, testerText: { textContent: '' }, testerTrack: { style: {} },
+  testerStop: { disabled: true }, testerJobId: 'job-1',
+  testerCard: { querySelector: () => ({ className: '', textContent: '' }) },
+  testerIsTerminal: (job) => ['COMMITTED', 'FAILED', 'CANCELLED'].includes(job.state),
+  collectionIsActive: () => false, collectionImportReady: () => false,
+  normalImportAuthorized: false, authorizedTesterJobId: '',
+  testerCollectionId: '', normalVerifyInFlight: false, collectionActionBusy: false, collectionActivePacks: 0,
+  inboxVerifyV2: { disabled: true }, importStartV2: { disabled: true },
+  importStatusV2: testerStatus, importJobV2: '',
+  setTesterControls: (busy) => { context.generateDisabled = busy; },
+};
+vm.createContext(context);
+vm.runInContext(source, context);
+vm.runInContext("renderTester({job_id:'job-1', state:'RUNNING', kind:'strategies.tester.start', progress:{stage:'BOT_RUN', total:3, current:1}})", context);
+assert.equal(context.generateDisabled, true);
+assert.match(testerStatus.textContent, /BOT_RUN.*Generate READY JSON.*Performance v2/s);
+const once = testerStatus.textContent;
+vm.runInContext("renderTester({job_id:'job-1', state:'RUNNING', kind:'strategies.tester.start', progress:{stage:'BOT_RUN', total:3, current:1}})", context);
+assert.equal(testerStatus.textContent, once);
+assert.equal(collectionStatus.textContent, 'Collection: 2 packs');
+"""
+    script = script.replace("__RENDER_TESTER__", json.dumps(js[start:end]))
+    result = subprocess.run(["node", "-e", script], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+
+
 def test_researched_filters_have_fixed_order_and_editable_settings() -> None:
     html, js = _read("index.html"), _read("app.js")
     stages = re.findall(r'data-selection-stage="([^"]+)"', html)

@@ -2164,7 +2164,7 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
   addInitialBalanceField(document.querySelector('#performance-v2-retest-start'), 'performance-v2-retest-initial-balance');
   const testerCard = strategyCards[2];
   const testerText = testerCard?.querySelector('.progress-block p');
-  const testerStatus = testerCard?.querySelector('.card-status');
+  const testerStatus = document.querySelector('#tester-status');
   const testerTrack = testerCard?.querySelector('.progress-track span');
   const testerStart = document.querySelector('#tester-start');
   const testerStop = document.querySelector('#tester-stop');
@@ -2302,7 +2302,7 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
     if (testerStatus) {
       const error = job.error?.code ? ` ${job.error.code}: ${job.error.message || ''}` : '';
       const gate = importAllowed ? 'CHECKED' : 'CHECK REQUIRED';
-      testerStatus.textContent = `${singleMode ? 'SINGLE_MODE' : 'Tester'}: ${detail} · ${gate}.${error}`;
+      testerStatus.textContent = `${singleMode ? 'SINGLE_MODE' : 'Tester'}: ${detail} · ${gate}.${error}${testerIsTerminal(job) ? '' : ' · Generate READY JSON заблокирован: запись задачи tester в панели ещё активна.'}`;
     }
     if (testerStop) testerStop.disabled = !testerJobId || testerIsTerminal(job);
     testerRetryable = singleMode && ['FAILED', 'CANCELLED'].includes(job.state) && job.job_id === testerJobId;
@@ -2314,11 +2314,11 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
       else inboxVerifyV2.disabled = importAllowed || normalVerifyInFlight || collectionActivePacks > 0 || !collectionReady;
     }
     if (importStartV2) importStartV2.disabled = collectionActionBusy || !importAllowed;
-    if (importStatusV2 && !importJobV2) importStatusV2.textContent = ready
+    if (importStatusV2 && !importJobV2) importStatusV2.textContent += ' · ' + (ready
       ? `Performance v2: ${importAllowed ? 'CHECKED · import enabled.' : 'CHECK REQUIRED · press Проверить to verify the committed inbox.'}`
       : verifiable
         ? 'Performance v2: reports complete · press Проверить to recover and verify the inbox.'
-        : 'Performance v2: waiting for completed tester reports.';
+        : 'Performance v2: waiting for completed tester reports.');
     const badge = testerCard?.querySelector('summary .state-badge');
     if (badge) {
       badge.className = `state-badge ${importAllowed ? 'state-ready' : 'state-pending'}`;
