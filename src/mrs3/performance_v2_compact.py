@@ -30,7 +30,7 @@ TABLES = (
     "strategy_actions", "strategy_equity", "window_metrics", "import_runs",
     "import_files", "selection_runs", "selection_results",
     "selection_review_imports", "selection_review_rows", "strategy_tags",
-    "optimizer_prepared_inputs", "equity_quality_metrics",
+    "optimizer_prepared_inputs", "equity_quality_metrics", "strategy_rejection_sources",
 )
 TABLE_LEADING_KEY = {
     "strategies": "strategy_id",
@@ -49,6 +49,7 @@ TABLE_LEADING_KEY = {
     "strategy_tags": "strategy_id",
     "optimizer_prepared_inputs": "result_id",
     "equity_quality_metrics": "result_id",
+    "strategy_rejection_sources": "strategy_id",
 }
 TABLE_PRIMARY_KEY = {
     "strategies": ("strategy_id",),
@@ -69,6 +70,7 @@ TABLE_PRIMARY_KEY = {
     "strategy_tags": ("strategy_id", "tag"),
     "optimizer_prepared_inputs": ("result_id",),
     "equity_quality_metrics": ("result_id", "algo_version"),
+    "strategy_rejection_sources": ("strategy_id", "source_kind", "reason_code"),
 }
 PREPARED = "optimizer_prepared_inputs"
 RANGE_VALUES = 128
@@ -185,6 +187,15 @@ def _markers(connection: duckdb.DuckDBPyConnection, catalog: str = "main") -> di
             f"select key, value from {prefix}.schema_info"
         ).fetchall()
     }
+
+
+def _table_names(connection: duckdb.DuckDBPyConnection) -> frozenset[str]:
+    return frozenset(
+        str(row[0])
+        for row in connection.execute(
+            "select table_name from information_schema.tables where table_schema = 'main'"
+        ).fetchall()
+    )
 
 
 def _unknown_catalog_objects(connection: duckdb.DuckDBPyConnection) -> None:
@@ -397,9 +408,16 @@ def _copy_table(
 ) -> int:
     columns = _table_columns(connection, "origin", table)
     target_columns = _table_columns(connection, "main", table)
-    if columns != target_columns:
+    legacy_selection_results = (
+        table == "selection_results"
+        and target_columns == (*columns, "equity_regime_json")
+    )
+    if columns != target_columns and not legacy_selection_results:
         raise ValueError(f"source/target column schema mismatch for {table}")
-    selected = ", ".join(_ident(column) for column in columns)
+    selected = ", ".join(_ident(column) for column in target_columns)
+    source_selected = ", ".join(_ident(column) for column in columns)
+    if legacy_selection_results:
+        source_selected += ", NULL"
     lead = _ident(TABLE_LEADING_KEY[table])
     copied = 0
     ranges = (
@@ -420,7 +438,7 @@ def _copy_table(
             try:
                 connection.execute(
                     f"insert into {_ident(table)} ({selected}) "
-                    f"select {selected} from origin.main.{_ident(table)} "
+                    f"select {source_selected} from origin.main.{_ident(table)} "
                     f"where {lead} between ? and ?",
                     [low, high],
                 )
@@ -484,6 +502,13 @@ def _verify_table(
     result_ranges: Sequence[tuple[object, object]] | None = None,
 ) -> int:
     columns = _table_columns(connection, "origin", table)
+    target_columns = _table_columns(connection, "main", table)
+    legacy_selection_results = (
+        table == "selection_results"
+        and target_columns == (*columns, "equity_regime_json")
+    )
+    if columns != target_columns and not legacy_selection_results:
+        raise ValueError(f"source/target column schema mismatch for {table}")
     payload_index = columns.index("prepared_json") if table == PREPARED else -1
     typed_columns = tuple(column for index, column in enumerate(columns) if index != payload_index)
     source_count = int(connection.execute(f"select count(*) from origin.main.{_ident(table)}").fetchone()[0])
@@ -532,6 +557,10 @@ def _verify_table(
         raise ValueError(f"typed verification coverage mismatch in {table}")
     if table == PREPARED and payload_checked != source_count:
         raise ValueError("prepared payload verification coverage mismatch")
+    if legacy_selection_results and connection.execute(
+        "select count(*) from main.selection_results where equity_regime_json is not null"
+    ).fetchone()[0]:
+        raise ValueError("legacy selection snapshots were backfilled during v9 migration")
     _progress(callback, {"phase": "verify", "table": table, "rows": checked})
     return checked
 
@@ -563,15 +592,18 @@ def compact_performance_v2(
     source_wal_before = _wal_state(source)
     source_signature: dict[str, object]
     source_markers: dict[str, str]
+    source_tables: frozenset[str]
     source_version: int
     with duckdb.connect(str(source), read_only=True) as connection:
         source_version = require_performance_v2_readable(connection)
-        expected_nullable = "NO" if source_version == 6 else "YES"
+        expected_nullable = "NO" if source_version in {5, 6} else "YES"
         if _commission_nullable(connection) != expected_nullable:
             raise ValueError("source commission_rate nullability does not match schema version")
         _unknown_catalog_objects(connection)
         source_signature = _catalog_signature(connection)
         source_markers = _markers(connection)
+        source_tables = _table_names(connection)
+    copy_tables = tuple(table for table in TABLES if table in source_tables)
 
     stage = output.with_name(f".{output.name}.{uuid.uuid4().hex}.staging.duckdb")
     temp_root = Path(tempfile.gettempdir()).resolve()
@@ -604,18 +636,22 @@ def compact_performance_v2(
         target.execute("detach origin")
         if require_performance_v2_readable(target) != source_version:
             raise ValueError("native schema copy changed the source schema version")
-        if _commission_nullable(target) != ("NO" if source_version == 6 else "YES"):
+        if _catalog_signature(target) != source_signature:
+            raise ValueError("native schema copy changed the source catalog")
+        if _commission_nullable(target) != ("NO" if source_version in {5, 6} else "YES"):
             raise ValueError("native schema copy changed commission_rate nullability")
         initialize_performance_v2(target, create_if_missing=False)
-        if require_performance_v2_readable(target) != 8:
-            raise ValueError("target did not reach schema version 8")
+        if require_performance_v2_readable(target) != 9:
+            raise ValueError("target did not reach schema version 9")
         if _commission_nullable(target) != "YES":
-            raise ValueError("target commission_rate is not nullable in schema version 8")
+            raise ValueError("target commission_rate is not nullable in schema version 9")
+        target_signature = _catalog_signature(target)
         if any(int(target.execute(f"select count(*) from main.{_ident(table)}").fetchone()[0]) for table in TABLES):
             raise ValueError("target was not empty before migration")
         target.execute(f"attach {source_sql} as origin (read_only)")
         result_ranges = tuple(_ranges(target, "strategy_results"))
-        for table in TABLES:
+        counts = {table: 0 for table in TABLES}
+        for table in copy_tables:
             counts[table] = _copy_table(
                 target, table, workers, spill, output.parent, payload_stats, progress_callback,
                 result_ranges,
@@ -627,18 +663,23 @@ def compact_performance_v2(
 
         with duckdb.connect(str(stage), read_only=True) as check:
             _configure_connection(check, workers, spill)
-            if require_performance_v2_readable(check) != 8:
-                raise ValueError("candidate is not a readable v8 database")
+            if require_performance_v2_readable(check) != 9:
+                raise ValueError("candidate is not a readable v9 database")
             if _commission_nullable(check) != "YES":
-                raise ValueError("candidate commission_rate is not nullable in schema version 8")
-            if _markers(check) != {**source_markers, "schema_version": "8"}:
+                raise ValueError("candidate commission_rate is not nullable in schema version 9")
+            if _markers(check) != {**source_markers, "schema_version": "9"}:
                 raise ValueError("database markers were not preserved")
-            if _catalog_signature(check) != source_signature:
+            if _catalog_signature(check) != target_signature:
                 raise ValueError("database catalog changed during compaction")
             check.execute(f"attach {source_sql} as origin (read_only)")
             result_ranges = tuple(_ranges(check, "strategy_results"))
-            for table in TABLES:
+            verified_counts = {table: 0 for table in TABLES}
+            for table in copy_tables:
                 verified_counts[table] = _verify_table(check, table, progress_callback, result_ranges)
+            for table in set(TABLES) - set(copy_tables):
+                target_count = int(check.execute(f"select count(*) from main.{_ident(table)}").fetchone()[0])
+                if target_count:
+                    raise ValueError(f"unexpected rows in schema-upgraded table {table}")
             check.execute("detach origin")
 
         _refuse_nonzero_wal(source)
@@ -661,7 +702,7 @@ def compact_performance_v2(
             "source": {"path": str(source), **source_before, "sha256": source_hash_before, "wal": source_wal_before},
             "source_after": {**source_after, "sha256": source_hash_after, "wal": source_wal_after},
             "source_schema_version": source_version,
-            "target": {"path": str(output), **stage_stat, "sha256": target_hash, "schema_version": 8},
+            "target": {"path": str(output), **stage_stat, "sha256": target_hash, "schema_version": 9},
             "table_counts": counts,
             "verified_table_counts": verified_counts,
             "prepared": payload_stats,

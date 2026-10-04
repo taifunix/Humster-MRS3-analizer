@@ -15,7 +15,8 @@ from mrs3.performance_v2_equity_quality import (
     calculate_equity_quality_facts,
 )
 from mrs3.performance_v2_import import _optimizer_source_metadata_json
-from mrs3.performance_v2_store import initialize_performance_v2
+from mrs3 import performance_v2_store
+from mrs3.performance_v2_store import initialize_performance_v2, require_performance_v2_readable
 
 
 def _cache_module():
@@ -50,6 +51,39 @@ def _facts_for_points(start: datetime, end: datetime, points: list[tuple[datetim
 
 def _canonical(document: object) -> str:
     return json.dumps(document, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _initialize_v5_fixture(connection: duckdb.DuckDBPyConnection) -> None:
+    schema = performance_v2_store._SCHEMA.split(
+        "\nCREATE TABLE IF NOT EXISTS optimizer_prepared_inputs", 1
+    )[0]
+    for column in (
+        "    sizing_use_upnl BOOLEAN,\n",
+        "    sizing_use_frozen_balance BOOLEAN,\n",
+        "    sizing_use_fix BOOLEAN,\n",
+        "    sizing_balance_percentage_long DECIMAL(38,12),\n",
+        "    sizing_risk_long DECIMAL(38,12),\n",
+        "    sizing_max_balance DECIMAL(38,12),\n",
+        "    price DECIMAL(38,12),\n",
+        "    cost DECIMAL(38,12),\n",
+    ):
+        schema = schema.replace(column, "")
+    schema = schema.replace(
+        "    commission_rate DECIMAL(38,12),\n",
+        "    commission_rate DECIMAL(38,12) NOT NULL,\n",
+    )
+    connection.execute("create table schema_info (key varchar primary key, value varchar not null)")
+    connection.execute(schema)
+    connection.execute(performance_v2_store._SELECTION_SCHEMA)
+    connection.executemany(
+        "insert into schema_info values (?, ?)",
+        [
+            ("schema_version", "4"),
+            ("database_kind", "unified_performance_v2"),
+            ("database_instance_id", "00000000-0000-0000-0000-000000000001"),
+        ],
+    )
+    performance_v2_store._migrate_schema_v4_to_v5(connection)
 
 
 def _source_metadata(result_id: int = 1) -> dict[str, object]:
@@ -384,12 +418,15 @@ def test_cache_facts_are_not_foreign_key_coupled_to_source_rows() -> None:
 def test_v5_cache_read_reports_upgrade_required_without_selecting_new_table() -> None:
     cache = _cache_module()
     with duckdb.connect(":memory:") as connection:
-        initialize_performance_v2(connection)
-        connection.execute("drop table equity_quality_metrics")
-        connection.execute("update schema_info set value = '5' where key = 'schema_version'")
+        _initialize_v5_fixture(connection)
+
+        assert require_performance_v2_readable(connection) == 5
+        assert connection.execute(
+            "select count(*) from information_schema.tables where table_name = 'equity_quality_metrics'"
+        ).fetchone() == (0,)
 
         with pytest.raises(cache.EquityQualityCacheError, match="EQUITY_SCHEMA_UPGRADE_REQUIRED"):
-            cache.read_equity_quality_facts(connection, 1, "any-revision")
+            cache.read_equity_quality_facts(connection, 1, "0" * 64)
 
 
 def _insert_result(connection: duckdb.DuckDBPyConnection, name: str) -> int:

@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP, localcontext
 from pathlib import Path
+import json
 import re
 from threading import RLock, Thread
 import tempfile
@@ -24,6 +25,8 @@ from .performance_v2_import import (
     _safe_phase_snapshot,
     import_performance_v2,
 )
+from .performance_v2_equity_regime import ALGORITHM_VERSION as EQUITY_REGIME_ALGORITHM_VERSION
+from .performance_v2_equity_regime_cache import EquityRegimeCacheError, equity_regime_source_revision
 from .performance_v2_store import (
     PerformanceV2Config,
     PerformanceV2StoreError,
@@ -158,6 +161,7 @@ def _export_xlsx(
     review_metadata: Mapping[str, str],
     user_reviews: Mapping[int, Mapping[str, object]],
     cached_candidates: Mapping[int, Mapping[str, object]],
+    equity_regime_snapshots: Mapping[int, str],
 ) -> bytes:
     """Reuse the agreed Pareto-and-filters workbook writer; filtering adds no XLSX schema."""
     candidates: list[dict[str, object]] = []
@@ -165,6 +169,9 @@ def _export_xlsx(
         strategy_id = int(row[0])
         status, rank, tagged = metadata.get(strategy_id, (None, None, False))
         candidate = dict(cached_candidates.get(strategy_id, {}))
+        candidate.pop("equity_regime_json", None)
+        if strategy_id in equity_regime_snapshots:
+            candidate["equity_regime_json"] = equity_regime_snapshots[strategy_id]
         candidate.update({
             "strategy_id": strategy_id, "strategy_name": row[1], "symbol": row[2], "side": row[3],
             "timeframe": row[4], "close_ma_len": row[5], "order_count": row[6], "result_id": row[25],
@@ -203,6 +210,94 @@ def _export_cached_candidates(
     return candidates
 
 
+def _export_equity_regime_snapshots(
+    connection: duckdb.DuckDBPyConnection,
+    rows: list[tuple[object, ...]],
+    schema_version: int,
+) -> dict[int, str]:
+    """Return current, revision-matched assessments from each strategy's newest publication."""
+    if schema_version < 9 or not rows:
+        return {}
+    strategy_ids = sorted({int(row[0]) for row in rows})
+    published = connection.execute(
+            """with published as (
+                   select result.strategy_id, result.result_id_at_selection,
+                          result.equity_regime_json, runs.request_json,
+                          row_number() over (
+                              partition by result.strategy_id
+                              order by runs.created_at_utc desc, runs.selection_run_id desc
+                          ) as row_number
+                     from selection_results result
+                     join selection_runs runs using (selection_run_id)
+                     join strategies strategy
+                       on strategy.strategy_id = result.strategy_id
+                      and strategy.current_result_id = result.result_id_at_selection
+                    where result.strategy_id in (select unnest(?::bigint[]))
+               )
+               select strategy_id, result_id_at_selection, equity_regime_json, request_json
+                 from published where row_number = 1""",
+            [strategy_ids],
+        ).fetchall()
+    result_ids = sorted({int(result_id) for _, result_id, payload, _ in published if isinstance(payload, str)})
+    source_revisions: dict[int, str] = {}
+    if result_ids:
+        source_rows = connection.execute(
+            """select result_id, imported_at_utc, report_start_utc, report_end_utc,
+                      effective_start_utc, effective_end_utc, optimizer_source_metadata_json
+                 from strategy_results
+                where result_id in (select unnest(?::bigint[]))""",
+            [result_ids],
+        ).fetchall()
+        timestamp_fields = (
+            "imported_at_utc", "report_start_utc", "report_end_utc",
+            "effective_start_utc", "effective_end_utc",
+        )
+        for source_row in source_rows:
+            result_id = int(source_row[0])
+            metadata = dict(zip((
+                "result_id", *timestamp_fields, "optimizer_source_metadata_json",
+            ), source_row))
+            for field in timestamp_fields:
+                value = metadata[field]
+                if value is not None:
+                    if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
+                        continue
+                    metadata[field] = value.astimezone(timezone.utc)
+            try:
+                source_revisions[result_id] = equity_regime_source_revision(metadata)
+            except (EquityRegimeCacheError, TypeError, ValueError):
+                continue
+    snapshots: dict[int, str] = {}
+    for strategy_id, result_id, payload, request_json in published:
+        if not isinstance(payload, str):
+            continue
+        try:
+            request = json.loads(request_json)
+            snapshot = request.get("equity_regime_snapshot") if isinstance(request, dict) else None
+            sources = snapshot.get("sources") if isinstance(snapshot, dict) else None
+            source = sources.get(str(strategy_id)) if isinstance(sources, dict) else None
+            source_revision = source.get("source_revision") if isinstance(source, dict) else None
+            if (
+                not isinstance(snapshot, dict)
+                or set(snapshot) != {"algorithm_version", "sources"}
+                or snapshot.get("algorithm_version") != EQUITY_REGIME_ALGORITHM_VERSION
+                or not isinstance(sources, dict)
+                or not isinstance(source, dict)
+                or set(source) != {"result_id", "source_revision"}
+                or type(source.get("result_id")) is not int
+                or source["result_id"] != int(result_id)
+                or not isinstance(source_revision, str)
+                or re.fullmatch(r"[0-9a-f]{64}", source_revision) is None
+            ):
+                continue
+            if source_revisions.get(int(result_id)) != source_revision:
+                continue
+        except (EquityRegimeCacheError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+        snapshots[int(strategy_id)] = payload
+    return snapshots
+
+
 def export_performance_v2(
     database_path: Path,
     selection: PerformanceV2ExportSelection,
@@ -214,7 +309,7 @@ def export_performance_v2(
         raise PerformanceV2ApiError("PERFORMANCE_DB_UNAVAILABLE", status=503, message="PerformanceDB is unavailable.")
     try:
         with duckdb.connect(str(database_path), read_only=True) as connection:
-            require_performance_v2_readable(connection)
+            schema_version = require_performance_v2_readable(connection)
             decisions = effective_selection_decisions(connection)
             retest_ids = {int(row[0]) for row in connection.execute("select strategy_id from strategy_tags where tag = 'RETEST'").fetchall()}
             if selection.all_active:
@@ -229,7 +324,7 @@ def export_performance_v2(
             params: list[object] = []
             if selected_ids is not None:
                 if not selected_ids:
-                    return _export_filename(now), _export_xlsx([], {}, new_run_metadata(connection), {}, {})
+                    return _export_filename(now), _export_xlsx([], {}, new_run_metadata(connection), {}, {}, {})
                 where += " and s.strategy_id in (select unnest(?::bigint[]))"
                 params.append(sorted(selected_ids))
             order_columns = ", ".join(
@@ -263,7 +358,15 @@ def export_performance_v2(
             }
             review_metadata = new_run_metadata(connection)
             user_reviews = latest_user_reviews_by_strategy(connection, [int(row[0]) for row in rows])
+            for row in rows:
+                strategy_id = int(row[0])
+                decision = decisions.get(strategy_id)
+                review = dict(user_reviews.get(strategy_id, {}))
+                review["user_status"] = None if decision is None else decision[0]
+                review["user_rank"] = None if decision is None else decision[1]
+                user_reviews[strategy_id] = review
             cached_candidates = _export_cached_candidates(connection, rows, selection_config)
+            equity_regime_snapshots = _export_equity_regime_snapshots(connection, rows, schema_version)
             decision_order = {"FINALIST": 1, "RESERVE": 2}
             rows.sort(key=lambda row: (
                 decision_order.get(metadata[int(row[0])][0], 3),
@@ -273,7 +376,9 @@ def export_performance_v2(
                 row[25] is None, str(row[25]) if row[25] is not None else "",
                 int(row[0]),
             ))
-            return _export_filename(now), _export_xlsx(rows, metadata, review_metadata, user_reviews, cached_candidates)
+            return _export_filename(now), _export_xlsx(
+                rows, metadata, review_metadata, user_reviews, cached_candidates, equity_regime_snapshots,
+            )
     except PerformanceV2ApiError:
         raise
     except PerformanceV2StoreError as error:

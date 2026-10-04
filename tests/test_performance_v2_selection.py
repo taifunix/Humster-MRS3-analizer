@@ -51,6 +51,17 @@ from mrs3.performance_v2_equity_cache import (
     read_equity_quality_facts,
 )
 from mrs3.performance_v2_equity_quality import EquitySample, calculate_equity_quality_facts
+from mrs3.performance_v2_equity_regime import (
+    ALGORITHM_VERSION as EQUITY_REGIME_ALGORITHM_VERSION,
+    EquityRegimeSample,
+    assess_equity_regime,
+    calculate_equity_regime_facts,
+)
+from mrs3.performance_v2_equity_regime_cache import (
+    encode_equity_regime_assessment,
+    encode_equity_regime_facts,
+    equity_regime_source_revision,
+)
 
 
 def test_retest_cohort_request_is_explicit_and_rejects_empty_members():
@@ -344,7 +355,7 @@ def test_equity_quality_rank_orders_class_then_exact_score_tie_chain() -> None:
     assert result.loc["class0-low", "final_rank"] < result.loc["class1-high", "final_rank"]
 
 
-def test_equity_quality_unscoreable_is_reserve_and_non_up_can_rank() -> None:
+def test_equity_quality_miss_falls_back_after_scored_rows_within_regime() -> None:
     request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
         {"id": "rank_robust_top_n", "enabled": True, "scope": "pair_side", "top_n": 1,
          "method": "equity_quality_v1"},
@@ -359,7 +370,7 @@ def test_equity_quality_unscoreable_is_reserve_and_non_up_can_rank() -> None:
 
     assert result.loc["declining", "auto_status"] == "FINALIST"
     assert result.loc["unscoreable", "auto_status"] == "RESERVE"
-    assert result.loc["unscoreable", "elimination_reason"] == "RANK_NOT_EVALUATED_INSUFFICIENT_DATA"
+    assert result.loc["unscoreable", "elimination_reason"] == "RANK_ROBUST_TOP_N"
 
 
 def test_robust_rank_is_equivalent_with_equity_filter_when_every_fact_passes() -> None:
@@ -656,37 +667,62 @@ def test_disabled_rank_method_variants_share_v1_golden_json_and_hash() -> None:
 
 
 @pytest.mark.parametrize(
-    ("state", "disposition", "reason", "finalist", "unassessed"),
+    ("state", "decision", "finalist", "status"),
     [
-        ("GROWING", "PASS", "H_UP_SHORTS_NONDECLINING", True, 0),
-        ("WEAKENING", "PASS", "SHORT_WINDOW_DECLINE", True, 0),
-        ("FLAT", "BLOCK_IF_ERF_ENABLED", "H_FLAT", False, 0),
-        ("DECLINING_OR_MIXED", "BLOCK", "H_DECLINING_OR_MIXED", False, 0),
-        ("NONPOSITIVE_EQUITY", "BLOCK", "NONPOSITIVE_EQUITY", False, 0),
-        ("INSUFFICIENT_HISTORY", "NOT_EVALUATED", "INSUFFICIENT_HISTORY", True, 1),
-        ("MISSING_BASELINE", "NOT_EVALUATED", "MISSING_BASELINE", True, 1),
-        ("UNKNOWN_INVALID_SOURCE", "NOT_EVALUATED", "UNKNOWN_INVALID_SOURCE", True, 1),
+        ("GROWING", "PASS", True, None),
+        ("WEAKENING", "PASS", True, None),
+        ("RESUMED", "PASS", True, None),
+        ("STALLED", "PASS", False, "RESERVE"),
+        ("DROP", "DROP", False, "FILTERED"),
+        ("NOT_EVALUATED", "NOT_EVALUATED", False, "FILTERED"),
     ],
 )
-def test_equity_regime_filter_uses_cached_disposition_without_false_pass(
-    state: str, disposition: str, reason: str, finalist: bool, unassessed: int,
+def test_equity_regime_filter_applies_classifier_decisions_and_technical_reasons(
+    state: str, decision: str, finalist: bool, status: str | None,
 ) -> None:
     request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
         {"id": "filter_equity_regime", "enabled": True, "scope": "pair_side"},
     ]})
-    result = run_selection(pd.DataFrame([_selection_row(
-        "candidate", _equity_state=state, _equity_disposition=disposition,
-        _equity_reason=reason,
-    )]), request)
+    candidate = _selection_row("candidate", _equity_state=state)
+    expected = candidate["_equity_regime_cache"]["assessment"]
+    result = run_selection(pd.DataFrame([candidate]), request)
 
     assert bool(result.loc[0, "finalist"]) is finalist
     assert result.loc[0, "equity_regime_state"] == state
-    assert result.loc[0, "equity_regime_reason"] == reason
-    assert result.attrs["stage_counts"]["filter_equity_regime"]["not_evaluated"] == unassessed
-    if not finalist:
-        assert result.loc[0, "elimination_reason"] == "FILTER_EQUITY_REGIME"
-    if unassessed:
-        assert result.loc[0, "elimination_reason"] == reason
+    assert result.loc[0, "equity_regime_decision"] == decision == expected.decision
+    assert result.loc[0, "equity_regime_reasons"] == ";".join(expected.reasons)
+    assert result.attrs["stage_counts"]["filter_equity_regime"]["not_evaluated"] == int(
+        decision == "NOT_EVALUATED"
+    )
+    if status is not None:
+        assert result.loc[0, "auto_status"] == status
+    if decision == "DROP":
+        assert result.loc[0, "elimination_reason"] == "DD_14_7_GTE_23"
+    elif decision == "NOT_EVALUATED":
+        assert result.loc[0, "elimination_reason"] == "W28_UNAVAILABLE"
+    elif state == "STALLED":
+        assert result.loc[0, "elimination_reason"] == "EQUITY_REGIME_STALLED_RESERVE"
+
+
+def test_stalled_equity_reserve_survives_later_stages_with_separate_trace_and_count() -> None:
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "filter_equity_regime", "enabled": True, "scope": "pair_side"},
+        {"id": "pareto_primary", "enabled": True, "scope": "pair_side"},
+    ]})
+    result = run_selection(pd.DataFrame([
+        _selection_row("stalled", strategy_id=1, _equity_state="STALLED"),
+        _selection_row("growing", strategy_id=2, _equity_state="GROWING"),
+    ]), request).set_index("strategy_name")
+
+    stalled = result.loc["stalled"]
+    assert not stalled["finalist"]
+    assert stalled["auto_status"] == "RESERVE"
+    assert stalled["elimination_reason"] == "EQUITY_REGIME_STALLED_RESERVE"
+    assert not stalled["eliminated_by_filter_equity_regime"]
+    assert not stalled["eliminated_by_pareto_primary"]
+    assert result.attrs["stage_counts"]["filter_equity_regime"] == {
+        "enabled": True, "eliminated": 0, "remaining": 1, "not_evaluated": 0, "reserved": 1,
+    }
 
 
 def test_run_selection_maps_fresh_equity_facts_after_duplicate_input_index() -> None:
@@ -714,10 +750,12 @@ def test_run_selection_maps_fresh_equity_facts_after_duplicate_input_index() -> 
     rows = pd.DataFrame([
         _selection_row(
             "first", strategy_id=1, result_id=101,
+            _equity_state="GROWING",
             _equity_quality=quality(101, "GROWING", "0.123456789", "0.23456789", 28),
         ),
         _selection_row(
             "second", strategy_id=2, result_id=102,
+            _equity_state="FLAT",
             _equity_quality=quality(102, "WEAKENING", "0.23456789", "-0.3456789", 14),
         ),
     ], index=[7, 7])
@@ -732,20 +770,22 @@ def test_run_selection_maps_fresh_equity_facts_after_duplicate_input_index() -> 
     assert result.loc["second", ["equity_state", "equity_basis", "equity_dd_pct", "equity_smoothness"]].tolist() == [
         "WEAKENING", "14d / PARTIAL", Decimal("23.456789000"), Decimal("-0.3456789"),
     ]
+    assert result.loc["first", "equity_regime_state"] == "GROWING"
+    assert result.loc["first", "elimination_reason"] is None
+    assert result.loc["second", "equity_regime_state"] == "DROP"
+    assert result.loc["second", "elimination_reason"] == "DD_14_7_GTE_23"
 
 
-@pytest.mark.parametrize("missing_column", ["_equity_state", "_equity_disposition", "_equity_reason"])
-def test_equity_regime_rejects_missing_cached_fact_columns(missing_column: str) -> None:
+@pytest.mark.parametrize("missing_field", ["assessment", "facts_sha256", "equity_regime_json"])
+def test_equity_regime_rejects_missing_cached_evidence(missing_field: str) -> None:
     request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
         {"id": "filter_equity_regime", "enabled": True, "scope": "pair_side"},
     ]})
-    row = _selection_row(
-        "candidate", _equity_state="UNKNOWN_INVALID_SOURCE",
-        _equity_disposition="NOT_EVALUATED", _equity_reason="UNKNOWN_INVALID_SOURCE",
-    )
-    frame = pd.DataFrame([row]).drop(columns=[missing_column, "_equity_cache"])
+    row = _selection_row("candidate", _equity_state="NOT_EVALUATED")
+    row["_equity_regime_cache"].pop(missing_field)
+    frame = pd.DataFrame([row])
 
-    with pytest.raises(PerformanceV2SelectionError, match="EQUITY_CACHE_INCOMPLETE"):
+    with pytest.raises(PerformanceV2SelectionError, match="EQUITY_REGIME_CACHE_INCOMPLETE"):
         run_selection(frame, request)
 
 
@@ -753,13 +793,10 @@ def test_enabled_equity_consumer_rejects_legacy_projection_without_cache_entry()
     request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
         {"id": "filter_equity_regime", "enabled": True, "scope": "pair_side"},
     ]})
-    row = _selection_row(
-        "candidate", result_id=101, _equity_state="GROWING", _equity_disposition="PASS",
-        _equity_reason="H_UP_SHORTS_NONDECLINING",
-    )
-    row.pop("_equity_cache", None)
+    row = _selection_row("candidate", result_id=101, _equity_state="GROWING")
+    row.pop("_equity_regime_cache", None)
 
-    with pytest.raises(PerformanceV2SelectionError, match="EQUITY_CACHE_INCOMPLETE"):
+    with pytest.raises(PerformanceV2SelectionError, match="EQUITY_REGIME_CACHE_INCOMPLETE"):
         run_selection(pd.DataFrame([row]), request)
 
 
@@ -768,12 +805,11 @@ def test_equity_regime_rejects_missing_or_invalid_cached_disposition(disposition
     request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
         {"id": "filter_equity_regime", "enabled": True, "scope": "pair_side"},
     ]})
-    frame = pd.DataFrame([_selection_row(
-        "candidate", _equity_state="UNKNOWN_INVALID_SOURCE", _equity_disposition=disposition,
-        _equity_reason="UNKNOWN_INVALID_SOURCE",
-    )])
+    row = _selection_row("candidate", _equity_state="GROWING")
+    row["_equity_regime_cache"]["equity_regime_json"] = disposition
+    frame = pd.DataFrame([row])
 
-    with pytest.raises(PerformanceV2SelectionError, match="EQUITY_CACHE_INCOMPLETE"):
+    with pytest.raises(PerformanceV2SelectionError, match="EQUITY_REGIME_CACHE_INCOMPLETE"):
         run_selection(frame, request)
 
 
@@ -811,7 +847,7 @@ def test_equity_regime_preserves_mixed_lot_group_until_blocked_variant_is_remove
     assert result.loc["passing-sibling", "finalist"]
     assert result.loc["passing-sibling", "elimination_reason"] is None
     assert not result["eliminated_by_filter_lot_variant_redundancy"].any()
-    assert result.loc["old-lot-winner", "elimination_reason"] == "FILTER_EQUITY_REGIME"
+    assert result.loc["old-lot-winner", "elimination_reason"] == "DD_14_7_GTE_23"
 
 
 def test_equity_regime_skips_whole_three_member_lot_group_if_any_member_is_blocked() -> None:
@@ -835,7 +871,7 @@ def test_equity_regime_skips_whole_three_member_lot_group_if_any_member_is_block
     assert not result.loc["blocked-c", "finalist"]
     assert result.loc["pass-a", "elimination_reason"] is None
     assert result.loc["pass-b", "elimination_reason"] is None
-    assert result.loc["blocked-c", "elimination_reason"] == "FILTER_EQUITY_REGIME"
+    assert result.loc["blocked-c", "elimination_reason"] == "DD_14_7_GTE_23"
     assert not result["eliminated_by_filter_lot_variant_redundancy"].any()
     assert result["eliminated_by_filter_equity_regime"].to_dict() == {
         "pass-a": False, "pass-b": False, "blocked-c": True,
@@ -866,12 +902,12 @@ def test_equity_regime_all_pass_lot_group_keeps_existing_winner_and_precedence_f
                          _equity_state="MISSING_BASELINE", _equity_disposition="NOT_EVALUATED",
                          _equity_reason="MISSING_BASELINE"),
     ]), request).set_index("strategy_name")
-    assert not unknown.loc["blocked", "finalist"] and unknown.loc["unassessed", "finalist"]
-    assert unknown.loc["unassessed", "elimination_reason"] == "MISSING_BASELINE"
+    assert not unknown.loc["blocked", "finalist"] and not unknown.loc["unassessed", "finalist"]
+    assert unknown.loc["unassessed", "elimination_reason"] == "W28_UNAVAILABLE"
     assert not unknown["eliminated_by_filter_lot_variant_redundancy"].any()
 
 
-def test_lot_unassessed_advisory_is_replaced_when_later_pareto_eliminates_survivor() -> None:
+def test_technical_equity_rejection_precedes_later_pareto_filter() -> None:
     request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
         {"id": "filter_equity_regime", "enabled": True, "scope": "pair_side"},
         {"id": "pareto_primary", "enabled": True, "scope": "pair_side"},
@@ -885,10 +921,11 @@ def test_lot_unassessed_advisory_is_replaced_when_later_pareto_eliminates_surviv
                          _equity_disposition="NOT_EVALUATED", _equity_reason="MISSING_BASELINE"),
     ]), request).set_index("strategy_name")
 
-    assert result.loc["unassessed-winner", "finalist"]
-    assert result.loc["unassessed-winner", "elimination_reason"] == "MISSING_BASELINE"
+    assert not result.loc["unassessed-winner", "finalist"]
+    assert result.loc["unassessed-winner", "elimination_reason"] == "W28_UNAVAILABLE"
     assert not result.loc["unassessed-loser", "finalist"]
-    assert result.loc["unassessed-loser", "elimination_reason"] == "PARETO_PRIMARY"
+    assert result.loc["unassessed-loser", "elimination_reason"] == "W28_UNAVAILABLE"
+    assert not result["eliminated_by_pareto_primary"].any()
 
 
 def test_equity_regime_off_keeps_legacy_selection_frame_without_equity_columns() -> None:
@@ -1145,6 +1182,47 @@ def _selection_job_inputs(tmp_path: Path) -> tuple[Path, int, datetime, datetime
     ).fetchone()
     connection.close()
     return database, int(result_id), report_start, report_end
+
+
+def test_selection_window_job_uses_sample_index_order_for_regime_when_windows_are_missing(
+    tmp_path: Path,
+) -> None:
+    database, result_id, report_start, report_end = _selection_job_inputs(tmp_path)
+    with duckdb.connect(str(database)) as writer:
+        writer.execute(
+            "update strategy_equity set timestamp_utc = ? where result_id = ? and sample_index = 1",
+            [datetime(2026, 1, 4, tzinfo=UTC), result_id],
+        )
+    with duckdb.connect(str(database), read_only=True) as connection:
+        samples = tuple(
+            EquityRegimeSample(result_id, int(index), timestamp, equity)
+            for index, timestamp, equity in connection.execute(
+                "select sample_index, timestamp_utc, equity from strategy_equity "
+                "where result_id = ? order by sample_index, timestamp_utc",
+                [result_id],
+            ).fetchall()
+        )
+    samples = tuple(
+        replace(sample, timestamp_utc=sample.timestamp_utc.astimezone(UTC))
+        for sample in samples
+    )
+    expected = calculate_equity_regime_facts(
+        result_id, report_start.astimezone(UTC), report_end.astimezone(UTC), samples,
+    )
+    assert expected.invalid_reasons == ("UNORDERED_EQUITY_SOURCE",)
+
+    result = selection_module._selection_window_job(
+        str(database), result_id, report_start, report_end, 5, include_equity_regime=True,
+    )
+
+    publication = result.equity_regime_publication
+    assert publication is not None
+    _, facts = publication
+    expected_json = encode_equity_regime_facts(expected)
+    assert facts == expected
+    assert hashlib.sha256(encode_equity_regime_facts(facts).encode("utf-8")).hexdigest() == hashlib.sha256(
+        expected_json.encode("utf-8")
+    ).hexdigest()
 
 
 def test_selection_window_job_skips_unused_flat_timeline_in_requested_order(tmp_path: Path, monkeypatch) -> None:
@@ -1432,15 +1510,35 @@ def test_enabled_equity_selection_batch_reads_only_fresh_facts_for_exact_retest_
         assert candidates.loc[0, "_equity_cache"]["status"] == "FRESH"
         assert candidates.loc[0, "_equity_cache"]["facts"].state == "FLAT"
         assert candidates.loc[0, "_equity_cache"]["facts"].erf_disposition == "BLOCK_IF_ERF_ENABLED"
-        assert len(equity_queries) == 1
-        assert "result_id in (?)" in equity_queries[0][0].lower()
-        assert equity_queries[0][1][-1] == second_result
+        quality_queries = [
+            (sql, parameters) for sql, parameters in equity_queries
+            if "where result_id in (" in sql.lower()
+        ]
+        regime_queries = [
+            (sql, parameters) for sql, parameters in equity_queries
+            if parameters[0] == EQUITY_REGIME_ALGORITHM_VERSION
+        ]
+        assert len(quality_queries) == len(regime_queries) == 1
+        assert "result_id in (?)" in quality_queries[0][0].lower()
+        assert quality_queries[0][1][-1] == second_result
+        assert "result_id in (?)" in regime_queries[0][0].lower()
+        assert regime_queries[0][1][-1] == second_result
 
         equity_queries.clear()
-        with pytest.raises(PerformanceV2SelectionError, match="EQUITY_CACHE_INCOMPLETE"):
-            load_selection_candidates(CountingConnection(), request, SelectionConfig(), cache_only=True)
-        assert len(equity_queries) == 1
-        assert "result_id in (?,?)" in equity_queries[0][0].lower()
+        all_candidates = load_selection_candidates(CountingConnection(), request, SelectionConfig(), cache_only=True)
+        quality_queries = [
+            (sql, parameters) for sql, parameters in equity_queries
+            if "where result_id in (" in sql.lower()
+        ]
+        regime_queries = [
+            (sql, parameters) for sql, parameters in equity_queries
+            if parameters[0] == EQUITY_REGIME_ALGORITHM_VERSION
+        ]
+        assert len(quality_queries) == len(regime_queries) == 1
+        assert "result_id in (?,?)" in quality_queries[0][0].lower()
+        assert "result_id in (?,?)" in regime_queries[0][0].lower()
+        assert all_candidates["_equity_cache"].tolist()[0]["status"] == "STALE"
+        assert all(entry["status"] == "FRESH" for entry in all_candidates["_equity_regime_cache"])
         after = check.execute("select result_id, facts_json, facts_sha256 from equity_quality_metrics order by result_id").fetchall()
 
     assert before == after
@@ -1456,19 +1554,20 @@ def test_equity_rank_only_reads_verified_cached_facts_in_one_batch(tmp_path: Pat
     ]})
     prepare_selection_window_cache(database, request, SelectionConfig(), workers=1, include_equity=True)
     with duckdb.connect(str(database), read_only=True) as check:
-        queries: list[str] = []
+        queries: list[tuple[str, object]] = []
 
         class CountingConnection:
             def execute(self, sql: str, parameters: object = None):
                 if "from equity_quality_metrics" in sql.lower():
-                    queries.append(sql)
+                    queries.append((sql, parameters))
                 return check.execute(sql) if parameters is None else check.execute(sql, parameters)
 
         monkeypatch.setattr(selection_module, "_load_source", lambda *args: (_ for _ in ()).throw(AssertionError("raw source read")))
         monkeypatch.setattr(selection_module, "_load_equity_samples_for_quality", lambda *args: (_ for _ in ()).throw(AssertionError("raw equity read")))
         candidates = load_selection_candidates(CountingConnection(), request, SelectionConfig(), cache_only=True)
 
-    assert len(queries) == 1
+    assert sum("where result_id in (" in sql.lower() for sql, _ in queries) == 1
+    assert sum(parameters[0] == EQUITY_REGIME_ALGORITHM_VERSION for _, parameters in queries) == 1
     cached = candidates.loc[0, "_equity_cache"]
     assert cached["status"] == "FRESH"
     assert cached["facts"].state == "FLAT"
@@ -1498,12 +1597,12 @@ def test_equity_rank_allows_mixed_report_ends_in_exact_retest_cohort(tmp_path: P
     database = tmp_path / "strategy_performance.duckdb"
     prepare_selection_window_cache(database, request, SelectionConfig(), workers=1, include_equity=True)
     with duckdb.connect(str(database), read_only=True) as check:
-        fact_queries: list[str] = []
+        fact_queries: list[tuple[str, object]] = []
 
         class CountingConnection:
             def execute(self, sql: str, parameters: object = None):
                 if "from equity_quality_metrics" in sql.lower():
-                    fact_queries.append(sql)
+                    fact_queries.append((sql, parameters))
                 return check.execute(sql) if parameters is None else check.execute(sql, parameters)
 
         monkeypatch.setattr(selection_module, "_load_source", lambda *args: (_ for _ in ()).throw(AssertionError("raw source read")))
@@ -1511,17 +1610,26 @@ def test_equity_rank_allows_mixed_report_ends_in_exact_retest_cohort(tmp_path: P
         candidates = load_selection_candidates(CountingConnection(), request, SelectionConfig(), cache_only=True)
 
     assert len(candidates) == 2
-    assert len(fact_queries) == 1
+    quality_queries = [
+        (sql, parameters) for sql, parameters in fact_queries
+        if "where result_id in (" in sql.lower()
+    ]
+    regime_queries = [
+        (sql, parameters) for sql, parameters in fact_queries
+        if parameters[0] == EQUITY_REGIME_ALGORITHM_VERSION
+    ]
+    assert len(quality_queries) == len(regime_queries) == 1
     assert {row["report_end_utc"] for _, row in candidates.iterrows()} == {
         datetime(2026, 1, 31, tzinfo=UTC), second_end,
     }
     assert {
         row["_equity_cache"]["facts"].report_end_utc for _, row in candidates.iterrows()
     } == {datetime(2026, 1, 31, tzinfo=UTC), second_end}
-    assert f"result_id in (?,?)" in fact_queries[0].lower()
+    assert "result_id in (?,?)" in quality_queries[0][0].lower()
+    assert "result_id in (?,?)" in regime_queries[0][0].lower()
 
 
-def test_equity_rank_rejects_malformed_facts_on_previously_eliminated_candidate() -> None:
+def test_equity_rank_rejects_malformed_regime_evidence_on_previously_eliminated_candidate() -> None:
     request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
         {"id": "filter_min_shift", "enabled": True, "scope": "pair_side_timeframe", "min_shift_pct": "1"},
         {"id": "rank_robust_top_n", "enabled": True, "scope": "pair_side", "top_n": 1,
@@ -1529,12 +1637,13 @@ def test_equity_rank_rejects_malformed_facts_on_previously_eliminated_candidate(
     ]})
     rows = [
         _selection_row("filtered-bad-facts", strategy_id=1, result_id=101, order_1_shift_bp=1,
-                       _equity_quality={**_equity_rank_facts(101, 0, "1", "0", "0", 28), "source_revision": None}),
+                       _equity_quality=_equity_rank_facts(101, 0, "1", "0", "0", 28)),
         _selection_row("rankable", strategy_id=2, result_id=102, order_1_shift_bp=100,
                        _equity_quality=_equity_rank_facts(102, 0, "1", "0", "0", 28)),
     ]
+    rows[0]["_equity_regime_cache"]["facts_sha256"] = "0" * 64
 
-    with pytest.raises(PerformanceV2SelectionError, match="EQUITY_CACHE_INCOMPLETE"):
+    with pytest.raises(PerformanceV2SelectionError, match="EQUITY_REGIME_CACHE_INCOMPLETE"):
         run_selection(pd.DataFrame(rows), request)
 
 
@@ -1548,7 +1657,7 @@ def test_equity_rank_id_lookup_avoids_iterrows_numeric_upcast() -> None:
 
 
 @pytest.mark.parametrize("corruption", ["missing", "stale", "wrong-algorithm", "bad-digest"])
-def test_enabled_equity_selection_rejects_unverified_cache_facts(
+def test_enabled_equity_selection_ignores_unverified_r73_cache_facts(
     tmp_path: Path, monkeypatch, corruption: str,
 ) -> None:
     connection = _candidate_db(tmp_path)
@@ -1561,20 +1670,140 @@ def test_enabled_equity_selection_rejects_unverified_cache_facts(
     prepare_selection_window_cache(database, request, SelectionConfig(), workers=1, include_equity=True)
     with duckdb.connect(str(database)) as writer:
         if corruption == "missing":
-            writer.execute("delete from equity_quality_metrics where result_id = ?", [result_id])
+            writer.execute(
+                "delete from equity_quality_metrics where result_id = ? and algo_version = ?",
+                [result_id, equity_cache_module.ALGORITHM_VERSION],
+            )
         elif corruption == "stale":
-            writer.execute("update equity_quality_metrics set source_revision = 'stale' where result_id = ?", [result_id])
+            writer.execute(
+                "update equity_quality_metrics set source_revision = 'stale' "
+                "where result_id = ? and algo_version = ?",
+                [result_id, equity_cache_module.ALGORITHM_VERSION],
+            )
         elif corruption == "wrong-algorithm":
-            writer.execute("update equity_quality_metrics set algo_version = 'old' where result_id = ?", [result_id])
+            writer.execute(
+                "update equity_quality_metrics set algo_version = 'old' "
+                "where result_id = ? and algo_version = ?",
+                [result_id, equity_cache_module.ALGORITHM_VERSION],
+            )
         else:
-            writer.execute("update equity_quality_metrics set facts_sha256 = ? where result_id = ?", ["0" * 64, result_id])
+            writer.execute(
+                "update equity_quality_metrics set facts_sha256 = ? "
+                "where result_id = ? and algo_version = ?",
+                ["0" * 64, result_id, equity_cache_module.ALGORITHM_VERSION],
+            )
 
     monkeypatch.setattr(selection_module, "_load_source", lambda *args: (_ for _ in ()).throw(AssertionError("raw source read")))
-    monkeypatch.setattr(selection_module, "_load_equity_samples_for_quality", lambda *args: (_ for _ in ()).throw(AssertionError("raw equity read")))
+    monkeypatch.setattr(selection_module, "_load_equity_samples_for_quality", lambda *args: (_ for _ in ()).throw(AssertionError("unexpected R7.3 fallback")))
     monkeypatch.setattr(selection_module, "_persist_many", lambda *args: (_ for _ in ()).throw(AssertionError("cache write")))
     with duckdb.connect(str(database), read_only=True) as check:
-        with pytest.raises(PerformanceV2SelectionError, match="EQUITY_CACHE_INCOMPLETE"):
+        candidates = load_selection_candidates(check, request, SelectionConfig(), cache_only=True)
+    assert candidates.loc[0, "_equity_cache"]["status"] == {
+        # The regime-v1 row still exists after removing the R7.3 version, so
+        # the legacy cache sentinel correctly reports a different algo as stale.
+        "missing": "STALE", "stale": "STALE", "wrong-algorithm": "STALE", "bad-digest": "INVALID",
+    }[corruption]
+    assert candidates.loc[0, "_equity_regime_cache"]["status"] == "FRESH"
+    result = run_selection(candidates, request)
+    assert result.loc[0, "equity_regime_state"] == candidates.loc[0, "_equity_regime_cache"]["assessment"].state
+
+
+@pytest.mark.parametrize("corruption", ["digest", "json", "result-id"])
+def test_equity_quality_rank_rejects_corrupt_current_cache_without_memory_fallback(
+    tmp_path: Path, monkeypatch, corruption: str,
+) -> None:
+    connection = _candidate_db(tmp_path)
+    database = tmp_path / "strategy_performance.duckdb"
+    result_id = int(connection.execute("select result_id from strategy_results").fetchone()[0])
+    connection.close()
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "rank_robust_top_n", "enabled": True, "scope": "pair_side", "top_n": 1,
+         "method": "equity_quality_v1"},
+    ]})
+    prepare_selection_window_cache(database, request, SelectionConfig(), workers=1, include_equity=True)
+    with duckdb.connect(str(database)) as writer:
+        payload, = writer.execute(
+            "select facts_json from equity_quality_metrics where result_id = ? and algo_version = ?",
+            [result_id, equity_cache_module.ALGORITHM_VERSION],
+        ).fetchone()
+        if corruption == "digest":
+            writer.execute(
+                "update equity_quality_metrics set facts_sha256 = ? where result_id = ? and algo_version = ?",
+                ["0" * 64, result_id, equity_cache_module.ALGORITHM_VERSION],
+            )
+        elif corruption == "json":
+            malformed = "not-json"
+            writer.execute(
+                "update equity_quality_metrics set facts_json = ?, facts_sha256 = ? "
+                "where result_id = ? and algo_version = ?",
+                [malformed, hashlib.sha256(malformed.encode("utf-8")).hexdigest(), result_id,
+                 equity_cache_module.ALGORITHM_VERSION],
+            )
+        else:
+            document = json.loads(payload)
+            document["result_id"] = result_id + 1
+            malformed = json.dumps(document, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+            writer.execute(
+                "update equity_quality_metrics set facts_json = ?, facts_sha256 = ? "
+                "where result_id = ? and algo_version = ?",
+                [malformed, hashlib.sha256(malformed.encode("utf-8")).hexdigest(), result_id,
+                 equity_cache_module.ALGORITHM_VERSION],
+            )
+
+    monkeypatch.setattr(
+        selection_module, "_load_equity_samples_for_quality",
+        lambda *args: pytest.fail("corrupt current cache must not be masked by a memory fallback"),
+    )
+    with duckdb.connect(str(database), read_only=True) as check:
+        with pytest.raises(EquityQualityCacheError, match="EQUITY_CACHE_FACTS_INVALID"):
             load_selection_candidates(check, request, SelectionConfig(), cache_only=True)
+
+
+def test_equity_quality_rank_preserves_schema5_upgrade_error(tmp_path: Path) -> None:
+    connection = _candidate_db(tmp_path)
+    connection.execute("drop table equity_quality_metrics")
+    connection.execute("update schema_info set value = '5' where key = 'schema_version'")
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "rank_robust_top_n", "enabled": True, "scope": "pair_side", "top_n": 1,
+         "method": "equity_quality_v1"},
+    ]})
+    try:
+        with pytest.raises(EquityQualityCacheError, match="EQUITY_SCHEMA_UPGRADE_REQUIRED"):
+            load_selection_candidates(connection, request, SelectionConfig(), cache_only=True)
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("cache_state", ["absent", "stale"])
+def test_equity_quality_rank_recomputes_legitimate_cache_misses_in_memory(
+    tmp_path: Path, cache_state: str,
+) -> None:
+    connection = _candidate_db(tmp_path)
+    database = tmp_path / "strategy_performance.duckdb"
+    result_id = int(connection.execute("select result_id from strategy_results").fetchone()[0])
+    connection.close()
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "rank_robust_top_n", "enabled": True, "scope": "pair_side", "top_n": 1,
+         "method": "equity_quality_v1"},
+    ]})
+    prepare_selection_window_cache(database, request, SelectionConfig(), workers=1, include_equity=True)
+    with duckdb.connect(str(database)) as writer:
+        if cache_state == "absent":
+            writer.execute(
+                "delete from equity_quality_metrics where result_id = ? and algo_version = ?",
+                [result_id, equity_cache_module.ALGORITHM_VERSION],
+            )
+        else:
+            writer.execute(
+                "update equity_quality_metrics set source_revision = 'stale' "
+                "where result_id = ? and algo_version = ?",
+                [result_id, equity_cache_module.ALGORITHM_VERSION],
+            )
+
+    with duckdb.connect(str(database), read_only=True) as check:
+        candidate = load_selection_candidates(check, request, SelectionConfig(), cache_only=True).loc[0]
+        assert candidate["_equity_cache"]["status"] == "FRESH"
+        assert candidate["_equity_cache"]["calculated_in_memory"] is True
 
 
 def test_equity_fact_batch_does_not_mask_malformed_candidate_source_fields(tmp_path: Path) -> None:
@@ -1610,10 +1839,11 @@ def test_equity_selection_accepts_cached_no_sample_not_evaluated_fact(tmp_path: 
         candidates = load_selection_candidates(check, request, SelectionConfig(), cache_only=True)
     result = run_selection(candidates, request)
 
-    assert result.loc[0, "finalist"]
-    assert result.loc[0, "equity_regime_state"] == "MISSING_BASELINE"
-    assert result.loc[0, "equity_regime_disposition"] == "NOT_EVALUATED"
-    assert result.loc[0, "equity_regime_reason"] == "MISSING_BASELINE"
+    assert not result.loc[0, "finalist"]
+    assert result.loc[0, "equity_regime_state"] == "NOT_EVALUATED"
+    assert result.loc[0, "equity_regime_decision"] == "NOT_EVALUATED"
+    assert result.loc[0, "equity_regime_reasons"] == "W28_UNAVAILABLE"
+    assert result.loc[0, "elimination_reason"] == "W28_UNAVAILABLE"
     assert result.attrs["stage_counts"]["filter_equity_regime"]["not_evaluated"] == 1
 
 
@@ -1646,8 +1876,10 @@ def test_equity_selection_reads_cached_growing_pass_fact(tmp_path: Path) -> None
     assert candidates.loc[0, "_equity_cache"]["facts"].state == "GROWING"
     assert candidates.loc[0, "_equity_cache"]["facts"].erf_disposition == "PASS"
     assert result.loc[0, "equity_regime_state"] == "GROWING"
-    assert result.loc[0, "equity_regime_disposition"] == "PASS"
-    assert result.loc[0, "equity_regime_reason"] == "H_UP_SHORTS_NONDECLINING"
+    assert result.loc[0, "equity_regime_decision"] == candidates.loc[0, "_equity_regime_cache"]["assessment"].decision
+    assert result.loc[0, "equity_regime_reasons"] == ";".join(
+        candidates.loc[0, "_equity_regime_cache"]["assessment"].reasons
+    )
     assert result.loc[0, "finalist"]
 
 
@@ -1681,8 +1913,219 @@ def test_equity_selection_reads_verified_facts_when_optional_optimizer_metadata_
     assert candidates.loc[0, "_equity_cache"]["status"] == "FRESH"
     assert candidates.loc[0, "_equity_cache"]["facts"].state == facts.state
     assert candidates.loc[0, "_equity_cache"]["facts"].erf_disposition == facts.erf_disposition
-    assert result.loc[0, "equity_regime_reason"] == facts.reason
-    assert not result.loc[0, "finalist"]
+    assessment = candidates.loc[0, "_equity_regime_cache"]["assessment"]
+    assert result.loc[0, "equity_regime_state"] == assessment.state
+    assert result.loc[0, "equity_regime_decision"] == assessment.decision
+    assert result.loc[0, "equity_regime_reasons"] == ";".join(assessment.reasons)
+    assert bool(result.loc[0, "finalist"]) is (assessment.decision == "PASS")
+
+
+@pytest.mark.parametrize("consumer", ["filter_equity_regime", "equity_quality_rank"])
+def test_equity_regime_explicit_warm_turns_preview_miss_into_cache_hit(
+    tmp_path: Path, monkeypatch, consumer: str,
+) -> None:
+    connection = _candidate_db(tmp_path)
+    database = tmp_path / "strategy_performance.duckdb"
+    strategy_id, result_id = connection.execute(
+        "select strategy_id, current_result_id from strategies"
+    ).fetchone()
+    active_stage = (
+        {"id": "filter_equity_regime", "enabled": True, "scope": "pair_side"}
+        if consumer == "filter_equity_regime"
+        else {"id": "rank_robust_top_n", "enabled": True, "scope": "pair_side", "top_n": 1,
+              "method": "equity_quality_v1"}
+    )
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [active_stage]})
+    legacy_request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
+    connection.close()
+    prepare_selection_window_cache(
+        database, legacy_request, SelectionConfig(), workers=1, include_equity=True,
+    )
+    connection = duckdb.connect(str(database), read_only=True)
+    preview = load_selection_candidates(connection, request, SelectionConfig(), cache_only=True)
+    assert preview.loc[0, "_equity_regime_cache"]["calculated_in_memory"] is True
+    quality_before = connection.execute(
+        "select facts_sha256, calculated_at_utc from equity_quality_metrics "
+        "where result_id = ? and algo_version = ?",
+        [result_id, equity_cache_module.ALGORITHM_VERSION],
+    ).fetchone()
+    assert connection.execute(
+        "select count(*) from equity_quality_metrics where algo_version = ?",
+        [EQUITY_REGIME_ALGORITHM_VERSION],
+    ).fetchone() == (0,)
+    assert selection_cache_missing_strategy_ids(
+        connection, request, SelectionConfig(), include_equity=True,
+    ) == (int(strategy_id),)
+    connection.close()
+    monkeypatch.setattr(
+        selection_module, "_load_equity_samples_for_quality",
+        lambda *args: (_ for _ in ()).throw(AssertionError("fresh R7.3 cache was rescanned")),
+    )
+
+    prepare_selection_window_cache(database, request, SelectionConfig(), workers=1, include_equity=True)
+
+    with duckdb.connect(str(database), read_only=True) as check:
+        cached = check.execute(
+            "select source_revision, facts_json, facts_sha256 from equity_quality_metrics "
+            "where result_id = ? and algo_version = ?",
+            [result_id, EQUITY_REGIME_ALGORITHM_VERSION],
+        ).fetchone()
+        assert cached is not None
+        assert check.execute(
+            "select count(*) from equity_quality_metrics where result_id = ? and algo_version = ?",
+            [result_id, EQUITY_REGIME_ALGORITHM_VERSION],
+        ).fetchone() == (1,)
+        quality_after = check.execute(
+            "select facts_sha256, calculated_at_utc from equity_quality_metrics "
+            "where result_id = ? and algo_version = ?",
+            [result_id, equity_cache_module.ALGORITHM_VERSION],
+        ).fetchone()
+        assert quality_after == quality_before
+        assert selection_cache_missing_strategy_ids(
+            check, request, SelectionConfig(), include_equity=True,
+        ) == ()
+
+    monkeypatch.setattr(
+        selection_module, "calculate_equity_regime_facts",
+        lambda *args: (_ for _ in ()).throw(AssertionError("warm regime cache miss")),
+    )
+    with duckdb.connect(str(database), read_only=True) as check:
+        candidates = load_selection_candidates(check, request, SelectionConfig(), cache_only=True)
+        result = run_selection(candidates, request)
+        current_revision = equity_regime_source_revision(
+            current_equity_source_metadata(check, int(result_id))
+        )
+    assert candidates.loc[0, "_equity_regime_cache"]["calculated_in_memory"] is False
+    assert result.loc[0, "equity_regime_json"] == candidates.loc[0, "_equity_regime_cache"]["equity_regime_json"]
+    assert cached[0] == current_revision
+
+
+@pytest.mark.parametrize("consumer", ["filter_equity_regime", "equity_quality_rank"])
+def test_equity_regime_stale_same_version_cache_is_upserted_by_explicit_warm(
+    tmp_path: Path, consumer: str,
+) -> None:
+    connection = _candidate_db(tmp_path)
+    database = tmp_path / "strategy_performance.duckdb"
+    strategy_id, result_id = connection.execute(
+        "select strategy_id, current_result_id from strategies"
+    ).fetchone()
+    active_stage = (
+        {"id": "filter_equity_regime", "enabled": True, "scope": "pair_side"}
+        if consumer == "filter_equity_regime"
+        else {"id": "rank_robust_top_n", "enabled": True, "scope": "pair_side", "top_n": 1,
+              "method": "equity_quality_v1"}
+    )
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [active_stage]})
+    connection.close()
+    prepare_selection_window_cache(database, request, SelectionConfig(), workers=1, include_equity=True)
+    with duckdb.connect(str(database)) as writer:
+        previous = writer.execute(
+            "select source_revision from equity_quality_metrics where result_id = ? and algo_version = ?",
+            [result_id, EQUITY_REGIME_ALGORITHM_VERSION],
+        ).fetchone()[0]
+        writer.execute(
+            "update equity_quality_metrics set source_revision = ? where result_id = ? and algo_version = ?",
+            ["0" * 64, result_id, EQUITY_REGIME_ALGORITHM_VERSION],
+        )
+    with duckdb.connect(str(database), read_only=True) as check:
+        assert selection_cache_missing_strategy_ids(
+            check, request, SelectionConfig(), include_equity=True,
+        ) == (int(strategy_id),)
+
+    prepare_selection_window_cache(
+        database, request, SelectionConfig(), workers=1,
+        strategy_ids=(int(strategy_id),), include_equity=True,
+    )
+
+    with duckdb.connect(str(database), read_only=True) as check:
+        current = current_equity_source_metadata(check, int(result_id))
+        repaired = check.execute(
+            "select source_revision from equity_quality_metrics where result_id = ? and algo_version = ?",
+            [result_id, EQUITY_REGIME_ALGORITHM_VERSION],
+        ).fetchall()
+        assert repaired == [(equity_regime_source_revision(current),)]
+        assert repaired[0][0] != "0" * 64
+        assert previous == repaired[0][0]
+        assert selection_cache_missing_strategy_ids(
+            check, request, SelectionConfig(), include_equity=True,
+        ) == ()
+
+
+@pytest.mark.parametrize("stages", [[], [
+    {"id": "filter_equity_regime", "enabled": False, "scope": "pair_side"},
+], [
+    {"id": "rank_robust_top_n", "enabled": False, "scope": "pair_side", "top_n": 1,
+     "method": "equity_quality_v1"},
+]])
+def test_equity_regime_warm_is_opt_in_to_enabled_consumers(tmp_path: Path, stages: list[dict[str, object]]) -> None:
+    connection = _candidate_db(tmp_path)
+    database = tmp_path / "strategy_performance.duckdb"
+    connection.close()
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": stages})
+
+    prepare_selection_window_cache(database, request, SelectionConfig(), workers=1, include_equity=True)
+
+    with duckdb.connect(str(database), read_only=True) as check:
+        assert check.execute(
+            "select count(*) from equity_quality_metrics where algo_version = ?",
+            [EQUITY_REGIME_ALGORITHM_VERSION],
+        ).fetchone() == (0,)
+
+
+def test_equity_regime_source_mismatch_rolls_back_explicit_warm_batch(tmp_path: Path, monkeypatch) -> None:
+    connection = _candidate_db(tmp_path)
+    database = tmp_path / "strategy_performance.duckdb"
+    strategy_id, result_id = connection.execute(
+        "select strategy_id, result_id from strategy_results"
+    ).fetchone()
+    strategy_id, result_id = int(strategy_id), int(result_id)
+    connection.close()
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "filter_equity_regime", "enabled": True, "scope": "pair_side"},
+    ]})
+    legacy_request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
+    prepare_selection_window_cache(
+        database, legacy_request, SelectionConfig(), workers=1, include_equity=True,
+    )
+    with duckdb.connect(str(database), read_only=True) as check:
+        before_windows = check.execute("select * from window_metrics order by result_id, requested_start_utc").fetchall()
+        before_quality = check.execute(
+            "select * from equity_quality_metrics where algo_version = ? order by result_id",
+            [equity_cache_module.ALGORITHM_VERSION],
+        ).fetchall()
+    original = selection_module._selection_window_job_from_args
+    changed = False
+
+    def mutate_after_source_read(args):
+        nonlocal changed
+        result = original(args)
+        if not changed:
+            changed = True
+            with duckdb.connect(str(database)) as writer:
+                writer.execute(
+                    "update strategy_results set imported_at_utc = imported_at_utc + interval '1 second' "
+                    "where result_id = ?",
+                    [result_id],
+                )
+        return result
+
+    monkeypatch.setattr(selection_module, "_selection_window_job_from_args", mutate_after_source_read)
+    with pytest.raises(EquitySourceChangedError, match="EQUITY_SOURCE_CHANGED"):
+        prepare_selection_window_cache(
+            database, request, SelectionConfig(), workers=1,
+            strategy_ids=(strategy_id,), include_equity=True,
+        )
+
+    with duckdb.connect(str(database), read_only=True) as check:
+        assert check.execute("select * from window_metrics order by result_id, requested_start_utc").fetchall() == before_windows
+        assert check.execute(
+            "select * from equity_quality_metrics where algo_version = ? order by result_id",
+            [equity_cache_module.ALGORITHM_VERSION],
+        ).fetchall() == before_quality
+        assert check.execute(
+            "select count(*) from equity_quality_metrics where algo_version = ?",
+            [EQUITY_REGIME_ALGORITHM_VERSION],
+        ).fetchone() == (0,)
 
 
 def test_enabled_equity_selection_handles_empty_candidate_frame_without_empty_in_query(tmp_path: Path) -> None:
@@ -1700,7 +2143,7 @@ def test_enabled_equity_selection_handles_empty_candidate_frame_without_empty_in
     assert "_equity_cache" in candidates.columns
     assert result.empty
     assert result.attrs["stage_counts"]["filter_equity_regime"] == {
-        "enabled": True, "eliminated": 0, "remaining": 0, "not_evaluated": 0,
+        "enabled": True, "eliminated": 0, "remaining": 0, "not_evaluated": 0, "reserved": 0,
     }
 
 
@@ -2137,7 +2580,8 @@ def test_warm_selection_batch_skips_writer_and_preserves_public_state(tmp_path: 
         after_revision = equity_source_revision(current_equity_source_metadata(reader, result_id))
         assert after_revision != before_revision
         assert selection_cache_status(reader, request, config, include_readiness_breakdown=True) == {
-            "total": 3, "missing": 0, "ready": True, "window_missing": 0, "equity_missing": 0,
+            "total": 3, "missing": 0, "ready": True, "window_missing": 0,
+            "equity_missing": 0, "regime_missing": 0, "warm_missing": 0,
         }
         assert selection_cache_missing_strategy_ids(reader, request, config) == ()
 
@@ -2323,6 +2767,46 @@ def test_equity_readiness_is_opt_in_and_rechecks_source_revision_and_digest(tmp_
     with duckdb.connect(str(database), read_only=True) as check:
         assert selection_cache_status(check, request, config, include_equity=True)["ready"] is False
         assert selection_cache_missing_strategy_ids(check, request, config, include_equity=True) == (strategy_id,)
+
+
+@pytest.mark.parametrize(
+    ("filter_enabled", "rank_enabled", "expected_missing"),
+    [(False, False, False), (True, False, True), (False, True, True), (True, True, True)],
+)
+def test_selection_cache_status_matches_enabled_equity_consumers(
+    tmp_path: Path, filter_enabled: bool, rank_enabled: bool, expected_missing: bool,
+) -> None:
+    connection = _candidate_db(tmp_path)
+    database = tmp_path / "strategy_performance.duckdb"
+    strategy_id = int(connection.execute("select strategy_id from strategies").fetchone()[0])
+    connection.close()
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "filter_equity_regime", "enabled": filter_enabled, "scope": "pair_side"},
+        {"id": "rank_robust_top_n", "enabled": rank_enabled, "scope": "pair_side", "top_n": 1,
+         "method": "equity_quality_v1"},
+    ]})
+    prepare_selection_window_cache(database, request, SelectionConfig(), workers=1, include_equity=True)
+    if filter_enabled or rank_enabled:
+        with duckdb.connect(str(database)) as writer:
+            writer.execute(
+                "delete from equity_quality_metrics where algo_version = ?",
+                [EQUITY_REGIME_ALGORITHM_VERSION],
+            )
+
+    with duckdb.connect(str(database), read_only=True) as check:
+        status = selection_cache_status(
+            check, request, SelectionConfig(), include_equity=True, include_readiness_breakdown=True,
+        )
+        missing_ids = selection_cache_missing_strategy_ids(
+            check, request, SelectionConfig(), include_equity=True,
+        )
+
+    assert status["ready"] is True
+    assert status["missing"] == 0
+    assert status["equity_missing"] == 0
+    assert status["regime_missing"] == int(expected_missing)
+    assert status["warm_missing"] == int(expected_missing)
+    assert missing_ids == ((strategy_id,) if expected_missing else ())
 
 
 def test_equity_publication_rechecks_source_revision_and_rolls_back_current_batch(
@@ -2863,6 +3347,60 @@ def _with_test_equity_cache(row: dict[str, object]) -> dict[str, object]:
             "status": "FRESH", "facts": facts,
             "source_revision": "0" * 64, "facts_sha256": digest,
         }
+    if "_equity_regime_cache" not in row and ("_equity_quality" in row or "_equity_state" in row):
+        raw_result_id = row.get("result_id")
+        if raw_result_id is None:
+            raw_result_id = 100_000 + int(row.get("strategy_id", 1))
+            row["result_id"] = raw_result_id
+        state = str(row.get("_equity_state", "GROWING"))
+        state = {
+            "FLAT": "DROP",
+            "DECLINING_OR_MIXED": "DROP",
+            "NONPOSITIVE_EQUITY": "DROP",
+            "INSUFFICIENT_HISTORY": "NOT_EVALUATED",
+            "MISSING_BASELINE": "NOT_EVALUATED",
+            "UNKNOWN_INVALID_SOURCE": "NOT_EVALUATED",
+        }.get(state, state)
+        result_id = int(raw_result_id)
+        start = datetime(2026, 1, 1, tzinfo=UTC)
+        samples = tuple(
+            EquityRegimeSample(
+                result_id, index, start + timedelta(days=index),
+                Decimal("100") * (Decimal("1.01") ** index),
+            )
+            for index in range(43)
+        )
+        regime_facts = calculate_equity_regime_facts(result_id, start, start + timedelta(days=42), samples)
+        if state == "WEAKENING":
+            windows = {
+                key: replace(regime_facts.windows[key], v=Decimal(value), p=Decimal(value), direction="UP")
+                for key, value in (("28", "8"), ("14", "9"), ("7", "9"))
+            }
+            regime_facts = replace(
+                regime_facts,
+                windows_28=windows["28"], windows_14=windows["14"], windows_7=windows["7"],
+            )
+        elif state == "RESUMED":
+            flat = replace(regime_facts.windows_28, v=Decimal(0), p=Decimal(0), direction="FLAT")
+            regime_facts = replace(regime_facts, windows_28=flat)
+        elif state == "STALLED":
+            regime_facts = replace(regime_facts, held_w7_breakout=False)
+        elif state == "DROP":
+            regime_facts = replace(regime_facts, dd14=Decimal("23"))
+        elif state == "NOT_EVALUATED":
+            regime_facts = calculate_equity_regime_facts(result_id, start, start + timedelta(days=42), ())
+        assessment = assess_equity_regime(regime_facts)
+        assert assessment.state == state
+        facts_json = encode_equity_regime_facts(regime_facts)
+        row["_equity_regime_cache"] = {
+            "status": "FRESH",
+            "facts": regime_facts,
+            "assessment": assessment,
+            "source_revision": "0" * 64,
+            "facts_sha256": hashlib.sha256(facts_json.encode("utf-8")).hexdigest(),
+            "classifier_algo_version": EQUITY_REGIME_ALGORITHM_VERSION,
+            "equity_regime_json": encode_equity_regime_assessment(assessment),
+        }
     return row
 
 
@@ -3396,6 +3934,27 @@ def test_equity_workbook_appends_four_precise_columns_and_labels_method(tmp_path
     assert score_header.comment is not None and "equity_quality_v1" in score_header.comment.text
     metadata_sheet = workbook["_MRS_SELECTION_META"]
     assert ("selection_method", "equity_quality_v1") in {tuple(row) for row in metadata_sheet.iter_rows(min_row=1, max_col=2, values_only=True)}
+
+
+def test_equity_regime_workbook_displays_rank_only_when_regime_is_enabled(tmp_path: Path) -> None:
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "filter_equity_regime", "enabled": True, "scope": "pair_side"},
+    ]})
+    result = run_selection(pd.DataFrame([_selection_row("stalled", _equity_state="STALLED")]), request)
+    sheet = load_workbook(
+        write_selection_workbook(result, tmp_path / "regime-rank.xlsx", request), data_only=True,
+    )["All candidates"]
+    headers = [cell.value for cell in sheet[1]]
+
+    assert "Regime rank" in headers
+    assert sheet.cell(2, headers.index("Regime rank") + 1).value == "RESERVED"
+
+    legacy_request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
+    legacy_result = run_selection(pd.DataFrame([_selection_row("legacy")]), legacy_request)
+    legacy_sheet = load_workbook(
+        write_selection_workbook(legacy_result, tmp_path / "legacy.xlsx", legacy_request), data_only=True,
+    )["All candidates"]
+    assert "Regime rank" not in [cell.value for cell in legacy_sheet[1]]
 
 
 def test_equity_method_metadata_without_review_preserves_existing_score_comment(

@@ -12,13 +12,24 @@ import pandas as pd
 import pytest
 
 from mrs3.performance_v2_selection import (
-    SelectionConfig, parse_selection_request, retest_cohort_request,
+    SelectionConfig, load_selection_candidates, parse_selection_request, retest_cohort_request,
     run_selection, write_selection_workbook,
 )
 from mrs3.performance_v2_equity_cache import (
     current_equity_source_metadata, encode_equity_facts, equity_source_revision,
 )
 from mrs3.performance_v2_equity_quality import EquitySample, calculate_equity_quality_facts
+from mrs3.performance_v2_equity_regime import (
+    ALGORITHM_VERSION as EQUITY_REGIME_ALGORITHM_VERSION,
+    EquityRegimeSample,
+    assess_equity_regime,
+    calculate_equity_regime_facts,
+)
+from mrs3.performance_v2_equity_regime_cache import (
+    encode_equity_regime_assessment,
+    encode_equity_regime_facts,
+    equity_regime_source_revision,
+)
 from mrs3.performance_v2_selection_review import (
     META_SHEET,
     SelectionReviewError,
@@ -74,6 +85,34 @@ def _result() -> pd.DataFrame:
          "final_rank": None, "final_score": 80.0, "elimination_reason": "ANALOG", "analog_group_key": '["a"]',
          "auto_analog_of_strategy_id": 1, "prior_rejected": False, "eliminated_by_rank_robust_top_n": True},
     ])
+
+
+def _equity_regime_cache_entry(
+    connection: duckdb.DuckDBPyConnection, result_id: int,
+) -> dict[str, object]:
+    source = current_equity_source_metadata(connection, result_id)
+    samples = [
+        EquityRegimeSample(int(row[0]), int(row[1]), row[2].astimezone(UTC), row[3])
+        for row in connection.execute(
+            """select result_id, sample_index, timestamp_utc, equity from strategy_equity
+               where result_id = ? order by sample_index, timestamp_utc""",
+            [result_id],
+        ).fetchall()
+    ]
+    facts = calculate_equity_regime_facts(
+        result_id, source["report_start_utc"], source["report_end_utc"], samples,
+    )
+    assessment = assess_equity_regime(facts)
+    facts_json = encode_equity_regime_facts(facts)
+    return {
+        "status": "FRESH",
+        "assessment": assessment,
+        "facts": facts,
+        "source_revision": equity_regime_source_revision(source),
+        "facts_sha256": sha256(facts_json.encode()).hexdigest(),
+        "classifier_algo_version": EQUITY_REGIME_ALGORITHM_VERSION,
+        "equity_regime_json": encode_equity_regime_assessment(assessment),
+    }
 
 
 def test_hard_cutoff_publication_tags_only_actual_exclusion(tmp_path: Path) -> None:
@@ -269,8 +308,10 @@ def _equity_ranked_result(connection: duckdb.DuckDBPyConnection) -> tuple[object
     ]})
     result = _result().copy()
     result["_equity_cache"] = None
+    result["_equity_regime_cache"] = None
     for row_index in result.index:
         result_id = int(result.at[row_index, "result_id"])
+        result.at[row_index, "_equity_regime_cache"] = _equity_regime_cache_entry(connection, result_id)
         source = current_equity_source_metadata(connection, result_id)
         facts = calculate_equity_quality_facts(
             result_id, source["report_start_utc"], source["report_end_utc"], (),
@@ -373,7 +414,7 @@ def _insert_history_fixture(connection: duckdb.DuckDBPyConnection, count: int) -
         )
         connection.execute(
             """insert into selection_results values (
-                ?, 1, 101, 'FINALIST', 0, 1, null, null, null, true, '{}'
+                ?, 1, 101, 'FINALIST', 0, 1, null, null, null, true, '{}', null
             )""",
             [run_id],
         )
@@ -454,7 +495,7 @@ def _insert_decision_run(
     for strategy_id, prior_rejected in result_rows:
         connection.execute(
             """insert into selection_results values (
-                ?, ?, ?, 'FINALIST', 0, 1, null, null, null, ?, '{}'
+                ?, ?, ?, 'FINALIST', 0, 1, null, null, null, ?, '{}', null
             )""",
             [run_id, strategy_id, 100 + strategy_id, prior_rejected],
         )
@@ -660,7 +701,7 @@ def test_effective_selection_decisions_streams_results_across_fetchmany_boundary
     connection.execute(
         """insert into selection_results
            select 'wide-base', strategy_id, 100000 + strategy_id, 'FINALIST', 0, 1,
-                  null, null, null, true, '{}'
+                  null, null, null, true, '{}', null
              from range(1, 1026) as values(strategy_id)""",
     )
     connection.execute("update selection_runs set candidate_count = 1025 where selection_run_id = 'wide-base'")
@@ -816,6 +857,33 @@ def test_equity_quality_review_v2_round_trips_cached_decision_evidence(tmp_path:
     assert import_selection_review(connection, path.read_bytes())["row_count"] == 2
 
 
+def test_equity_quality_rank_publishes_in_memory_facts_on_r73_cache_miss(tmp_path: Path) -> None:
+    connection = _database(tmp_path)
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "rank_robust_top_n", "enabled": True, "scope": "pair_side", "top_n": 1,
+         "method": "equity_quality_v1"},
+    ]})
+    candidates = load_selection_candidates(connection, request, SelectionConfig(), cache_only=True)
+    result = run_selection(apply_prior_rejected(connection, candidates), request)
+    assert set(result.attrs["equity_quality_facts"]) == {"1", "2"}
+    assert connection.execute(
+        "select count(*) from equity_quality_metrics where algo_version = ?", ["equity-quality-r7.3-v1"],
+    ).fetchone() == (0,)
+    metadata = new_run_metadata(connection, request)
+    path = write_selection_workbook(result, tmp_path / "r73-cache-miss.xlsx", request, metadata, _review_rows(result))
+
+    persist_selection_snapshot(connection, request, SelectionConfig(), result, metadata, path.read_bytes())
+
+    stored = json.loads(connection.execute(
+        "select request_json from selection_runs where selection_run_id = ?",
+        [metadata["selection_run_id"]],
+    ).fetchone()[0])
+    snapshot = stored["equity_quality_snapshot"]
+    assert set(snapshot["sources"]) == {"1", "2"}
+    assert "fallback_strategy_ids" not in snapshot
+    assert import_selection_review(connection, path.read_bytes())["row_count"] == 2
+
+
 def test_equity_review_import_accepts_historical_retired_time_stage(tmp_path: Path) -> None:
     connection = _database(tmp_path)
     request, result = _equity_ranked_result(connection)
@@ -941,7 +1009,7 @@ def test_equity_revision_import_rejects_naive_database_timestamps() -> None:
         _current_equity_revisions(FakeConnection(), [1])
 
 
-def test_mixed_equity_retest_cohort_round_trips_unscoreable_reserve_evidence(tmp_path: Path) -> None:
+def test_mixed_equity_retest_cohort_keeps_rejected_pass_candidate_as_reserve(tmp_path: Path) -> None:
     connection = _database(tmp_path)
     now = datetime(2026, 9, 2, tzinfo=UTC)
     start = datetime(2026, 1, 1, tzinfo=UTC)
@@ -961,6 +1029,16 @@ def test_mixed_equity_retest_cohort_round_trips_unscoreable_reserve_evidence(tmp
     connection.execute("update strategies set current_result_id = 103 where strategy_id = 3")
     connection.execute("update strategy_results set report_start_utc = ?, report_end_utc = ?", [start, end])
     connection.execute("insert into strategy_tags values (3, 'REJECTED', 'SELECTION_REVIEW', 'older-run', ?)", [now])
+    for result_id, step in ((101, Decimal("0.1")), (102, Decimal("0.05")), (103, Decimal("0.03"))):
+        connection.executemany(
+            """insert into strategy_equity (result_id, sample_index, timestamp_utc, wallet, equity)
+               values (?, ?, ?, 100, ?)""",
+            [
+                [result_id, sample_index, start + timedelta(hours=6 * sample_index),
+                 Decimal(100) + Decimal(sample_index) * step]
+                for sample_index in range(113)
+            ],
+        )
 
     base_request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
         {"id": "rank_robust_top_n", "enabled": True, "scope": "pair_side", "top_n": 1,
@@ -968,29 +1046,11 @@ def test_mixed_equity_retest_cohort_round_trips_unscoreable_reserve_evidence(tmp
     ]})
     request = retest_cohort_request(base_request, "mixed-review-cohort", {1: 101, 2: 102, 3: 103})
     config = SelectionConfig(lot_variant_redundancy_enabled=False)
-    result = pd.concat([_result().iloc[[0]], _result().iloc[[0]], _result().iloc[[0]]], ignore_index=True)
-    result["strategy_id"] = [1, 2, 3]
-    result["result_id"] = [101, 102, 103]
-    result["strategy_name"] = ["strategy-1", "strategy-2", "strategy-3"]
-    result["auto_analog_of_strategy_id"] = None
-    result["_equity_cache"] = None
-    for row_index in result.index:
-        result_id = int(result.at[row_index, "result_id"])
-        source = current_equity_source_metadata(connection, result_id)
-        samples = () if result_id == 103 else tuple(
-            EquitySample(result_id, sample_index, start + timedelta(hours=6 * sample_index),
-                         Decimal(100) + Decimal(sample_index) * Decimal("0.1" if result_id == 101 else "0.05"))
-            for sample_index in range(113)
-        )
-        facts = calculate_equity_quality_facts(result_id, source["report_start_utc"], source["report_end_utc"], samples)
-        facts_json = encode_equity_facts(facts)
-        result.at[row_index, "_equity_cache"] = {
-            "status": "FRESH",
-            "facts": facts,
-            "source_revision": equity_source_revision(source),
-            "facts_sha256": sha256(facts_json.encode()).hexdigest(),
-        }
-    result = run_selection(apply_prior_rejected(connection, result), request, config)
+    candidates = load_selection_candidates(connection, request, config, cache_only=True)
+    assert candidates["_equity_regime_cache"].map(
+        lambda value: value["assessment"].decision
+    ).tolist() == ["PASS", "PASS", "PASS"]
+    result = run_selection(apply_prior_rejected(connection, candidates), request, config)
     metadata = new_run_metadata(connection, request)
     path = write_selection_workbook(result, tmp_path / "mixed-equity-review.xlsx", request, metadata, _review_rows(result))
     persist_selection_snapshot(connection, request, config, result, metadata, path.read_bytes())
@@ -1002,14 +1062,13 @@ def test_mixed_equity_retest_cohort_round_trips_unscoreable_reserve_evidence(tmp
     decisions = result.set_index("strategy_id")
     assert decisions.loc[3, "auto_status"] == "RESERVE"
     assert decisions.loc[3, "elimination_reason"] == "PRIOR_USER_REJECTED"
-    assert pd.isna(decisions.loc[3, "final_rank"])
-    assert decisions.loc[3, "final_score"] is None
-    assert sorted(int(value) for value in decisions["final_rank"].dropna()) == [1, 2]
-    assert all(isinstance(value, Decimal) for value in decisions.loc[[1, 2], "final_score"])
+    assert int(decisions.loc[3, "final_rank"]) in {1, 2, 3}
+    assert sorted(int(value) for value in decisions["final_rank"].dropna()) == [1, 2, 3]
+    assert all(isinstance(value, Decimal) for value in decisions["final_score"])
     sources = stored["equity_quality_snapshot"]["sources"]
     assert set(sources) == {"1", "2", "3"}
-    assert sources["3"]["decision_facts"]["state"] == "MISSING_BASELINE"
-    assert sources["3"]["decision_facts"]["score12"] is None
+    assert sources["3"]["decision_facts"]["score12"] is not None
+    assert decisions.loc[3, "equity_regime_decision"] == "PASS"
     assert import_selection_review(connection, path.read_bytes())["row_count"] == 3
 
 

@@ -18,6 +18,17 @@ import pandas as pd
 
 from .performance_v2_equity_cache import equity_source_revision
 from .performance_v2_equity_quality import ALGORITHM_VERSION
+from .performance_v2_equity_regime import (
+    ALGORITHM_VERSION as EQUITY_REGIME_ALGORITHM_VERSION,
+    EquityRegimeSample,
+    assess_equity_regime,
+    calculate_equity_regime_facts,
+)
+from .performance_v2_equity_regime_cache import (
+    EquityRegimeCacheError,
+    decode_equity_regime_assessment,
+    encode_equity_regime_facts,
+)
 from .performance_v2_selection import (
     SelectionConfig, SelectionRequest, effective_selection_stages, parse_selection_request,
 )
@@ -108,6 +119,184 @@ def _equity_quality_rank_enabled(request: SelectionRequest | None) -> bool:
         stage.id == "rank_robust_top_n" and stage.enabled and stage.method == "equity_quality_v1"
         for stage in request.stages
     ))
+
+
+def _equity_filter_enabled(request: SelectionRequest) -> bool:
+    return any(stage.id == "filter_equity_regime" and stage.enabled for stage in request.stages)
+
+
+def _equity_regime_publication_data(
+    connection: duckdb.DuckDBPyConnection,
+    request: SelectionRequest,
+    result: pd.DataFrame,
+    expected: Mapping[int, int],
+    current_sources: Mapping[int, tuple[int, str]],
+) -> tuple[dict[int, str], list[list[object]]]:
+    """Validate canonical regime evidence and prepare durable rejection sources."""
+    filter_enabled = _equity_filter_enabled(request)
+    if not filter_enabled and not _equity_quality_rank_enabled(request):
+        return {}, []
+    evidence = result.attrs.get("equity_regime_evidence")
+    expected_keys = {str(strategy_id) for strategy_id in expected}
+    if not isinstance(evidence, Mapping) or set(evidence) != expected_keys:
+        raise SelectionReviewError("SELECTION_REVIEW_INVALID_SELECTION")
+
+    hard_reasons = {"DD_14_7_GTE_23", "W28_DOWN", "PRE28_AND_W28_NOT_UP"}
+    records_by_result: dict[int, list[tuple[int, str, str, str]]] = {}
+    stale: set[int] = set()
+    for strategy_id, result_id in expected.items():
+        item = evidence[str(strategy_id)]
+        if not isinstance(item, Mapping) or set(item) != {
+            "strategy_id", "result_id", "source_revision", "facts_sha256",
+            "classifier_algo_version", "equity_regime_json", "equity_filter_enabled",
+        }:
+            raise SelectionReviewError("SELECTION_REVIEW_INVALID_SELECTION")
+        source_result_id = item.get("result_id")
+        source_revision = item.get("source_revision")
+        facts_sha256 = item.get("facts_sha256")
+        payload = item.get("equity_regime_json")
+        if (
+            type(item.get("strategy_id")) is not int or item["strategy_id"] != strategy_id
+            or type(source_result_id) is not int or source_result_id != result_id
+            or not isinstance(source_revision, str) or len(source_revision) != 64
+            or not isinstance(facts_sha256, str) or len(facts_sha256) != 64
+            or not isinstance(payload, str)
+            or item.get("classifier_algo_version") != EQUITY_REGIME_ALGORITHM_VERSION
+            or item.get("equity_filter_enabled") is not filter_enabled
+        ):
+            raise SelectionReviewError("SELECTION_REVIEW_INVALID_SELECTION")
+        try:
+            int(source_revision, 16)
+            int(facts_sha256, 16)
+        except ValueError:
+            raise SelectionReviewError("SELECTION_REVIEW_INVALID_SELECTION") from None
+        if current_sources.get(strategy_id) != (result_id, source_revision):
+            stale.add(strategy_id)
+            continue
+        records_by_result.setdefault(result_id, []).append(
+            (strategy_id, source_revision, facts_sha256, payload)
+        )
+    if stale:
+        raise SelectionReviewError("SELECTION_REVIEW_STALE_RESULTS", details=sorted(stale))
+
+    result_ids = sorted(records_by_result)
+    report_bounds = {
+        int(row[0]): (row[1], row[2])
+        for row in connection.execute(
+            """select result_id, report_start_utc, report_end_utc from strategy_results
+               where result_id in (select unnest(?::bigint[]))""",
+            [result_ids],
+        ).fetchall()
+    } if result_ids else {}
+    assessments: dict[int, str] = {}
+    rejection_sources: list[list[object]] = []
+
+    def validate_result(result_id: int, samples: list[EquityRegimeSample]) -> None:
+        bounds = report_bounds.get(result_id)
+        if (
+            bounds is None
+            or not isinstance(bounds[0], datetime) or bounds[0].tzinfo is None
+            or not isinstance(bounds[1], datetime) or bounds[1].tzinfo is None
+        ):
+            stale.update(record[0] for record in records_by_result[result_id])
+            return
+        facts = calculate_equity_regime_facts(
+            result_id,
+            bounds[0].astimezone(timezone.utc),
+            bounds[1].astimezone(timezone.utc),
+            samples,
+        )
+        facts_payload = encode_equity_regime_facts(facts)
+        actual_facts_sha256 = sha256(facts_payload.encode("utf-8")).hexdigest()
+        for strategy_id, source_revision, facts_sha256, payload in records_by_result[result_id]:
+            if actual_facts_sha256 != facts_sha256:
+                stale.add(strategy_id)
+                continue
+            try:
+                assessment_digest = sha256(payload.encode("utf-8")).hexdigest()
+                assessment = decode_equity_regime_assessment(
+                    payload, assessment_digest, expected_result_id=result_id,
+                )
+            except (EquityRegimeCacheError, UnicodeEncodeError):
+                raise SelectionReviewError("SELECTION_REVIEW_INVALID_SELECTION") from None
+            if assessment.facts != facts or assess_equity_regime(facts) != assessment:
+                raise SelectionReviewError("SELECTION_REVIEW_INVALID_SELECTION")
+            assessments[strategy_id] = payload
+            if filter_enabled and assessment.decision == "DROP":
+                reasons = set(assessment.reasons)
+                if not reasons or not reasons.issubset(hard_reasons):
+                    raise SelectionReviewError("SELECTION_REVIEW_INVALID_SELECTION")
+                created_at = datetime.now(timezone.utc)
+                rejection_sources.extend([
+                    [strategy_id, "EQUITY_REGIME_FILTER", reason, result_id, None,
+                     EQUITY_REGIME_ALGORITHM_VERSION, source_revision, facts_sha256, created_at]
+                    for reason in assessment.reasons
+                ])
+
+    sample_cursor = connection.execute(
+        """select result_id, sample_index, timestamp_utc, equity from strategy_equity
+           where result_id in (select unnest(?::bigint[]))
+           order by result_id, sample_index, timestamp_utc""",
+        [result_ids],
+    ) if result_ids else None
+    seen_results: set[int] = set()
+    active_result_id: int | None = None
+    active_samples: list[EquityRegimeSample] = []
+    while sample_cursor is not None:
+        batch = sample_cursor.fetchmany(4096)
+        if not batch:
+            break
+        for raw_result_id, sample_index, timestamp_utc, equity in batch:
+            result_id = int(raw_result_id)
+            if active_result_id is not None and result_id != active_result_id:
+                validate_result(active_result_id, active_samples)
+                active_samples = []
+            active_result_id = result_id
+            seen_results.add(result_id)
+            if (
+                not isinstance(timestamp_utc, datetime) or timestamp_utc.tzinfo is None
+                or timestamp_utc.utcoffset() is None
+            ):
+                raise SelectionReviewError("SELECTION_REVIEW_SCHEMA_MISMATCH")
+            active_samples.append(EquityRegimeSample(
+                result_id, int(sample_index), timestamp_utc.astimezone(timezone.utc), equity,
+            ))
+    if active_result_id is not None:
+        validate_result(active_result_id, active_samples)
+    for result_id in result_ids:
+        if result_id not in seen_results:
+            validate_result(result_id, [])
+    if stale:
+        raise SelectionReviewError("SELECTION_REVIEW_STALE_RESULTS", details=sorted(stale))
+    return assessments, rejection_sources
+
+
+def _equity_regime_evidence_identity(
+    request: SelectionRequest, result: pd.DataFrame, expected: Mapping[int, int],
+) -> dict[int, tuple[int, str, str, str]]:
+    if not _equity_filter_enabled(request) and not _equity_quality_rank_enabled(request):
+        return {}
+    evidence = result.attrs.get("equity_regime_evidence")
+    if not isinstance(evidence, Mapping) or set(evidence) != {str(value) for value in expected}:
+        raise SelectionReviewError("SELECTION_REVIEW_INVALID_SELECTION")
+    identities: dict[int, tuple[int, str, str, str]] = {}
+    for strategy_id, expected_result_id in expected.items():
+        raw = evidence[str(strategy_id)]
+        if not isinstance(raw, Mapping):
+            raise SelectionReviewError("SELECTION_REVIEW_INVALID_SELECTION")
+        result_id = raw.get("result_id")
+        source_revision = raw.get("source_revision")
+        facts_sha256 = raw.get("facts_sha256")
+        payload = raw.get("equity_regime_json")
+        if (
+            type(result_id) is not int or result_id != expected_result_id
+            or not isinstance(source_revision, str) or len(source_revision) != 64
+            or not isinstance(facts_sha256, str) or len(facts_sha256) != 64
+            or not isinstance(payload, str)
+        ):
+            raise SelectionReviewError("SELECTION_REVIEW_INVALID_SELECTION")
+        identities[strategy_id] = (result_id, source_revision, facts_sha256, payload)
+    return identities
 
 
 def new_run_metadata(
@@ -219,9 +408,26 @@ def _equity_snapshot_stale_ids(
     return sorted(stale)
 
 
+def _rejected_strategy_ids(connection: duckdb.DuckDBPyConnection) -> set[int]:
+    query = """select strategy_id from strategy_tags where tag = 'REJECTED'
+               union select strategy_id from strategy_rejection_sources"""
+    try:
+        rows = connection.execute(query).fetchall()
+    except duckdb.CatalogException:
+        version_row = connection.execute(
+            "select value from schema_info where key = 'schema_version'"
+        ).fetchone()
+        if version_row is None or str(version_row[0]) not in {"5", "6", "7", "8"}:
+            raise
+        rows = connection.execute(
+            "select strategy_id from strategy_tags where tag = 'REJECTED'"
+        ).fetchall()
+    return {int(row[0]) for row in rows}
+
+
 def apply_prior_rejected(connection: duckdb.DuckDBPyConnection, candidates: pd.DataFrame) -> pd.DataFrame:
     output = candidates.copy()
-    rejected = {int(row[0]) for row in connection.execute("select strategy_id from strategy_tags where tag = 'REJECTED'").fetchall()}
+    rejected = _rejected_strategy_ids(connection)
     retest = {int(row[0]) for row in connection.execute("select strategy_id from strategy_tags where tag = 'RETEST'").fetchall()}
     output["prior_rejected"] = output["strategy_id"].map(lambda value: int(value) in rejected)
     output["prior_retest"] = output["strategy_id"].map(lambda value: int(value) in retest)
@@ -364,12 +570,31 @@ def persist_selection_snapshots(
         request_extra_json["effective_stage_order"] = [
             stage.id for stage in effective_selection_stages(request, config)
         ]
+        expected = {int(row.strategy_id): int(row.result_id) for row in result.itertuples()}
+        if len(expected) != len(result) or any(strategy_id <= 0 or result_id <= 0 for strategy_id, result_id in expected.items()):
+            raise SelectionReviewError("SELECTION_REVIEW_INVALID_SELECTION")
+        regime_identities = _equity_regime_evidence_identity(request, result, expected)
+        if regime_identities:
+            regime_snapshot = {
+                "algorithm_version": EQUITY_REGIME_ALGORITHM_VERSION,
+                "sources": {
+                    str(strategy_id): {
+                        "result_id": identity[0], "source_revision": identity[1],
+                    }
+                    for strategy_id, identity in sorted(regime_identities.items())
+                },
+            }
+            if ("equity_regime_snapshot" in request_extra_json
+                    and request_extra_json["equity_regime_snapshot"] != regime_snapshot):
+                raise SelectionReviewError("SELECTION_REVIEW_INVALID_SELECTION")
+            request_extra_json["equity_regime_snapshot"] = regime_snapshot
+        elif "equity_regime_snapshot" in request_extra_json:
+            raise SelectionReviewError("SELECTION_REVIEW_INVALID_SELECTION")
         if request_extra_json:
             parsed_request = json.loads(request_json)
             parsed_request.update(request_extra_json)
             request_json = canonical_json(parsed_request)
             request_hash = sha256(request_json.encode()).hexdigest()
-        expected = {int(row.strategy_id): int(row.result_id) for row in result.itertuples()}
         current = dict(connection.execute(
             "select strategy_id, current_result_id from strategies where strategy_id in (select unnest(?::bigint[]))",
             [list(expected)],
@@ -406,20 +631,54 @@ def persist_selection_snapshots(
     now = datetime.now(timezone.utc)
     connection.execute("begin transaction")
     try:
+        # Validate every source while the publication transaction is open,
+        # before inserting any run, snapshot, or durable rejection evidence.
+        regime_source_by_strategy: dict[int, tuple[int, str, str, str]] = {}
         for item in prepared:
             request = item["request"]
             config = item["config"]
             result = item["result"]
-            metadata = item["metadata"]
             if item["equity_snapshot"] is not None:
                 stale = _equity_snapshot_stale_ids(connection, item["equity_snapshot"])
                 if stale:
                     raise SelectionReviewError("SELECTION_REVIEW_STALE_RESULTS", details=stale)
+            current_result_ids = dict(connection.execute(
+                "select strategy_id, current_result_id from strategies where strategy_id in (select unnest(?::bigint[]))",
+                [list(item["expected"])],
+            ).fetchall()) if item["expected"] else {}
+            stale = sorted(
+                strategy_id for strategy_id, result_id in item["expected"].items()
+                if current_result_ids.get(strategy_id) != result_id
+            )
+            if stale:
+                raise SelectionReviewError("SELECTION_REVIEW_STALE_RESULTS", details=stale)
             current_sources = _current_equity_revisions(connection, list(item["expected"]))
             stale = sorted(strategy_id for strategy_id, source in item["source_revisions"].items()
                            if current_sources.get(strategy_id) != source)
             if stale:
                 raise SelectionReviewError("SELECTION_REVIEW_STALE_RESULTS", details=stale)
+            for strategy_id, identity in _equity_regime_evidence_identity(
+                request, result, item["expected"],
+            ).items():
+                prior_identity = regime_source_by_strategy.setdefault(strategy_id, identity)
+                if prior_identity != identity:
+                    raise SelectionReviewError(
+                        "SELECTION_REVIEW_STALE_RESULTS", details=[strategy_id],
+                    )
+            regime_json, rejection_sources = _equity_regime_publication_data(
+                connection, request, result, item["expected"], current_sources,
+            )
+            item["equity_regime_json_by_strategy"] = regime_json
+            item["rejection_sources"] = [
+                [*source[:4], item["run_id"], *source[5:8], now]
+                for source in rejection_sources
+            ]
+
+        for item in prepared:
+            request = item["request"]
+            config = item["config"]
+            result = item["result"]
+            metadata = item["metadata"]
             connection.execute(
                 """insert into selection_runs (
                     selection_run_id, database_instance_id, symbol, side, selection_contract_version,
@@ -440,12 +699,23 @@ def persist_selection_snapshots(
                     _cell(row.get("final_score")), _cell(row.get("final_rank")), _cell(row.get("elimination_reason")),
                     _cell(row.get("analog_group_key")), _cell(row.get("auto_analog_of_strategy_id")),
                     bool(row.get("prior_rejected", False)), trace,
+                    item["equity_regime_json_by_strategy"].get(int(row["strategy_id"])),
                 ])
             _insert_rows(connection, "selection_results", (
                 "selection_run_id", "strategy_id", "result_id_at_selection", "auto_status", "auto_score",
                 "auto_rank", "auto_reason", "analog_group_key", "auto_analog_of_strategy_id", "prior_rejected",
-                "stage_trace_json",
+                "stage_trace_json", "equity_regime_json",
             ), rows)
+            if item["rejection_sources"]:
+                connection.executemany(
+                    """insert into strategy_rejection_sources (
+                           strategy_id, source_kind, reason_code, first_result_id,
+                           first_selection_run_id, classifier_algo_version, source_revision,
+                           facts_sha256, created_at_utc
+                       ) values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       on conflict (strategy_id, source_kind, reason_code) do nothing""",
+                    item["rejection_sources"],
+                )
             for strategy_id in sorted(item["hard_rejected_ids"]):
                 connection.execute(
                     """insert into strategy_tags (strategy_id, tag, source, source_ref, updated_at_utc)
@@ -757,8 +1027,9 @@ def import_selection_review(connection: duckdb.DuckDBPyConnection, data: bytes) 
              from selection_results where selection_run_id = ?""", [run_id]
     ).fetchall()
     snapshot = {int(row[0]): row[1:] for row in snapshot_rows}
-    if equity_snapshot is not None and set(equity_snapshot["sources"]) != {str(strategy_id) for strategy_id in snapshot}:
-        raise SelectionReviewError("SELECTION_REVIEW_SCHEMA_MISMATCH")
+    if equity_snapshot is not None:
+        if set(equity_snapshot["sources"]) != {str(strategy_id) for strategy_id in snapshot}:
+            raise SelectionReviewError("SELECTION_REVIEW_SCHEMA_MISMATCH")
     names = dict(connection.execute(
         "select strategy_id, strategy_name from strategies where strategy_id in (select unnest(?::bigint[]))", [list(snapshot)]
     ).fetchall()) if snapshot else {}
@@ -1027,10 +1298,7 @@ def effective_selection_decisions(
             raise ValueError("selection results out of order")
         pending_result = next(result_iter, None)
     decisions = {strategy_id: decision for state in states.values() for strategy_id, decision in state.items()}
-    for (strategy_id,) in connection.execute(
-        "select strategy_id from strategy_tags where tag = 'REJECTED'"
-    ).fetchall():
-        strategy_id = int(strategy_id)
+    for strategy_id in _rejected_strategy_ids(connection):
         if strategy_id in latest_run_for_strategy:
             prior = decisions.get(strategy_id)
             rank = (prior[1] if prior else latest_reviews.get(strategy_id, {}).get("user_rank"))

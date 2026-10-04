@@ -30,6 +30,23 @@ from .performance_v2_equity_cache import (
     upsert_equity_quality_facts_checked,
 )
 from .performance_v2_equity_quality import EquityQualityFacts, EquitySample, calculate_equity_quality_facts
+from .performance_v2_equity_regime import (
+    ALGORITHM_VERSION as EQUITY_REGIME_ALGORITHM_VERSION,
+    EquityRegimeAssessment,
+    EquityRegimeFacts,
+    EquityRegimeSample,
+    assess_equity_regime,
+    calculate_equity_regime_facts,
+)
+from .performance_v2_equity_regime_cache import (
+    EquityRegimeCacheError,
+    decode_equity_regime_facts,
+    encode_equity_regime_assessment,
+    encode_equity_regime_facts,
+    equity_regime_source_revision,
+    read_equity_regime_facts,
+    upsert_equity_regime_facts_checked,
+)
 from .performance_v2_store import PerformanceV2StoreError, require_performance_v2_readable
 from .audit import write_audit_workbook
 
@@ -855,6 +872,7 @@ class _SelectionWindowJobResult:
     metrics: tuple[WindowMetrics, ...]
     equity_publication: tuple[Mapping[str, object], EquityQualityFacts] | None
     source_recheck: Mapping[str, object] | None = None
+    equity_regime_publication: tuple[Mapping[str, object], EquityRegimeFacts] | None = None
 
 
 def _facts_from_full_source(
@@ -870,7 +888,7 @@ def _facts_from_full_source(
 
 def _selection_window_job(
     database: str, result_id: int, report_start: datetime, report_end: datetime, final_days: int,
-    include_equity: bool = False,
+    include_equity: bool = False, include_equity_regime: bool = False,
 ) -> _SelectionWindowJobResult:
     """Compute missing windows/facts in one bounded read-only worker."""
     windows = _selection_windows(report_start, report_end, SelectionConfig(ab_final_days=final_days))
@@ -887,11 +905,22 @@ def _selection_window_job(
             equity_missing = equity_facts is None
         else:
             equity_facts = None
-        if not missing_windows and not equity_missing:
+        regime_missing = False
+        if include_equity_regime:
+            if metadata is None:
+                metadata = current_equity_source_metadata(connection, result_id)
+            regime_revision = equity_regime_source_revision(metadata)
+            regime_facts = read_equity_regime_facts(connection, result_id, regime_revision)
+            regime_missing = regime_facts is None
+        else:
+            regime_facts = None
+        if not missing_windows and not equity_missing and not regime_missing:
             return _SelectionWindowJobResult((), None)
 
         publication: tuple[Mapping[str, object], EquityQualityFacts] | None = None
+        regime_publication: tuple[Mapping[str, object], EquityRegimeFacts] | None = None
         source_recheck: Mapping[str, object] | None = None
+        source: tuple[datetime, datetime, tuple[object, ...], tuple[object, ...]] | None = None
         if missing_windows:
             source = _load_source(connection, result_id)
             initial_balance = _load_initial_balance(connection, result_id)
@@ -915,34 +944,67 @@ def _selection_window_job(
                 metric for metric, cached_metric in zip(calculated, cached) if cached_metric is None
             )
         else:
-            if not include_equity or metadata is None:
-                raise PerformanceV2SelectionError("EQUITY_SOURCE_METADATA_MISSING")
-            samples, summary = _load_equity_samples_for_quality(
-                connection, result_id,
-                metadata["report_start_utc"], metadata["report_end_utc"],
-            )
-            facts = calculate_equity_quality_facts(
-                result_id, metadata["report_start_utc"], metadata["report_end_utc"], samples
-            )
-            source_recheck = metadata
-            invalid_reasons = tuple(sorted(set(facts.invalid_reasons).union(summary.invalid_reasons)))
-            publication = (
-                metadata,
-                replace(
-                    facts,
-                    raw_sample_count=summary.raw_sample_count,
-                    in_report_sample_count=summary.in_report_sample_count,
-                    nonpositive_in_report_rows=summary.nonpositive_in_report_rows,
-                    duplicate_timestamp_count=summary.duplicate_timestamp_count,
-                    invalid_reasons=invalid_reasons,
-                ),
-            )
             metrics_to_write = ()
-    return _SelectionWindowJobResult(tuple(metrics_to_write), publication, source_recheck)
+            if equity_missing:
+                if not include_equity or metadata is None:
+                    raise PerformanceV2SelectionError("EQUITY_SOURCE_METADATA_MISSING")
+                samples, summary = _load_equity_samples_for_quality(
+                    connection, result_id,
+                    metadata["report_start_utc"], metadata["report_end_utc"],
+                )
+                facts = calculate_equity_quality_facts(
+                    result_id, metadata["report_start_utc"], metadata["report_end_utc"], samples
+                )
+                source_recheck = metadata
+                invalid_reasons = tuple(sorted(set(facts.invalid_reasons).union(summary.invalid_reasons)))
+                publication = (
+                    metadata,
+                    replace(
+                        facts,
+                        raw_sample_count=summary.raw_sample_count,
+                        in_report_sample_count=summary.in_report_sample_count,
+                        nonpositive_in_report_rows=summary.nonpositive_in_report_rows,
+                        duplicate_timestamp_count=summary.duplicate_timestamp_count,
+                        invalid_reasons=invalid_reasons,
+                    ),
+                )
+        if regime_missing:
+            if metadata is None:
+                raise PerformanceV2SelectionError("EQUITY_SOURCE_METADATA_MISSING")
+            if source is not None:
+                samples = tuple(
+                    EquityRegimeSample(result_id, item.index, item.timestamp, item.equity)
+                    for item in sorted(source[3], key=lambda item: (item.index, item.timestamp))
+                )
+            else:
+                cursor = connection.execute(
+                    "select sample_index, timestamp_utc, equity from strategy_equity "
+                    "where result_id = ? order by sample_index, timestamp_utc",
+                    [result_id],
+                )
+                samples_list: list[EquityRegimeSample] = []
+                while batch := cursor.fetchmany(4096):
+                    for sample_index, timestamp_utc, equity in batch:
+                        if isinstance(timestamp_utc, datetime) and timestamp_utc.tzinfo is not None:
+                            timestamp_utc = timestamp_utc.astimezone(timezone.utc)
+                        samples_list.append(
+                            EquityRegimeSample(result_id, sample_index, timestamp_utc, equity)
+                        )
+                samples = tuple(samples_list)
+            facts = calculate_equity_regime_facts(
+                result_id, metadata["report_start_utc"], metadata["report_end_utc"], samples,
+            )
+            regime_publication = (metadata, facts)
+            source_recheck = metadata
+    return _SelectionWindowJobResult(
+        tuple(metrics_to_write), publication, source_recheck, regime_publication,
+    )
 
 
 def _selection_window_job_from_args(
-    args: tuple[str, int, datetime, datetime, int] | tuple[str, int, datetime, datetime, int, bool],
+    args: tuple[str, int, datetime, datetime, int]
+    | tuple[str, int, datetime, datetime, int, bool]
+    | tuple[str, int, datetime, datetime, int, bool, bool],
 ) -> _SelectionWindowJobResult:
     return _selection_window_job(*args)
 
@@ -961,6 +1023,16 @@ def _equity_metadata_from_selection_row(row: Sequence[object]) -> dict[str, obje
 
 
 def _require_equity_read_schema(connection: duckdb.DuckDBPyConnection) -> int:
+    # Schema 5 predates both equity fact tables. Check that version before the
+    # current catalog validator, which expects the v9 table inventory.
+    try:
+        legacy_version = connection.execute(
+            "select value from schema_info where key = 'schema_version'"
+        ).fetchone()
+    except duckdb.Error:
+        legacy_version = None
+    if legacy_version is not None and str(legacy_version[0]) == "5":
+        raise EquitySchemaUpgradeRequiredError("EQUITY_SCHEMA_UPGRADE_REQUIRED")
     try:
         version = require_performance_v2_readable(connection)
     except PerformanceV2StoreError as error:
@@ -1000,12 +1072,21 @@ def _selection_equity_facts_by_result(
     connection: duckdb.DuckDBPyConnection, rows: Sequence[Sequence[object]],
 ) -> dict[int, dict[str, object]]:
     """Hydrate fresh facts or an explicit cache sentinel with one scoped read."""
+    if not rows:
+        return {}
+    try:
+        legacy_version = connection.execute(
+            "select value from schema_info where key = 'schema_version'"
+        ).fetchone()
+    except duckdb.Error:
+        legacy_version = None
+    if legacy_version is not None and str(legacy_version[0]) == "5":
+        result_ids = tuple(dict.fromkeys(int(row[1]) for row in rows))
+        return {result_id: {"status": "SCHEMA5"} for result_id in result_ids}
     try:
         schema_version = require_performance_v2_readable(connection)
     except PerformanceV2StoreError as error:
         raise EquityCacheSchemaInvalidError("Performance database schema is invalid") from error
-    if not rows:
-        return {}
     result_ids = tuple(dict.fromkeys(int(row[1]) for row in rows))
     if schema_version == 5:
         return {result_id: {"status": "SCHEMA5"} for result_id in result_ids}
@@ -1053,6 +1134,146 @@ def _selection_equity_facts_by_result(
     return facts_by_result
 
 
+def _selection_equity_quality_with_memory_fallback(
+    connection: duckdb.DuckDBPyConnection,
+    rows: Sequence[Sequence[object]],
+    cached_by_result: Mapping[int, Mapping[str, object]],
+) -> dict[int, dict[str, object]]:
+    """Hydrate missing R7.3 rank evidence in memory for ranking/publication only."""
+    result: dict[int, dict[str, object]] = {}
+    for row in rows:
+        result_id = int(row[1])
+        cached = cached_by_result.get(result_id, {})
+        status = cached.get("status", "ABSENT")
+        if status == "FRESH":
+            result[result_id] = dict(cached)
+            continue
+        if status == "SCHEMA5":
+            raise EquitySchemaUpgradeRequiredError("EQUITY_SCHEMA_UPGRADE_REQUIRED")
+        if status == "INVALID":
+            raise EquityQualityCacheError("EQUITY_CACHE_FACTS_INVALID")
+        metadata = _equity_metadata_from_selection_row(row)
+        source_revision = equity_source_revision(metadata)
+        samples, summary = _load_equity_samples_for_quality(
+            connection, result_id, metadata["report_start_utc"], metadata["report_end_utc"]
+        )
+        facts = calculate_equity_quality_facts(
+            result_id, metadata["report_start_utc"], metadata["report_end_utc"], samples
+        )
+        facts = replace(
+            facts,
+            raw_sample_count=summary.raw_sample_count,
+            in_report_sample_count=summary.in_report_sample_count,
+            nonpositive_in_report_rows=summary.nonpositive_in_report_rows,
+            duplicate_timestamp_count=summary.duplicate_timestamp_count,
+            invalid_reasons=tuple(sorted(set(facts.invalid_reasons).union(summary.invalid_reasons))),
+        )
+        encoded = json.dumps(
+            facts.to_canonical_dict(), sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        ).encode("utf-8")
+        result[result_id] = {
+            "status": "FRESH", "facts": facts, "source_revision": source_revision,
+            "facts_sha256": sha256(encoded).hexdigest(), "calculated_in_memory": True,
+        }
+    return result
+
+
+def _equity_regime_entry(
+    facts: object, source_revision: str, *, calculated_in_memory: bool = False,
+) -> dict[str, object]:
+    if not hasattr(facts, "result_id"):
+        raise _error("EQUITY_REGIME_CACHE_INCOMPLETE")
+    assessment = assess_equity_regime(facts)
+    facts_json = encode_equity_regime_facts(facts)
+    return {
+        "status": "FRESH",
+        "assessment": assessment,
+        "facts": facts,
+        "source_revision": source_revision,
+        "facts_sha256": sha256(facts_json.encode("utf-8")).hexdigest(),
+        "classifier_algo_version": EQUITY_REGIME_ALGORITHM_VERSION,
+        "equity_regime_json": encode_equity_regime_assessment(assessment),
+        "calculated_in_memory": calculated_in_memory,
+    }
+
+
+def _selection_equity_regime_by_result(
+    connection: duckdb.DuckDBPyConnection, rows: Sequence[Sequence[object]],
+) -> dict[int, dict[str, object]]:
+    """Read exact-version facts and calculate cache misses in memory without writes."""
+    _require_equity_read_schema(connection)
+    if not rows:
+        return {}
+    metadata_by_result: dict[int, dict[str, object]] = {}
+    revision_by_result: dict[int, str] = {}
+    for row in rows:
+        result_id = int(row[1])
+        metadata = _equity_metadata_from_selection_row(row)
+        try:
+            revision_by_result[result_id] = equity_regime_source_revision(metadata)
+        except (EquityRegimeCacheError, AttributeError, TypeError, ValueError):
+            raise _error("EQUITY_REGIME_CACHE_INCOMPLETE") from None
+        metadata_by_result[result_id] = metadata
+
+    result_ids = tuple(metadata_by_result)
+    cached_rows = connection.execute(
+        """select result_id, source_revision, algo_version, facts_json, facts_sha256
+             from equity_quality_metrics where algo_version = ? and result_id in ("""
+        + ",".join("?" for _ in result_ids) + ")",
+        [EQUITY_REGIME_ALGORITHM_VERSION, *result_ids],
+    ).fetchall()
+    by_result: dict[int, dict[str, object]] = {}
+    for result_id, source_revision, algo_version, payload, digest in cached_rows:
+        result_id = int(result_id)
+        if source_revision != revision_by_result[result_id] or algo_version != EQUITY_REGIME_ALGORITHM_VERSION:
+            continue
+        try:
+            facts = decode_equity_regime_facts(payload, digest, expected_result_id=result_id)
+            by_result[result_id] = _equity_regime_entry(facts, str(source_revision))
+        except (EquityRegimeCacheError, AttributeError, TypeError, ValueError):
+            continue
+
+    missing_ids = tuple(result_id for result_id in result_ids if result_id not in by_result)
+    if missing_ids:
+        cursor = connection.execute(
+            """select result_id, sample_index, timestamp_utc, equity
+                 from strategy_equity where result_id in ("""
+            + ",".join("?" for _ in missing_ids) + ") order by result_id, sample_index, timestamp_utc",
+            list(missing_ids),
+        )
+
+        def publish_miss(result_id: int, samples: list[EquityRegimeSample]) -> None:
+            metadata = metadata_by_result[result_id]
+            facts = calculate_equity_regime_facts(
+                result_id,
+                metadata["report_start_utc"],
+                metadata["report_end_utc"],
+                samples,
+            )
+            by_result[result_id] = _equity_regime_entry(
+                facts, revision_by_result[result_id], calculated_in_memory=True,
+            )
+
+        current_result_id: int | None = None
+        current_samples: list[EquityRegimeSample] = []
+        while batch := cursor.fetchmany(4096):
+            for raw_result_id, sample_index, timestamp_utc, equity in batch:
+                result_id = int(raw_result_id)
+                if current_result_id is not None and result_id != current_result_id:
+                    publish_miss(current_result_id, current_samples)
+                    current_samples = []
+                current_result_id = result_id
+                if isinstance(timestamp_utc, datetime) and timestamp_utc.tzinfo is not None:
+                    timestamp_utc = timestamp_utc.astimezone(timezone.utc)
+                current_samples.append(EquityRegimeSample(result_id, sample_index, timestamp_utc, equity))
+        if current_result_id is not None:
+            publish_miss(current_result_id, current_samples)
+        for result_id in missing_ids:
+            if result_id not in by_result:
+                publish_miss(result_id, [])
+    return by_result
+
+
 def _equity_cache_ready_by_result(
     connection: duckdb.DuckDBPyConnection,
     rows: Sequence[Sequence[object]],
@@ -1088,6 +1309,46 @@ def _equity_cache_ready_by_result(
     return ready
 
 
+def _equity_regime_cache_ready_by_result(
+    connection: duckdb.DuckDBPyConnection,
+    rows: Sequence[Sequence[object]],
+) -> dict[int, bool]:
+    """Check current, digest-verified regime versions without touching raw points."""
+    _require_equity_read_schema(connection)
+    result_ids = tuple(dict.fromkeys(int(row[1]) for row in rows))
+    if not result_ids:
+        return {}
+    raw = connection.execute(
+        """select result_id, source_revision, algo_version, facts_json, facts_sha256
+             from equity_quality_metrics where algo_version = ? and result_id in ("""
+        + ",".join("?" for _ in result_ids) + ")",
+        [EQUITY_REGIME_ALGORITHM_VERSION, *result_ids],
+    ).fetchall()
+    cached_by_result = {int(row[0]): row for row in raw}
+    ready: dict[int, bool] = {}
+    for row in rows:
+        result_id = int(row[1])
+        cached = cached_by_result.get(result_id)
+        if cached is None:
+            ready[result_id] = False
+            continue
+        try:
+            metadata = _equity_metadata_from_selection_row(row)
+            if (
+                cached[1] != equity_regime_source_revision(metadata)
+                or cached[2] != EQUITY_REGIME_ALGORITHM_VERSION
+            ):
+                ready[result_id] = False
+                continue
+            facts = decode_equity_regime_facts(
+                cached[3], cached[4], expected_result_id=result_id,
+            )
+            ready[result_id] = facts.result_id == result_id
+        except (EquityRegimeCacheError, AttributeError, TypeError, ValueError):
+            ready[result_id] = False
+    return ready
+
+
 def selection_equity_facts_token(
     connection: duckdb.DuckDBPyConnection, request: SelectionRequest,
     *, schema_version: int | None = None,
@@ -1111,7 +1372,7 @@ def selection_equity_facts_token(
         except PerformanceV2StoreError as error:
             raise EquityQualityCacheError("Performance database schema is invalid") from error
     cache_rows: dict[int, tuple[object, object]] = {}
-    if version in {6, 7, 8} and rows:
+    if version in {6, 7, 8, 9} and rows:
         ids = tuple(int(row[1]) for row in rows)
         raw = connection.execute(
             """select result_id, source_revision, facts_sha256 from equity_quality_metrics
@@ -1119,14 +1380,40 @@ def selection_equity_facts_token(
             [ALGORITHM_VERSION, *ids],
         ).fetchall()
         cache_rows = {int(row[0]): (row[1], row[2]) for row in raw}
+    regime_consumer = any(
+        stage.enabled and (
+            stage.id == "filter_equity_regime"
+            or (stage.id == "rank_robust_top_n" and stage.method == "equity_quality_v1")
+        )
+        for stage in request.stages
+    )
+    regime_cache_rows: dict[int, tuple[object, object]] = {}
+    if regime_consumer and version in {6, 7, 8, 9} and rows:
+        ids = tuple(int(row[1]) for row in rows)
+        raw = connection.execute(
+            """select result_id, source_revision, facts_sha256 from equity_quality_metrics
+                 where algo_version = ? and result_id in (""" + ",".join("?" for _ in ids) + ")",
+            [EQUITY_REGIME_ALGORITHM_VERSION, *ids],
+        ).fetchall()
+        regime_cache_rows = {int(row[0]): (row[1], row[2]) for row in raw}
     token: list[object] = [ALGORITHM_VERSION]
+    if regime_consumer:
+        token.append(EQUITY_REGIME_ALGORITHM_VERSION)
     for row in rows:
         result_id = int(row[1])
         metadata = _equity_metadata_from_selection_row(row)
         revision = equity_source_revision(metadata)
         cached = cache_rows.get(result_id)
         digest = cached[1] if cached is not None and cached[0] == revision else None
-        token.append((result_id, revision, digest))
+        item: tuple[object, ...] = (result_id, revision, digest)
+        if regime_consumer:
+            regime_revision = equity_regime_source_revision(metadata)
+            regime_cached = regime_cache_rows.get(result_id)
+            regime_digest = (
+                regime_cached[1] if regime_cached is not None and regime_cached[0] == regime_revision else None
+            )
+            item = (*item, regime_revision, regime_digest)
+        token.append(item)
     return tuple(token)
 
 
@@ -1147,6 +1434,17 @@ def _selection_cache_missing_strategy_ids(
     ).fetchall()
     cached_metrics = _selection_cached_metrics(connection, request)
     equity_ready = _equity_cache_ready_by_result(connection, rows) if include_equity else {}
+    regime_consumer = any(
+        stage.enabled and (
+            stage.id == "filter_equity_regime"
+            or (stage.id == "rank_robust_top_n" and stage.method == "equity_quality_v1")
+        )
+        for stage in request.stages
+    )
+    regime_ready = (
+        _equity_regime_cache_ready_by_result(connection, rows)
+        if include_equity and regime_consumer else {}
+    )
     missing: list[int] = []
     for row in rows:
         strategy_id, result_id, report_start, report_end = row[:4]
@@ -1155,7 +1453,11 @@ def _selection_cache_missing_strategy_ids(
             cached_metrics.get((int(result_id), window_start, window_end)) is None
             for window_start, window_end in windows
         )
-        if old_missing or (include_equity and not equity_ready.get(int(result_id), False)):
+        if (
+            old_missing
+            or (include_equity and not equity_ready.get(int(result_id), False))
+            or (include_equity and regime_consumer and not regime_ready.get(int(result_id), False))
+        ):
             missing.append(int(strategy_id))
     return tuple(missing)
 
@@ -1201,8 +1503,18 @@ def prepare_selection_window_cache(
         return
     worker_count = max(1, min(int(workers), len(rows)))
     batch_size = 2 * worker_count
+    include_equity_regime = include_equity and any(
+        stage.enabled and (
+            stage.id == "filter_equity_regime"
+            or (stage.id == "rank_robust_top_n" and stage.method == "equity_quality_v1")
+        )
+        for stage in request.stages
+    )
     jobs = [
-        (str(database), int(result_id), report_start, report_end, config.ab_final_days, include_equity)
+        (
+            str(database), int(result_id), report_start, report_end, config.ab_final_days,
+            include_equity, include_equity_regime,
+        )
         for result_id, report_start, report_end in rows
     ]
     with ThreadPoolExecutor(max_workers=worker_count) as executor:
@@ -1222,6 +1534,10 @@ def prepare_selection_window_cache(
                 result.equity_publication for result in completed
                 if result.equity_publication is not None
             ]
+            regime_publications = [
+                result.equity_regime_publication for result in completed
+                if result.equity_regime_publication is not None
+            ]
             source_rechecks = [
                 result.source_recheck for result in completed
                 if result.source_recheck is not None
@@ -1231,7 +1547,7 @@ def prepare_selection_window_cache(
                 metadata for metadata in source_rechecks
                 if int(metadata["result_id"]) not in publication_ids
             ]
-            if not metrics and not publications:
+            if not metrics and not publications and not regime_publications:
                 if on_batch_complete is not None:
                     on_batch_complete(len(completed))
                 continue
@@ -1248,6 +1564,12 @@ def prepare_selection_window_cache(
                         upsert_equity_quality_facts_checked(
                             writer, publications, calculated_at_utc=datetime.now(timezone.utc)
                         )
+                    if regime_publications:
+                        calculated_at_utc = datetime.now(timezone.utc)
+                        for metadata, facts in regime_publications:
+                            upsert_equity_regime_facts_checked(
+                                writer, metadata, facts, calculated_at_utc=calculated_at_utc,
+                            )
                     writer.execute("commit")
                 except BaseException:
                     writer.execute("rollback")
@@ -1270,11 +1592,24 @@ def selection_cache_status(
             where s.lifecycle_status = 'ACTIVE' and s.symbol = ? and s.side = ?""" + cohort_sql,
         [request.symbol, request.side, *cohort_params],
     ).fetchall()
+    regime_consumer = any(
+        stage.enabled and (
+            stage.id == "filter_equity_regime"
+            or (stage.id == "rank_robust_top_n" and stage.method == "equity_quality_v1")
+        )
+        for stage in request.stages
+    )
     cached_metrics = _selection_cached_metrics(connection, request)
     equity_ready = _equity_cache_ready_by_result(connection, rows) if include_equity else {}
+    regime_ready = (
+        _equity_regime_cache_ready_by_result(connection, rows)
+        if include_equity and regime_consumer else {}
+    )
     missing = 0
     window_missing = 0
     equity_missing = 0
+    regime_missing = 0
+    warm_missing = 0
     for row in rows:
         result_id, start, end = row[1], row[2], row[3]
         windows = _selection_windows(start, end, config)
@@ -1283,14 +1618,22 @@ def selection_cache_status(
             for window_start, window_end in windows
         )
         current_equity_missing = include_equity and not equity_ready.get(int(result_id), False)
+        current_regime_missing = include_equity and regime_consumer and not regime_ready.get(
+            int(result_id), False
+        )
+        current_warm_missing = current_equity_missing or current_regime_missing
         window_missing += int(old_missing)
         equity_missing += int(current_equity_missing)
-        if old_missing or current_equity_missing:
+        regime_missing += int(current_regime_missing)
+        warm_missing += int(current_warm_missing)
+        if old_missing or (current_equity_missing and not regime_consumer):
             missing += 1
     status: dict[str, int | bool] = {"total": len(rows), "missing": missing, "ready": bool(rows) and missing == 0}
     if include_readiness_breakdown:
         status["window_missing"] = window_missing
         status["equity_missing"] = equity_missing
+        status["regime_missing"] = regime_missing
+        status["warm_missing"] = warm_missing
     return status
 
 
@@ -1441,28 +1784,35 @@ def load_selection_candidates(
         full_hold, b_hold = candidate["holding_p95_minutes"], candidate["ab_holding_p95_minutes"]
         if full_hold is not None and b_hold is not None:
             candidate["worst_holding_p95_minutes"] = max(full_hold, b_hold)
-    equity_consumer_enabled = any(
-        stage.enabled and (
-            stage.id == "filter_equity_regime"
-            or (stage.id == "rank_robust_top_n" and stage.method == "equity_quality_v1")
-        )
+    equity_rank_enabled = any(
+        stage.enabled and stage.id == "rank_robust_top_n" and stage.method == "equity_quality_v1"
         for stage in request.stages
     )
-    if equity_consumer_enabled and not equity_source_rows:
-        _require_equity_read_schema(connection)
-        facts_by_result = {}
-    else:
-        facts_by_result = _selection_equity_facts_by_result(connection, tuple(equity_source_rows.values()))
+    equity_consumer_enabled = equity_rank_enabled or any(
+        stage.enabled and stage.id == "filter_equity_regime" for stage in request.stages
+    )
+    facts_by_result = _selection_equity_facts_by_result(connection, tuple(equity_source_rows.values()))
+    if equity_rank_enabled:
+        facts_by_result = _selection_equity_quality_with_memory_fallback(
+            connection, tuple(equity_source_rows.values()), facts_by_result
+        )
+    regime_by_result = (
+        _selection_equity_regime_by_result(connection, tuple(equity_source_rows.values()))
+        if equity_consumer_enabled else {}
+    )
     for candidate in candidates.values():
         cached = facts_by_result.get(
             int(candidate["result_id"]), {"status": "ABSENT"}
         )
-        if equity_consumer_enabled and cached.get("status") != "FRESH":
-            if cached.get("status") == "SCHEMA5":
-                raise EquitySchemaUpgradeRequiredError("EQUITY_SCHEMA_UPGRADE_REQUIRED")
-            raise _error("EQUITY_CACHE_INCOMPLETE")
         candidate["_equity_cache"] = cached
+        if equity_consumer_enabled:
+            regime = regime_by_result.get(int(candidate["result_id"]))
+            if regime is None:
+                raise _error("EQUITY_REGIME_CACHE_INCOMPLETE")
+            candidate["_equity_regime_cache"] = regime
     columns = (*_CANDIDATE_COLUMNS, "_equity_cache")
+    if equity_consumer_enabled:
+        columns = (*columns, "_equity_regime_cache")
     return pd.DataFrame.from_records(list(candidates.values())).reindex(columns=columns)
 
 
@@ -1721,6 +2071,71 @@ def _rank_equity_quality(group: pd.DataFrame) -> tuple[pd.DataFrame, list[object
     return ranked, ordered
 
 
+def _rank_equity_regime(group: pd.DataFrame) -> tuple[pd.DataFrame, list[object]]:
+    ranked = group.copy()
+    ordered: list[object] = []
+    regime_order = {"GROWING": 0, "WEAKENING": 1, "RESUMED": 2}
+    for state in regime_order:
+        part = group.loc[group["equity_regime_state"].eq(state)]
+        if part.empty:
+            continue
+        if "_equity_quality" in part:
+            quality_indexes = [
+                index for index, cached in part["_equity_quality"].items()
+                if isinstance(cached, Mapping) and isinstance(cached.get("facts"), EquityQualityFacts)
+            ]
+        else:
+            quality_indexes = []
+        state_order: list[object] = []
+        if quality_indexes:
+            by_quality, state_order = _rank_equity_quality(part.loc[quality_indexes])
+            ranked.loc[state_order, "final_score"] = by_quality.loc[state_order, "final_score"]
+        fallback = sorted(
+            part.index.difference(state_order, sort=False),
+            key=lambda index: _equity_rank_strategy_id(part, index),
+        )
+        ordered.extend((*state_order, *fallback))
+    ranked["final_rank"] = np.nan
+    ranked.loc[ordered, "final_rank"] = range(1, len(ordered) + 1)
+    return ranked, ordered
+
+
+def _validate_equity_regime_evidence(cached: object, result_id: object) -> tuple[EquityRegimeAssessment, str]:
+    if (
+        isinstance(result_id, bool) or not isinstance(result_id, (int, np.integer)) or int(result_id) < 1
+        or not isinstance(cached, Mapping) or cached.get("status") != "FRESH"
+    ):
+        raise _error("EQUITY_REGIME_CACHE_INCOMPLETE")
+    facts = cached.get("facts")
+    assessment = cached.get("assessment")
+    source_revision = cached.get("source_revision")
+    facts_sha256 = cached.get("facts_sha256")
+    payload = cached.get("equity_regime_json")
+    if (
+        not isinstance(facts, EquityRegimeFacts) or facts.result_id != int(result_id)
+        or not isinstance(assessment, EquityRegimeAssessment) or assessment.facts != facts
+        or not isinstance(source_revision, str) or len(source_revision) != 64
+        or not isinstance(facts_sha256, str) or len(facts_sha256) != 64
+        or any(char not in "0123456789abcdef" for char in source_revision + facts_sha256)
+        or cached.get("classifier_algo_version") != EQUITY_REGIME_ALGORITHM_VERSION
+        or facts.algo_version != EQUITY_REGIME_ALGORITHM_VERSION
+    ):
+        raise _error("EQUITY_REGIME_CACHE_INCOMPLETE")
+    try:
+        facts_json = encode_equity_regime_facts(facts)
+        expected_assessment = assess_equity_regime(facts)
+        canonical_assessment = encode_equity_regime_assessment(assessment)
+    except (EquityRegimeCacheError, AttributeError, TypeError, ValueError):
+        raise _error("EQUITY_REGIME_CACHE_INCOMPLETE") from None
+    if (
+        sha256(facts_json.encode("utf-8")).hexdigest() != facts_sha256
+        or assessment != expected_assessment
+        or not isinstance(payload, str) or payload != canonical_assessment
+    ):
+        raise _error("EQUITY_REGIME_CACHE_INCOMPLETE")
+    return assessment, canonical_assessment
+
+
 def _validate_equity_quality_evidence(cached: object, result_id: object) -> None:
     if (
         isinstance(result_id, bool) or not isinstance(result_id, (int, np.integer)) or int(result_id) < 1
@@ -1785,6 +2200,59 @@ def _equity_workbook_values(cached: object) -> dict[str, object]:
         "equity_dd_pct": drawdown * 100 if isinstance(drawdown, Decimal) else None,
         "equity_smoothness": None if window is None else window.er,
     }
+
+
+_EQUITY_REGIME_WORKBOOK_COLUMNS = (
+    "equity_regime_state", "equity_regime_decision", "equity_regime_rank", "equity_regime_reasons",
+    "equity_regime_w28_direction", "equity_regime_w28_v", "equity_regime_w28_p",
+    "equity_regime_w14_direction", "equity_regime_w14_v", "equity_regime_w14_p",
+    "equity_regime_w7_direction", "equity_regime_w7_v", "equity_regime_w7_p",
+    "equity_regime_pre28_direction", "equity_regime_pre28_v", "equity_regime_pre28_p",
+    "equity_regime_dd14_pct", "equity_regime_dd7_pct", "equity_regime_previous_ath_w7",
+    "equity_regime_hwm_t28", "equity_regime_hwm_t14", "equity_regime_hwm_t7", "equity_regime_hwm_t",
+    "equity_regime_ath_stage_counts", "equity_regime_new_ath_w7", "equity_regime_held_w7_breakout",
+)
+
+
+def _equity_regime_workbook_values(payload: object) -> dict[str, object]:
+    values = {column: None for column in _EQUITY_REGIME_WORKBOOK_COLUMNS}
+    if not isinstance(payload, str):
+        return values
+    try:
+        assessment = json.loads(payload)
+        facts = assessment["facts"]
+        windows = facts["windows"]
+    except (KeyError, TypeError, ValueError):
+        return values
+    values.update({
+        "equity_regime_state": assessment.get("state"),
+        "equity_regime_decision": assessment.get("decision"),
+        "equity_regime_rank": assessment.get("rank"),
+        "equity_regime_reasons": ";".join(assessment.get("reasons", ())),
+        "equity_regime_dd14_pct": _decimal_or_none(facts.get("dd14")),
+        "equity_regime_dd7_pct": _decimal_or_none(facts.get("dd7")),
+        "equity_regime_previous_ath_w7": _decimal_or_none(facts.get("previous_ath_w7")),
+        "equity_regime_hwm_t28": _decimal_or_none(facts.get("hwm_t28")),
+        "equity_regime_hwm_t14": _decimal_or_none(facts.get("hwm_t14")),
+        "equity_regime_hwm_t7": _decimal_or_none(facts.get("hwm_t7")),
+        "equity_regime_hwm_t": _decimal_or_none(facts.get("hwm_t")),
+        "equity_regime_ath_stage_counts": "/".join(map(str, facts.get("ath_stage_counts", ()))),
+        "equity_regime_new_ath_w7": facts.get("new_ath_w7"),
+        "equity_regime_held_w7_breakout": facts.get("held_w7_breakout"),
+    })
+    for days in (28, 14, 7):
+        label, window = f"w{days}", windows.get(str(days))
+        if isinstance(window, Mapping):
+            values[f"equity_regime_{label}_direction"] = window.get("direction")
+            values[f"equity_regime_{label}_v"] = _decimal_or_none(window.get("v"))
+            values[f"equity_regime_{label}_p"] = _decimal_or_none(window.get("p"))
+    window = facts.get("pre28")
+    if isinstance(window, Mapping):
+        for key in ("direction", "v", "p"):
+            values[f"equity_regime_pre28_{key}"] = (
+                window.get(key) if key == "direction" else _decimal_or_none(window.get(key))
+            )
+    return values
 
 
 _FIXED_PREFIX = (
@@ -2602,40 +3070,47 @@ def run_selection(
         stage.id == "filter_equity_regime" and stage.enabled for stage in request.stages
     )
     equity_consumer_enabled = equity_rank_enabled or equity_filter_enabled
-    if equity_consumer_enabled and "_equity_cache" not in result:
-        raise _error("EQUITY_CACHE_INCOMPLETE")
-    if equity_consumer_enabled:
-        projected_quality: list[object] = []
-        projected_state: list[object] = []
-        projected_disposition: list[object] = []
-        projected_reason: list[object] = []
-        for index in result.index:
-            entry = result.at[index, "_equity_cache"]
-            if not isinstance(entry, Mapping) or entry.get("status") != "FRESH":
-                if isinstance(entry, Mapping) and entry.get("status") == "SCHEMA5":
-                    raise EquitySchemaUpgradeRequiredError("EQUITY_SCHEMA_UPGRADE_REQUIRED")
-                raise _error("EQUITY_CACHE_INCOMPLETE")
-            facts = entry.get("facts")
-            cached = {
-                "facts": facts,
-                "source_revision": entry.get("source_revision"),
-                "facts_sha256": entry.get("facts_sha256"),
-            }
-            _validate_equity_quality_evidence(cached, result.at[index, "result_id"])
-            projected_quality.append(cached)
-            projected_state.append(facts.state)
-            projected_disposition.append(facts.erf_disposition)
-            projected_reason.append(facts.reason)
-        result["_equity_quality"] = projected_quality
-        if equity_filter_enabled:
-            result["_equity_state"] = projected_state
-            result["_equity_disposition"] = projected_disposition
-            result["_equity_reason"] = projected_reason
+    if equity_filter_enabled and not equity_rank_enabled:
+        if "strategy_id" not in result:
+            raise _error("EQUITY_REGIME_INVALID_STRATEGY_ID")
+        strategy_ids = result["strategy_id"].tolist()
+        if any(
+            isinstance(value, bool) or not isinstance(value, (int, np.integer)) or int(value) < 1
+            for value in strategy_ids
+        ) or len({int(value) for value in strategy_ids}) != len(strategy_ids):
+            raise _error("EQUITY_REGIME_INVALID_STRATEGY_ID")
     if equity_rank_enabled:
-        if "result_id" not in result or "_equity_quality" not in result:
-            raise _error("EQUITY_CACHE_INCOMPLETE")
+        projected_quality: list[object] = []
         for index in result.index:
-            _validate_equity_quality_evidence(result.at[index, "_equity_quality"], result.at[index, "result_id"])
+            entry = result.at[index, "_equity_cache"] if "_equity_cache" in result else None
+            facts = entry.get("facts") if isinstance(entry, Mapping) and entry.get("status") == "FRESH" else None
+            cached: object = {
+                "facts": facts,
+                "source_revision": entry.get("source_revision") if isinstance(entry, Mapping) else None,
+                "facts_sha256": entry.get("facts_sha256") if isinstance(entry, Mapping) else None,
+            }
+            try:
+                _validate_equity_quality_evidence(cached, result.at[index, "result_id"])
+            except (PerformanceV2SelectionError, KeyError, TypeError, ValueError):
+                cached = None
+            projected_quality.append(cached)
+        result["_equity_quality"] = projected_quality
+    regime_assessments: list[EquityRegimeAssessment] = []
+    regime_json: list[str] = []
+    if equity_consumer_enabled:
+        if "_equity_regime_cache" not in result or "result_id" not in result:
+            raise _error("EQUITY_REGIME_CACHE_INCOMPLETE")
+        for index in result.index:
+            assessment, encoded = _validate_equity_regime_evidence(
+                result.at[index, "_equity_regime_cache"], result.at[index, "result_id"]
+            )
+            regime_assessments.append(assessment)
+            regime_json.append(encoded)
+        result["equity_regime_state"] = [assessment.state for assessment in regime_assessments]
+        result["equity_regime_decision"] = [assessment.decision for assessment in regime_assessments]
+        result["equity_regime_rank"] = [assessment.rank for assessment in regime_assessments]
+        result["equity_regime_reasons"] = [";".join(assessment.reasons) for assessment in regime_assessments]
+        result["equity_regime_json"] = regime_json
     result["finalist"] = True
     result["elimination_reason"] = None
     result["auto_status"] = None
@@ -2644,17 +3119,6 @@ def run_selection(
     result["lot_variant_group_key"] = None
     result["lot_variant_representative_strategy_id"] = pd.NA
     stage_counts: dict[str, dict[str, int | bool]] = {}
-    if equity_filter_enabled:
-        equity_columns = ("_equity_state", "_equity_disposition", "_equity_reason")
-        if any(column not in result for column in equity_columns):
-            raise _error("EQUITY_CACHE_INCOMPLETE")
-        if result[list(equity_columns)].isna().any().any() or not result["_equity_disposition"].isin(
-            {"PASS", "BLOCK", "BLOCK_IF_ERF_ENABLED", "NOT_EVALUATED"}
-        ).all():
-            raise _error("EQUITY_CACHE_INCOMPLETE")
-        result["equity_regime_state"] = result["_equity_state"]
-        result["equity_regime_disposition"] = result["_equity_disposition"]
-        result["equity_regime_reason"] = result["_equity_reason"]
     explicit_stage_ids = {stage.id for stage in request.stages}
     stages = list(effective_selection_stages(request, config))
     implicit_lot_variant_stage = _LOT_VARIANT_STAGE_ID not in explicit_stage_ids
@@ -2726,10 +3190,30 @@ def run_selection(
             continue
         if stage.id == "rank_robust_top_n":
             survivors = result.loc[result["finalist"]]
+            if stage.enabled and stage.method == "equity_quality_v1":
+                unrankable = survivors.index[survivors["equity_regime_state"].isin({"DROP", "NOT_EVALUATED"})]
+                stalled = survivors.index[survivors["equity_regime_state"].eq("STALLED")]
+                for index in unrankable:
+                    result.at[index, column] = True
+                    result.at[index, "finalist"] = False
+                    result.at[index, "auto_status"] = "FILTERED"
+                    result.at[index, "elimination_reason"] = "EQUITY_RANK_UNRANKABLE"
+                for index in stalled:
+                    result.at[index, column] = True
+                    result.at[index, "finalist"] = False
+                    result.at[index, "auto_status"] = "RESERVE"
+                    result.at[index, "elimination_reason"] = "EQUITY_REGIME_STALLED_RESERVE"
+                survivors = result.loc[result["finalist"]]
+                if survivors.empty:
+                    stage_counts[stage.id] = {
+                        "enabled": True, "eliminated": int(result[column].sum()),
+                        "remaining": 0,
+                    }
+                    continue
             if stage.enabled and stage.method == "equity_quality_v1" and "final_score" in result:
                 result["final_score"] = result["final_score"].astype(object)
             ranked, ordered = (
-                _rank_equity_quality(survivors)
+                _rank_equity_regime(survivors)
                 if stage.enabled and stage.method == "equity_quality_v1"
                 else _rank_robust(survivors)
             )
@@ -2785,25 +3269,29 @@ def run_selection(
                     result.at[index, "auto_status"] = "RESERVE"
                     result.at[index, "elimination_reason"] = stage.id.upper()
                 result.at[index, column] = not result.at[index, "finalist"]
-            eliminated_count = int(result.loc[survivors.index, column].sum())
+            eliminated_count = int(result[column].sum())
             stage_counts[stage.id] = {"enabled": stage.enabled, "eliminated": eliminated_count, "remaining": int(result["finalist"].sum())}
             continue
         if stage.id == "filter_equity_regime":
             survivors = result.loc[result["finalist"]]
-            disposition = survivors["equity_regime_disposition"]
-            blocked = disposition.isin({"BLOCK", "BLOCK_IF_ERF_ENABLED"})
-            not_evaluated = ~(disposition.eq("PASS") | blocked)
+            decisions = survivors["equity_regime_decision"]
+            blocked = decisions.isin({"DROP", "NOT_EVALUATED"})
             eliminated = survivors.index[blocked]
-            if len(eliminated):
-                result.loc[eliminated, column] = True
-                result.loc[eliminated, "finalist"] = False
-                result.loc[eliminated, "elimination_reason"] = stage.id.upper()
-            for index in survivors.index[not_evaluated]:
-                if result.at[index, "elimination_reason"] is None:
-                    result.at[index, "elimination_reason"] = result.at[index, "equity_regime_reason"]
+            stalled = survivors.index[survivors["equity_regime_state"].eq("STALLED")]
+            for index in eliminated:
+                result.at[index, column] = True
+                result.at[index, "finalist"] = False
+                result.at[index, "auto_status"] = "FILTERED"
+                result.at[index, "elimination_reason"] = result.at[index, "equity_regime_reasons"]
+            for index in stalled:
+                result.at[index, "finalist"] = False
+                result.at[index, "auto_status"] = "RESERVE"
+                result.at[index, "elimination_reason"] = "EQUITY_REGIME_STALLED_RESERVE"
             stage_counts[stage.id] = {
                 "enabled": True, "eliminated": len(eliminated),
-                "remaining": int(result["finalist"].sum()), "not_evaluated": int(not_evaluated.sum()),
+                "remaining": int(result["finalist"].sum()),
+                "not_evaluated": int(decisions.eq("NOT_EVALUATED").sum()),
+                "reserved": len(stalled),
             }
             continue
         survivors = result.loc[result["finalist"]]
@@ -2904,10 +3392,31 @@ def run_selection(
                 "facts": row["_equity_quality"]["facts"].to_canonical_dict(),
             }
             for _, row in result.iterrows()
+            if isinstance(row["_equity_quality"], Mapping)
+        }
+    if equity_consumer_enabled:
+        result.attrs["equity_filter_enabled"] = equity_filter_enabled
+        result.attrs["equity_regime_evidence"] = {
+            str(int(row["strategy_id"])): {
+                "strategy_id": int(row["strategy_id"]),
+                "result_id": int(row["result_id"]),
+                "source_revision": row["_equity_regime_cache"]["source_revision"],
+                "facts_sha256": row["_equity_regime_cache"]["facts_sha256"],
+                "classifier_algo_version": row["_equity_regime_cache"]["classifier_algo_version"],
+                "equity_regime_json": row["equity_regime_json"],
+                "equity_filter_enabled": equity_filter_enabled,
+            }
+            for _, row in result.iterrows()
         }
     result = result.drop(columns=[
-        "_source_order", "_equity_state", "_equity_disposition", "_equity_reason", "_equity_quality", "_equity_cache",
+        "_source_order", "_equity_state", "_equity_disposition", "_equity_reason", "_equity_quality",
+        "_equity_cache", "_equity_regime_cache",
     ], errors="ignore")
+    if not equity_consumer_enabled:
+        result = result.drop(columns=[
+            "equity_regime_json",
+            *(column for column in result.columns if column.startswith("equity_regime_")),
+        ], errors="ignore")
     result.attrs["stage_counts"] = stage_counts
     return result
 
@@ -2928,7 +3437,13 @@ def write_selection_workbook(
     equity_request_enabled = selection_method is not None or any(
         stage.id == "filter_equity_regime" and stage.enabled for stage in request.stages
     )
+    published_regime_present = "equity_regime_json" in result and any(
+        isinstance(value, str) and value.strip() not in {"", "null"}
+        for value in result["equity_regime_json"]
+    )
+    equity_regime_display_enabled = equity_request_enabled or published_regime_present
     equity_columns = ("equity_state", "equity_basis", "equity_dd_pct", "equity_smoothness")
+    regime_columns = _EQUITY_REGIME_WORKBOOK_COLUMNS
     cached_equity_values = result.get("_equity_cache")
     fresh_equity_present = cached_equity_values is not None and any(
         isinstance(value, Mapping) and value.get("status") == "FRESH"
@@ -2941,15 +3456,28 @@ def write_selection_workbook(
             result = result.copy()
             for column in missing_equity_columns:
                 result[column] = [item[column] for item in values]
+    if equity_regime_display_enabled and "equity_regime_json" in result:
+        result = result.copy()
+        regime_values = [_equity_regime_workbook_values(value) for value in result["equity_regime_json"]]
+        for column in regime_columns:
+            result[column] = [item[column] for item in regime_values]
     display = result.drop(columns=[
         column for column in result.columns
         if column.startswith("ab_") and column not in {
             "ab_pnl_change_30d_pct", "ab_return_a_30d_pct", "ab_calendar_days_a", "ab_return_b_30d_pct", "ab_calendar_days_b", "ab_stability_ratio", "ab_completed_cycle_count", "ab_win_rate_b_pct",
         }
-    ] + ["total_pnl", "total_pnl_pct", "max_drawdown", "total_fees", "risk_scale", "scaled_lot_sum", "daily_log_return", "_equity_cache"], errors="ignore").copy()
+    ] + [
+        "total_pnl", "total_pnl_pct", "max_drawdown", "total_fees", "risk_scale", "scaled_lot_sum",
+        "daily_log_return", "_equity_cache", "equity_regime_json",
+        *(column for column in result.columns if column.startswith("equity_regime_") and not equity_regime_display_enabled),
+    ], errors="ignore").copy()
     equity_block_enabled = equity_request_enabled or any(column in display for column in equity_columns)
     if equity_block_enabled:
         for column in equity_columns:
+            if column not in display:
+                display[column] = None
+    if equity_regime_display_enabled:
+        for column in regime_columns:
             if column not in display:
                 display[column] = None
     if "ab_pnl_change_30d_pct" not in display:
@@ -3100,6 +3628,7 @@ def write_selection_workbook(
         "points",
         "open_ma",
         *(equity_columns if equity_block_enabled else ()),
+        *(regime_columns if equity_regime_display_enabled else ()),
         "auto_status", "auto_rank", *review_columns,
         "elimination_reason",
     ]
@@ -3133,6 +3662,21 @@ def write_selection_workbook(
         "user_analog_of_strategy_id": "Analog Of ID", "comment": "Comment",
         "equity_state": "Equity state", "equity_basis": "Equity basis",
         "equity_dd_pct": "Equity DD, %", "equity_smoothness": "Equity smoothness",
+        "equity_regime_state": "Regime state", "equity_regime_decision": "Regime decision",
+        "equity_regime_rank": "Regime rank",
+        "equity_regime_reasons": "Regime reasons",
+        "equity_regime_w28_direction": "W28 direction", "equity_regime_w28_v": "W28 v",
+        "equity_regime_w28_p": "W28 p", "equity_regime_w14_direction": "W14 direction",
+        "equity_regime_w14_v": "W14 v", "equity_regime_w14_p": "W14 p",
+        "equity_regime_w7_direction": "W7 direction", "equity_regime_w7_v": "W7 v",
+        "equity_regime_w7_p": "W7 p", "equity_regime_pre28_direction": "PRE28 direction",
+        "equity_regime_pre28_v": "PRE28 v", "equity_regime_pre28_p": "PRE28 p",
+        "equity_regime_dd14_pct": "Regime DD14, %", "equity_regime_dd7_pct": "Regime DD7, %",
+        "equity_regime_previous_ath_w7": "Previous ATH W7",
+        "equity_regime_hwm_t28": "ATH W28", "equity_regime_hwm_t14": "ATH W14",
+        "equity_regime_hwm_t7": "ATH W7", "equity_regime_hwm_t": "ATH End",
+        "equity_regime_ath_stage_counts": "New ATH stages",
+        "equity_regime_new_ath_w7": "New ATH W7", "equity_regime_held_w7_breakout": "Held ATH W7",
     })
     finalists = display.loc[finalist_flags].copy()
     finalist_fills = [color for color, finalist in zip(row_fills, finalist_flags) if finalist]

@@ -222,6 +222,7 @@ from .panel_performance_v2 import (
     LocalPerformanceV2Jobs,
     PerformanceV2ApiError,
     PerformanceV2PanelRequest,
+    _is_duckdb_lock_error,
     calculate_performance_v2_windows,
     export_performance_v2,
     parse_performance_v2_export_query,
@@ -4407,12 +4408,49 @@ class PanelController:
             if identity in self._performance_v2_schema_ready:
                 return
             try:
+                if stat.st_size == 0:
+                    self._initialize_missing_performance_v2_target(self._performance_v2_config())
+                with duckdb.connect(str(target), read_only=True) as connection:
+                    has_schema_info = connection.execute(
+                        "select count(*) from information_schema.tables "
+                        "where table_schema = 'main' and table_name = 'schema_info'"
+                    ).fetchone()[0] == 1
+                    if has_schema_info:
+                        version_row = connection.execute(
+                            "select value from schema_info where key = 'schema_version'"
+                        ).fetchone()
+                        version = None if version_row is None else str(version_row[0])
+                        if version in {"5", "6", "7", "8"}:
+                            require_performance_v2_readable(connection)
+                            raise PerformanceV2ApiError(
+                                "PERFORMANCE_V2_MIGRATION_REQUIRED", status=409,
+                                message="Existing Performance v2 database requires an explicit offline migration",
+                            )
+                        if version in {"2", "3", "4"}:
+                            raise PerformanceV2ApiError(
+                                "PERFORMANCE_V2_MIGRATION_REQUIRED", status=409,
+                                message="Existing Performance v2 database requires an explicit offline migration",
+                            )
+                        if version == "9":
+                            require_performance_v2_readable(connection)
                 with duckdb.connect(str(target)) as connection:
                     initialize_performance_v2(connection)
+                    require_performance_v2(connection)
+            except PerformanceV2ApiError:
+                raise
             except PerformanceV2StoreError as error:
                 raise PerformanceV2ApiError("PERFORMANCE_V2_SCHEMA_INVALID", status=500, message=str(error)) from error
             except duckdb.Error as error:
-                raise PerformanceV2ApiError("PERFORMANCE_V2_LOCKED", status=409, message="Performance v2 database is locked") from error
+                if isinstance(error, duckdb.IOException) and _is_duckdb_lock_error(error):
+                    raise PerformanceV2ApiError(
+                        "PERFORMANCE_V2_LOCKED", status=409, message="Performance v2 database is locked",
+                    ) from error
+                raise PerformanceV2ApiError("PERFORMANCE_V2_SCHEMA_INVALID", status=500, message=str(error)) from error
+            stat = target.stat()
+            identity = (
+                str(target.resolve()), int(stat.st_dev), int(stat.st_ino),
+                int(stat.st_ctime_ns), int(stat.st_mtime_ns), int(stat.st_size),
+            )
             self._performance_v2_schema_ready.add(identity)
 
     @staticmethod
@@ -4421,17 +4459,32 @@ class PanelController:
         target = config.database_root / "strategy_performance.duckdb"
         if target.is_symlink() or target != resolved_target:
             raise PerformanceV2StoreError("Performance v2 target is redirected")
-        if target.exists():
+        if target.exists() and target.stat().st_size != 0:
             return
         target.parent.mkdir(parents=True, exist_ok=True)
         staging = target.parent / f".{target.name}.{uuid.uuid4().hex}.tmp"
         try:
             with PerformanceV2WriterLock(target.parent):
+                empty_identity = None
                 if target.exists():
-                    return
+                    existing = target.stat()
+                    if existing.st_size != 0:
+                        return
+                    empty_identity = (
+                        int(existing.st_dev), int(existing.st_ino), int(existing.st_ctime_ns),
+                        int(existing.st_mtime_ns), int(existing.st_size),
+                    )
                 with duckdb.connect(str(staging)) as connection:
                     initialize_performance_v2(connection)
                     require_performance_v2(connection)
+                if empty_identity is not None:
+                    current = target.stat()
+                    if (
+                        int(current.st_dev), int(current.st_ino), int(current.st_ctime_ns),
+                        int(current.st_mtime_ns), int(current.st_size),
+                    ) != empty_identity:
+                        return
+                    target.unlink()
                 try:
                     os.link(staging, target)
                 except FileExistsError:
@@ -4730,11 +4783,19 @@ class PanelController:
 
     @staticmethod
     def _selection_requires_equity(request: SelectionRequest) -> bool:
-        return any(
-            (stage.id == "filter_equity_regime" and stage.enabled)
-            or (stage.id == "rank_robust_top_n" and stage.enabled and stage.method == "equity_quality_v1")
+        return any(PanelController._selection_equity_toggles(request))
+
+    @staticmethod
+    def _selection_equity_toggles(request: SelectionRequest) -> tuple[bool, bool]:
+        filter_enabled = any(
+            stage.id == "filter_equity_regime" and stage.enabled
             for stage in request.stages
         )
+        rank_enabled = any(
+            stage.id == "rank_robust_top_n" and stage.enabled and stage.method == "equity_quality_v1"
+            for stage in request.stages
+        )
+        return filter_enabled, rank_enabled
 
     @staticmethod
     def _bulk_retest_range(payload: Mapping[str, object], listing_dates: Mapping[str, object], connection: duckdb.DuckDBPyConnection, include_reserve: bool) -> tuple[str, str]:
@@ -5458,7 +5519,8 @@ class PanelController:
             selection_config = load_selection_config(self.default_config.with_name("config.performance.json"))
         except PerformanceV2SelectionError as error:
             raise PerformanceV2ApiError("INVALID_REQUEST", status=400, message=str(error)) from error
-        equity_consumer_enabled = self._selection_requires_equity(request)
+        equity_filter_enabled, equity_rank_enabled = self._selection_equity_toggles(request)
+        equity_consumer_enabled = equity_filter_enabled or equity_rank_enabled
         performance_config = self._performance_v2_config()
         target = performance_v2_database_path(performance_config)
         if not target.is_file():
@@ -5519,6 +5581,8 @@ class PanelController:
                     request.bulk_retest_job_id,
                     request.cohort_members,
                     tuple(asdict(selection_config).items()),
+                    equity_filter_enabled,
+                    equity_rank_enabled,
                     result_token,
                     facts_token,
                     equity_facts_token,
@@ -5642,9 +5706,11 @@ class PanelController:
         try:
             with duckdb.connect(str(target), read_only=True) as connection:
                 require_performance_v2_readable(connection)
-                # Cache-status reports aggregate readiness; preview alone needs the breakdown.
+                # Equity consumers receive readiness counts; both-off stays legacy-shaped.
                 return selection_cache_status(
-                    connection, request, config, include_equity=equity_consumer_enabled,
+                    connection, request, config,
+                    include_equity=equity_consumer_enabled,
+                    include_readiness_breakdown=equity_consumer_enabled,
                 )
         except EquitySchemaUpgradeRequiredError as error:
             raise PerformanceV2ApiError(error.code, status=409, message=str(error)) from error

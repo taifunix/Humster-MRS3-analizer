@@ -31,6 +31,15 @@ from mrs3.panel import PanelController, create_panel_server
 from mrs3.performance_v2_import import PerformanceV2ImportError, PerformanceV2ImportResult
 from mrs3.performance_v2_finalist_retest import FinalistRetestError, combined_control_workbook_bytes
 from mrs3.performance_v2_equity_quality import EquitySample, calculate_equity_quality_facts
+from mrs3.performance_v2_equity_regime import (
+    ALGORITHM_VERSION as EQUITY_REGIME_ALGORITHM_VERSION,
+    EquityRegimeSample,
+    classify_equity_regime,
+)
+from mrs3.performance_v2_equity_regime_cache import (
+    encode_equity_regime_assessment,
+    encode_equity_regime_facts,
+)
 from mrs3.performance_v2_selection import (
     PerformanceV2SelectionError,
     SelectionConfig,
@@ -682,9 +691,9 @@ def test_v2_panel_controller_initializes_missing_target_and_uses_committed_teste
         server.server_close()
 
 
-@pytest.mark.parametrize("existing", [b"", b"foreign target"])
-def test_v2_panel_first_import_bootstrap_preserves_existing_target(
-    tmp_path: Path, existing: bytes,
+@pytest.mark.parametrize(("existing", "should_initialize"), [(b"", True), (b"foreign target", False)])
+def test_v2_panel_first_import_bootstrap_initializes_empty_and_preserves_foreign_target(
+    tmp_path: Path, existing: bytes, should_initialize: bool,
 ) -> None:
     config = PerformanceV2Config(tmp_path / "performance-v2")
     target = performance_v2_database_path(config)
@@ -693,7 +702,13 @@ def test_v2_panel_first_import_bootstrap_preserves_existing_target(
 
     PanelController._initialize_missing_performance_v2_target(config)
 
-    assert target.read_bytes() == existing
+    if should_initialize:
+        with duckdb.connect(str(target), read_only=True) as connection:
+            assert connection.execute(
+                "select value from schema_info where key = 'schema_version'"
+            ).fetchone() == ("9",)
+    else:
+        assert target.read_bytes() == existing
 
 
 def test_v2_panel_first_import_bootstrap_preserves_unsupported_duckdb(tmp_path: Path) -> None:
@@ -1611,6 +1626,19 @@ def _controller_for_windows(tmp_path: Path) -> tuple[PanelController, Path, int]
     return PanelController(tmp_path, config), tmp_path / "data" / "strategy_performance.duckdb", result_id
 
 
+def _make_v5_catalog(connection: duckdb.DuckDBPyConnection) -> None:
+    connection.execute("drop table strategy_rejection_sources")
+    connection.execute("alter table selection_results drop column equity_regime_json")
+    connection.execute("drop table equity_quality_metrics")
+    connection.execute("update schema_info set value = '5' where key = 'schema_version'")
+
+
+def _make_v8_catalog(connection: duckdb.DuckDBPyConnection) -> None:
+    connection.execute("drop table strategy_rejection_sources")
+    connection.execute("alter table selection_results drop column equity_regime_json")
+    connection.execute("update schema_info set value = '8' where key = 'schema_version'")
+
+
 def _http_server(controller: PanelController):
     server = create_panel_server("127.0.0.1", 0, controller)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -2279,8 +2307,95 @@ def test_selection_preview_returns_current_stage_counts(tmp_path: Path) -> None:
     assert preview["stages"]["pareto_dd5_capital"] == {"enabled": False, "eliminated": 0, "remaining": 1}
 
 
+def test_equity_regime_preview_then_publish_needs_only_windows_not_r73_cache(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    controller, database, result_id = _controller_for_windows(tmp_path)
+    import mrs3.performance_v2_selection as selection_module
+
+    enabled = {"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "filter_equity_regime", "enabled": True, "scope": "pair_side"},
+        {"id": "rank_robust_top_n", "enabled": True, "scope": "pair_side",
+         "top_n": 1, "method": "equity_quality_v1"},
+    ]}
+    request = parse_selection_request(enabled)
+    selection_module.prepare_selection_window_cache(
+        database, request, SelectionConfig(), workers=1, include_equity=False,
+    )
+    with duckdb.connect(str(database), read_only=True) as connection:
+        assert connection.execute(
+            "select count(*) from window_metrics where result_id = ?", [result_id],
+        ).fetchone()[0] > 0
+        assert connection.execute(
+            "select count(*) from equity_quality_metrics where result_id = ?", [result_id],
+        ).fetchone() == (0,)
+
+    calls = {"candidates": 0, "regime": 0}
+    original_candidates = panel_module.load_selection_candidates
+    original_regime = selection_module._selection_equity_regime_by_result
+
+    def counted_candidates(*args, **kwargs):
+        calls["candidates"] += 1
+        return original_candidates(*args, **kwargs)
+
+    def counted_regime(*args, **kwargs):
+        calls["regime"] += 1
+        return original_regime(*args, **kwargs)
+
+    monkeypatch.setattr(panel_module, "load_selection_candidates", counted_candidates)
+    monkeypatch.setattr(selection_module, "_selection_equity_regime_by_result", counted_regime)
+    with monkeypatch.context() as context:
+        context.setattr(
+            selection_module, "_selection_equity_regime_by_result",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("both-off path called classifier")),
+        )
+        assert controller.strategies_performance_v2_selection_cache_status(
+            {"symbol": "BTCUSDT", "side": "LONG", "stages": []}
+        )["ready"] is True
+        assert controller.strategies_performance_v2_selection_preview(
+            {"symbol": "BTCUSDT", "side": "LONG", "stages": []}
+        ) == {"stages": {}}
+    assert calls == {"candidates": 1, "regime": 0}
+
+    cache_status = controller.strategies_performance_v2_selection_cache_status(enabled)
+    assert cache_status["ready"] is True
+    before_preview = None
+    with duckdb.connect(str(database), read_only=True) as connection:
+        before_preview = connection.execute(
+            "select (select count(*) from equity_quality_metrics), "
+            "(select count(*) from selection_runs), "
+            "(select count(*) from selection_results)"
+        ).fetchone()
+    preview = controller.strategies_performance_v2_selection_preview(enabled)
+    assert preview["stages"]["filter_equity_regime"]["enabled"] is True
+    assert preview["stages"]["rank_robust_top_n"]["enabled"] is True
+    assert calls["regime"] == 1
+    assert calls["candidates"] == 2
+    with duckdb.connect(str(database), read_only=True) as connection:
+        assert connection.execute(
+            "select (select count(*) from equity_quality_metrics), "
+            "(select count(*) from selection_runs), "
+            "(select count(*) from selection_results)"
+        ).fetchone() == before_preview
+
+    filename, workbook_bytes = controller.strategies_performance_v2_selection(enabled)
+    assert filename.startswith("performance-v2-finalists-BTCUSDT-LONG")
+    assert workbook_bytes.startswith(b"PK")
+    with duckdb.connect(str(database), read_only=True) as connection:
+        snapshot = connection.execute(
+            "select result_id_at_selection, equity_regime_json from selection_results "
+            "where strategy_id = (select strategy_id from strategies where strategy_name = 'alpha') "
+            "order by selection_run_id desc limit 1"
+        ).fetchone()
+        assert snapshot[0] == result_id
+        assert json.loads(snapshot[1])["state"]
+        assert connection.execute(
+            "select count(*) from equity_quality_metrics where result_id = ?", [result_id],
+        ).fetchone() == (0,)
+
+
 @pytest.mark.parametrize("corruption", ["missing", "stale"])
-def test_selection_preview_maps_enabled_equity_cache_incomplete_to_409(
+def test_selection_preview_uses_equity_regime_when_r73_cache_is_missing_or_stale(
     tmp_path: Path, corruption: str,
 ) -> None:
     controller, database, result_id = _controller_for_windows(tmp_path)
@@ -2294,11 +2409,8 @@ def test_selection_preview_maps_enabled_equity_cache_incomplete_to_409(
     enabled = {"symbol": "BTCUSDT", "side": "LONG", "stages": [
         {"id": "filter_equity_regime", "enabled": True, "scope": "pair_side"},
     ]}
-    with pytest.raises(PerformanceV2ApiError) as raised:
-        controller.strategies_performance_v2_selection_preview(enabled)
-
-    assert raised.value.code == "EQUITY_CACHE_INCOMPLETE"
-    assert raised.value.status == 409
+    preview = controller.strategies_performance_v2_selection_preview(enabled)
+    assert preview["stages"]["filter_equity_regime"]["enabled"] is True
     with duckdb.connect(str(database), read_only=True) as check:
         if corruption == "missing":
             assert check.execute(
@@ -2308,6 +2420,7 @@ def test_selection_preview_maps_enabled_equity_cache_incomplete_to_409(
             assert check.execute(
                 "select source_revision from equity_quality_metrics where result_id = ?", [result_id]
             ).fetchone() == ("stale",)
+        assert check.execute("select count(*) from selection_runs").fetchone() == (0,)
 
     disabled = {"symbol": "BTCUSDT", "side": "LONG", "stages": [
         {"id": "filter_equity_regime", "enabled": False, "scope": "pair_side"},
@@ -2338,7 +2451,7 @@ def test_selection_preview_keeps_window_cache_error_when_erf_facts_are_ready(tmp
     assert raised.value.status == 409
 
 
-def test_selection_preview_maps_equity_cache_lost_after_preflight_to_409(
+def test_selection_preview_calculates_when_r73_cache_disappears_after_preflight(
     tmp_path: Path, monkeypatch,
 ) -> None:
     controller, _, _ = _controller_for_windows(tmp_path)
@@ -2361,12 +2474,10 @@ def test_selection_preview_maps_equity_cache_lost_after_preflight_to_409(
         return {}
 
     monkeypatch.setattr(selection_module, "_selection_equity_facts_by_result", facts_removed_after_preflight)
-    with pytest.raises(PerformanceV2ApiError) as raised:
-        controller.strategies_performance_v2_selection_preview(enabled)
+    preview = controller.strategies_performance_v2_selection_preview(enabled)
 
     assert raced_reads == 1
-    assert raised.value.code == "EQUITY_CACHE_INCOMPLETE"
-    assert raised.value.status == 409
+    assert preview["stages"]["filter_equity_regime"]["enabled"] is True
 
 
 def test_selection_preview_reloads_candidates_when_equity_filter_is_enabled_after_off_warm(
@@ -2424,13 +2535,95 @@ def test_selection_preview_reuses_candidates_when_equity_rank_is_enabled_after_o
         ],
     })
 
-    assert calls == 1
+    assert calls == 4  # Candidate payloads are distinct for off, rank-only, filter-only, and combined modes.
     assert ranked["stages"]["rank_robust_top_n"]["enabled"] is True
     assert filtered["stages"]["filter_equity_regime"]["enabled"] is True
     assert combined["stages"]["rank_robust_top_n"]["enabled"] is True
 
 
-def test_selection_preview_reuses_equity_candidates_but_reranks_for_method(
+def test_selection_memo_reloads_filter_only_candidates_for_rank_only_request(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    controller, _, _ = _controller_for_windows(tmp_path)
+    controller.strategies_performance_v2_recalculate({"symbol": "BTCUSDT", "side": "LONG"})
+    import mrs3.panel as panel_module
+    original = panel_module.load_selection_candidates
+    calls = 0
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(panel_module, "load_selection_candidates", counted)
+    _, filtered = controller._performance_v2_selection_result({
+        "symbol": "BTCUSDT", "side": "LONG", "stages": [
+            {"id": "filter_equity_regime", "enabled": True, "scope": "pair_side"},
+        ],
+    })
+    _, ranked = controller._performance_v2_selection_result({
+        "symbol": "BTCUSDT", "side": "LONG", "stages": [
+            {"id": "rank_robust_top_n", "enabled": True, "scope": "pair_side",
+             "top_n": 1, "method": "equity_quality_v1"},
+        ],
+    })
+
+    assert calls == 2
+    assert "equity_quality_facts" not in filtered.attrs
+    assert set(ranked.attrs["equity_quality_facts"]) == {str(int(value)) for value in ranked["strategy_id"]}
+
+
+def test_recalculate_requires_offline_migration_for_existing_v8_database(tmp_path: Path) -> None:
+    controller, database, _ = _controller_for_windows(tmp_path)
+    with duckdb.connect(str(database)) as connection:
+        _make_v8_catalog(connection)
+    before_file = (sha256(database.read_bytes()).hexdigest(), database.stat().st_mtime_ns)
+
+    with pytest.raises(PerformanceV2ApiError) as raised:
+        controller.strategies_performance_v2_recalculate({"symbol": "BTCUSDT", "side": "LONG"})
+
+    assert (raised.value.code, raised.value.status) == ("PERFORMANCE_V2_MIGRATION_REQUIRED", 409)
+    assert (sha256(database.read_bytes()).hexdigest(), database.stat().st_mtime_ns) == before_file
+    with duckdb.connect(str(database), read_only=True) as connection:
+        assert connection.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("8",)
+        assert connection.execute(
+            "select count(*) from information_schema.tables where table_name = 'strategy_rejection_sources'"
+        ).fetchone() == (0,)
+        assert connection.execute(
+            "select count(*) from information_schema.columns where table_name = 'selection_results' "
+            "and column_name = 'equity_regime_json'"
+        ).fetchone() == (0,)
+
+
+def test_panel_schema_preflight_initializes_an_empty_new_database(tmp_path: Path) -> None:
+    controller, database, _ = _controller_for_windows(tmp_path)
+    database.unlink()
+    database.write_bytes(b"")
+
+    controller._ensure_performance_v2_schema(database)
+
+    with duckdb.connect(str(database), read_only=True) as connection:
+        assert connection.execute(
+            "select value from schema_info where key = 'schema_version'"
+        ).fetchone() == ("9",)
+        assert connection.execute(
+            "select count(*) from information_schema.tables where table_name = 'strategy_rejection_sources'"
+        ).fetchone() == (1,)
+
+
+def test_panel_schema_preflight_maps_corrupt_database_to_schema_invalid(tmp_path: Path) -> None:
+    controller, database, _ = _controller_for_windows(tmp_path)
+    database.write_bytes(b"not a DuckDB database")
+    before = (sha256(database.read_bytes()).hexdigest(), database.stat().st_mtime_ns)
+
+    with pytest.raises(PerformanceV2ApiError) as raised:
+        controller._ensure_performance_v2_schema(database)
+
+    assert (raised.value.code, raised.value.status) == ("PERFORMANCE_V2_SCHEMA_INVALID", 500)
+    assert (sha256(database.read_bytes()).hexdigest(), database.stat().st_mtime_ns) == before
+
+
+def test_selection_preview_reloads_candidates_when_equity_rank_method_is_enabled(
     tmp_path: Path, monkeypatch,
 ) -> None:
     controller, _, _ = _controller_for_windows(tmp_path)
@@ -2458,7 +2651,7 @@ def test_selection_preview_reuses_equity_candidates_but_reranks_for_method(
         ],
     })
 
-    assert calls == 1  # Only candidates/facts are memoized; ranking is per request.
+    assert calls == 2  # Enabling equity ranking changes which facts the candidate payload needs.
     assert robust_request.stages[-1].method is None
     assert equity_request.stages[-1].method == "equity_quality_v1"
     assert "equity_quality_facts" not in robust.attrs
@@ -2490,19 +2683,16 @@ def test_equity_rank_readiness_is_gated_only_by_enabled_rank(
         {"id": "rank_robust_top_n", "enabled": rank_enabled, "scope": "pair_side",
          "top_n": 1, "method": "equity_quality_v1"},
     ]}
-    if rank_enabled and not facts_present:
-        with pytest.raises(PerformanceV2ApiError) as raised:
-            controller.strategies_performance_v2_selection_preview(payload)
-        assert raised.value.code == "EQUITY_CACHE_INCOMPLETE"
-        assert raised.value.status == 409
-    else:
-        preview = controller.strategies_performance_v2_selection_preview(payload)
-        assert preview["stages"]["rank_robust_top_n"]["enabled"] is rank_enabled
+    preview = controller.strategies_performance_v2_selection_preview(payload)
+    assert preview["stages"]["rank_robust_top_n"]["enabled"] is rank_enabled
 
     cache_status = controller.strategies_performance_v2_selection_cache_status(payload)
-    assert set(cache_status) == {"total", "missing", "ready"}
-    assert cache_status["ready"] is (facts_present or not rank_enabled)
-    assert cache_status["missing"] == (0 if facts_present or not rank_enabled else 1)
+    expected_status_fields = {"total", "missing", "ready"}
+    if rank_enabled:
+        expected_status_fields.update({"window_missing", "equity_missing", "regime_missing", "warm_missing"})
+    assert set(cache_status) == expected_status_fields
+    assert cache_status["ready"] is True
+    assert cache_status["missing"] == 0
     with duckdb.connect(str(database), read_only=True) as connection:
         after = connection.execute(
             "select (select count(*) from window_metrics), (select count(*) from selection_runs), "
@@ -2522,8 +2712,7 @@ def test_equity_rank_cache_status_maps_v5_upgrade_and_keeps_disabled_method_lega
     controller, database, _ = _controller_for_windows(tmp_path)
     controller.strategies_performance_v2_recalculate({"symbol": "BTCUSDT", "side": "LONG"})
     with duckdb.connect(str(database)) as connection:
-        connection.execute("drop table equity_quality_metrics")
-        connection.execute("update schema_info set value = '5' where key = 'schema_version'")
+        _make_v5_catalog(connection)
 
     disabled = {"symbol": "BTCUSDT", "side": "LONG", "stages": [
         {"id": "rank_robust_top_n", "enabled": False, "scope": "pair_side",
@@ -2551,8 +2740,7 @@ def test_equity_rank_cache_status_maps_v5_upgrade_and_keeps_disabled_method_lega
 def test_equity_rank_v5_upgrade_error_precedes_empty_cohort_readiness(tmp_path: Path) -> None:
     controller, database, _ = _controller_for_windows(tmp_path)
     with duckdb.connect(str(database)) as connection:
-        connection.execute("drop table equity_quality_metrics")
-        connection.execute("update schema_info set value = '5' where key = 'schema_version'")
+        _make_v5_catalog(connection)
     payload = {"symbol": "NO_CANDIDATES", "side": "LONG", "stages": [
         {"id": "rank_robust_top_n", "enabled": True, "scope": "pair_side",
          "top_n": 1, "method": "equity_quality_v1"},
@@ -2627,8 +2815,7 @@ def test_performance_v2_catalog_and_cache_status_do_not_upgrade_v5_on_read(tmp_p
     payload = {"symbol": "BTCUSDT", "side": "LONG", "stages": []}
     controller.strategies_performance_v2_recalculate(payload)
     with duckdb.connect(str(database)) as connection:
-        connection.execute("drop table equity_quality_metrics")
-        connection.execute("update schema_info set value = '5' where key = 'schema_version'")
+        _make_v5_catalog(connection)
 
     controller.performance_v2_catalog()
     assert controller.strategies_performance_v2_selection_preview(payload) == {"stages": {}}
@@ -2702,12 +2889,29 @@ def test_selection_workbook_handles_equity_stage_only_when_enabled_column_is_pre
                 "source_revision": "0" * 64, "facts_sha256": facts_sha256,
             },
         })
+        regime_end = start + timedelta(days=42)
+        regime_samples = tuple(
+            EquityRegimeSample(1, index, start + timedelta(days=index), Decimal("100") * Decimal("1.01") ** index)
+            for index in range(43)
+        )
+        assessment = classify_equity_regime(1, start, regime_end, regime_samples)
+        regime_facts = assessment.facts
+        regime_facts_json = encode_equity_regime_facts(regime_facts)
+        row["_equity_regime_cache"] = {
+            "status": "FRESH",
+            "assessment": assessment,
+            "facts": regime_facts,
+            "source_revision": "0" * 64,
+            "facts_sha256": sha256(regime_facts_json.encode("utf-8")).hexdigest(),
+            "classifier_algo_version": EQUITY_REGIME_ALGORITHM_VERSION,
+            "equity_regime_json": encode_equity_regime_assessment(assessment),
+        }
     result = panel_module.run_selection(pd.DataFrame([row]), request)
     path = write_selection_workbook(result, tmp_path / f"equity-{enabled}.xlsx", request)
     headers = [cell.value for cell in load_workbook(path, data_only=True)["All candidates"][1]]
 
     if enabled:
-        assert result.loc[0, "equity_regime_disposition"] == "PASS"
+        assert result.loc[0, "equity_regime_decision"] == "PASS"
     assert "eliminated_by_filter_equity_regime" not in headers
     assert ("Equity state" in headers) is enabled
 
@@ -2800,6 +3004,20 @@ def test_selection_cache_status_reports_missing_default_windows(tmp_path: Path) 
     }
 
 
+def test_equity_selection_cache_status_reports_regime_readiness_breakdown(tmp_path: Path) -> None:
+    controller, _, _ = _controller_for_windows(tmp_path)
+    payload = {"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "filter_equity_regime", "enabled": True, "scope": "pair_side"},
+    ]}
+
+    status = controller.strategies_performance_v2_selection_cache_status(payload)
+
+    assert status == {
+        "total": 1, "missing": 1, "ready": False,
+        "window_missing": 1, "equity_missing": 1, "regime_missing": 1, "warm_missing": 1,
+    }
+
+
 def test_selection_recalculate_passes_only_missing_strategy_ids(tmp_path: Path, monkeypatch) -> None:
     controller, _, _ = _controller_for_windows(tmp_path)
     import mrs3.panel as panel_module
@@ -2823,8 +3041,7 @@ def test_selection_recalculate_maps_equity_cache_errors_to_typed_api_errors(
     if schema == "v5":
         controller.strategies_performance_v2_recalculate({"symbol": "BTCUSDT", "side": "LONG"})
         with duckdb.connect(str(database)) as connection:
-            connection.execute("drop table equity_quality_metrics")
-            connection.execute("update schema_info set value = '5' where key = 'schema_version'")
+            _make_v5_catalog(connection)
     else:
         with duckdb.connect(str(database)) as connection:
             connection.execute("drop table equity_quality_metrics")

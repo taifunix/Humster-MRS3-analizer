@@ -23,12 +23,57 @@ def test_compact_refuses_existing_target(tmp_path: Path) -> None:
     assert target.read_bytes() == b"keep"
 
 
-def test_compact_copies_complete_small_v8_fixture(tmp_path: Path) -> None:
+def test_compact_copies_complete_small_v9_fixture(tmp_path: Path) -> None:
     from tests.test_performance_v2_selection import _candidate_db
 
     (tmp_path / "source").mkdir()
     connection = _candidate_db(tmp_path / "source")
     source = tmp_path / "source" / "strategy_performance.duckdb"
+    strategy_id, result_id = connection.execute(
+        "select strategy_id, result_id from strategy_results"
+    ).fetchone()
+    selection_run_id = "compact-v9-run"
+    instance_id = connection.execute(
+        "select value from schema_info where key = 'database_instance_id'"
+    ).fetchone()[0]
+    connection.execute(
+        """insert into selection_runs values
+           (?, ?, 'BTCUSDT', 'LONG', 'v1', '{}', 'request', '{}', 'config', 1, 1, 0, 1, 'workbook', now())""",
+        [selection_run_id, instance_id],
+    )
+    snapshot_json = '{"snapshot":"preserve exact value"}'
+    connection.execute(
+        """insert into selection_results (
+               selection_run_id, strategy_id, result_id_at_selection, auto_status,
+               auto_reason, prior_rejected, stage_trace_json, equity_regime_json
+           ) values (?, ?, ?, 'FILTERED', 'test', false, '{}', ?)""",
+        [selection_run_id, strategy_id, result_id, snapshot_json],
+    )
+    source_evidence = (
+        999, "EQUITY_REGIME_FILTER", "W28_DOWN", 999, "orphan-run",
+        "equity-regime-v1", "source-revision", "a" * 64,
+    )
+    connection.execute(
+        """insert into strategy_rejection_sources (
+               strategy_id, source_kind, reason_code, first_result_id,
+               first_selection_run_id, classifier_algo_version, source_revision,
+               facts_sha256, created_at_utc
+           ) values (?, ?, ?, ?, ?, ?, ?, ?, now())""",
+        source_evidence,
+    )
+    selection_result_before = connection.execute(
+        "select * from selection_results"
+    ).fetchall()
+    rejection_sources_before = connection.execute(
+        "select * from strategy_rejection_sources"
+    ).fetchall()
+    rejection_constraints_before = connection.execute(
+        """select constraint_type, constraint_column_names, referenced_table,
+                  referenced_column_names
+             from duckdb_constraints()
+            where schema_name = 'main' and table_name = 'strategy_rejection_sources'
+            order by constraint_index"""
+        ).fetchall()
     before = {
         table: connection.execute(f"select count(*) from {table}").fetchone()[0]
         for table in (
@@ -36,7 +81,7 @@ def test_compact_copies_complete_small_v8_fixture(tmp_path: Path) -> None:
             "strategy_actions", "strategy_equity", "window_metrics", "import_runs",
             "import_files", "selection_runs", "selection_results",
             "selection_review_imports", "selection_review_rows", "strategy_tags",
-            "optimizer_prepared_inputs", "equity_quality_metrics",
+            "optimizer_prepared_inputs", "equity_quality_metrics", "strategy_rejection_sources",
         )
     }
     connection.close()
@@ -46,11 +91,25 @@ def test_compact_copies_complete_small_v8_fixture(tmp_path: Path) -> None:
     report = compact_performance_v2(source, target, workers=2)
 
     assert report["source_stat_unchanged"] is True
-    assert report["source_schema_version"] == 8
-    assert report["target"]["schema_version"] == 8
+    assert report["source_schema_version"] == 9
+    assert report["target"]["schema_version"] == 9
     assert report["memory_limit"] == "16GB"
     assert report["table_counts"] == {name: int(count) for name, count in before.items()}
     assert report["verified_table_counts"] == report["table_counts"]
+    with duckdb.connect(str(target), read_only=True) as compacted:
+        assert compacted.execute("select * from selection_results").fetchall() == selection_result_before
+        assert compacted.execute("select * from strategy_rejection_sources").fetchall() == rejection_sources_before
+        assert compacted.execute(
+            "select count(*) from duckdb_constraints() where schema_name = 'main' "
+            "and table_name = 'strategy_rejection_sources' and constraint_type = 'FOREIGN KEY'"
+        ).fetchone() == (0,)
+        assert compacted.execute(
+            """select constraint_type, constraint_column_names, referenced_table,
+                      referenced_column_names
+                 from duckdb_constraints()
+                where schema_name = 'main' and table_name = 'strategy_rejection_sources'
+                order by constraint_index"""
+        ).fetchall() == rejection_constraints_before
 
 
 def test_compact_transforms_prepared_payload_before_insert(tmp_path: Path) -> None:
@@ -108,7 +167,7 @@ def test_compact_preserves_semantically_invalid_legacy_payload(tmp_path: Path) -
     assert decode_prepared_storage(target_payload) == legacy_payload
 
 
-def test_compact_migrates_empty_v6_schema_to_v8(tmp_path: Path) -> None:
+def test_compact_migrates_empty_v6_schema_to_v9(tmp_path: Path) -> None:
     from tests.test_performance_v2_store import _initialize_v6_fixture
 
     source = tmp_path / "source.duckdb"
@@ -119,7 +178,111 @@ def test_compact_migrates_empty_v6_schema_to_v8(tmp_path: Path) -> None:
     report = compact_performance_v2(source, target, workers=1)
 
     assert report["source_schema_version"] == 6
-    assert report["target"]["schema_version"] == 8
+    assert report["target"]["schema_version"] == 9
+
+
+def test_compact_accepts_v5_commission_rate_not_nullability(tmp_path: Path) -> None:
+    from tests.test_performance_v2_store import _initialize_v4_fixture
+    from mrs3.performance_v2_store import _migrate_schema_v4_to_v5, require_performance_v2_readable
+
+    source = tmp_path / "source-v5.duckdb"
+    with duckdb.connect(str(source)) as connection:
+        _initialize_v4_fixture(connection)
+        _migrate_schema_v4_to_v5(connection)
+        assert require_performance_v2_readable(connection) == 5
+        assert connection.execute(
+            "select is_nullable from information_schema.columns "
+            "where table_name = 'strategy_results' and column_name = 'commission_rate'"
+        ).fetchone() == ("NO",)
+
+    target = tmp_path / "target-v9.duckdb"
+    report = compact_performance_v2(source, target, workers=1)
+
+    assert report["source_schema_version"] == 5
+    assert report["target"]["schema_version"] == 9
+    with duckdb.connect(str(source), read_only=True) as connection:
+        assert require_performance_v2_readable(connection) == 5
+        assert connection.execute(
+            "select is_nullable from information_schema.columns "
+            "where table_name = 'strategy_results' and column_name = 'commission_rate'"
+        ).fetchone() == ("NO",)
+
+
+def test_compact_migrates_v8_selection_rows_without_backfill(tmp_path: Path) -> None:
+    from tests.test_performance_v2_store import (
+        _initialize_v6_fixture,
+        _migrate_schema_v6_to_v7,
+        _migrate_schema_v7_to_v8,
+        _strategy,
+    )
+    from mrs3.performance_v2_store import require_performance_v2_readable
+
+    source = tmp_path / "source-v8.duckdb"
+    selection_run_id = "compact-v8-run"
+    with duckdb.connect(str(source)) as connection:
+        _initialize_v6_fixture(connection)
+        _migrate_schema_v6_to_v7(connection)
+        _migrate_schema_v7_to_v8(connection)
+        strategy_id = _strategy(connection, name="compact-v8")
+        result_id = connection.execute(
+            """insert into strategy_results (
+                   strategy_id, report_start_utc, report_end_utc, exchange,
+                   commission_rate, initial_balance, final_balance, imported_at_utc
+               ) values (?, '2026-01-01', '2026-01-02', 'BYBIT', .001, 100, 101, now())
+               returning result_id""",
+            [strategy_id],
+        ).fetchone()[0]
+        connection.execute(
+            "update strategies set current_result_id = ? where strategy_id = ?",
+            [result_id, strategy_id],
+        )
+        connection.execute(
+            "insert into equity_quality_metrics values (?, 'legacy-revision', 'R7.3', 'legacy-facts', ?, now())",
+            [result_id, "a" * 64],
+        )
+        instance_id = connection.execute(
+            "select value from schema_info where key = 'database_instance_id'"
+        ).fetchone()[0]
+        connection.execute(
+            """insert into selection_runs values
+               (?, ?, 'BTCUSDT', 'LONG', 'v1', '{}', 'request', '{}', 'config', 1, 1, 0, 1, 'workbook', now())""",
+            [selection_run_id, instance_id],
+        )
+        connection.execute(
+            """insert into selection_results (
+                   selection_run_id, strategy_id, result_id_at_selection, auto_status,
+                   auto_reason, prior_rejected, stage_trace_json
+               ) values (?, ?, ?, 'FILTERED', 'legacy', false, '{}')""",
+            [selection_run_id, strategy_id, result_id],
+        )
+        selection_before = connection.execute("select * from selection_results").fetchall()
+        metrics_before = connection.execute("select * from equity_quality_metrics").fetchall()
+        assert len(selection_before) == 1
+
+    target = tmp_path / "target-v9.duckdb"
+    report = compact_performance_v2(source, target, workers=1)
+
+    assert report["source_schema_version"] == 8
+    assert report["target"]["schema_version"] == 9
+    assert report["table_counts"]["selection_results"] == 1
+    assert report["verified_table_counts"]["selection_results"] == 1
+    assert report["table_counts"]["strategy_rejection_sources"] == 0
+    assert report["verified_table_counts"]["strategy_rejection_sources"] == 0
+    with duckdb.connect(str(target), read_only=True) as connection:
+        assert require_performance_v2_readable(connection) == 9
+        assert connection.execute("select * from selection_results").fetchall() == [
+            (*selection_before[0], None)
+        ]
+        assert connection.execute("select * from equity_quality_metrics").fetchall() == metrics_before
+        assert connection.execute("select count(*) from strategy_rejection_sources").fetchone() == (0,)
+        assert connection.execute(
+            "select count(*) from selection_results where equity_regime_json is not null"
+        ).fetchone() == (0,)
+    with duckdb.connect(str(source), read_only=True) as connection:
+        assert require_performance_v2_readable(connection) == 8
+        assert connection.execute(
+            "select count(*) from information_schema.tables where table_name = 'strategy_rejection_sources'"
+        ).fetchone() == (0,)
 
 
 @pytest.mark.parametrize("version", [6, 7])

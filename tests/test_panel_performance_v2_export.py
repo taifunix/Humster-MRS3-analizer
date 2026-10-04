@@ -11,6 +11,7 @@ import threading
 
 import duckdb
 from openpyxl import load_workbook
+import pandas as pd
 import pytest
 
 from mrs3.panel import PanelController, create_panel_server
@@ -24,6 +25,7 @@ from mrs3.performance_v2_store import initialize_performance_v2
 from mrs3.performance_v2_equity_cache import current_equity_source_metadata, upsert_equity_quality_facts_checked
 from mrs3.performance_v2_equity_quality import EquitySample, calculate_equity_quality_facts
 from mrs3.performance_v2_windows import METRICS_VERSION
+from mrs3.performance_v2_selection_review import apply_prior_rejected
 import mrs3.performance_v2_selection as selection_module
 
 
@@ -138,7 +140,10 @@ def test_performance_v2_export_rejects_unknown_query_parameter(tmp_path: Path) -
         thread.join(timeout=2)
 
 
-def test_read_only_export_accepts_v5_without_schema_or_review_changes(tmp_path: Path) -> None:
+@pytest.mark.parametrize("schema_version", [5, 8])
+def test_read_only_export_accepts_v5_and_v8_without_schema_or_review_changes(
+    tmp_path: Path, schema_version: int,
+) -> None:
     database, strategy_id = _export_database(tmp_path / "strategy_performance.duckdb")
     selection = PerformanceV2ExportSelection(all_active=True)
     fixed_now = datetime(2026, 1, 2, tzinfo=UTC)
@@ -148,8 +153,17 @@ def test_read_only_export_accepts_v5_without_schema_or_review_changes(tmp_path: 
     v6_headers = [cell.value for cell in v6_sheet[1]]
 
     with duckdb.connect(str(database)) as connection:
-        connection.execute("drop table equity_quality_metrics")
-        connection.execute("update schema_info set value = '5' where key = 'schema_version'")
+        connection.execute("drop table strategy_rejection_sources")
+        connection.execute("alter table selection_results drop column equity_regime_json")
+        if schema_version == 5:
+            connection.execute("drop table equity_quality_metrics")
+        connection.execute("update schema_info set value = ? where key = 'schema_version'", [str(schema_version)])
+        connection.execute(
+            "insert into strategy_tags values (?, 'REJECTED', 'TEST', 'legacy-schema', current_timestamp)",
+            [strategy_id],
+        )
+        prior = apply_prior_rejected(connection, pd.DataFrame({"strategy_id": [strategy_id]}))
+        assert prior["prior_rejected"].tolist() == [True]
 
     before_file = (sha256(database.read_bytes()).hexdigest(), database.stat().st_mtime_ns)
     before_catalog = _catalog_identity(database)

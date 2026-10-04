@@ -17,7 +17,43 @@ the rendered status after reloading the page, then reconcile the orphaned tester
 job through the existing safe restart/recovery path after confirming no tester
 process is active; do not edit the journal directly.
 
+## Equity regime production integration (2026-10-05)
+
+The locally implemented `equity-regime-v1` classifier, versioned cache,
+schema v9, atomic selection publication, independent rejection-source ledger,
+Panel and Excel readers, and explicit cache-warm path passed a combined
+verification of **627 tests** (4 Windows symlink skips). The frozen M3 replay
+classified all **30,940** rows twice with identical output SHA-256
+`870C88D293067C2CB1E8A58B4A297E2C4234E7AC87DA509E225EA374F6CCE0AF`;
+there were no valid unclassified rows. The replay verifies classification of
+frozen summary facts, not re-extraction from all raw equity points. Full
+implementation details and limits are in
+`docs/reports/2026-10-04-equity-regime-production-replay.md`.
+
+Initial independent Opus code review returned findings R1–R10. The confirmed
+issues were addressed by GPT-6 Luna executors and rerun with the tests above;
+R6 was disproved by a v5 fixture, while R9 preserves the agreed
+`STALLED` PASS + RESERVE semantics. Independent Opus 5/high re-review returned
+`CODE_REVIEW_PASS` after verifying the deterministic latest-publication order
+and the `(result_id, sample_index)` primary key. The existing production DuckDB is
+still v8 and a tester writer was active during the check. The Panel now
+returns `PERFORMANCE_V2_MIGRATION_REQUIRED` for that database instead of
+upgrading it on open. Next: prepare a verified offline copy with writers stopped
+before considering live v8→v9 migration. No live database mutation or
+research-status backfill has occurred.
+
 ## Equity regime M3 read-only validation (2026-10-04)
+
+The production status contract and implementation plan P6 are now frozen in
+`docs/specs/2026-10-03-equity-regime-status-map.md` and
+`docs/superpowers/plans/2026-10-04-equity-regime-production.md`.
+Independent Claude Opus 5 Advisor review returned `PLAN_APPROVED` after the
+unrequested `UNRANKED` value was removed. The existing `FILTERED` Auto Status
+with reason `EQUITY_RANK_UNRANKABLE` covers rank-only exclusions; no Auto Status
+schema CHECK change is planned. ADR-0056 defines independent sticky equity
+rejection sources. This paragraph records the pre-implementation M3 baseline;
+the current verified implementation and remaining live migration are summarized
+above. No research-status backfill has occurred.
 
 The full read-only pass verified 30,940 current results and 139,740,157 raw
 equity points, with unchanged source SHA and zero stale/invalid R7.3 caches.
@@ -29,9 +65,10 @@ proved prefix pauses. At the unaccepted epsilon=0.5, absolute-slowdown=1
 anchor: GROWING 9,565; WEAKENING 4,786; RESUMED 3,249; STALLED 10,138;
 DECLINING 41; UNRESOLVED 3,161. One retained result per strategy means
 T-14/T-7 transitions are same-curve proxies, not independent retests.
-Direction and slowdown tolerances, numeric FLAT/COLLAPSING predicates, and
-1,199 unproved-resume cases remain open. The first final review found a
-Windows text-mode SHA mismatch; a failing CRLF test led to raw-byte hashing,
+At the time of this M3 pass, direction and slowdown tolerances, numeric
+FLAT/COLLAPSING predicates, and 1,199 unproved-resume cases remained open.
+The first final review found a Windows text-mode SHA mismatch; a failing
+CRLF test led to raw-byte hashing,
 and full replay retained the same status SHA. Independent GPT-6 Sol re-review
 returned `CODE_REVIEW_PASS`; Claude Opus 5/high independently confirmed
 `CODE_REVIEW_PASS` on the final research packet. No
@@ -39,6 +76,32 @@ DB/cache/production/tester change was made. The Advisor
 bridge failed; the user authorized task-local GPT-6 Sol review, and P3 received
 independent PLAN_APPROVED before extraction.
 Evidence: `docs/reports/2026-10-04-equity-regime-m3-research.md`.
+
+Post-research user decisions now set direction epsilon=2, GROWING speed floors
+10/10/10 or accelerating 7/10/10, and WEAKENING for weaker confirmed growth
+or two consecutive speed reductions of at least 20%. RESUMED needs no prior
+saved status. W28 DOWN now gives DROP with User Status REJECTED regardless of
+PRE28; W28 FLAT/MIXED with PRE28 not UP or unavailable gives the same outcome.
+For PRE28 UP and W28 FLAT/MIXED, bounded DD, W14 UP, W7 UP and a held new
+W7 full ATH together give RESUMED; otherwise STALLED / PASS + RESERVED.
+On 3,030 PRE28-UP and W28-not-UP frozen facts, the draft rule yields
+295 DROP / User Status REJECTED (including 21 DD cases), 361 RESUMED and
+2,374 STALLED.
+Of 484 held-ATH cases, 123 remain STALLED because W14 or W7 is not UP.
+The W28-DOWN/W14-W7-UP subcase also receives REJECTED (11 facts). The
+48-tuple read-only census is in
+`docs/reports/2026-10-04-equity-regime-pre28-up-w28-not-up-casebook.md`.
+PRE28 DOWN with W28 UP now admits RESUMED or STALLED under the existing W28-UP
+rules, while GROWING/WEAKENING still require PRE28 UP when available. All 12
+such frozen M3 facts have W14/W7 UP, held new W7 ATH and DD<23%; all project
+to RESUMED. Distinct FLAT/COLLAPSING labels are unnecessary. Equity hard
+rejection uses the existing User Status REJECTED immediately when the enabled
+filter produces a durable result; no REJECT60 User Status, scheduled retest,
+or automatic 60-day deletion is added. Later manual heavy-fact cleanup must
+retain settings, compact metrics and REJECTED for dedup and record cleanup
+state plus actual deleted_at_utc. ADR-0055 records this policy. The current
+prune deletes settings and cannot serve this purpose. Manual cleanup and
+import integration remain separate future work.
 
 ## Performance v2 stage 9 near-duplicate tolerance (2026-10-03)
 
