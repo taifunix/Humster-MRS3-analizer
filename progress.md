@@ -1,5 +1,28 @@
 # MRS3 — current verification
 
+## Equity regime M3 read-only validation (2026-10-04)
+
+The full read-only pass verified 30,940 current results and 139,740,157 raw
+equity points, with unchanged source SHA and zero stale/invalid R7.3 caches.
+Full raw ATH, historical DD14/DD7, and actual PRE28 were measured. A separate
+Decimal reference matched 612 metric fields on 21 selected curves (maximum
+difference 5.06E-35); 20 focused tests pass. Exact held-weekly-ATH H1 replay
+changed 404 research statuses: 332 to STALLED and 72 to RESUMED through newly
+proved prefix pauses. At the unaccepted epsilon=0.5, absolute-slowdown=1
+anchor: GROWING 9,565; WEAKENING 4,786; RESUMED 3,249; STALLED 10,138;
+DECLINING 41; UNRESOLVED 3,161. One retained result per strategy means
+T-14/T-7 transitions are same-curve proxies, not independent retests.
+Direction and slowdown tolerances, numeric FLAT/COLLAPSING predicates, and
+1,199 unproved-resume cases remain open. The first final review found a
+Windows text-mode SHA mismatch; a failing CRLF test led to raw-byte hashing,
+and full replay retained the same status SHA. Independent GPT-6 Sol re-review
+returned `CODE_REVIEW_PASS`; Claude Opus 5/high independently confirmed
+`CODE_REVIEW_PASS` on the final research packet. No
+DB/cache/production/tester change was made. The Advisor
+bridge failed; the user authorized task-local GPT-6 Sol review, and P3 received
+independent PLAN_APPROVED before extraction.
+Evidence: `docs/reports/2026-10-04-equity-regime-m3-research.md`.
+
 ## Performance v2 stage 9 near-duplicate tolerance (2026-10-03)
 
 Stage 9 now has a narrow cross-TF near-duplicate rule for equal ORD count and
