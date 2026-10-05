@@ -5763,11 +5763,11 @@ class PanelController:
             with self._performance_v2_writer_lock:
                 with duckdb.connect(str(target), read_only=True) as connection:
                     missing_strategy_ids = selection_cache_missing_strategy_ids(
-                        connection, request, config, include_equity=True
+                        connection, request, config, include_equity_regime=True,
                     )
                 prepare_selection_window_cache(
                     target, request, config, performance_config.workers, missing_strategy_ids,
-                    include_equity=True,
+                    include_equity_regime=True,
                 )
             with self._selection_candidate_cache_lock:
                 self._selection_candidate_cache.clear()
@@ -5812,7 +5812,7 @@ class PanelController:
                     for symbol, side in pairs:
                         request = SelectionRequest(str(symbol), str(side), ())
                         missing_strategy_ids = selection_cache_missing_strategy_ids(
-                            connection, request, config, include_equity=True
+                            connection, request, config, include_equity_regime=True,
                         )
                         if missing_strategy_ids:
                             pending.append((request, missing_strategy_ids))
@@ -5833,7 +5833,7 @@ class PanelController:
                         self._performance_v2_recalculate_progress["current_pair"] = f"{request.symbol}/{request.side}"
                     prepare_selection_window_cache(
                         target, request, config, performance_config.workers, missing_strategy_ids,
-                        include_equity=True, on_batch_complete=after_batch,
+                        include_equity_regime=True, on_batch_complete=after_batch,
                     )
                     with self._lock:
                         self._performance_v2_recalculate_progress["completed_pairs"] += 1

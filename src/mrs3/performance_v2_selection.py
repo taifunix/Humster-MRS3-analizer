@@ -1417,9 +1417,18 @@ def selection_equity_facts_token(
     return tuple(token)
 
 
+def _selection_requires_equity_regime(request: SelectionRequest) -> bool:
+    return any(
+        stage.enabled and (
+            stage.id == "filter_equity_regime"
+            or (stage.id == "rank_robust_top_n" and stage.method == "equity_quality_v1")
+        ) for stage in request.stages
+    )
+
+
 def _selection_cache_missing_strategy_ids(
     connection: duckdb.DuckDBPyConnection, request: SelectionRequest, config: SelectionConfig,
-    *, include_equity: bool = False,
+    *, include_equity: bool = False, include_equity_regime: bool | None = None,
 ) -> tuple[int, ...]:
     _verify_retest_cohort(connection, request)
     cohort_sql, cohort_params = _cohort_clause(request)
@@ -1434,16 +1443,11 @@ def _selection_cache_missing_strategy_ids(
     ).fetchall()
     cached_metrics = _selection_cached_metrics(connection, request)
     equity_ready = _equity_cache_ready_by_result(connection, rows) if include_equity else {}
-    regime_consumer = any(
-        stage.enabled and (
-            stage.id == "filter_equity_regime"
-            or (stage.id == "rank_robust_top_n" and stage.method == "equity_quality_v1")
-        )
-        for stage in request.stages
-    )
+    if include_equity_regime is None:
+        include_equity_regime = _selection_requires_equity_regime(request)
     regime_ready = (
         _equity_regime_cache_ready_by_result(connection, rows)
-        if include_equity and regime_consumer else {}
+        if include_equity_regime else {}
     )
     missing: list[int] = []
     for row in rows:
@@ -1456,7 +1460,7 @@ def _selection_cache_missing_strategy_ids(
         if (
             old_missing
             or (include_equity and not equity_ready.get(int(result_id), False))
-            or (include_equity and regime_consumer and not regime_ready.get(int(result_id), False))
+            or (include_equity_regime and not regime_ready.get(int(result_id), False))
         ):
             missing.append(int(strategy_id))
     return tuple(missing)
@@ -1464,15 +1468,19 @@ def _selection_cache_missing_strategy_ids(
 
 def selection_cache_missing_strategy_ids(
     connection: duckdb.DuckDBPyConnection, request: SelectionRequest, config: SelectionConfig,
-    *, include_equity: bool = False,
+    *, include_equity: bool = False, include_equity_regime: bool | None = None,
 ) -> tuple[int, ...]:
     """Return active strategies whose current result lacks a required cache window."""
-    return _selection_cache_missing_strategy_ids(connection, request, config, include_equity=include_equity)
+    return _selection_cache_missing_strategy_ids(
+        connection, request, config,
+        include_equity=include_equity, include_equity_regime=include_equity_regime,
+    )
 
 
 def prepare_selection_window_cache(
     database: Path, request: SelectionRequest, config: SelectionConfig, workers: int,
     strategy_ids: Sequence[int] | None = None, *, include_equity: bool = False,
+    include_equity_regime: bool | None = None,
     on_batch_complete: Callable[[int], None] | None = None,
 ) -> None:
     """Warm bounded result batches in independent readers and one checked writer."""
@@ -1503,13 +1511,8 @@ def prepare_selection_window_cache(
         return
     worker_count = max(1, min(int(workers), len(rows)))
     batch_size = 2 * worker_count
-    include_equity_regime = include_equity and any(
-        stage.enabled and (
-            stage.id == "filter_equity_regime"
-            or (stage.id == "rank_robust_top_n" and stage.method == "equity_quality_v1")
-        )
-        for stage in request.stages
-    )
+    if include_equity_regime is None:
+        include_equity_regime = _selection_requires_equity_regime(request)
     jobs = [
         (
             str(database), int(result_id), report_start, report_end, config.ab_final_days,
@@ -1592,19 +1595,15 @@ def selection_cache_status(
             where s.lifecycle_status = 'ACTIVE' and s.symbol = ? and s.side = ?""" + cohort_sql,
         [request.symbol, request.side, *cohort_params],
     ).fetchall()
-    regime_consumer = any(
-        stage.enabled and (
-            stage.id == "filter_equity_regime"
-            or (stage.id == "rank_robust_top_n" and stage.method == "equity_quality_v1")
-        )
+    regime_consumer = _selection_requires_equity_regime(request)
+    quality_rank_consumer = any(
+        stage.enabled and stage.id == "rank_robust_top_n" and stage.method == "equity_quality_v1"
         for stage in request.stages
     )
+    quality_check_required = quality_rank_consumer or (include_equity and not regime_consumer)
     cached_metrics = _selection_cached_metrics(connection, request)
-    equity_ready = _equity_cache_ready_by_result(connection, rows) if include_equity else {}
-    regime_ready = (
-        _equity_regime_cache_ready_by_result(connection, rows)
-        if include_equity and regime_consumer else {}
-    )
+    equity_ready = _equity_cache_ready_by_result(connection, rows) if quality_check_required else {}
+    regime_ready = _equity_regime_cache_ready_by_result(connection, rows) if regime_consumer else {}
     missing = 0
     window_missing = 0
     equity_missing = 0
@@ -1617,8 +1616,8 @@ def selection_cache_status(
             cached_metrics.get((int(result_id), window_start, window_end)) is None
             for window_start, window_end in windows
         )
-        current_equity_missing = include_equity and not equity_ready.get(int(result_id), False)
-        current_regime_missing = include_equity and regime_consumer and not regime_ready.get(
+        current_equity_missing = quality_check_required and not equity_ready.get(int(result_id), False)
+        current_regime_missing = regime_consumer and not regime_ready.get(
             int(result_id), False
         )
         current_warm_missing = current_equity_missing or current_regime_missing
@@ -1626,7 +1625,7 @@ def selection_cache_status(
         equity_missing += int(current_equity_missing)
         regime_missing += int(current_regime_missing)
         warm_missing += int(current_warm_missing)
-        if old_missing or (current_equity_missing and not regime_consumer):
+        if old_missing or current_equity_missing or current_regime_missing:
             missing += 1
     status: dict[str, int | bool] = {"total": len(rows), "missing": missing, "ready": bool(rows) and missing == 0}
     if include_readiness_breakdown:

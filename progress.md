@@ -4704,3 +4704,7 @@ terminated, writer-open smoke passed, and the retry reached `RUNNING` with
 cache batches committing normally. Next: observe the terminal result, then
 establish the unchanged Phase 8 baseline and apply only the first measured
 optimization that passes OPT-01e.
+
+## PURR equity-regime cache repair (2026-10-05)
+
+The PURRUSDT/LONG selection hang was traced to a missing equity-regime-v1 cache: 3,369 active results and 20,874,717 raw equity points were scanned under the Panel lock because readiness ignored regime misses. Explicit pair/all-pair recalculation now warms regime independently of selected stages and skips old R7.3 quality; missing regime or explicit legacy rank cache blocks preview/XLSX before raw scanning. Focused regression and broader selection/Panel suites passed (369 passed, 4 skipped); Claude Opus 5 review returned CODE_REVIEW_PASS. A detached 16-worker warm of the live D: database finished 3,369/3,369 with zero remaining misses. Panel is running on port 8766. Live cache-status returned ready=true, missing=0 (59.5 seconds on first request); the filter-only preview returned 648 passing, 2,690 reserved and 31 dropped in 21.1 seconds. Legacy equity-quality ranking remains deferred.

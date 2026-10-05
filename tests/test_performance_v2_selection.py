@@ -2000,6 +2000,72 @@ def test_equity_regime_explicit_warm_turns_preview_miss_into_cache_hit(
     assert cached[0] == current_revision
 
 
+def test_equity_regime_explicit_warm_with_empty_stages_fills_and_detects_cache_miss(
+    tmp_path: Path,
+) -> None:
+    connection = _candidate_db(tmp_path)
+    database = tmp_path / "strategy_performance.duckdb"
+    strategy_id = int(connection.execute("select strategy_id from strategies").fetchone()[0])
+    connection.close()
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
+
+    prepare_selection_window_cache(
+        database, request, SelectionConfig(), workers=1, include_equity_regime=True,
+    )
+
+    with duckdb.connect(str(database), read_only=True) as check:
+        assert check.execute(
+            "select count(*) from equity_quality_metrics where algo_version = ?",
+            [EQUITY_REGIME_ALGORITHM_VERSION],
+        ).fetchone() == (1,)
+        assert check.execute(
+            "select count(*) from equity_quality_metrics where algo_version <> ?",
+            [EQUITY_REGIME_ALGORITHM_VERSION],
+        ).fetchone() == (0,)
+        assert selection_cache_missing_strategy_ids(
+            check, request, SelectionConfig(), include_equity_regime=True,
+        ) == ()
+
+    with duckdb.connect(str(database)) as writer:
+        writer.execute(
+            "delete from equity_quality_metrics where algo_version = ?",
+            [EQUITY_REGIME_ALGORITHM_VERSION],
+        )
+    with duckdb.connect(str(database), read_only=True) as check:
+        assert selection_cache_missing_strategy_ids(
+            check, request, SelectionConfig(), include_equity_regime=True,
+        ) == (strategy_id,)
+
+
+def test_explicit_regime_only_warm_publishes_every_result_with_parallel_workers(tmp_path: Path) -> None:
+    connection = _candidate_db(tmp_path)
+    _clone_current_candidate(connection, "beta")
+    database = tmp_path / "strategy_performance.duckdb"
+    expected_result_ids = tuple(sorted(
+        int(row[0]) for row in connection.execute("select result_id from strategy_results").fetchall()
+    ))
+    connection.close()
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
+
+    prepare_selection_window_cache(
+        database, request, SelectionConfig(), workers=2, include_equity_regime=True,
+    )
+
+    with duckdb.connect(str(database), read_only=True) as check:
+        regime_result_ids = tuple(row[0] for row in check.execute(
+            "select result_id from equity_quality_metrics where algo_version = ? order by result_id",
+            [EQUITY_REGIME_ALGORITHM_VERSION],
+        ).fetchall())
+        assert regime_result_ids == expected_result_ids
+        assert check.execute(
+            "select count(*) from equity_quality_metrics where algo_version <> ?",
+            [EQUITY_REGIME_ALGORITHM_VERSION],
+        ).fetchone() == (0,)
+        assert selection_cache_missing_strategy_ids(
+            check, request, SelectionConfig(), include_equity_regime=True,
+        ) == ()
+
+
 @pytest.mark.parametrize("consumer", ["filter_equity_regime", "equity_quality_rank"])
 def test_equity_regime_stale_same_version_cache_is_upserted_by_explicit_warm(
     tmp_path: Path, consumer: str,
@@ -2801,12 +2867,54 @@ def test_selection_cache_status_matches_enabled_equity_consumers(
             check, request, SelectionConfig(), include_equity=True,
         )
 
-    assert status["ready"] is True
-    assert status["missing"] == 0
+    assert status["ready"] is (not expected_missing)
+    assert status["missing"] == int(expected_missing)
+    assert status["window_missing"] == 0
     assert status["equity_missing"] == 0
     assert status["regime_missing"] == int(expected_missing)
     assert status["warm_missing"] == int(expected_missing)
     assert missing_ids == ((strategy_id,) if expected_missing else ())
+
+
+def test_filter_equity_regime_status_requires_regime_cache_without_quality_opt_in(tmp_path: Path) -> None:
+    connection = _candidate_db(tmp_path)
+    database = tmp_path / "strategy_performance.duckdb"
+    connection.close()
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "filter_equity_regime", "enabled": True, "scope": "pair_side"},
+    ]})
+    prepare_selection_window_cache(
+        database, request, SelectionConfig(), workers=1, include_equity=False,
+        include_equity_regime=False,
+    )
+
+    with duckdb.connect(str(database), read_only=True) as check:
+        status = selection_cache_status(
+            check, request, SelectionConfig(), include_equity=False, include_readiness_breakdown=True,
+        )
+
+    assert status == {
+        "total": 1, "missing": 1, "ready": False,
+        "window_missing": 0, "equity_missing": 0, "regime_missing": 1, "warm_missing": 1,
+    }
+
+    # The default follows the active regime consumer even when quality facts
+    # were not requested, so the normal prepare path warms the regime cache.
+    prepare_selection_window_cache(database, request, SelectionConfig(), workers=1, include_equity=False)
+    with duckdb.connect(str(database), read_only=True) as check:
+        status = selection_cache_status(
+            check, request, SelectionConfig(), include_equity=False, include_readiness_breakdown=True,
+        )
+        assert status["ready"] is True
+        assert status["regime_missing"] == 0
+        assert check.execute(
+            "select count(*) from equity_quality_metrics where algo_version = ?",
+            [EQUITY_REGIME_ALGORITHM_VERSION],
+        ).fetchone() == (1,)
+        assert check.execute(
+            "select count(*) from equity_quality_metrics where algo_version <> ?",
+            [EQUITY_REGIME_ALGORITHM_VERSION],
+        ).fetchone() == (0,)
 
 
 def test_equity_publication_rechecks_source_revision_and_rolls_back_current_batch(
