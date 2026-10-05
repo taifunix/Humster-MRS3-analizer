@@ -1,5 +1,18 @@
 # MRS3 — current verification
 
+## Performance v2 Panel recalculation connection fix (2026-10-05)
+
+The live PerformanceDB on D: is schema v9, and the restarted Panel serves it on
+port 8766. Per-pair and all-pair recalculation had failed with DuckDB's
+same-file/different-configuration error when Panel read-only and read-write
+connections overlapped. Panel PerformanceDB access now shares its controller
+RLock; a complete v9 preflight stays read-only, while missing repairable v9
+columns still trigger the existing repair. The final panel test module passed
+145 tests with 4 Windows symlink skips; focused two-worker and schema-cache
+regressions passed. Independent Opus 5/high review returned CODE_REVIEW_PASS.
+The user is checking the live PURR recalculation; the separate in-process
+PerformanceV2 importer does not use this controller lock.
+
 ## READY JSON button diagnostic (2026-10-04)
 
 On the running static Panel, the operator selected 1386 LONG candidates but

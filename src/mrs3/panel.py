@@ -4046,7 +4046,7 @@ class PanelController:
         if not target.is_file():
             return {"count": 0, "retest_count": 0, "active_count": 0, "phase": "IDLE"}
         try:
-            with duckdb.connect(str(target), read_only=True) as connection:
+            with self._performance_v2_writer_lock, duckdb.connect(str(target), read_only=True) as connection:
                 status = retest_status(connection)
                 defaults = self._retest_default_dates(connection) if status.active_count else None
         except (duckdb.Error, OSError, PerformanceV2StoreError) as error:
@@ -4237,7 +4237,7 @@ class PanelController:
             return reusable
         listing_path, listing_relative = self._retest_listing_context()
         templates = self._workflow_defaults().get("strategy_templates", {})
-        with duckdb.connect(str(target), read_only=True) as connection:
+        with self._performance_v2_writer_lock, duckdb.connect(str(target), read_only=True) as connection:
             start, end = self._retest_range(payload, connection)
             self._validate_retest_listing(connection, listing_path, start)
             batch = build_retest_manifest(
@@ -4305,7 +4305,7 @@ class PanelController:
             raise ValueError("RETEST inbox must be a committed SINGLE_MODE snapshot")
         config = self._performance_v2_config()
         target = performance_v2_database_path(config)
-        with duckdb.connect(str(target), read_only=True) as connection:
+        with self._performance_v2_writer_lock, duckdb.connect(str(target), read_only=True) as connection:
             rows = connection.execute(
                 """
                 select s.strategy_name, s.strategy_id
@@ -4410,6 +4410,8 @@ class PanelController:
             try:
                 if stat.st_size == 0:
                     self._initialize_missing_performance_v2_target(self._performance_v2_config())
+                version = None
+                v9_repair_required = False
                 with duckdb.connect(str(target), read_only=True) as connection:
                     has_schema_info = connection.execute(
                         "select count(*) from information_schema.tables "
@@ -4433,9 +4435,31 @@ class PanelController:
                             )
                         if version == "9":
                             require_performance_v2_readable(connection)
-                with duckdb.connect(str(target)) as connection:
-                    initialize_performance_v2(connection)
-                    require_performance_v2(connection)
+                            repairable_columns = {
+                                ("window_metrics", "holding_seconds"),
+                                ("window_metrics", "time_in_market_pct"),
+                                ("strategy_results", "reported_start_utc"),
+                                ("strategy_results", "reported_end_utc"),
+                                ("strategy_results", "listing_date_utc"),
+                                ("strategy_results", "listing_date_raw"),
+                                ("strategy_results", "listing_date_source"),
+                                ("strategy_results", "effective_start_utc"),
+                                ("strategy_results", "effective_end_utc"),
+                                ("strategy_results", "warmup_hours"),
+                                ("strategy_results", "excluded_trade_count"),
+                                ("strategy_results", "exclusion_reason"),
+                                ("strategy_results", "optimizer_source_metadata_json"),
+                            }
+                            existing_columns = set(connection.execute(
+                                """select table_name, column_name from information_schema.columns
+                                    where table_schema = 'main'
+                                      and table_name in ('window_metrics', 'strategy_results')"""
+                            ).fetchall())
+                            v9_repair_required = not repairable_columns.issubset(existing_columns)
+                if version != "9" or v9_repair_required:
+                    with duckdb.connect(str(target)) as connection:
+                        initialize_performance_v2(connection)
+                        require_performance_v2(connection)
             except PerformanceV2ApiError:
                 raise
             except PerformanceV2StoreError as error:
@@ -4687,7 +4711,7 @@ class PanelController:
         if not target.is_file():
             return {"strategies": [], "selection_config": selection_config}
         try:
-            with duckdb.connect(str(target), read_only=True) as connection:
+            with self._performance_v2_writer_lock, duckdb.connect(str(target), read_only=True) as connection:
                 require_performance_v2_readable(connection)
                 catalog = performance_v2_catalog(connection)
                 pairs_with_runs: list[str] = []
@@ -4717,12 +4741,13 @@ class PanelController:
             target = performance_v2_database_path(config)
         except (OSError, TypeError, ValueError) as error:
             raise PerformanceV2ApiError("PERFORMANCE_DB_UNAVAILABLE", status=503, message="PerformanceDB is unavailable.") from error
-        return export_performance_v2(
-            target,
-            selection,
-            selection_config=load_selection_config(self.default_config.with_name("config.performance.json")),
-            now=now,
-        )
+        with self._performance_v2_writer_lock:
+            return export_performance_v2(
+                target,
+                selection,
+                selection_config=load_selection_config(self.default_config.with_name("config.performance.json")),
+                now=now,
+            )
 
     def performance_v2_windows(self, payload: Mapping[str, object]) -> dict[str, object]:
         if not isinstance(payload, Mapping):
@@ -4733,7 +4758,8 @@ class PanelController:
         if not target.is_file():
             raise PerformanceV2ApiError("PERFORMANCE_V2_NOT_FOUND", status=404, message="Performance v2 database is unavailable")
         self._ensure_performance_v2_schema(target)
-        return calculate_performance_v2_windows(target, strategy_id, window_a, window_b)
+        with self._performance_v2_writer_lock:
+            return calculate_performance_v2_windows(target, strategy_id, window_a, window_b)
 
     def strategies_performance_v2_windows(self, payload: Mapping[str, object]) -> dict[str, object]:
         return self.performance_v2_windows(payload)
@@ -4845,7 +4871,7 @@ class PanelController:
         if not target.is_file():
             raise FinalistRetestError("PERFORMANCE_V2_NOT_FOUND", "Performance v2 database is unavailable")
         templates = self._workflow_defaults().get("strategy_templates", {})
-        with duckdb.connect(str(target), read_only=True) as connection:
+        with self._performance_v2_writer_lock, duckdb.connect(str(target), read_only=True) as connection:
             start, end = self._bulk_retest_range(payload, listing_dates, connection, include_reserve)
             current_cohort = freeze_finalist_cohort(
                 connection, test_start=start, test_end=end,
@@ -4880,7 +4906,7 @@ class PanelController:
             # Terminal all-failure jobs intentionally fall through and create
             # a new frozen run for a fresh retry.
         run_id = f"finalist-retest-{uuid.uuid4().hex}"
-        with duckdb.connect(str(target), read_only=True) as connection:
+        with self._performance_v2_writer_lock, duckdb.connect(str(target), read_only=True) as connection:
             batch = build_finalist_retest_manifest(
                 connection, templates if isinstance(templates, Mapping) else {},
                 config.strategy_root.parent if config.strategy_root is not None else self.root / "Output",
@@ -4918,7 +4944,7 @@ class PanelController:
         target = performance_v2_database_path(self._performance_v2_config())
         if not target.is_file():
             raise FinalistRetestError("PERFORMANCE_V2_NOT_FOUND", "Performance v2 database is unavailable")
-        with duckdb.connect(str(target), read_only=True) as connection:
+        with self._performance_v2_writer_lock, duckdb.connect(str(target), read_only=True) as connection:
             start, end = self._bulk_retest_range({}, listing_dates, connection, include_reserve)
             cohort = freeze_finalist_cohort(
                 connection, test_start=start, test_end=end,
@@ -5027,7 +5053,7 @@ class PanelController:
         current: dict[int, int | None] = {}
         if child.get("state") == "COMMITTED" and target.is_file():
             try:
-                with duckdb.connect(str(target), read_only=True) as connection:
+                with self._performance_v2_writer_lock, duckdb.connect(str(target), read_only=True) as connection:
                     current = {int(strategy_id): (None if result_id is None else int(result_id)) for strategy_id, result_id in connection.execute("select strategy_id, current_result_id from strategies").fetchall()}
             except duckdb.Error:
                 return
@@ -5137,7 +5163,7 @@ class PanelController:
         target = performance_v2_database_path(performance_config)
         if not target.is_file():
             raise FinalistRetestError("PERFORMANCE_V2_NOT_FOUND")
-        with duckdb.connect(str(target), read_only=True) as connection:
+        with self._performance_v2_writer_lock, duckdb.connect(str(target), read_only=True) as connection:
             current_members = current_effective_finalist_members(connection, include_reserve=include_reserve)
             if not current_members:
                 raise FinalistRetestError("COHORT_EMPTY", "there are no current effective finalists")
@@ -5342,7 +5368,7 @@ class PanelController:
                     # cohort export.  A legacy run may have no decodable stage
                     # payload, in which case the pipeline's ordinary empty
                     # stage behavior remains the safe fallback.
-                    with duckdb.connect(str(target), read_only=True) as connection:
+                    with self._performance_v2_writer_lock, duckdb.connect(str(target), read_only=True) as connection:
                         latest_request = connection.execute(
                             "select request_json from selection_runs where symbol = ? and side = ? order by created_at_utc desc, selection_run_id desc limit 1",
                             [symbol, side],
@@ -5358,14 +5384,15 @@ class PanelController:
                         base, job_id,
                         {strategy_id: int(success_members[strategy_id].get("new_result_id", member["result_id"])) for strategy_id, member in group_members.items()},
                     )
-                    with duckdb.connect(str(target), read_only=True) as connection:
+                    with self._performance_v2_writer_lock, duckdb.connect(str(target), read_only=True) as connection:
                         require_performance_v2(connection)
                         cache = selection_cache_status(connection, cohort_request, selection_config)
                     if not cache.get("ready"):
-                        with duckdb.connect(str(target), read_only=True) as connection:
+                        with self._performance_v2_writer_lock, duckdb.connect(str(target), read_only=True) as connection:
                             missing = selection_cache_missing_strategy_ids(connection, cohort_request, selection_config)
-                        prepare_selection_window_cache(target, cohort_request, selection_config, performance_config.workers, missing)
-                    with duckdb.connect(str(target), read_only=True) as connection:
+                        with self._performance_v2_writer_lock:
+                            prepare_selection_window_cache(target, cohort_request, selection_config, performance_config.workers, missing)
+                    with self._performance_v2_writer_lock, duckdb.connect(str(target), read_only=True) as connection:
                         if not selection_cache_status(connection, cohort_request, selection_config).get("ready"):
                             raise FinalistRetestError("SELECTION_CACHE_INCOMPLETE")
                         result = run_selection(
@@ -5471,7 +5498,7 @@ class PanelController:
             "immutable_content_sha256": canonical_digest(immutable),
             "groups_sha256": canonical_digest(group_digest_rows), "failures_sha256": canonical_digest(failure_digest_rows),
         }
-        with duckdb.connect(str(target), read_only=True) as connection:
+        with self._performance_v2_writer_lock, duckdb.connect(str(target), read_only=True) as connection:
             metadata["database_instance_id"] = connection.execute("select value from schema_info where key='database_instance_id'").fetchone()[0]
         candidate_workbook = self._finalist_control_candidate_workbook(
             candidates,
@@ -5526,7 +5553,7 @@ class PanelController:
         if not target.is_file():
             raise PerformanceV2ApiError("PERFORMANCE_V2_NOT_FOUND", status=404, message="Performance v2 database is unavailable")
         try:
-            with duckdb.connect(str(target), read_only=True) as connection:
+            with self._performance_v2_writer_lock, duckdb.connect(str(target), read_only=True) as connection:
                 connection.execute(f"set threads to {performance_config.workers}")
                 schema_version = require_performance_v2_readable(connection)
                 cache_status = selection_cache_status(
@@ -5623,7 +5650,7 @@ class PanelController:
         selection_config = load_selection_config(self.default_config.with_name("config.performance.json"))
         try:
             with tempfile.TemporaryDirectory() as directory:
-                with duckdb.connect(str(target), read_only=True) as connection:
+                with self._performance_v2_writer_lock, duckdb.connect(str(target), read_only=True) as connection:
                     metadata = new_run_metadata(connection, request=request)
                     user_review_rows = latest_user_reviews_by_strategy(
                         connection, [int(strategy_id) for strategy_id in result["strategy_id"]]
@@ -5704,7 +5731,7 @@ class PanelController:
         if not target.is_file():
             raise PerformanceV2ApiError("PERFORMANCE_V2_NOT_FOUND", status=404, message="Performance v2 database is unavailable")
         try:
-            with duckdb.connect(str(target), read_only=True) as connection:
+            with self._performance_v2_writer_lock, duckdb.connect(str(target), read_only=True) as connection:
                 require_performance_v2_readable(connection)
                 # Equity consumers receive readiness counts; both-off stays legacy-shaped.
                 return selection_cache_status(

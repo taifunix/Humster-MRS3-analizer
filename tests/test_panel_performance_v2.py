@@ -3030,6 +3030,266 @@ def test_selection_recalculate_passes_only_missing_strategy_ids(tmp_path: Path, 
     assert calls and calls[0][0][-1] == (17, 23) and calls[0][1] == {"include_equity": True}
 
 
+def test_valid_v9_schema_check_does_not_open_writer_with_reader_present(tmp_path: Path) -> None:
+    controller, database, _ = _controller_for_windows(tmp_path)
+
+    with duckdb.connect(str(database), read_only=True) as reader:
+        assert reader.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("9",)
+        controller._ensure_performance_v2_schema(database)
+
+
+def test_cached_v9_schema_check_skips_reopen_with_reader_present(tmp_path: Path, monkeypatch) -> None:
+    controller, database, _ = _controller_for_windows(tmp_path)
+    controller._ensure_performance_v2_schema(database)
+
+    with duckdb.connect(str(database), read_only=True) as reader:
+        assert reader.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("9",)
+
+        def unexpected_reopen(*_args, **_kwargs):
+            raise AssertionError("schema cache hit reopened the database")
+
+        monkeypatch.setattr(panel_module.duckdb, "connect", unexpected_reopen)
+        controller._ensure_performance_v2_schema(database)
+
+
+def test_v9_schema_check_rejects_malformed_catalog(tmp_path: Path) -> None:
+    controller, database, _ = _controller_for_windows(tmp_path)
+    with duckdb.connect(str(database)) as connection:
+        connection.execute("drop table strategy_rejection_sources")
+
+    with pytest.raises(PerformanceV2ApiError) as raised:
+        controller._ensure_performance_v2_schema(database)
+
+    assert raised.value.code == "PERFORMANCE_V2_SCHEMA_INVALID"
+    assert raised.value.status == 500
+
+
+def test_v9_schema_check_repairs_missing_window_column(tmp_path: Path) -> None:
+    controller, database, _ = _controller_for_windows(tmp_path)
+    with duckdb.connect(str(database)) as connection:
+        connection.execute("alter table window_metrics drop column holding_seconds")
+
+    controller._ensure_performance_v2_schema(database)
+
+    with duckdb.connect(str(database), read_only=True) as connection:
+        repaired = connection.execute(
+            """select data_type from information_schema.columns
+                where table_schema = 'main' and table_name = 'window_metrics'
+                  and column_name = 'holding_seconds'"""
+        ).fetchone()
+    assert repaired == ("DECIMAL(38,12)",)
+
+
+@pytest.mark.parametrize("recalculate_all", [False, True])
+def test_recalculate_serializes_catalog_reader(
+    tmp_path: Path, monkeypatch, recalculate_all: bool,
+) -> None:
+    controller, database, _ = _controller_for_windows(tmp_path)
+    controller._ensure_performance_v2_schema(database)
+    writer_open = threading.Event()
+    release_writer = threading.Event()
+    reader_start = threading.Event()
+    catalog_entered = threading.Event()
+    lock_attempt = threading.Event()
+    recalculate_results: list[dict[str, object]] = []
+    catalog_results: list[dict[str, object]] = []
+    errors: list[Exception] = []
+
+    class TrackingRLock:
+        def __init__(self) -> None:
+            self._lock = threading.RLock()
+
+        def __enter__(self):
+            lock_attempt.set()
+            self._lock.acquire()
+            return self
+
+        def __exit__(self, *_args) -> None:
+            self._lock.release()
+
+    controller._performance_v2_writer_lock = TrackingRLock()
+    connect = duckdb.connect
+    catalog = panel_module.performance_v2_catalog
+
+    def track_catalog(connection):
+        catalog_entered.set()
+        return catalog(connection)
+
+    def paused_prepare(path, *_args, on_batch_complete=None, **_kwargs):
+        with connect(str(path)):
+            writer_open.set()
+            assert release_writer.wait(5)
+        if on_batch_complete is not None:
+            on_batch_complete(1)
+
+    monkeypatch.setattr(panel_module, "performance_v2_catalog", track_catalog)
+    monkeypatch.setattr(panel_module, "prepare_selection_window_cache", paused_prepare)
+
+    def recalculate() -> None:
+        try:
+            result = (
+                controller.strategies_performance_v2_recalculate_all()
+                if recalculate_all
+                else controller.strategies_performance_v2_recalculate({"symbol": "BTCUSDT", "side": "LONG"})
+            )
+            recalculate_results.append(result)
+        except Exception as error:
+            errors.append(error)
+
+    def read_catalog() -> None:
+        reader_start.set()
+        try:
+            catalog_results.append(controller.strategies_performance_v2_catalog())
+        except Exception as error:
+            errors.append(error)
+
+    writer = threading.Thread(target=recalculate)
+    reader = threading.Thread(target=read_catalog)
+    writer.start()
+    try:
+        assert writer_open.wait(5)
+        lock_attempt.clear()
+        reader.start()
+        assert reader_start.wait(5)
+        deadline = time.monotonic() + 5
+        while not lock_attempt.is_set() and not catalog_entered.is_set() and time.monotonic() < deadline:
+            time.sleep(.005)
+        assert lock_attempt.is_set()
+        assert not catalog_entered.is_set()
+    finally:
+        release_writer.set()
+        writer.join(timeout=5)
+        if reader.ident is not None:
+            reader.join(timeout=5)
+
+    assert not writer.is_alive()
+    assert not reader.is_alive()
+    assert not errors
+    assert len(recalculate_results) == len(catalog_results) == 1
+    assert recalculate_results[0]["status"] == "READY"
+    if recalculate_all:
+        assert recalculate_results[0]["total_pairs"] > 0
+        assert recalculate_results[0]["recalculated_pairs"] > 0
+        assert controller.strategies_performance_v2_recalculate_all_progress()["status"] == "READY"
+    assert catalog_results[0]["strategies"]
+    assert all(strategy["symbol"] == "BTCUSDT" for strategy in catalog_results[0]["strategies"])
+
+
+def test_recalculate_runs_real_window_workers_under_controller_lock(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    controller, database, first_result_id = _controller_for_windows(tmp_path)
+    config_path = tmp_path / "config.performance.json"
+    config_path.write_text(
+        json.dumps({"unified_performance_v2": {"database_root": "data", "workers": 2}}),
+        encoding="utf-8",
+    )
+    with duckdb.connect(str(database)) as connection:
+        now = datetime(2026, 1, 1, tzinfo=UTC)
+        strategy_id = int(connection.execute(
+            """insert into strategies (strategy_name, symbol, side, timeframe, close_ma_len,
+               order_count, analysis_run_id, candidate_identity, lifecycle_status,
+               created_at_utc, updated_at_utc) values ('beta', 'BTCUSDT', 'LONG', '1h',
+               3, 1, 'run', 'candidate-beta', 'ACTIVE', ?, ?) returning strategy_id""",
+            [now, now],
+        ).fetchone()[0])
+        result_id = int(connection.execute(
+            """insert into strategy_results (strategy_id, report_start_utc, report_end_utc, exchange,
+               commission_rate, initial_balance, final_balance, total_pnl, total_pnl_pct,
+               max_drawdown, max_drawdown_pct, total_fees, total_trades, imported_at_utc)
+               select ?, report_start_utc, report_end_utc, exchange, commission_rate, initial_balance,
+                      final_balance, total_pnl, total_pnl_pct, max_drawdown, max_drawdown_pct,
+                      total_fees, total_trades, imported_at_utc
+                 from strategy_results where result_id = ? returning result_id""",
+            [strategy_id, first_result_id],
+        ).fetchone()[0])
+        connection.execute(
+            "update strategies set current_result_id = ? where strategy_id = ?", [result_id, strategy_id]
+        )
+        connection.execute(
+            """insert into strategy_actions (result_id, action_index, timestamp_utc, symbol, order_id,
+                   action, size, post_size, post_side, pnl, fee, balance, price, cost, raw_action_json)
+               select ?, action_index, timestamp_utc, symbol, order_id, action, size, post_size,
+                      post_side, pnl, fee, balance, price, cost, raw_action_json
+                 from strategy_actions where result_id = ?""",
+            [result_id, first_result_id],
+        )
+        connection.execute(
+            "insert into strategy_equity select ?, sample_index, timestamp_utc, wallet, equity from strategy_equity where result_id = ?",
+            [result_id, first_result_id],
+        )
+
+    workers_entered = threading.Event()
+    release_workers = threading.Event()
+    worker_ids: list[int] = []
+    recalculate_results: list[dict[str, object]] = []
+    errors: list[Exception] = []
+
+    class TrackingRLock:
+        def __init__(self) -> None:
+            self._lock = threading.RLock()
+            self.depth = 0
+            self.owner_thread_id: int | None = None
+
+        def __enter__(self):
+            self._lock.acquire()
+            thread_id = threading.get_ident()
+            if self.depth == 0:
+                self.owner_thread_id = thread_id
+            else:
+                assert self.owner_thread_id == thread_id
+            self.depth += 1
+            return self
+
+        def __exit__(self, *_args) -> None:
+            assert self.owner_thread_id == threading.get_ident()
+            self.depth -= 1
+            if self.depth == 0:
+                self.owner_thread_id = None
+            self._lock.release()
+
+    tracking_lock = TrackingRLock()
+    controller._performance_v2_writer_lock = tracking_lock
+    import mrs3.performance_v2_selection as selection_module
+    real_worker = selection_module._selection_window_job_from_args
+    orchestrator_thread_id: int | None = None
+
+    def gated_worker(args):
+        assert orchestrator_thread_id is not None
+        assert tracking_lock.owner_thread_id == orchestrator_thread_id
+        assert tracking_lock.depth > 0
+        worker_ids.append(int(args[1]))
+        if len(worker_ids) == 2:
+            workers_entered.set()
+        assert release_workers.wait(5)
+        return real_worker(args)
+
+    monkeypatch.setattr(selection_module, "_selection_window_job_from_args", gated_worker)
+
+    def recalculate() -> None:
+        nonlocal orchestrator_thread_id
+        orchestrator_thread_id = threading.get_ident()
+        try:
+            recalculate_results.append(controller.strategies_performance_v2_recalculate({
+                "symbol": "BTCUSDT", "side": "LONG",
+            }))
+        except Exception as error:
+            errors.append(error)
+
+    writer = threading.Thread(target=recalculate)
+    writer.start()
+    try:
+        assert workers_entered.wait(10)
+        assert len(set(worker_ids)) == 2
+    finally:
+        release_workers.set()
+        writer.join(timeout=10)
+
+    assert not writer.is_alive()
+    assert not errors
+    assert recalculate_results == [{"status": "READY"}]
+
+
 @pytest.mark.parametrize(
     ("schema", "code", "status"),
     [("v5", "EQUITY_SCHEMA_UPGRADE_REQUIRED", 409), ("invalid_v6", "PERFORMANCE_V2_SCHEMA_INVALID", 500)],
