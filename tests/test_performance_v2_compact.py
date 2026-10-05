@@ -456,3 +456,335 @@ def test_compact_rejects_corrupt_prepared_stream_without_publishing(tmp_path: Pa
 def test_typed_comparison_preserves_float_signed_zero() -> None:
     assert not compact_module._equal(-0.0, 0.0)
     assert compact_module._equal(float("nan"), float("nan"))
+
+
+def test_verify_existing_candidate_compares_large_tables_and_publishes_hardlink(
+    tmp_path: Path,
+) -> None:
+    from tests.test_performance_v2_selection import _candidate_db
+
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    source_connection = _candidate_db(source_dir)
+    source_connection.close()
+    source = source_dir / "strategy_performance.duckdb"
+    candidate = tmp_path / "candidate.duckdb"
+    shutil.copyfile(source, candidate)
+    source_before = compact_module._sha256(source)
+    candidate_before = compact_module._sha256(candidate)
+    output = tmp_path / "published.duckdb"
+    progress: list[dict[str, object]] = []
+
+    report = compact_module.verify_existing_candidate(
+        source, candidate, output, workers=1, spill_parent=tmp_path,
+        progress_callback=progress.append,
+    )
+
+    assert report["verified_table_counts"]["strategy_actions"] == 3
+    assert report["verified_table_counts"]["strategy_equity"] == 4
+    assert report["publication"] == "hardlink_alias_not_backup"
+    assert os.path.samefile(candidate, output)
+    assert compact_module._sha256(source) == source_before
+    assert compact_module._sha256(candidate) == candidate_before
+    assert {event["table"] for event in progress if event["phase"] == "verify_range"} == {
+        "strategy_actions", "strategy_equity",
+    }
+
+
+def test_verify_existing_candidate_mismatch_preserves_candidate_and_skips_publication(
+    tmp_path: Path,
+) -> None:
+    from tests.test_performance_v2_selection import _candidate_db
+
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    source_connection = _candidate_db(source_dir)
+    source_connection.close()
+    source = source_dir / "strategy_performance.duckdb"
+    candidate = tmp_path / "candidate.duckdb"
+    shutil.copyfile(source, candidate)
+    with duckdb.connect(str(candidate)) as connection:
+        connection.execute("update strategy_equity set equity = 999 where sample_index = 0")
+    candidate_before = compact_module._sha256(candidate)
+    output = tmp_path / "published.duckdb"
+
+    with pytest.raises(ValueError, match="EXCEPT ALL mismatch in strategy_equity"):
+        compact_module.verify_existing_candidate(
+            source, candidate, output, workers=1, spill_parent=tmp_path,
+        )
+
+    assert compact_module._sha256(candidate) == candidate_before
+    assert not output.exists()
+
+
+def test_verify_existing_candidate_rejects_candidate_only_result_id_range(
+    tmp_path: Path,
+) -> None:
+    from tests.test_performance_v2_selection import _candidate_db
+
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    source_connection = _candidate_db(source_dir)
+    source_connection.close()
+    source = source_dir / "strategy_performance.duckdb"
+    candidate = tmp_path / "candidate.duckdb"
+    shutil.copyfile(source, candidate)
+    with duckdb.connect(str(candidate)) as connection:
+        strategy_id = connection.execute(
+            """insert into strategies (strategy_name, symbol, side, timeframe, close_ma_len,
+               order_count, analysis_run_id, candidate_identity, lifecycle_status,
+               created_at_utc, updated_at_utc) values ('candidate-only', 'ETHUSDT', 'LONG',
+               '1h', 3, 1, 'run', 'candidate-only-999', 'ACTIVE', now(), now())
+               returning strategy_id"""
+        ).fetchone()[0]
+        connection.execute(
+            """insert into strategy_results (result_id, strategy_id, report_start_utc,
+               report_end_utc, exchange, commission_rate, initial_balance, final_balance,
+               total_pnl, total_pnl_pct, max_drawdown, max_drawdown_pct, total_fees,
+               total_trades, imported_at_utc)
+               values (999, ?, now(), now(), 'Bybit', .0004, 100, 110, 10, 10, 5, 5, 2, 2, now())""",
+            [strategy_id],
+        )
+        connection.execute("update strategy_actions set result_id = 999 where action_index = 2")
+    candidate_before = compact_module._sha256(candidate)
+    output = tmp_path / "published.duckdb"
+
+    with pytest.raises(ValueError):
+        compact_module.verify_existing_candidate(
+            source, candidate, output, workers=1, spill_parent=tmp_path,
+        )
+
+    assert compact_module._sha256(candidate) == candidate_before
+    assert not output.exists()
+
+
+def test_verify_existing_candidate_fails_closed_on_oversized_range(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tests.test_performance_v2_selection import _candidate_db
+
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    source_connection = _candidate_db(source_dir)
+    source_connection.close()
+    source = source_dir / "strategy_performance.duckdb"
+    candidate = tmp_path / "candidate.duckdb"
+    shutil.copyfile(source, candidate)
+    monkeypatch.setattr(compact_module, "MAX_FAST_VERIFY_RANGE_ROWS", 2)
+
+    with pytest.raises(ValueError, match="exceeds fast verification limit"):
+        compact_module.verify_existing_candidate(
+            source, candidate, tmp_path / "published.duckdb", workers=1,
+            spill_parent=tmp_path,
+        )
+
+
+def test_verify_existing_candidate_smoke_checks_ranges_without_publication(
+    tmp_path: Path,
+) -> None:
+    from tests.test_performance_v2_selection import _candidate_db
+
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    source_connection = _candidate_db(source_dir)
+    source_connection.close()
+    source = source_dir / "strategy_performance.duckdb"
+    candidate = tmp_path / "candidate.duckdb"
+    shutil.copyfile(source, candidate)
+
+    report = compact_module.verify_existing_candidate(
+        source, candidate, workers=1, spill_parent=tmp_path, smoke_ranges=1,
+    )
+
+    assert report["partial"] is True
+    assert report["publication"] is None
+    assert report["verified_ranges"] == {"strategy_actions": 1, "strategy_equity": 1}
+
+
+def test_verify_existing_candidate_refuses_existing_publication_path(tmp_path: Path) -> None:
+    from tests.test_performance_v2_selection import _candidate_db
+
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    source_connection = _candidate_db(source_dir)
+    source_connection.close()
+    source = source_dir / "strategy_performance.duckdb"
+    candidate = tmp_path / "candidate.duckdb"
+    shutil.copyfile(source, candidate)
+    output = tmp_path / "published.duckdb"
+    output.write_bytes(b"keep")
+
+    with pytest.raises(FileExistsError):
+        compact_module.verify_existing_candidate(
+            source, candidate, output, workers=1, spill_parent=tmp_path,
+        )
+
+    assert output.read_bytes() == b"keep"
+    assert not os.path.samefile(candidate, output)
+
+
+def test_verify_existing_candidate_does_not_replace_concurrent_output(tmp_path: Path) -> None:
+    from tests.test_performance_v2_selection import _candidate_db
+
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    source_connection = _candidate_db(source_dir)
+    source_connection.close()
+    source = source_dir / "strategy_performance.duckdb"
+    candidate = tmp_path / "candidate.duckdb"
+    shutil.copyfile(source, candidate)
+    candidate_before = compact_module._sha256(candidate)
+    output = tmp_path / "published.duckdb"
+    planted = False
+
+    def create_output_before_link(event: dict[str, object]) -> None:
+        nonlocal planted
+        if not planted and event.get("phase") == "verify" and event.get("table") == "strategy_rejection_sources":
+            output.write_bytes(b"created concurrently")
+            planted = True
+
+    with pytest.raises(FileExistsError):
+        compact_module.verify_existing_candidate(
+            source, candidate, output, workers=1, spill_parent=tmp_path,
+            progress_callback=create_output_before_link,
+        )
+
+    assert planted
+    assert output.read_bytes() == b"created concurrently"
+    assert compact_module._sha256(candidate) == candidate_before
+    assert not os.path.samefile(candidate, output)
+
+
+def test_compact_uses_sql_fast_verifier_for_action_and_equity_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tests.test_performance_v2_selection import _candidate_db
+
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    source_connection = _candidate_db(source_dir)
+    source_connection.close()
+    checked: list[str] = []
+    original = compact_module._verify_fast_table
+
+    def record_fast_table(*args, **kwargs):
+        checked.append(args[1])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(compact_module, "_verify_fast_table", record_fast_table)
+    compact_performance_v2(
+        source_dir / "strategy_performance.duckdb", tmp_path / "compact.duckdb",
+        workers=1,
+    )
+
+    assert checked == ["strategy_actions", "strategy_equity"]
+
+
+def test_compact_falls_back_to_typed_rows_when_fast_metadata_is_unsupported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tests.test_performance_v2_selection import _candidate_db
+
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    source_connection = _candidate_db(source_dir)
+    source_connection.close()
+    events: list[dict[str, object]] = []
+
+    def unsupported(*_args, **_kwargs):
+        raise compact_module._FastVerifyUnsupported
+
+    monkeypatch.setattr(compact_module, "_fast_column_signature", unsupported)
+    report = compact_performance_v2(
+        source_dir / "strategy_performance.duckdb", tmp_path / "compact.duckdb",
+        workers=1, progress_callback=events.append,
+    )
+
+    assert report["verified_table_counts"]["strategy_actions"] == 3
+    assert report["verified_table_counts"]["strategy_equity"] == 4
+    assert [event["table"] for event in events if event["phase"] == "verify_fallback"] == [
+        "strategy_actions", "strategy_equity",
+    ]
+
+
+def _candidate_verifier_cli():
+    import importlib.util
+
+    script = Path(__file__).parents[1] / "scripts" / "verify_performance_v2_candidate.py"
+    spec = importlib.util.spec_from_file_location("verify_performance_v2_candidate_cli", script)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_verify_candidate_cli_workers_override_config(tmp_path: Path, monkeypatch, capsys) -> None:
+    from types import SimpleNamespace
+
+    cli = _candidate_verifier_cli()
+    monkeypatch.setattr(cli, "load_duckdb_import_settings", lambda _path: SimpleNamespace(workers=30))
+    called: dict[str, object] = {}
+
+    def verify(*_args, **kwargs):
+        called.update(kwargs)
+        return {"partial": False}
+
+    monkeypatch.setattr(cli, "verify_existing_candidate", verify)
+
+    exit_code = cli.main([
+        "--source", str(tmp_path / "source.duckdb"),
+        "--candidate", str(tmp_path / "candidate.duckdb"),
+        "--output", str(tmp_path / "output.duckdb"),
+        "--config", "config.local.json",
+        "--spill-parent", str(tmp_path),
+        "--workers", "16",
+    ])
+
+    assert exit_code == 0
+    assert called["workers"] == 16
+    assert '"partial": false' in capsys.readouterr().out
+
+
+def test_verify_candidate_cli_uses_config_workers_without_override(
+    tmp_path: Path, monkeypatch, capsys,
+) -> None:
+    from types import SimpleNamespace
+
+    cli = _candidate_verifier_cli()
+    monkeypatch.setattr(cli, "load_duckdb_import_settings", lambda _path: SimpleNamespace(workers=30))
+    called: dict[str, object] = {}
+    monkeypatch.setattr(
+        cli, "verify_existing_candidate",
+        lambda *_args, **kwargs: (called.update(kwargs) or {"partial": False}),
+    )
+
+    exit_code = cli.main([
+        "--source", str(tmp_path / "source.duckdb"),
+        "--candidate", str(tmp_path / "candidate.duckdb"),
+        "--output", str(tmp_path / "output.duckdb"),
+        "--config", "config.local.json",
+        "--spill-parent", str(tmp_path),
+    ])
+
+    assert exit_code == 0
+    assert called["workers"] == 30
+    assert '"partial": false' in capsys.readouterr().out
+
+
+def test_verify_candidate_cli_rejects_nonpositive_worker_override(
+    tmp_path: Path, capsys,
+) -> None:
+    cli = _candidate_verifier_cli()
+
+    with pytest.raises(SystemExit) as error:
+        cli.main([
+            "--source", str(tmp_path / "source.duckdb"),
+            "--candidate", str(tmp_path / "candidate.duckdb"),
+            "--output", str(tmp_path / "output.duckdb"),
+            "--config", "config.local.json",
+            "--spill-parent", str(tmp_path),
+            "--workers", "0",
+        ])
+
+    assert error.value.code == 2
+    assert "workers must be a positive integer" in capsys.readouterr().err

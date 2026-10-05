@@ -76,8 +76,14 @@ PREPARED = "optimizer_prepared_inputs"
 RANGE_VALUES = 128
 FETCH_BATCH = 4096
 PREPARED_FETCH_BATCH = 16
+MAX_FAST_VERIFY_RANGE_ROWS = 20_000_000
 CAPACITY_RESERVE = 10 * 1024**3
 MEMORY_LIMIT = "16GB"
+FAST_VERIFY_TABLES = {"strategy_actions", "strategy_equity"}
+
+
+class _FastVerifyUnsupported(Exception):
+    pass
 
 
 def _ident(value: str) -> str:
@@ -565,6 +571,328 @@ def _verify_table(
     return checked
 
 
+def _fast_column_signature(
+    connection: duckdb.DuckDBPyConnection,
+    catalog: str,
+    table: str,
+) -> tuple[tuple[object, ...], ...]:
+    try:
+        duckdb_rows = connection.execute(
+            "select column_name, column_index, data_type, numeric_precision, numeric_scale "
+            "from duckdb_columns() where database_name = ? and schema_name = 'main' "
+            "and table_name = ? order by column_index",
+            [catalog, table],
+        ).fetchall()
+        information_rows = connection.execute(
+            "select column_name, ordinal_position, data_type, numeric_precision, numeric_scale, "
+            "collation_name, is_generated, generation_expression "
+            "from information_schema.columns where table_catalog = ? and table_schema = 'main' "
+            "and table_name = ? order by ordinal_position",
+            [catalog, table],
+        ).fetchall()
+    except duckdb.Error as exc:
+        raise _FastVerifyUnsupported from exc
+    if not duckdb_rows or len(duckdb_rows) != len(information_rows):
+        raise _FastVerifyUnsupported
+    signature: list[tuple[object, ...]] = []
+    for duckdb_row, information_row in zip(duckdb_rows, information_rows):
+        name, index, data_type, precision, scale = duckdb_row
+        info_name, ordinal, info_type, info_precision, info_scale, collation, generated, expression = information_row
+        if (
+            name != info_name or int(index) != int(ordinal)
+            or data_type != info_type or precision != info_precision or scale != info_scale
+        ):
+            raise _FastVerifyUnsupported
+        normalized_type = str(data_type).upper()
+        if (
+            "FLOAT" in normalized_type or "DOUBLE" in normalized_type
+            or normalized_type == "REAL" or collation is not None
+        ):
+            raise _FastVerifyUnsupported
+        signature.append((
+            str(name), str(data_type), precision, scale, collation,
+            str(generated), expression,
+        ))
+    return tuple(signature)
+
+
+def _fast_except_count(
+    connection: duckdb.DuckDBPyConnection,
+    table: str,
+    columns: Sequence[str],
+    left_catalog: str,
+    right_catalog: str,
+    low: object,
+    high: object,
+) -> int:
+    lead = _ident("result_id")
+    projection = ", ".join(_ident(column) for column in columns)
+    return int(connection.execute(
+        f"select count(*) from ("
+        f"select {projection} from {_ident(left_catalog)}.main.{_ident(table)} "
+        f"where {lead} between ? and ? except all "
+        f"select {projection} from {_ident(right_catalog)}.main.{_ident(table)} "
+        f"where {lead} between ? and ?"
+        ") as difference",
+        [low, high, low, high],
+    ).fetchone()[0])
+
+
+def _verify_fast_table(
+    connection: duckdb.DuckDBPyConnection,
+    table: str,
+    source_catalog: str,
+    target_catalog: str,
+    result_ranges: Sequence[tuple[object, object]],
+    callback: Callable[[dict[str, object]], object] | None,
+    *,
+    max_ranges: int | None = None,
+) -> int:
+    source_schema = _fast_column_signature(connection, source_catalog, table)
+    target_schema = _fast_column_signature(connection, target_catalog, table)
+    if source_schema != target_schema:
+        raise ValueError(f"source/target column schema mismatch for {table}")
+    columns = tuple(sorted(str(column[0]) for column in source_schema))
+    lead = _ident("result_id")
+    table_ref = f"{{catalog}}.main.{_ident(table)}"
+    if max_ranges is None:
+        source_count, source_nulls = connection.execute(
+            f"select count(*), count(*) filter (where {lead} is null) "
+            f"from {table_ref.format(catalog=_ident(source_catalog))}"
+        ).fetchone()
+        target_count, target_nulls = connection.execute(
+            f"select count(*), count(*) filter (where {lead} is null) "
+            f"from {table_ref.format(catalog=_ident(target_catalog))}"
+        ).fetchone()
+        source_count, target_count = int(source_count), int(target_count)
+        if int(source_nulls) or int(target_nulls):
+            raise ValueError(f"NULL result_id rows cannot be ranged in {table}")
+        if source_count != target_count:
+            raise ValueError(f"row count mismatch in {table}")
+    ranges = result_ranges[:max_ranges] if max_ranges is not None else result_ranges
+
+    checked = 0
+    range_count = len(ranges)
+    for range_index, (low, high) in enumerate(ranges, 1):
+        source_rows = _count_range(connection, table, low, high)
+        target_rows = int(connection.execute(
+            f"select count(*) from main.{_ident(table)} where {lead} between ? and ?",
+            [low, high],
+        ).fetchone()[0])
+        if source_rows != target_rows:
+            raise ValueError(f"range row count mismatch in {table}")
+        if max(source_rows, target_rows) > MAX_FAST_VERIFY_RANGE_ROWS:
+            raise ValueError(
+                f"result_id range exceeds fast verification limit in {table}: "
+                f"{MAX_FAST_VERIFY_RANGE_ROWS} rows"
+            )
+        if (
+            _fast_except_count(connection, table, columns, source_catalog, target_catalog, low, high)
+            or _fast_except_count(connection, table, columns, target_catalog, source_catalog, low, high)
+        ):
+            raise ValueError(f"EXCEPT ALL mismatch in {table}")
+        checked += source_rows
+        _progress(callback, {
+            "phase": "verify_range", "table": table,
+            "range_index": range_index, "range_count": range_count,
+            "result_id_low": low, "result_id_high": high,
+            "rows": source_rows, "checked_rows": checked,
+        })
+    if max_ranges is None and checked != source_count:
+        raise ValueError(f"result_id range count coverage mismatch in {table}")
+    _progress(callback, {"phase": "verify", "table": table, "rows": checked})
+    return checked
+
+
+def verify_existing_candidate(
+    source_path: Path | str,
+    candidate_path: Path | str,
+    output_path: Path | str | None = None,
+    *,
+    workers: int,
+    spill_parent: Path | str | None = None,
+    progress_callback: Callable[[dict[str, object]], object] | None = None,
+    smoke_ranges: int | None = None,
+) -> dict[str, object]:
+    """Read-only compare an existing candidate; smoke mode never publishes."""
+    if isinstance(workers, bool) or not isinstance(workers, int) or workers < 1:
+        raise ValueError("workers must be a positive integer")
+    if smoke_ranges is not None and (
+        isinstance(smoke_ranges, bool) or not isinstance(smoke_ranges, int) or smoke_ranges < 1
+    ):
+        raise ValueError("smoke_ranges must be a positive integer")
+    if smoke_ranges is not None and output_path is not None:
+        raise ValueError("smoke mode cannot publish an output")
+    if smoke_ranges is None and output_path is None:
+        raise ValueError("output_path is required outside smoke mode")
+    source = _source_path(Path(source_path))
+    candidate_input = Path(candidate_path).expanduser()
+    if candidate_input.is_symlink():
+        raise ValueError("candidate must not be a symlink")
+    candidate = _source_path(candidate_input)
+    if os.path.samefile(source, candidate):
+        raise ValueError("source and candidate alias the same database")
+    output = _output_path(Path(output_path), candidate) if output_path is not None else None
+    c_temp = Path(tempfile.gettempdir()).resolve()
+    if candidate.drive.upper() != c_temp.drive.upper():
+        raise ValueError("candidate and publication output must be on the C TEMP volume")
+    if output is not None and output.drive.upper() != candidate.drive.upper():
+        raise ValueError("candidate and publication output must be on the C TEMP volume")
+    if output is not None and candidate.stat().st_dev != output.parent.stat().st_dev:
+        raise ValueError("publication output must be on the candidate volume for hardlink publication")
+
+    spill_root = Path(spill_parent).expanduser().resolve(strict=True) if spill_parent else c_temp
+    if not spill_root.is_dir():
+        raise ValueError("spill parent must be an existing directory")
+    spill = Path(tempfile.mkdtemp(prefix="mrs3-fast-verify-", dir=str(spill_root))).resolve()
+    started = time.monotonic()
+    try:
+        _refuse_nonzero_wal(source)
+        _refuse_nonzero_wal(candidate)
+        source_before, candidate_before = _stat(source), _stat(candidate)
+        source_wal_before, candidate_wal_before = _wal_state(source), _wal_state(candidate)
+        source_hash_before: str | None = None
+        candidate_hash_before: str | None = None
+        if smoke_ranges is None:
+            _progress(progress_callback, {"phase": "snapshot", "file": "source", "state": "hash_before"})
+            source_hash_before = _sha256(source)
+            _progress(progress_callback, {"phase": "snapshot", "file": "candidate", "state": "hash_before"})
+            candidate_hash_before = _sha256(candidate)
+
+        with duckdb.connect(str(source), read_only=True) as source_connection:
+            source_version = require_performance_v2_readable(source_connection)
+            if source_version not in {8, 9}:
+                raise ValueError("source schema version must be 8 or 9")
+            _unknown_catalog_objects(source_connection)
+            source_markers = _markers(source_connection)
+            source_tables = _table_names(source_connection)
+            source_signature = _catalog_signature(source_connection)
+
+        with duckdb.connect(str(candidate), read_only=True) as connection:
+            _configure_connection(connection, workers, spill)
+            target_version = require_performance_v2_readable(connection)
+            if target_version not in {8, 9} or target_version < source_version:
+                raise ValueError("candidate schema version must be 8 or 9 and no older than source")
+            _unknown_catalog_objects(connection)
+            target_markers = _markers(connection)
+            target_tables = _table_names(connection)
+            target_signature = _catalog_signature(connection)
+            if target_signature["sequences"] != source_signature["sequences"]:
+                raise ValueError("source/candidate sequence state differs")
+            if target_version == source_version and target_signature != source_signature:
+                raise ValueError("source/candidate catalog signatures differ")
+            if target_version == 9 and source_version == 8:
+                if target_tables != source_tables | {"strategy_rejection_sources"}:
+                    raise ValueError("source/candidate catalog tables differ")
+            elif target_tables != source_tables:
+                raise ValueError("source/candidate catalog tables differ")
+            if target_markers != {**source_markers, "schema_version": str(target_version)}:
+                raise ValueError("database markers or instance identity differ")
+
+            source_catalog = "origin"
+            target_catalog = str(connection.execute("select current_database()").fetchone()[0])
+            connection.execute(f"attach {_path_sql(source)} as origin (read_only)")
+            result_ranges = tuple(_ranges(connection, "strategy_results"))
+            counts: dict[str, int | None] = {table: None for table in TABLES}
+            verified_counts: dict[str, int | None] = {table: None for table in TABLES}
+            verified_ranges: dict[str, int] = {}
+            if smoke_ranges is None:
+                counts = {table: 0 for table in TABLES}
+                verified_counts = {table: 0 for table in TABLES}
+            for table in TABLES:
+                if table not in source_tables:
+                    continue
+                if smoke_ranges is not None:
+                    if table in FAST_VERIFY_TABLES:
+                        try:
+                            verified_counts[table] = _verify_fast_table(
+                                connection, table, source_catalog, target_catalog,
+                                result_ranges, progress_callback, max_ranges=smoke_ranges,
+                            )
+                        except _FastVerifyUnsupported as exc:
+                            raise ValueError(f"smoke mode cannot verify SQL columns in {table}") from exc
+                        verified_ranges[table] = min(smoke_ranges, len(result_ranges))
+                    continue
+                if table in FAST_VERIFY_TABLES:
+                    try:
+                        verified_counts[table] = _verify_fast_table(
+                            connection, table, source_catalog, target_catalog,
+                            result_ranges, progress_callback,
+                        )
+                    except _FastVerifyUnsupported:
+                        _progress(progress_callback, {
+                            "phase": "verify_fallback", "table": table,
+                            "method": "typed_python",
+                        })
+                        verified_counts[table] = _verify_table(
+                            connection, table, progress_callback, result_ranges,
+                        )
+                else:
+                    verified_counts[table] = _verify_table(
+                        connection, table, progress_callback, result_ranges,
+                    )
+                counts[table] = verified_counts[table]
+            if smoke_ranges is None:
+                for table in target_tables - source_tables:
+                    if table == "schema_info":
+                        continue
+                    target_rows = int(connection.execute(
+                        f"select count(*) from main.{_ident(table)}"
+                    ).fetchone()[0])
+                    if target_rows:
+                        raise ValueError(f"unexpected rows in candidate-only table {table}")
+            connection.execute("detach origin")
+
+        _refuse_nonzero_wal(source)
+        _refuse_nonzero_wal(candidate)
+        source_after, candidate_after = _stat(source), _stat(candidate)
+        source_wal_after, candidate_wal_after = _wal_state(source), _wal_state(candidate)
+        source_hash_after: str | None = None
+        candidate_hash_after: str | None = None
+        if smoke_ranges is None:
+            source_hash_after, candidate_hash_after = _sha256(source), _sha256(candidate)
+        if (
+            source_before != source_after or source_wal_before != source_wal_after
+            or (smoke_ranges is None and source_hash_before != source_hash_after)
+        ):
+            raise ValueError("source database changed during verification")
+        if (
+            candidate_before != candidate_after or candidate_wal_before != candidate_wal_after
+            or (smoke_ranges is None and candidate_hash_before != candidate_hash_after)
+        ):
+            raise ValueError("candidate database changed during verification")
+
+        if output is not None:
+            os.link(candidate, output)
+        return {
+            "source": {"path": str(source), **source_before, "sha256": source_hash_before, "wal": source_wal_before},
+            "source_after": {**source_after, "sha256": source_hash_after, "wal": source_wal_after},
+            "candidate": {"path": str(candidate), **candidate_before, "sha256": candidate_hash_before, "wal": candidate_wal_before},
+            "candidate_after": {**candidate_after, "sha256": candidate_hash_after, "wal": candidate_wal_after},
+            "source_schema_version": source_version,
+            "candidate_schema_version": target_version,
+            "output": {"path": str(output), "hardlink_to_candidate": True} if output else None,
+            "publication": "hardlink_alias_not_backup" if output else None,
+            "table_counts": counts,
+            "verified_table_counts": verified_counts,
+            "verified_ranges": verified_ranges,
+            "partial": smoke_ranges is not None,
+            "verification_scope": "fast_smoke" if smoke_ranges is not None else "full_database",
+            "smoke_range_limit": smoke_ranges,
+            "content_hashes_checked": smoke_ranges is None,
+            "workers": workers,
+            "memory_limit": MEMORY_LIMIT,
+            "range_leading_key_limit": RANGE_VALUES,
+            "fast_verify_range_row_limit": MAX_FAST_VERIFY_RANGE_ROWS,
+            "source_candidate_unchanged": True,
+            "duration_seconds": round(time.monotonic() - started, 6),
+        }
+    finally:
+        resolved_spill = spill.resolve(strict=False)
+        if resolved_spill.parent == spill_root and resolved_spill.name.startswith("mrs3-fast-verify-"):
+            shutil.rmtree(resolved_spill, ignore_errors=True)
+
+
 def _cleanup(path: Path, output_parent: Path) -> None:
     if path.parent.resolve() != output_parent.resolve() or not path.name.startswith("."):
         raise RuntimeError("refusing to clean an unexpected staging path")
@@ -673,9 +1001,27 @@ def compact_performance_v2(
                 raise ValueError("database catalog changed during compaction")
             check.execute(f"attach {source_sql} as origin (read_only)")
             result_ranges = tuple(_ranges(check, "strategy_results"))
+            target_catalog = str(check.execute("select current_database()").fetchone()[0])
             verified_counts = {table: 0 for table in TABLES}
             for table in copy_tables:
-                verified_counts[table] = _verify_table(check, table, progress_callback, result_ranges)
+                if table in FAST_VERIFY_TABLES:
+                    try:
+                        verified_counts[table] = _verify_fast_table(
+                            check, table, "origin", target_catalog,
+                            result_ranges, progress_callback,
+                        )
+                    except _FastVerifyUnsupported:
+                        _progress(progress_callback, {
+                            "phase": "verify_fallback", "table": table,
+                            "method": "typed_python",
+                        })
+                        verified_counts[table] = _verify_table(
+                            check, table, progress_callback, result_ranges,
+                        )
+                else:
+                    verified_counts[table] = _verify_table(
+                        check, table, progress_callback, result_ranges,
+                    )
             for table in set(TABLES) - set(copy_tables):
                 target_count = int(check.execute(f"select count(*) from main.{_ident(table)}").fetchone()[0])
                 if target_count:
@@ -732,4 +1078,4 @@ def compact_performance_v2(
                 pass
 
 
-__all__ = ["compact_performance_v2"]
+__all__ = ["compact_performance_v2", "verify_existing_candidate"]

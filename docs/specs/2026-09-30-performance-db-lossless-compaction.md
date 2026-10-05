@@ -103,6 +103,45 @@ size plus 8 GiB free, after the C candidate has been safely copied elsewhere.
 If a gate fails, stop with the original retained; never lower a reserve or
 delete unrelated files. Candidate size estimates are not admission evidence.
 
+### Existing candidate verification
+
+`verify_existing_candidate` verifies a completed source/candidate pair without
+copying either database. It accepts supported schema-v8/v9 sources and
+candidates with preserved database identity; a v8 source may also be compared
+with its schema-v9 upgrade. Markers, catalog validity, table sets, sequence
+state, every table's rows, and source/candidate file stat, SHA-256, and WAL
+state are checked before the candidate can be published. Any nonzero WAL,
+unsupported catalog/version, mismatch, or changed input fails closed. Both
+database connections and the source attachment are read-only.
+
+`strategy_actions` and `strategy_equity` use SQL `EXCEPT ALL` in both
+directions, so row order is irrelevant and duplicates remain significant.
+Before comparison, the verifier requires matching `duckdb_columns` and
+`information_schema.columns` metadata for names, types, precision, scale,
+collation, and generated-column metadata. Floating-point columns or
+unsupported metadata skip this SQL path and use the typed Python comparator.
+The fast path checks full row counts independently, rejects NULL
+`result_id`, then checks counts and exact differences for each of the existing
+128-result-id ranges. Range counts must sum to the full count. A range above
+20,000,000 rows fails closed. JSON progress is emitted after every checked
+range. The same fast verifier is used when building a fresh compaction
+candidate; other tables continue to use the bounded typed Python comparison
+and prepared-payload check.
+
+The CLI accepts a spill parent, so DuckDB temporary spill files can be placed
+on D without creating another database copy there. Only after all checks and
+input before/after checks pass does it create the requested output using a
+same-C-volume hardlink to the candidate. This publication is an alias, not a
+backup; an existing output is never replaced, and verification failures leave
+the candidate untouched.
+
+`--smoke-ranges N` performs a bounded diagnostic only: it checks catalog,
+markers, sequence state, column metadata, and at most the first N ranges from
+each large table. It skips whole-table counts and file hashing, reports
+`partial=true`, and never accepts an output path or publishes a hardlink. Use
+it to exercise the SQL comparison before committing to full verification; its
+result is not acceptance evidence for the complete candidate.
+
 ## Deployment and acceptance
 
 Deploy compatible code and v8 database together under maintenance. The manual
