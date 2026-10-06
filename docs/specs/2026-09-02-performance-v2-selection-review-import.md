@@ -413,6 +413,69 @@ then reports successful and failed files together. A bad file does not roll
 back valid files for other Pair + Side runs; each file remains its own atomic
 review import.
 
+### Partial selection user-fields import
+
+Card 6 (`Bulk RETEST current FINALIST`) has a separate folder import for the
+partially completed selection workbooks used to restore existing operator
+decisions. It has a dedicated API endpoint and does not relax the strict
+`selection-review-import` or RETEST tag import contracts.
+
+The partial importer accepts only `performance-v2-selection-review-v1`
+workbooks with `_MRS_SELECTION_META`. For files with decisions, it requires the
+workbook database instance to match the open PerformanceDB and its selection
+run ID to exist in that same database. It does not require the selection run to
+be latest and does not require a complete candidate row set. In the `All candidates` worksheet it
+finds exact `ID`, `User Status`, and `User Rank` headers, regardless of their
+column positions or the other columns present. Only rows with a nonblank
+`User Status` are submitted. Duplicate or malformed IDs, unknown strategies,
+and IDs outside the run snapshot reject the whole file when they belong to
+submitted rows.
+
+Rows with blank `User Status` are not written to the review ledger and do not
+change that strategy's previous user decision; they are counted as unchanged
+without database membership lookups. A workbook with no nonblank statuses
+completes as a no-op without database identity/run checks or database writes;
+its returned run ID is informational and the Panel does not use it. Nonblank
+statuses are limited to `FINALIST`, `RESERVE`, and `REJECTED`. A nonblank
+`User Rank` is accepted only for `FINALIST`; it must be a positive integer and
+unique among effective FINALIST reviews within the selection run after applying
+the submitted rows. Missing FINALIST ranks are allowed; an applied FINALIST
+with a blank rank clears its previous user rank. A rank on RESERVE or REJECTED
+is rejected with `SELECTION_REVIEW_INVALID_RANK`; the importer does not silently
+normalize submitted values.
+
+Each accepted file is one transaction in the existing
+`selection_review_imports` and `selection_review_rows` ledger. It appends only
+the nonblank status rows, stores rank only for FINALIST, and synchronizes the
+REJECTED tag for only those submitted strategy IDs: clear the prior REJECTED
+tag, then add it back only where the new status is REJECTED. It preserves prior
+comments and does not modify RETEST, automatic fields, selection results, or
+strategy/result facts. Since this import accepts no ANALOG status, it clears a
+prior analog target on each row whose status it replaces. Workbook SHA-256
+duplicate detection is shared with the existing review ledger; a repeated
+workbook returns the typed `SELECTION_REVIEW_ALREADY_IMPORTED` error with no
+writes. Any validation or write error rolls back the entire file.
+For nonempty imports, `row_count` and `finalist_count` describe only rows
+applied from that file; `unchanged_count` is the number of blank-status rows.
+A blank-only file reports zero applied/finalist rows and its blank rows as
+unchanged.
+
+The card processes selected `.xlsx` files sequentially and displays each
+filename, current file number, applied and unchanged counts, or the full
+backend message and stable error code. It then reports imported, unchanged, and
+failed file totals, refreshes the Performance v2 catalogue and current
+FINALIST RETEST preview, and clears the folder input. Its controls use IDs
+separate from card 7's RETEST folder import. Files are ordered by last-modified
+time oldest to newest, then by name; if a strategy has nonblank decisions in
+multiple files, the later accepted file supplies its current decision.
+
+Acceptance evidence for this partial path covers flexible exact-header parsing,
+blank-only no-op and prior-decision preservation, comment/analog handling,
+FINALIST rank optionality/clearing and same-run uniqueness, rankless
+RESERVE/REJECTED rows, atomic rollback and hash duplicates, run/database
+identity and strategy membership validation, the dedicated HTTP route, and
+card 6 folder/log wiring. No schema migration or new table is introduced.
+
 ## Errors
 
 New API failures use stable codes:

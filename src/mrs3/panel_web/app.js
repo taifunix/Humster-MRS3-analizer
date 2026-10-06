@@ -3481,6 +3481,10 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
   const selectionReviewImportButton = document.querySelector('#performance-v2-selection-review-import');
   const selectionReviewImportResults = document.querySelector('#performance-v2-selection-review-results');
   const selectionReviewImportStatus = document.querySelector('#performance-v2-retest-tag-import-status');
+  const selectionUserFieldsFile = document.querySelector('#performance-v2-selection-user-fields-file');
+  const selectionUserFieldsButton = document.querySelector('#performance-v2-selection-user-fields-import');
+  const selectionUserFieldsResults = document.querySelector('#performance-v2-selection-user-fields-results');
+  const selectionUserFieldsStatus = document.querySelector('#performance-v2-selection-user-fields-status');
   let selectionCacheStatusRevision = 0;
   const refreshSelectionCacheStatus = async () => {
     const revision = ++selectionCacheStatusRevision;
@@ -3729,6 +3733,75 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
       if (selectionPreviewStatus) selectionPreviewStatus.textContent = 'XLSX сформирован и скачан.';
     } catch (error) {
       if (selectionPreviewStatus) selectionPreviewStatus.textContent = `XLSX не сформирован: ${error.message || 'ошибка запроса'}`;
+    }
+  });
+  selectionUserFieldsButton?.addEventListener('click', () => selectionUserFieldsFile?.click());
+  selectionUserFieldsFile?.addEventListener('change', async () => {
+    const files = [...(selectionUserFieldsFile.files || [])]
+      .filter((file) => file.name.toLowerCase().endsWith('.xlsx'))
+      .sort((a, b) => a.lastModified - b.lastModified || a.name.localeCompare(b.name));
+    if (!files.length) { selectionUserFieldsFile.value = ''; return; }
+    selectionUserFieldsButton.disabled = true;
+    selectionUserFieldsResults?.replaceChildren();
+    let importedFiles = 0;
+    let unchangedFiles = 0;
+    let failedFiles = 0;
+    let appliedRows = 0;
+    let unchangedRows = 0;
+    try {
+      for (const [index, file] of files.entries()) {
+        const fileStatus = document.createElement('div');
+        fileStatus.className = 'selection-review-import-result state-badge state-running';
+        fileStatus.textContent = `Файл ${index + 1} из ${files.length}: ${file.name} — импортируется.`;
+        selectionUserFieldsResults?.append(fileStatus);
+        if (selectionUserFieldsStatus) selectionUserFieldsStatus.textContent = `Файл ${index + 1} из ${files.length}: ${file.name}`;
+        try {
+          const response = await fetch('/api/v2/strategies/performance-v2/selection-user-fields-import', {
+            method: 'POST', headers: { 'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }, body: file,
+          });
+          const result = await response.json().catch(() => ({}));
+          const code = result.error?.code || '';
+          if (response.ok) {
+            const applied = Number(result.applied_count || 0);
+            const unchanged = Number(result.unchanged_count || 0);
+            appliedRows += applied;
+            unchangedRows += unchanged;
+            if (applied) importedFiles += 1;
+            else unchangedFiles += 1;
+            fileStatus.className = `selection-review-import-result state-badge ${applied ? 'state-ready' : 'state-pending'}`;
+            fileStatus.textContent = `✓ ${file.name} — применено: ${applied}; без изменений: ${unchanged}.`;
+          } else {
+            const message = result.error?.message || code || 'Неизвестная ошибка';
+            if (code === 'SELECTION_REVIEW_ALREADY_IMPORTED') {
+              unchangedFiles += 1;
+              fileStatus.className = 'selection-review-import-result state-badge state-pending';
+              fileStatus.textContent = `↷ ${file.name} — уже импортирован (${code}).`;
+            } else {
+              failedFiles += 1;
+              fileStatus.className = 'selection-review-import-result state-badge state-pending';
+              fileStatus.textContent = `✗ ${file.name} — ${message} (${code || 'UNKNOWN'}).`;
+            }
+          }
+        } catch (error) {
+          failedFiles += 1;
+          fileStatus.className = 'selection-review-import-result state-badge state-pending';
+          fileStatus.textContent = `✗ ${file.name} — ${error.message || 'Ошибка запроса'} (REQUEST_FAILED).`;
+        }
+      }
+      let catalogError = '';
+      if (appliedRows) {
+        try {
+          catalogError = await loadPerformanceV2Catalog() || '';
+          await loadFinalistRetestPreview();
+        } catch (error) {
+          catalogError = error.message || 'неизвестная ошибка обновления';
+        }
+      }
+      if (selectionUserFieldsStatus) selectionUserFieldsStatus.textContent =
+        `Файлов: импортировано ${importedFiles}; без изменений ${unchangedFiles}; ошибок ${failedFiles}. Применено строк: ${appliedRows}; пустых статусов: ${unchangedRows}.${catalogError ? ` Каталог не обновлён: ${catalogError}.` : ''}`;
+    } finally {
+      selectionUserFieldsFile.value = '';
+      selectionUserFieldsButton.disabled = false;
     }
   });
   selectionReviewImportButton?.addEventListener('click', () => selectionReviewFile?.click());

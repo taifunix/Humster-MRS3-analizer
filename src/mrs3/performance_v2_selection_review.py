@@ -868,6 +868,246 @@ def _parse_workbook(data: bytes) -> tuple[dict[str, str], list[dict[str, object]
         workbook.close()
 
 
+def _parse_selection_user_fields_workbook(
+    data: bytes,
+) -> tuple[dict[str, str], list[tuple[object, object, object]]]:
+    try:
+        workbook = load_workbook(BytesIO(data), data_only=False, read_only=True)
+    except Exception:
+        raise SelectionReviewError("SELECTION_REVIEW_INVALID_FILE") from None
+    try:
+        if META_SHEET not in workbook.sheetnames or "All candidates" not in workbook.sheetnames:
+            raise SelectionReviewError("SELECTION_REVIEW_SCHEMA_MISMATCH")
+        meta_sheet = workbook[META_SHEET]
+        metadata = {
+            str(key): str(value)
+            for key, value in meta_sheet.iter_rows(min_col=1, max_col=2, values_only=True)
+            if key and value is not None
+        }
+        if (
+            metadata.get("workbook_schema_version") != WORKBOOK_SCHEMA_VERSION
+            or metadata.get("selection_contract_version") != SELECTION_CONTRACT_VERSION_V1
+            or not metadata.get("selection_run_id")
+            or not metadata.get("database_instance_id")
+        ):
+            raise SelectionReviewError("SELECTION_REVIEW_SCHEMA_MISMATCH")
+        sheet = workbook["All candidates"]
+        header_cells = next(sheet.iter_rows(min_row=1, max_row=1), ())
+        positions: dict[str, int] = {}
+        for position, cell in enumerate(header_cells):
+            if cell.value in {"ID", "User Status", "User Rank"}:
+                if cell.value in positions:
+                    raise SelectionReviewError("SELECTION_REVIEW_SCHEMA_MISMATCH")
+                positions[cell.value] = position
+        if set(positions) != {"ID", "User Status", "User Rank"}:
+            raise SelectionReviewError("SELECTION_REVIEW_SCHEMA_MISMATCH")
+        rows: list[tuple[object, object, object]] = []
+        for cells in sheet.iter_rows(min_row=2):
+            if all(cell.value is None for cell in cells):
+                continue
+            id_cell = cells[positions["ID"]]
+            status_cell = cells[positions["User Status"]]
+            rank_cell = cells[positions["User Rank"]]
+            if id_cell.data_type == "f" or status_cell.data_type == "f":
+                raise SelectionReviewError("SELECTION_REVIEW_INVALID_FILE")
+            rows.append((id_cell.value, status_cell.value, rank_cell.value))
+        return metadata, rows
+    except SelectionReviewError:
+        raise
+    except Exception:
+        raise SelectionReviewError("SELECTION_REVIEW_INVALID_FILE") from None
+    finally:
+        workbook.close()
+
+
+def _validate_selection_user_field_ids(
+    connection: duckdb.DuckDBPyConnection, run_id: str, strategy_ids: Sequence[int],
+) -> None:
+    if not strategy_ids:
+        return
+    strategy_set = set(strategy_ids)
+    known_ids = {
+        int(row[0]) for row in connection.execute(
+            "select strategy_id from strategies where strategy_id in (select unnest(?::bigint[]))",
+            [list(strategy_ids)],
+        ).fetchall()
+    }
+    run_ids = {
+        int(row[0]) for row in connection.execute(
+            "select strategy_id from selection_results where selection_run_id = ? and strategy_id in (select unnest(?::bigint[]))",
+            [run_id, list(strategy_ids)],
+        ).fetchall()
+    }
+    if known_ids != strategy_set or run_ids != strategy_set:
+        raise SelectionReviewError(
+            "SELECTION_REVIEW_ROWSET_MISMATCH",
+            "Every submitted ID must exist in the database and in the workbook selection run",
+            details=sorted(strategy_set - (known_ids & run_ids)),
+        )
+
+
+def _validate_selection_user_field_ranks(
+    connection: duckdb.DuckDBPyConnection,
+    run_id: str,
+    decisions: Sequence[Sequence[object]],
+) -> dict[int, dict[str, object]] | None:
+    if not any(status == "FINALIST" and rank is not None for _strategy_id, status, rank in decisions):
+        return None
+    run_strategy_ids = [
+        int(row[0]) for row in connection.execute(
+            "select strategy_id from selection_results where selection_run_id = ?", [run_id],
+        ).fetchall()
+    ]
+    prior_reviews = latest_user_reviews_by_strategy(connection, run_strategy_ids)
+    submitted = {
+        int(strategy_id): (str(status), rank)
+        for strategy_id, status, rank in decisions
+    }
+    rank_owners: dict[int, int] = {}
+    for strategy_id in run_strategy_ids:
+        if strategy_id in submitted:
+            status, rank = submitted[strategy_id]
+        else:
+            review = prior_reviews.get(strategy_id, {})
+            status, rank = review.get("user_status"), review.get("user_rank")
+        if status != "FINALIST" or rank is None:
+            continue
+        rank = int(rank)
+        if rank in rank_owners and rank_owners[rank] != strategy_id:
+            raise SelectionReviewError(
+                "SELECTION_REVIEW_INVALID_RANK",
+                "FINALIST User Rank values must be unique within the selection run",
+            )
+        rank_owners[rank] = strategy_id
+    return prior_reviews
+
+
+def import_selection_user_fields(
+    connection: duckdb.DuckDBPyConnection, data: bytes,
+) -> dict[str, object]:
+    """Append only nonblank operator status/rank cells from a selection workbook."""
+    metadata, submitted_rows = _parse_selection_user_fields_workbook(data)
+    run_id = metadata["selection_run_id"]
+    decisions: list[list[object]] = []
+    strategy_ids: set[int] = set()
+    ranks: set[int] = set()
+    unchanged_count = 0
+    for raw_id, raw_status, raw_rank in submitted_rows:
+        status_text = "" if raw_status is None else str(raw_status).strip().upper()
+        if not status_text:
+            unchanged_count += 1
+            continue
+        if status_text not in {"FINALIST", "RESERVE", "REJECTED"}:
+            raise SelectionReviewError(
+                "SELECTION_REVIEW_INVALID_STATUS",
+                "User Status must be FINALIST, RESERVE, REJECTED, or blank",
+            )
+        strategy_id = _whole_number(raw_id, "SELECTION_REVIEW_ROWSET_MISMATCH", optional=False)
+        if strategy_id in strategy_ids:
+            raise SelectionReviewError("SELECTION_REVIEW_ROWSET_MISMATCH", "Strategy IDs must be unique in the workbook")
+        strategy_ids.add(strategy_id)
+        rank = None
+        if raw_rank not in (None, ""):
+            if status_text != "FINALIST":
+                raise SelectionReviewError(
+                    "SELECTION_REVIEW_INVALID_RANK",
+                    "User Rank must be blank for RESERVE and REJECTED",
+                )
+            try:
+                rank = _whole_number(raw_rank, "SELECTION_REVIEW_INVALID_RANK", optional=False)
+            except SelectionReviewError:
+                raise SelectionReviewError(
+                    "SELECTION_REVIEW_INVALID_RANK", "FINALIST User Rank must be a positive integer",
+                ) from None
+            if rank in ranks:
+                raise SelectionReviewError(
+                    "SELECTION_REVIEW_INVALID_RANK", "FINALIST User Rank values must be unique in the workbook",
+                )
+            ranks.add(rank)
+        decisions.append([strategy_id, status_text, rank])
+
+    if not decisions:
+        return {
+            "selection_run_id": run_id,
+            "row_count": 0,
+            "applied_count": 0,
+            "unchanged_count": unchanged_count,
+            "finalist_count": 0,
+        }
+
+    workbook_hash = sha256(data).hexdigest()
+    review_id = str(uuid4())
+    now = datetime.now(timezone.utc)
+    connection.execute("begin transaction")
+    try:
+        instance_id = database_instance_id(connection)
+        if metadata["database_instance_id"] != instance_id:
+            raise SelectionReviewError("SELECTION_REVIEW_DATABASE_MISMATCH")
+        run = connection.execute(
+            "select database_instance_id, selection_contract_version from selection_runs where selection_run_id = ?",
+            [run_id],
+        ).fetchone()
+        if not run:
+            raise SelectionReviewError("SELECTION_REVIEW_SCHEMA_MISMATCH", "Selection run does not exist in this database")
+        if run[0] != instance_id or run[1] != SELECTION_CONTRACT_VERSION_V1:
+            raise SelectionReviewError("SELECTION_REVIEW_SCHEMA_MISMATCH", "Selection run metadata does not match this workbook")
+        if connection.execute(
+            "select 1 from selection_review_imports where workbook_sha256 = ?", [workbook_hash],
+        ).fetchone():
+            raise SelectionReviewError("SELECTION_REVIEW_ALREADY_IMPORTED")
+        _validate_selection_user_field_ids(connection, run_id, tuple(strategy_ids))
+        run_reviews = _validate_selection_user_field_ranks(connection, run_id, decisions)
+        prior_reviews = run_reviews if run_reviews is not None else latest_user_reviews_by_strategy(
+            connection, [row[0] for row in decisions],
+        )
+        connection.execute(
+            """insert into selection_review_imports (
+                review_import_id, selection_run_id, workbook_sha256, imported_at_utc, row_count
+            ) values (?, ?, ?, ?, ?)""",
+            [review_id, run_id, workbook_hash, now, len(decisions)],
+        )
+        review_rows = [
+            [review_id, strategy_id, status, rank,
+             None,
+             prior_reviews.get(strategy_id, {}).get("comment")]
+            for strategy_id, status, rank in decisions
+        ]
+        _insert_rows(connection, "selection_review_rows", (
+            "review_import_id", "strategy_id", "user_status", "user_rank",
+            "user_analog_of_strategy_id", "comment",
+        ), review_rows)
+        applied_ids = [row[0] for row in decisions]
+        if applied_ids:
+            connection.execute(
+                "delete from strategy_tags where tag = 'REJECTED' and strategy_id in (select unnest(?::bigint[]))",
+                [applied_ids],
+            )
+            rejected = [
+                [strategy_id, "REJECTED", "SELECTION_REVIEW", review_id, now]
+                for strategy_id, status, _rank in decisions if status == "REJECTED"
+            ]
+            _insert_rows(connection, "strategy_tags", (
+                "strategy_id", "tag", "source", "source_ref", "updated_at_utc",
+            ), rejected)
+        connection.execute("commit")
+    except duckdb.ConstraintException as error:
+        _rollback_quietly(connection)
+        if "workbook_sha256" in str(error):
+            raise SelectionReviewError("SELECTION_REVIEW_ALREADY_IMPORTED") from error
+        raise
+    except Exception:
+        _rollback_quietly(connection)
+        raise
+    return {
+        "review_import_id": review_id,
+        "selection_run_id": run_id,
+        "row_count": len(decisions),
+        "applied_count": len(decisions),
+        "unchanged_count": unchanged_count,
+        "finalist_count": sum(row[1] == "FINALIST" for row in decisions),
+    }
+
+
 def import_retest_tags(connection: duckdb.DuckDBPyConnection, data: bytes) -> dict[str, int]:
     """Apply only explicit RETEST cells from a trusted review workbook."""
     try:

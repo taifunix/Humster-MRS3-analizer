@@ -2545,6 +2545,36 @@ def test_performance_v2_retest_tag_import_uses_a_folder_picker_and_bounded_endpo
     assert ".filter((file) => file.name.toLowerCase().endsWith('.xlsx'))" in js
 
 
+def test_selection_user_fields_import_is_at_the_top_of_card_six_with_separate_controls() -> None:
+    html = _read("index.html")
+    js = _read("app.js")
+    import_handler = js.split("selectionUserFieldsFile?.addEventListener", 1)[1].split(
+        "selectionReviewImportButton?.addEventListener", 1,
+    )[0]
+    card = html.split('id="performance-v2-finalist-retest-card"', 1)[1].split("</details>", 1)[0]
+    controls = (
+        "performance-v2-selection-user-fields-file",
+        "performance-v2-selection-user-fields-import",
+        "performance-v2-selection-user-fields-results",
+        "performance-v2-selection-user-fields-status",
+    )
+
+    assert card.index('id="performance-v2-selection-user-fields-file"') < card.index(
+        'id="performance-v2-finalist-retest-reserve"'
+    )
+    assert 'accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" multiple webkitdirectory hidden' in card
+    assert "Импортировать статусы и ранги из XLSX" in card
+    assert all(html.count(f'id="{control}"') == 1 for control in controls)
+    assert "/api/v2/strategies/performance-v2/selection-user-fields-import" in js
+    assert "SELECTION_REVIEW_ALREADY_IMPORTED" in js
+    assert "loadPerformanceV2Catalog()" in js
+    assert "loadFinalistRetestPreview()" in js
+    assert "Файл ${index + 1} из ${files.length}" in js
+    assert "result.error?.message" in js
+    assert "result.selection_run_id" not in import_handler
+    assert "if (appliedRows)" in import_handler
+
+
 def test_retest_tag_batch_import_reports_one_clear_status_per_file() -> None:
     html = _read("index.html")
     js = _read("app.js")

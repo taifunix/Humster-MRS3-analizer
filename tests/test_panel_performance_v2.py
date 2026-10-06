@@ -3659,6 +3659,61 @@ def test_selection_review_import_maps_database_lock_to_api_error(tmp_path: Path,
     assert raised.value.status == 409
 
 
+def test_selection_user_fields_partial_import_has_dedicated_http_route(tmp_path: Path) -> None:
+    controller, _database, _ = _controller_for_windows(tmp_path)
+    payload = {"symbol": "BTCUSDT", "side": "LONG", "stages": []}
+    controller.strategies_performance_v2_recalculate(payload)
+    _filename, workbook_bytes = controller.strategies_performance_v2_selection(payload)
+    original = load_workbook(BytesIO(workbook_bytes))
+    metadata = {
+        str(key): str(value)
+        for key, value in original["_MRS_SELECTION_META"].iter_rows(min_col=1, max_col=2, values_only=True)
+        if key and value is not None
+    }
+    sheet = original["All candidates"]
+    headers = {cell.value: cell.column for cell in sheet[1]}
+    strategy_id = sheet.cell(2, headers["ID"]).value
+    partial = Workbook()
+    meta = partial.active
+    meta.title = "_MRS_SELECTION_META"
+    for key, value in metadata.items():
+        meta.append([key, value])
+    meta.sheet_state = "veryHidden"
+    rows = partial.create_sheet("All candidates")
+    rows.append(["extra", "User Rank", "ID", "User Status"])
+    rows.append(["ignored", None, strategy_id, "FINALIST"])
+    body = BytesIO()
+    partial.save(body)
+    server, thread = _http_server(controller)
+    try:
+        connection = HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+        connection.request(
+            "POST", "/api/v2/strategies/performance-v2/selection-user-fields-import",
+            body=body.getvalue(),
+            headers={"Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"},
+        )
+        response = connection.getresponse()
+        result = json.loads(response.read())
+        assert response.status == 200
+        assert result["applied_count"] == 1
+        connection.close()
+        connection = HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+        connection.request(
+            "POST", "/api/v2/strategies/performance-v2/selection-user-fields-import",
+            body=body.getvalue(),
+            headers={"Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"},
+        )
+        response = connection.getresponse()
+        duplicate = json.loads(response.read())
+        assert response.status == 409
+        assert duplicate["error"]["code"] == "SELECTION_REVIEW_ALREADY_IMPORTED"
+        connection.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
 def test_selection_review_workbook_import_runs_under_shared_writer_guard(tmp_path: Path, monkeypatch) -> None:
     controller, database, _ = _controller_for_windows(tmp_path)
     payload = {"symbol": "BTCUSDT", "side": "LONG", "stages": []}

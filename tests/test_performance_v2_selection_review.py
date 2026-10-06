@@ -1965,3 +1965,369 @@ def test_rank_on_non_selectable_status_is_normalized_to_blank(tmp_path: Path) ->
         "select user_status, user_rank from selection_review_rows where review_import_id = ? and strategy_id = 1",
         [imported["review_import_id"]],
     ).fetchone() == ("FILTERED", None)
+
+
+def _partial_selection_workbook(
+    metadata: dict[str, str], rows: list[tuple[object, object, object]], *,
+    width: int = 73, id_column: int = 1, status_column: int = 67, rank_column: int = 68,
+) -> bytes:
+    workbook = Workbook()
+    meta = workbook.active
+    meta.title = META_SHEET
+    for key, value in metadata.items():
+        meta.append([key, value])
+    meta.sheet_state = "veryHidden"
+    sheet = workbook.create_sheet("All candidates")
+    headers = [None] * width
+    headers[id_column - 1] = "ID"
+    headers[status_column - 1] = "User Status"
+    headers[rank_column - 1] = "User Rank"
+    sheet.append(headers)
+    for strategy_id, status, rank in rows:
+        values = [None] * width
+        values[id_column - 1] = strategy_id
+        values[status_column - 1] = status
+        values[rank_column - 1] = rank
+        sheet.append(values)
+    output = BytesIO()
+    workbook.save(output)
+    return output.getvalue()
+
+
+def _import_partial_selection(connection: duckdb.DuckDBPyConnection, data: bytes) -> dict[str, object]:
+    from mrs3 import performance_v2_selection_review as selection_review_module
+
+    importer = getattr(selection_review_module, "import_selection_user_fields", None)
+    assert callable(importer), "partial selection user-fields importer has not been implemented"
+    return importer(connection, data)
+
+
+@pytest.mark.parametrize(
+    ("width", "id_column", "status_column", "rank_column"),
+    [(73, 1, 67, 68), (99, 1, 93, 94), (69, 1, 63, 64)],
+)
+def test_partial_selection_import_uses_exact_headers_across_workbook_layouts(
+    tmp_path: Path, width: int, id_column: int, status_column: int, rank_column: int,
+) -> None:
+    connection = _database(tmp_path)
+    _, metadata = _export(connection, tmp_path)
+    data = _partial_selection_workbook(
+        metadata, [(1, "FINALIST", None), (2, "RESERVE", None)],
+        width=width, id_column=id_column, status_column=status_column, rank_column=rank_column,
+    )
+
+    imported = _import_partial_selection(connection, data)
+
+    assert imported["row_count"] == imported["applied_count"] == 2
+    assert imported["unchanged_count"] == 0
+    assert connection.execute(
+        "select strategy_id, user_status, user_rank from selection_review_rows order by strategy_id"
+    ).fetchall() == [(1, "FINALIST", None), (2, "RESERVE", None)]
+
+
+def test_partial_selection_import_preserves_prior_decisions_for_blank_status_rows(tmp_path: Path) -> None:
+    connection = _database(tmp_path)
+    path, metadata = _export(connection, tmp_path)
+    full = load_workbook(path)
+    sheet = full["All candidates"]
+    headers = {cell.value: cell.column for cell in sheet[1]}
+    sheet.cell(2, headers["User Status"], "FINALIST")
+    sheet.cell(2, headers["User Rank"], 5)
+    sheet.cell(2, headers["Comment"], "preserve finalist comment")
+    sheet.cell(3, headers["User Status"], "ANALOG")
+    sheet.cell(3, headers["User Rank"]).value = None
+    sheet.cell(3, headers["Analog Of ID"], 1)
+    sheet.cell(3, headers["Comment"], "preserve analog comment")
+    saved = BytesIO()
+    full.save(saved)
+    import_selection_review(connection, saved.getvalue())
+    data = _partial_selection_workbook(metadata, [(1, None, 500), (2, "REJECTED", None)])
+
+    imported = _import_partial_selection(connection, data)
+
+    assert imported["applied_count"] == 1
+    assert imported["unchanged_count"] == 1
+    assert latest_user_reviews_by_strategy(connection) == {
+        1: {"user_status": "FINALIST", "user_rank": 5, "user_analog_of_strategy_id": None, "comment": "preserve finalist comment"},
+        2: {"user_status": "REJECTED", "user_rank": None, "user_analog_of_strategy_id": None, "comment": "preserve analog comment"},
+    }
+    assert connection.execute(
+        "select strategy_id from strategy_tags where tag = 'REJECTED' order by strategy_id"
+    ).fetchall() == [(2,)]
+
+
+def test_partial_selection_import_skips_blank_rows_without_database_lookups_or_writes(tmp_path: Path) -> None:
+    connection = _database(tmp_path)
+    _, metadata = _export(connection, tmp_path)
+
+    no_op = _import_partial_selection(
+        connection, _partial_selection_workbook(metadata, [(999, None, 500)]),
+    )
+
+    assert no_op["applied_count"] == 0
+    assert no_op["unchanged_count"] == 1
+    assert connection.execute("select count(*) from selection_review_imports").fetchone() == (0,)
+    applied = _import_partial_selection(
+        connection, _partial_selection_workbook(metadata, [(999, None, 500), (1, "REJECTED", None)]),
+    )
+    assert applied["applied_count"] == 1
+    assert applied["unchanged_count"] == 1
+    assert connection.execute(
+        "select strategy_id, user_status from selection_review_rows order by strategy_id"
+    ).fetchall() == [(1, "REJECTED")]
+
+
+def test_partial_selection_blank_only_result_does_not_change_applied_finalists_or_validate_run(tmp_path: Path) -> None:
+    connection = _database(tmp_path)
+    _, metadata = _export(connection, tmp_path)
+    first = _import_partial_selection(
+        connection, _partial_selection_workbook(metadata, [(1, "FINALIST", 3)]),
+    )
+    reviews_before = latest_user_reviews_by_strategy(connection)
+    row_count_before = connection.execute("select count(*) from selection_review_rows").fetchone()
+    import_count_before = connection.execute("select count(*) from selection_review_imports").fetchone()
+
+    no_op_metadata = {**metadata, "database_instance_id": "other-db", "selection_run_id": "missing-run"}
+    no_op = _import_partial_selection(
+        connection, _partial_selection_workbook(no_op_metadata, [(999, None, 400)]),
+    )
+
+    assert first["row_count"] == first["finalist_count"] == 1
+    assert no_op == {
+        "selection_run_id": "missing-run",
+        "row_count": 0,
+        "applied_count": 0,
+        "unchanged_count": 1,
+        "finalist_count": 0,
+    }
+    assert latest_user_reviews_by_strategy(connection) == reviews_before
+    assert connection.execute("select count(*) from selection_review_rows").fetchone() == row_count_before
+    assert connection.execute("select count(*) from selection_review_imports").fetchone() == import_count_before
+
+
+@pytest.mark.parametrize("status", ["FINALIST", "RESERVE", "REJECTED"])
+def test_partial_selection_import_preserves_prior_comment_for_each_supported_status(
+    tmp_path: Path, status: str,
+) -> None:
+    connection = _database(tmp_path)
+    path, metadata = _export(connection, tmp_path)
+    full = load_workbook(path)
+    sheet = full["All candidates"]
+    headers = {cell.value: cell.column for cell in sheet[1]}
+    sheet.cell(2, headers["User Status"], "FINALIST")
+    sheet.cell(2, headers["User Rank"], 5)
+    sheet.cell(2, headers["Comment"], "keep this comment")
+    sheet.cell(2, headers["Analog Of ID"]).value = None
+    sheet.cell(3, headers["User Status"], "RESERVE")
+    sheet.cell(3, headers["User Rank"], 6)
+    sheet.cell(3, headers["Comment"], "other comment")
+    sheet.cell(3, headers["Analog Of ID"]).value = None
+    saved = BytesIO()
+    full.save(saved)
+    import_selection_review(connection, saved.getvalue())
+    rank = 1 if status == "FINALIST" else None
+
+    _import_partial_selection(connection, _partial_selection_workbook(metadata, [(1, status, rank)]))
+
+    assert latest_user_reviews_by_strategy(connection)[1]["comment"] == "keep this comment"
+
+
+def test_partial_selection_blank_status_preserves_existing_analog_target(tmp_path: Path) -> None:
+    connection = _database(tmp_path)
+    path, metadata = _export(connection, tmp_path)
+    full = load_workbook(path)
+    sheet = full["All candidates"]
+    headers = {cell.value: cell.column for cell in sheet[1]}
+    sheet.cell(2, headers["User Status"], "FINALIST")
+    sheet.cell(2, headers["User Rank"], 1)
+    sheet.cell(3, headers["User Status"], "ANALOG")
+    sheet.cell(3, headers["Analog Of ID"], 1)
+    saved = BytesIO()
+    full.save(saved)
+    import_selection_review(connection, saved.getvalue())
+    reviews_before = latest_user_reviews_by_strategy(connection)
+    ledger_rows_before = connection.execute("select count(*) from selection_review_rows").fetchone()
+
+    imported = _import_partial_selection(connection, _partial_selection_workbook(metadata, [(2, None, None)]))
+
+    assert imported["applied_count"] == 0
+    assert latest_user_reviews_by_strategy(connection) == reviews_before
+    assert latest_user_reviews_by_strategy(connection)[2]["user_analog_of_strategy_id"] == 1
+    assert connection.execute("select count(*) from selection_review_rows").fetchone() == ledger_rows_before
+
+
+def test_partial_selection_import_rejects_rank_collision_with_prior_review_in_same_run(tmp_path: Path) -> None:
+    connection = _database(tmp_path)
+    _, metadata = _export(connection, tmp_path)
+    first = _partial_selection_workbook(metadata, [(1, "FINALIST", 1)])
+    second = _partial_selection_workbook(metadata, [(2, "FINALIST", 1)])
+    _import_partial_selection(connection, first)
+
+    with pytest.raises(SelectionReviewError) as raised:
+        _import_partial_selection(connection, second)
+
+    assert raised.value.code == "SELECTION_REVIEW_INVALID_RANK"
+    assert connection.execute("select strategy_id, user_status, user_rank from selection_review_rows order by strategy_id").fetchall() == [
+        (1, "FINALIST", 1),
+    ]
+    assert connection.execute("select count(*) from selection_review_imports").fetchone() == (1,)
+
+
+def test_partial_selection_import_write_failure_rolls_back_and_connection_is_reusable(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    from mrs3 import performance_v2_selection_review as selection_review_module
+
+    connection = _database(tmp_path)
+    _, metadata = _export(connection, tmp_path)
+    now = datetime(2026, 9, 2, tzinfo=UTC)
+    connection.execute(
+        "insert into strategy_tags values (1, 'REJECTED', 'TEST', 'existing', ?)", [now],
+    )
+    data = _partial_selection_workbook(metadata, [(1, "REJECTED", None)])
+    original_insert_rows = selection_review_module._insert_rows
+
+    def fail_rejected_tag_insert(conn, table, columns, rows):
+        if table == "strategy_tags":
+            raise RuntimeError("forced tag insert failure")
+        return original_insert_rows(conn, table, columns, rows)
+
+    monkeypatch.setattr(selection_review_module, "_insert_rows", fail_rejected_tag_insert)
+    with pytest.raises(RuntimeError, match="forced tag insert failure"):
+        _import_partial_selection(connection, data)
+
+    assert connection.execute("select count(*) from selection_review_imports").fetchone() == (0,)
+    assert connection.execute("select count(*) from selection_review_rows").fetchone() == (0,)
+    assert connection.execute(
+        "select strategy_id, tag, source, source_ref from strategy_tags where strategy_id = 1",
+    ).fetchall() == [(1, "REJECTED", "TEST", "existing")]
+    monkeypatch.setattr(selection_review_module, "_insert_rows", original_insert_rows)
+    retried = _import_partial_selection(connection, data)
+    assert retried["applied_count"] == 1
+
+
+@pytest.mark.parametrize(("status", "rank"), [("RESERVE", 1), ("REJECTED", 1)])
+def test_partial_selection_import_rejects_rank_for_nonfinalist_atomically(
+    tmp_path: Path, status: str, rank: int,
+) -> None:
+    connection = _database(tmp_path)
+    _, metadata = _export(connection, tmp_path)
+    data = _partial_selection_workbook(metadata, [(1, status, rank)])
+
+    with pytest.raises(SelectionReviewError) as raised:
+        _import_partial_selection(connection, data)
+    assert raised.value.code == "SELECTION_REVIEW_INVALID_RANK"
+
+    assert connection.execute("select count(*) from selection_review_imports").fetchone() == (0,)
+    assert connection.execute("select count(*) from selection_review_rows").fetchone() == (0,)
+
+
+def test_partial_selection_import_missing_finalist_rank_and_atomic_unknown_id_and_duplicate(tmp_path: Path) -> None:
+    connection = _database(tmp_path)
+    _, metadata = _export(connection, tmp_path)
+    data = _partial_selection_workbook(metadata, [(1, "FINALIST", None)])
+
+    imported = _import_partial_selection(connection, data)
+
+    assert imported["applied_count"] == 1
+    assert connection.execute(
+        "select user_status, user_rank from selection_review_rows"
+    ).fetchone() == ("FINALIST", None)
+    with pytest.raises(SelectionReviewError) as raised:
+        _import_partial_selection(connection, data)
+    assert raised.value.code == "SELECTION_REVIEW_ALREADY_IMPORTED"
+    bad = _partial_selection_workbook(metadata, [(1, "REJECTED", None), (999, "FINALIST", 1)])
+    before = connection.execute("select count(*) from selection_review_imports").fetchone()
+    with pytest.raises(SelectionReviewError) as raised:
+        _import_partial_selection(connection, bad)
+    assert raised.value.code == "SELECTION_REVIEW_ROWSET_MISMATCH"
+    assert connection.execute("select count(*) from selection_review_imports").fetchone() == before
+    assert connection.execute(
+        "select strategy_id, user_status from selection_review_rows order by strategy_id"
+    ).fetchall() == [(1, "FINALIST")]
+
+
+def test_partial_selection_import_blank_finalist_rank_clears_previous_rank(tmp_path: Path) -> None:
+    connection = _database(tmp_path)
+    path, metadata = _export(connection, tmp_path)
+    full = load_workbook(path)
+    sheet = full["All candidates"]
+    headers = {cell.value: cell.column for cell in sheet[1]}
+    sheet.cell(2, headers["User Status"], "FINALIST")
+    sheet.cell(2, headers["User Rank"], 5)
+    sheet.cell(2, headers["Analog Of ID"]).value = None
+    sheet.cell(3, headers["User Status"], "RESERVE")
+    sheet.cell(3, headers["User Rank"], 6)
+    sheet.cell(3, headers["Analog Of ID"]).value = None
+    saved = BytesIO()
+    full.save(saved)
+    import_selection_review(connection, saved.getvalue())
+
+    _import_partial_selection(connection, _partial_selection_workbook(metadata, [(1, "FINALIST", None)]))
+
+    assert latest_user_reviews_by_strategy(connection)[1]["user_rank"] is None
+
+
+@pytest.mark.parametrize(
+    ("rows", "expected_code"),
+    [
+        ([(1, "ANALOG", None)], "SELECTION_REVIEW_INVALID_STATUS"),
+        ([(1, "FINALIST", 0)], "SELECTION_REVIEW_INVALID_RANK"),
+        ([(1, "FINALIST", 4), (2, "FINALIST", 4)], "SELECTION_REVIEW_INVALID_RANK"),
+    ],
+)
+def test_partial_selection_import_rejects_invalid_status_and_finalist_ranks_atomically(
+    tmp_path: Path, rows: list[tuple[object, object, object]], expected_code: str,
+) -> None:
+    connection = _database(tmp_path)
+    _, metadata = _export(connection, tmp_path)
+    data = _partial_selection_workbook(metadata, rows)
+
+    with pytest.raises(SelectionReviewError) as raised:
+        _import_partial_selection(connection, data)
+
+    assert raised.value.code == expected_code
+    assert connection.execute("select count(*) from selection_review_imports").fetchone() == (0,)
+    assert connection.execute("select count(*) from selection_review_rows").fetchone() == (0,)
+
+
+def test_partial_selection_import_checks_instance_run_and_snapshot_without_latest_or_current_result_gate(tmp_path: Path) -> None:
+    connection = _database(tmp_path)
+    _, metadata = _export(connection, tmp_path)
+    valid_row = [(1, "REJECTED", None)]
+    wrong_instance = _partial_selection_workbook(
+        {**metadata, "database_instance_id": "different-db"}, valid_row,
+    )
+    with pytest.raises(SelectionReviewError) as raised:
+        _import_partial_selection(connection, wrong_instance)
+    assert raised.value.code == "SELECTION_REVIEW_DATABASE_MISMATCH"
+
+    unknown_run = _partial_selection_workbook(
+        {**metadata, "selection_run_id": "missing-run"}, valid_row,
+    )
+    with pytest.raises(SelectionReviewError) as raised:
+        _import_partial_selection(connection, unknown_run)
+    assert raised.value.code == "SELECTION_REVIEW_SCHEMA_MISMATCH"
+
+    now = datetime(2026, 9, 2, tzinfo=UTC)
+    connection.execute(
+        """insert into strategies values (3, 'outside-run', 'BTCUSDT', 'LONG', '1h', 5, 1,
+           'run', 'candidate-3', 'ACTIVE', null, ?, ?)""",
+        [now, now],
+    )
+    outside_snapshot = _partial_selection_workbook(metadata, [(3, "REJECTED", None)])
+    with pytest.raises(SelectionReviewError) as raised:
+        _import_partial_selection(connection, outside_snapshot)
+    assert raised.value.code == "SELECTION_REVIEW_ROWSET_MISMATCH"
+
+    _, newer_metadata = _export(connection, tmp_path)
+    assert newer_metadata["selection_run_id"] != metadata["selection_run_id"]
+    connection.execute("update strategies set current_result_id = 102 where strategy_id = 1")
+    imported = _import_partial_selection(
+        connection, _partial_selection_workbook(metadata, valid_row),
+    )
+    assert imported["selection_run_id"] == metadata["selection_run_id"]
+    assert connection.execute(
+        "select strategy_id, user_status from selection_review_rows where review_import_id = ?",
+        [imported["review_import_id"]],
+    ).fetchall() == [(1, "REJECTED")]
