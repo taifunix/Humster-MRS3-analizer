@@ -4708,3 +4708,24 @@ optimization that passes OPT-01e.
 ## PURR equity-regime cache repair (2026-10-05)
 
 The PURRUSDT/LONG selection hang was traced to a missing equity-regime-v1 cache: 3,369 active results and 20,874,717 raw equity points were scanned under the Panel lock because readiness ignored regime misses. Explicit pair/all-pair recalculation now warms regime independently of selected stages and skips old R7.3 quality; missing regime or explicit legacy rank cache blocks preview/XLSX before raw scanning. Focused regression and broader selection/Panel suites passed (369 passed, 4 skipped); Claude Opus 5 review returned CODE_REVIEW_PASS. A detached 16-worker warm of the live D: database finished 3,369/3,369 with zero remaining misses. Panel is running on port 8766. Live cache-status returned ready=true, missing=0 (59.5 seconds on first request); the filter-only preview returned 648 passing, 2,690 reserved and 31 dropped in 21.1 seconds. Legacy equity-quality ranking remains deferred.
+
+## PerformanceDB manual pair maintenance (2026-10-06)
+
+Card 9 in Strategy and DD5 implements the pair catalog, exact-count preview, separate confirmation, physical Delete Rejected/full-delete, transient progress, elapsed time and source database error reporting. Schema remains v9. Delete Rejected removes only actions, equity facts and prepared inputs for currently effective REJECTED strategies while retaining their typed configuration and compact evidence. Full deletion removes selected strategy/selection scope, preserves shared plateaus still referenced elsewhere, and clears the global import journal as shown separately in preview/progress. The accepted contract is [specified here](docs/specs/2026-10-06-performance-db-maintenance.md) and [recorded in ADR-0057](docs/decisions/0057-performance-db-manual-maintenance.md).
+
+Root verification with `.venv` covered the maintenance service, PerformanceDB importer, Panel API and static UI: **428 passed, 4 skipped** in 327.76 s, with 78 existing pandas fragmentation warnings. The skips require unavailable symlink support. All writable fixtures were synthetic schema-v9 databases under `C:\TEMP`; the dedicated temp root was removed. No live PerformanceDB was opened for writing. After root fixes for out-of-order stale-preview responses, catalog refresh after apply and zero-total progress, the static UI suite passed again: 156 passed in 6.82 s. `git diff --check` passed.
+
+The synthetic workers=1/8 comparison produced identical final SHA-256, per-table/per-pair and global counts. Apply took 1.084 s / 135,213,056 B peak RSS at one worker and 1.126 s / 137,973,760 B at eight; parallel workers did not speed sequential DELETE, so writes remain single-writer and the configured worker count applies to read queries.
+
+Final review-fix verification: the combined synthetic maintenance/importer/Panel/static-UI suite passed **458 tests**, with **4 symlink capability skips** and 78 existing pandas fragmentation warnings, in 745.19 s. `node --check` and `git diff --cached --check` passed; the dedicated `C:\TEMP` test directory was removed. The former schema-v8 expectation was verified to fail against the unchanged schema-v9 source; the current v9 expectation passes. Independent Claude Opus 5 re-review returned `CODE_REVIEW_PASS`; a separate scoped feature commit is recorded in local `main`.
+
+## PerformanceDB maintenance final gate (2026-10-06)
+
+Independent Claude Opus 5 re-review returned `CODE_REVIEW_PASS` for the final
+Panel recovery/progress fixes; service review packets S1-S3 also passed. After
+the last fixes, the targeted Panel maintenance/static UI set passed **15 tests**;
+the maintenance service suite passed **42 tests**. The broader combined feature
+suite had passed **458 tests with 4 symlink capability skips** before these
+focused corrections. Tests used synthetic databases under C: TEMP, which was
+removed. Schema remains v9; no live PerformanceDB was opened for writing. A
+separate scoped feature commit in local `main` is the remaining action.

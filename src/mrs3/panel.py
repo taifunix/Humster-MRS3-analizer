@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from collections import OrderedDict, deque
+from contextlib import contextmanager
+from copy import deepcopy
 import csv
 from dataclasses import asdict, dataclass, field, is_dataclass, replace
 from datetime import date, datetime, timedelta, timezone
@@ -29,6 +31,9 @@ import uuid
 import webbrowser
 
 _PANEL_WEB = Path(__file__).with_name("panel_web")
+_PERFORMANCE_V2_MAINTENANCE_PREVIEW_TTL_SECONDS = 15 * 60
+_PERFORMANCE_V2_MAINTENANCE_RECOVERY_TTL_SECONDS = 15 * 60
+_PERFORMANCE_V2_MAINTENANCE_MAX_PREVIEWS = 32
 _LOGGER = logging.getLogger(__name__)
 _RETEST_INBOX_PATH_UNAVAILABLE = "committed RETEST inbox path is unavailable"
 _RETEST_INBOX_MANIFEST_UNAVAILABLE = "committed RETEST inbox manifest is unavailable"
@@ -238,6 +243,15 @@ from .performance_v2_store import (
     performance_v2_database_path,
     require_performance_v2,
     require_performance_v2_readable,
+)
+from .performance_v2_maintenance import (
+    PerformanceV2MaintenanceError,
+    PerformanceV2MaintenanceSchemaError,
+    apply_preview as apply_performance_v2_maintenance_preview,
+    catalog as performance_v2_maintenance_catalog,
+    create_preview as create_performance_v2_maintenance_preview,
+    public_preview as public_performance_v2_maintenance_preview,
+    set_query_workers as set_performance_v2_maintenance_workers,
 )
 from .performance_v2_equity_cache import EquitySourceChangedError
 from .performance_v2_selection import (
@@ -1342,6 +1356,11 @@ class PanelController:
         self._lock = threading.RLock()
         self._selection_candidate_cache_lock = threading.RLock()
         self._performance_v2_writer_lock = threading.RLock()
+        self._performance_v2_maintenance_state_lock = threading.RLock()
+        self._performance_v2_maintenance_active_job: str | None = None
+        self._performance_v2_maintenance_previews: dict[str, tuple[float, dict[str, object]]] = {}
+        self._performance_v2_maintenance_job: dict[str, object] | None = None
+        self._performance_v2_maintenance_recovery_preview: tuple[float, dict[str, object]] | None = None
         self._performance_v2_recalculate_progress: dict[str, object] = {
             "status": "IDLE", "total_pairs": 0, "ready_pairs": 0,
             "planned_pairs": 0, "completed_pairs": 0,
@@ -3902,6 +3921,23 @@ class PanelController:
         )
         return replace(config, workers=max(1, int(self._import_settings().workers)))
 
+    @contextmanager
+    def _performance_v2_writer_guard(self, target: Path):
+        """Serialize Panel writers before the shared cross-process lock."""
+        with self._performance_v2_writer_lock:
+            file_lock = PerformanceV2WriterLock(target.parent)
+            try:
+                file_lock.__enter__()
+            except PerformanceV2StoreError as error:
+                raise PerformanceV2ApiError(
+                    "PERFORMANCE_V2_LOCKED", status=409,
+                    message="Performance v2 database writer is busy",
+                ) from error
+            try:
+                yield
+            finally:
+                file_lock.__exit__(None, None, None)
+
     @staticmethod
     def _retest_date(value: object, field: str) -> str:
         if not isinstance(value, str):
@@ -4457,9 +4493,10 @@ class PanelController:
                             ).fetchall())
                             v9_repair_required = not repairable_columns.issubset(existing_columns)
                 if version != "9" or v9_repair_required:
-                    with duckdb.connect(str(target)) as connection:
-                        initialize_performance_v2(connection)
-                        require_performance_v2(connection)
+                    with self._performance_v2_writer_guard(target):
+                        with duckdb.connect(str(target)) as connection:
+                            initialize_performance_v2(connection)
+                            require_performance_v2(connection)
             except PerformanceV2ApiError:
                 raise
             except PerformanceV2StoreError as error:
@@ -4735,6 +4772,248 @@ class PanelController:
     def strategies_performance_v2_catalog(self) -> dict[str, object]:
         return self.performance_v2_catalog()
 
+    def _performance_v2_maintenance_target(self) -> tuple[Path, int]:
+        try:
+            config = self._performance_v2_config()
+            target = performance_v2_database_path(config)
+        except (OSError, TypeError, ValueError) as error:
+            raise PerformanceV2ApiError("PERFORMANCE_DB_UNAVAILABLE", status=503, message="PerformanceDB is unavailable") from error
+        if not target.is_file():
+            raise PerformanceV2ApiError("PERFORMANCE_V2_NOT_FOUND", status=404, message="PerformanceDB is unavailable")
+        return target, min(max(1, int(config.workers)), 16)
+
+    @staticmethod
+    def _performance_v2_maintenance_database_error(error: duckdb.Error) -> PerformanceV2ApiError:
+        if isinstance(error, duckdb.IOException) and _is_duckdb_lock_error(error):
+            return PerformanceV2ApiError("PERFORMANCE_V2_LOCKED", status=409, message=str(error))
+        return PerformanceV2ApiError("PERFORMANCE_V2_DATABASE_ERROR", status=500, message=str(error))
+
+    def _performance_v2_maintenance_prune_previews(self, now: float) -> None:
+        expired = [
+            token for token, (created_at, _preview) in self._performance_v2_maintenance_previews.items()
+            if now - created_at > _PERFORMANCE_V2_MAINTENANCE_PREVIEW_TTL_SECONDS
+        ]
+        for token in expired:
+            del self._performance_v2_maintenance_previews[token]
+        while len(self._performance_v2_maintenance_previews) > _PERFORMANCE_V2_MAINTENANCE_MAX_PREVIEWS:
+            del self._performance_v2_maintenance_previews[next(iter(self._performance_v2_maintenance_previews))]
+
+    def _performance_v2_maintenance_require_idle(self) -> None:
+        with self._performance_v2_maintenance_state_lock:
+            if self._performance_v2_maintenance_active_job is not None:
+                raise PerformanceV2ApiError(
+                    "PERFORMANCE_V2_MAINTENANCE_BUSY", status=409,
+                    message="PerformanceDB maintenance is running; retry after its status is terminal",
+                )
+
+    @contextmanager
+    def _performance_v2_maintenance_read_guard(self):
+        if not self._performance_v2_writer_lock.acquire(blocking=False):
+            raise PerformanceV2ApiError(
+                "PERFORMANCE_V2_LOCKED", status=409,
+                message="PerformanceDB has an active Panel writer; retry after it completes",
+            )
+        try:
+            yield
+        finally:
+            self._performance_v2_writer_lock.release()
+
+    def strategies_performance_v2_maintenance_catalog(self) -> dict[str, object]:
+        self._performance_v2_maintenance_require_idle()
+        target, workers = self._performance_v2_maintenance_target()
+        try:
+            with self._performance_v2_maintenance_read_guard(), duckdb.connect(str(target), read_only=True) as connection:
+                set_performance_v2_maintenance_workers(connection, workers)
+                symbols = performance_v2_maintenance_catalog(connection)
+            return {"symbols": symbols, "count": len(symbols)}
+        except PerformanceV2MaintenanceSchemaError as error:
+            raise PerformanceV2ApiError("PERFORMANCE_V2_SCHEMA_INVALID", status=409, message=str(error)) from error
+        except PerformanceV2MaintenanceError as error:
+            raise PerformanceV2ApiError("PERFORMANCE_V2_SCHEMA_INVALID", status=409, message=str(error)) from error
+        except PerformanceV2ApiError:
+            raise
+        except duckdb.Error as error:
+            raise self._performance_v2_maintenance_database_error(error) from error
+
+    def strategies_performance_v2_maintenance_preview(self, payload: object) -> dict[str, object]:
+        self._performance_v2_maintenance_require_idle()
+        if not isinstance(payload, Mapping) or set(payload) != {"operation", "symbols"}:
+            raise PerformanceV2ApiError("INVALID_REQUEST", status=400, message="preview requires exactly operation and symbols")
+        recovery_preview: Mapping[str, object] | None = None
+        requested_symbols = payload.get("symbols")
+        if (
+            payload.get("operation") == "full"
+            and isinstance(requested_symbols, (list, tuple))
+            and all(isinstance(symbol, str) for symbol in requested_symbols)
+        ):
+            with self._performance_v2_maintenance_state_lock:
+                recovery_entry = self._performance_v2_maintenance_recovery_preview
+                if recovery_entry is not None:
+                    created_at, candidate = recovery_entry
+                    if perf_counter() - created_at > _PERFORMANCE_V2_MAINTENANCE_RECOVERY_TTL_SECONDS:
+                        self._performance_v2_maintenance_recovery_preview = None
+                    elif set(requested_symbols) & set(candidate.get("symbols", ())):
+                        recovery_preview = candidate
+        target, workers = self._performance_v2_maintenance_target()
+        try:
+            with self._performance_v2_maintenance_read_guard(), duckdb.connect(str(target), read_only=True) as connection:
+                set_performance_v2_maintenance_workers(connection, workers)
+                preview = create_performance_v2_maintenance_preview(
+                    connection, payload["symbols"], payload["operation"],
+                    recovery_preview=recovery_preview,
+                )
+        except PerformanceV2MaintenanceSchemaError as error:
+            raise PerformanceV2ApiError("PERFORMANCE_V2_SCHEMA_INVALID", status=409, message=str(error)) from error
+        except PerformanceV2ApiError:
+            raise
+        except PerformanceV2MaintenanceError as error:
+            raise PerformanceV2ApiError("INVALID_REQUEST", status=400, message=str(error)) from error
+        except duckdb.Error as error:
+            raise self._performance_v2_maintenance_database_error(error) from error
+        token = uuid.uuid4().hex
+        with self._performance_v2_maintenance_state_lock:
+            self._performance_v2_maintenance_prune_previews(perf_counter())
+            self._performance_v2_maintenance_previews[token] = (perf_counter(), preview)
+            self._performance_v2_maintenance_prune_previews(perf_counter())
+        return {**public_performance_v2_maintenance_preview(preview), "token": token}
+
+    def strategies_performance_v2_maintenance_apply(self, payload: object) -> dict[str, object]:
+        if not isinstance(payload, Mapping) or set(payload) != {"token"} or not isinstance(payload.get("token"), str) or not payload["token"]:
+            raise PerformanceV2ApiError("INVALID_REQUEST", status=400, message="apply requires exactly one preview token")
+        with self._performance_v2_maintenance_state_lock:
+            if self._performance_v2_maintenance_active_job is not None:
+                raise PerformanceV2ApiError("PERFORMANCE_V2_MAINTENANCE_BUSY", status=409, message="PerformanceDB maintenance is already running")
+            token = payload["token"]
+            now = perf_counter()
+            self._performance_v2_maintenance_prune_previews(now)
+            token_entry = self._performance_v2_maintenance_previews.pop(token, None)
+            if token_entry is None:
+                raise PerformanceV2ApiError("PREVIEW_TOKEN_INVALID", status=409, message="Preview token is unknown, stale, or already used")
+            _created_at, preview = token_entry
+            job_id = uuid.uuid4().hex
+            start = perf_counter()
+            public = public_performance_v2_maintenance_preview(preview)
+            table_counts = {str(table): 0 for table in public["table_counts"]}
+            pair_counts = {str(pair["symbol"]): 0 for pair in public["pairs"]}
+            pair_table_counts = {
+                str(pair["symbol"]): {str(table): 0 for table in pair["table_counts"]}
+                for pair in public["pairs"]
+            }
+            job: dict[str, object] = {
+                "job_id": job_id, "status": "RUNNING", "phase": "waiting_for_writer",
+                "operation": str(public["operation"]),
+                "current_table": None, "symbols": list(public["symbols"]),
+                "pair_scoped_total": int(public["pair_scoped_total"]), "pair_scoped_deleted": 0,
+                "shared_plateau_total": int(public["shared_plateau_rows"]), "shared_plateau_deleted": 0,
+                "table_counts": table_counts, "pair_counts": pair_counts,
+                "pair_table_counts": pair_table_counts,
+                "global_journal_total": sum(int(value) for value in public["global_counts"].values()),
+                "global_journal_counts": {str(table): 0 for table in public["global_counts"]},
+                "started_at": start, "elapsed_seconds": 0.0, "error": None,
+            }
+            self._performance_v2_maintenance_job = job
+            self._performance_v2_maintenance_active_job = job_id
+
+        worker = threading.Thread(
+            target=self._run_performance_v2_maintenance,
+            args=(job_id, preview, start),
+            name=f"performance-v2-maintenance-{job_id[:8]}", daemon=True,
+        )
+        worker.start()
+        return {"job_id": job_id, "status": "RUNNING"}
+
+    def _run_performance_v2_maintenance(self, job_id: str, preview: Mapping[str, object], started_at: float) -> None:
+        target: Path | None = None
+
+        def phase_changed(phase: str) -> None:
+            with self._performance_v2_maintenance_state_lock:
+                job = self._performance_v2_maintenance_job
+                if job is not None and job.get("job_id") == job_id:
+                    job["phase"] = phase
+                    job["current_table"] = phase if phase not in {"revalidation", "waiting_for_writer"} else None
+
+        def committed(event: dict[str, object]) -> None:
+            with self._performance_v2_maintenance_state_lock:
+                job = self._performance_v2_maintenance_job
+                if job is None or job.get("job_id") != job_id:
+                    return
+                table = str(event["table"])
+                if event.get("global") is True:
+                    counts = job["global_journal_counts"]
+                    counts[table] = int(counts.get(table, 0)) + int(event["rows"])
+                    return
+                table_counts = job["table_counts"]
+                table_counts[table] = int(table_counts.get(table, 0)) + int(event["rows"])
+                by_symbol = event.get("rows_by_symbol", {})
+                for symbol, count in by_symbol.items():
+                    symbol = str(symbol)
+                    job["pair_counts"][symbol] = int(job["pair_counts"].get(symbol, 0)) + int(count)
+                    symbol_tables = job["pair_table_counts"].setdefault(symbol, {})
+                    symbol_tables[table] = int(symbol_tables.get(table, 0)) + int(count)
+                shared = int(event.get("shared_plateau_rows", 0))
+                job["shared_plateau_deleted"] += shared
+                job["pair_scoped_deleted"] += int(event["rows"]) - shared
+
+        try:
+            target, workers = self._performance_v2_maintenance_target()
+            # All PerformanceDB writers take the controller RLock, then this
+            # cross-process lock, then open their sole writable connection.
+            with self._performance_v2_writer_lock:
+                with PerformanceV2WriterLock(target.parent):
+                    phase_changed("revalidation")
+                    with duckdb.connect(str(target)) as connection:
+                        set_performance_v2_maintenance_workers(connection, workers)
+                        result = apply_performance_v2_maintenance_preview(
+                            connection, preview, on_phase=phase_changed, on_commit=committed,
+                        )
+            with self._performance_v2_maintenance_state_lock:
+                job = self._performance_v2_maintenance_job
+                if job is not None and job.get("job_id") == job_id:
+                    if preview.get("operation") == "full":
+                        self._performance_v2_maintenance_recovery_preview = None
+                    job.update({
+                        "status": "COMMITTED", "phase": "committed", "current_table": None,
+                        "pair_scoped_deleted": int(result["pair_scoped_deleted"]),
+                        "global_journal_counts": dict(result["global_deleted"]),
+                        "table_counts": dict(result["table_counts"]),
+                        "shared_plateau_deleted": int(result["shared_plateau_deleted"]),
+                        "elapsed_seconds": max(0.0, perf_counter() - started_at),
+                    })
+        except Exception as error:
+            with self._performance_v2_maintenance_state_lock:
+                job = self._performance_v2_maintenance_job
+                if job is not None and job.get("job_id") == job_id:
+                    job.update({
+                        "status": "FAILED", "error": str(error),
+                        "elapsed_seconds": max(0.0, perf_counter() - started_at),
+                    })
+                    if preview.get("operation") == "full":
+                        self._performance_v2_maintenance_recovery_preview = (perf_counter(), dict(preview))
+                        job["recovery_warning"] = (
+                            f"This full-delete recovery map is held in Panel memory for "
+                            f"{_PERFORMANCE_V2_MAINTENANCE_RECOVERY_TTL_SECONDS // 60} minutes; a later failed full delete can replace it. "
+                            "After a Panel restart or expiry, unattributed plateau rows are preserved because they cannot be safely assigned to selected pairs."
+                        )
+        finally:
+            with self._performance_v2_maintenance_state_lock:
+                if self._performance_v2_maintenance_active_job == job_id:
+                    self._performance_v2_maintenance_active_job = None
+
+    def strategies_performance_v2_maintenance_status(self, job_id: object) -> dict[str, object]:
+        if not isinstance(job_id, str) or not job_id:
+            raise PerformanceV2ApiError("INVALID_REQUEST", status=400, message="job_id is required")
+        with self._performance_v2_maintenance_state_lock:
+            job = self._performance_v2_maintenance_job
+            if job is None or job.get("job_id") != job_id:
+                raise PerformanceV2ApiError("MAINTENANCE_JOB_NOT_FOUND", status=404, message="maintenance job is unavailable")
+            result = deepcopy(job)
+            result["elapsed_seconds"] = (
+                max(0.0, perf_counter() - float(job["started_at"]))
+                if job.get("status") == "RUNNING" else float(job["elapsed_seconds"])
+            )
+            result.pop("started_at", None)
+            return result
+
     def strategies_performance_v2_export(self, selection: object, *, now: datetime | None = None) -> tuple[str, bytes]:
         try:
             config = self._performance_v2_config()
@@ -4758,7 +5037,7 @@ class PanelController:
         if not target.is_file():
             raise PerformanceV2ApiError("PERFORMANCE_V2_NOT_FOUND", status=404, message="Performance v2 database is unavailable")
         self._ensure_performance_v2_schema(target)
-        with self._performance_v2_writer_lock:
+        with self._performance_v2_writer_guard(target):
             return calculate_performance_v2_windows(target, strategy_id, window_a, window_b)
 
     def strategies_performance_v2_windows(self, payload: Mapping[str, object]) -> dict[str, object]:
@@ -5304,7 +5583,7 @@ class PanelController:
             "request_json_extra": {"control_mode": "CURRENT_EFFECTIVE", "ranking_scope": "CURRENT_EFFECTIVE"},
         } for spec in specs]
         try:
-            with self._performance_v2_writer_lock, duckdb.connect(str(target)) as connection:
+            with self._performance_v2_writer_guard(target), duckdb.connect(str(target)) as connection:
                 persist_selection_snapshots(connection, snapshots, workbook_bytes=data)
         except SelectionReviewError as error:
             raise FinalistRetestError(error.code, details=error.details) from error
@@ -5390,7 +5669,7 @@ class PanelController:
                     if not cache.get("ready"):
                         with self._performance_v2_writer_lock, duckdb.connect(str(target), read_only=True) as connection:
                             missing = selection_cache_missing_strategy_ids(connection, cohort_request, selection_config)
-                        with self._performance_v2_writer_lock:
+                        with self._performance_v2_writer_guard(target):
                             prepare_selection_window_cache(target, cohort_request, selection_config, performance_config.workers, missing)
                     with self._performance_v2_writer_lock, duckdb.connect(str(target), read_only=True) as connection:
                         if not selection_cache_status(connection, cohort_request, selection_config).get("ready"):
@@ -5515,7 +5794,7 @@ class PanelController:
             }
             snapshots.append({"request": spec["request"], "config": selection_config, "result": spec["result"], "metadata": snapshot_metadata, "request_json_extra": spec["request_json_extra"]})
         try:
-            with self._performance_v2_writer_lock, duckdb.connect(str(target)) as connection:
+            with self._performance_v2_writer_guard(target), duckdb.connect(str(target)) as connection:
                 persist_selection_snapshots(connection, snapshots, workbook_bytes=data)
         except SelectionReviewError as error:
             raise FinalistRetestError(error.code, details=error.details) from error
@@ -5529,7 +5808,7 @@ class PanelController:
         target = performance_v2_database_path(self._performance_v2_config())
         self._ensure_performance_v2_schema(target)
         try:
-            with self._performance_v2_writer_lock, duckdb.connect(str(target)) as connection:
+            with self._performance_v2_writer_guard(target), duckdb.connect(str(target)) as connection:
                 return import_combined_control_workbook(connection, data)
         except FinalistRetestError:
             raise
@@ -5664,7 +5943,7 @@ class PanelController:
                     result, Path(directory) / "finalists.xlsx", request, metadata, user_review_rows
                 )
                 data = workbook.read_bytes()
-                with self._performance_v2_writer_lock, duckdb.connect(str(target)) as connection:
+                with self._performance_v2_writer_guard(target), duckdb.connect(str(target)) as connection:
                     persist_selection_snapshot(connection, request, selection_config, result, metadata, data)
         except SelectionReviewError as error:
             status = 409 if error.code in {
@@ -5682,7 +5961,7 @@ class PanelController:
             raise PerformanceV2ApiError("PERFORMANCE_V2_NOT_FOUND", status=404)
         self._ensure_performance_v2_schema(target)
         try:
-            with self._performance_v2_writer_lock, duckdb.connect(str(target)) as connection:
+            with self._performance_v2_writer_guard(target), duckdb.connect(str(target)) as connection:
                 return import_selection_review(connection, data)
         except SelectionReviewError as error:
             status = 409 if error.code in {
@@ -5701,7 +5980,7 @@ class PanelController:
             raise PerformanceV2ApiError("PERFORMANCE_V2_NOT_FOUND", status=404)
         self._ensure_performance_v2_schema(target)
         try:
-            with self._performance_v2_writer_lock, duckdb.connect(str(target)) as connection:
+            with self._performance_v2_writer_guard(target), duckdb.connect(str(target)) as connection:
                 return import_retest_tags(connection, data)
         except SelectionReviewError as error:
             details = f": {error.details}" if error.details else ""
@@ -5765,10 +6044,11 @@ class PanelController:
                     missing_strategy_ids = selection_cache_missing_strategy_ids(
                         connection, request, config, include_equity_regime=True,
                     )
-                prepare_selection_window_cache(
-                    target, request, config, performance_config.workers, missing_strategy_ids,
-                    include_equity_regime=True,
-                )
+                with self._performance_v2_writer_guard(target):
+                    prepare_selection_window_cache(
+                        target, request, config, performance_config.workers, missing_strategy_ids,
+                        include_equity_regime=True,
+                    )
             with self._selection_candidate_cache_lock:
                 self._selection_candidate_cache.clear()
             return {"status": "READY"}
@@ -5831,10 +6111,11 @@ class PanelController:
                 for request, missing_strategy_ids in pending:
                     with self._lock:
                         self._performance_v2_recalculate_progress["current_pair"] = f"{request.symbol}/{request.side}"
-                    prepare_selection_window_cache(
-                        target, request, config, performance_config.workers, missing_strategy_ids,
-                        include_equity_regime=True, on_batch_complete=after_batch,
-                    )
+                    with self._performance_v2_writer_guard(target):
+                        prepare_selection_window_cache(
+                            target, request, config, performance_config.workers, missing_strategy_ids,
+                            include_equity_regime=True, on_batch_complete=after_batch,
+                        )
                     with self._lock:
                         self._performance_v2_recalculate_progress["completed_pairs"] += 1
             if pending:
@@ -8636,6 +8917,21 @@ class _PanelHandler(BaseHTTPRequestHandler):
                 _LOGGER.exception("Performance v2 catalog failed")
                 self._json(500, {"error": {"code": "INTERNAL", "message": "Performance v2 catalog failed"}})
             return
+        if parsed.path == "/api/v2/strategies/performance-v2/maintenance/catalog":
+            try:
+                self._json(200, self.server.controller.strategies_performance_v2_maintenance_catalog())
+            except PerformanceV2ApiError as error:
+                self._json(error.status, {"error": {"code": error.code, "message": str(error)}})
+            return
+        if parsed.path == "/api/v2/strategies/performance-v2/maintenance/status":
+            try:
+                query = parse_qs(parsed.query)
+                if set(query) != {"job_id"} or len(query["job_id"]) != 1:
+                    raise PerformanceV2ApiError("INVALID_REQUEST", status=400, message="status requires exactly one job_id")
+                self._json(200, self.server.controller.strategies_performance_v2_maintenance_status(query["job_id"][0]))
+            except PerformanceV2ApiError as error:
+                self._json(error.status, {"error": {"code": error.code, "message": str(error)}})
+            return
         if parsed.path == "/api/v2/strategies/performance-v2/selection-settings":
             try:
                 self._json(200, self.server.controller.performance_v2_selection_settings())
@@ -8929,11 +9225,16 @@ class _PanelHandler(BaseHTTPRequestHandler):
         fresh_generation = endpoint == "/api/v2/strategies/fresh/generate"
         performance_v2_windows_endpoint = endpoint == "/api/v2/strategies/performance-v2/windows"
         performance_v2_selection_endpoint = endpoint == "/api/v2/strategies/performance-v2/selection"
+        performance_v2_maintenance_apply_endpoint = endpoint == "/api/v2/strategies/performance-v2/maintenance/apply"
+        performance_v2_maintenance_endpoint = endpoint in {
+            "/api/v2/strategies/performance-v2/maintenance/preview",
+            "/api/v2/strategies/performance-v2/maintenance/apply",
+        }
         portfolio_preparation_route = endpoint == "/api/v2/portfolio/finalist-inputs"
         portfolio_route = portfolio_preparation_route or endpoint == "/api/v2/portfolio/campaigns" or bool(re.fullmatch(r"/api/v2/portfolio/jobs/[^/]+/cancel", endpoint)) or bool(re.fullmatch(r"/api/v2/portfolio/campaigns/[^/]+/tester-submissions", endpoint))
         portfolio_cancel_route = bool(re.fullmatch(r"/api/v2/portfolio/jobs/[^/]+/cancel", endpoint))
         portfolio_submission_route = bool(re.fullmatch(r"/api/v2/portfolio/campaigns/[^/]+/tester-submissions", endpoint))
-        if bulk_retest_endpoint is None and endpoint != "/api/v2/strategies/performance-v2/selection-settings" and endpoint not in {"/api/start", "/api/browse", "/api/duckdb-import/settings", "/api/duckdb-import/preflight", "/api/duckdb-import/start", "/api/duckdb-import/cancel", "/api/duckdb-import/migrate", "/api/duckdb-direct/coverage", "/api/duckdb-direct/preflight", "/api/duckdb-direct/start", "/api/duckdb-direct/cancel", "/api/analysis/library", "/api/analysis/initialize", "/api/analysis/rerun", "/api/analysis/compare", "/api/analysis/export", "/api/analysis/shortlist", "/api/analysis/filter-export", "/api/analysis/strategies", "/api/source-v6/preflight", "/api/source-v6/start", "/api/source-v6/fresh/multiscope/start", "/api/source-v6/fresh/multiscope/analysis/start", "/api/source-v6/cancel", "/api/source-v6/merge", "/api/v2/panel/restart", "/api/v2/settings/validate", "/api/v2/settings/save", "/api/v2/settings/analysis-profile", "/api/v2/jobs", "/api/v2/strategies/tester/verify-inbox", "/api/v2/strategies/tester/report-collection/clear", "/api/v2/testing/local/fill", "/api/v2/testing/local/start", "/api/v2/testing/local/stop", "/api/v2/testing/screener/fill", "/api/v2/testing/screener/start", "/api/v2/testing/screener/stop", "/api/v2/testing/screener/evaluate", "/api/v2/testing/remote/check-paths", "/api/v2/testing/remote/prepare", "/api/v2/testing/remote/fill", "/api/v2/testing/remote/start", "/api/v2/testing/remote/stop", "/api/v2/source/local/import/preflight", "/api/v2/source/local/import/start", "/api/v2/source/local/merge/preflight", "/api/v2/source/local/merge/start", "/api/v2/source/local/cancel", "/api/v2/source/remote/start", "/api/v2/source/remote/cancel", "/api/v2/surfaces/preflight", "/api/v2/surfaces/select", "/api/v2/surfaces/publish", "/api/v2/surfaces/publish/start", "/api/v2/strategies/fresh/analyze", "/api/v2/strategies/fresh/generate", "/api/v2/strategies/fresh/runs", "/api/v2/strategies/fresh/shortlist", "/api/v2/strategies/fresh/open", "/api/v2/strategies/performance-v2/windows", "/api/v2/strategies/performance-v2/selection", "/api/v2/strategies/performance-v2/selection-preview", "/api/v2/strategies/performance-v2/selection-cache-status", "/api/v2/strategies/performance-v2/recalculate", "/api/v2/strategies/performance-v2/recalculate-all", "/api/v2/strategies/performance-v2/selection-review-import", "/api/v2/strategies/performance-v2/retest-tags-import", "/api/v2/strategies/performance-v2/retest/start", "/api/v2/strategies/performance-v2/retest/import"} and not portfolio_route:
+        if bulk_retest_endpoint is None and endpoint != "/api/v2/strategies/performance-v2/selection-settings" and endpoint not in {"/api/start", "/api/browse", "/api/duckdb-import/settings", "/api/duckdb-import/preflight", "/api/duckdb-import/start", "/api/duckdb-import/cancel", "/api/duckdb-import/migrate", "/api/duckdb-direct/coverage", "/api/duckdb-direct/preflight", "/api/duckdb-direct/start", "/api/duckdb-direct/cancel", "/api/analysis/library", "/api/analysis/initialize", "/api/analysis/rerun", "/api/analysis/compare", "/api/analysis/export", "/api/analysis/shortlist", "/api/analysis/filter-export", "/api/analysis/strategies", "/api/source-v6/preflight", "/api/source-v6/start", "/api/source-v6/fresh/multiscope/start", "/api/source-v6/fresh/multiscope/analysis/start", "/api/source-v6/cancel", "/api/source-v6/merge", "/api/v2/panel/restart", "/api/v2/settings/validate", "/api/v2/settings/save", "/api/v2/settings/analysis-profile", "/api/v2/jobs", "/api/v2/strategies/tester/verify-inbox", "/api/v2/strategies/tester/report-collection/clear", "/api/v2/testing/local/fill", "/api/v2/testing/local/start", "/api/v2/testing/local/stop", "/api/v2/testing/screener/fill", "/api/v2/testing/screener/start", "/api/v2/testing/screener/stop", "/api/v2/testing/screener/evaluate", "/api/v2/testing/remote/check-paths", "/api/v2/testing/remote/prepare", "/api/v2/testing/remote/fill", "/api/v2/testing/remote/start", "/api/v2/testing/remote/stop", "/api/v2/source/local/import/preflight", "/api/v2/source/local/import/start", "/api/v2/source/local/merge/preflight", "/api/v2/source/local/merge/start", "/api/v2/source/local/cancel", "/api/v2/source/remote/start", "/api/v2/source/remote/cancel", "/api/v2/surfaces/preflight", "/api/v2/surfaces/select", "/api/v2/surfaces/publish", "/api/v2/surfaces/publish/start", "/api/v2/strategies/fresh/analyze", "/api/v2/strategies/fresh/generate", "/api/v2/strategies/fresh/runs", "/api/v2/strategies/fresh/shortlist", "/api/v2/strategies/fresh/open", "/api/v2/strategies/performance-v2/windows", "/api/v2/strategies/performance-v2/selection", "/api/v2/strategies/performance-v2/selection-preview", "/api/v2/strategies/performance-v2/selection-cache-status", "/api/v2/strategies/performance-v2/recalculate", "/api/v2/strategies/performance-v2/recalculate-all", "/api/v2/strategies/performance-v2/selection-review-import", "/api/v2/strategies/performance-v2/retest-tags-import", "/api/v2/strategies/performance-v2/retest/start", "/api/v2/strategies/performance-v2/retest/import"} and not portfolio_route and not performance_v2_maintenance_endpoint:
             self._json(404, {"error": "not found"})
             return
         if endpoint in {"/api/v2/strategies/performance-v2/selection-review-import", "/api/v2/strategies/performance-v2/retest-tags-import"}:
@@ -9087,6 +9388,10 @@ class _PanelHandler(BaseHTTPRequestHandler):
                 result = self.server.controller.strategies_fresh_shortlist(document)
             elif endpoint == "/api/v2/strategies/performance-v2/windows":
                 result = self.server.controller.strategies_performance_v2_windows(document)
+            elif endpoint == "/api/v2/strategies/performance-v2/maintenance/preview":
+                result = self.server.controller.strategies_performance_v2_maintenance_preview(document)
+            elif endpoint == "/api/v2/strategies/performance-v2/maintenance/apply":
+                result = self.server.controller.strategies_performance_v2_maintenance_apply(document)
             elif endpoint == "/api/v2/strategies/performance-v2/selection":
                 result = self.server.controller.strategies_performance_v2_selection(document)
             elif endpoint == "/api/v2/strategies/performance-v2/selection-settings":
@@ -9265,7 +9570,7 @@ class _PanelHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(data)
             return
-        accepted = portfolio_preparation_route or portfolio_cancel_route or portfolio_submission_route or endpoint in {"/api/start", "/api/duckdb-import/start", "/api/duckdb-direct/start", "/api/analysis/rerun", "/api/analysis/strategies", "/api/source-v6/analysis/start", "/api/source-v6/fresh/multiscope/start", "/api/source-v6/fresh/multiscope/analysis/start", "/api/v2/jobs", "/api/v2/surfaces/publish/start", "/api/v2/strategies/performance-v2/retest/start", "/api/v2/strategies/performance-v2/retest/import", "/api/v2/strategies/performance-v2/finalist-retest/start", "/api/v2/strategies/performance-v2/finalist-retest/import", "/api/v2/portfolio/campaigns"}
+        accepted = portfolio_preparation_route or portfolio_cancel_route or portfolio_submission_route or performance_v2_maintenance_apply_endpoint or endpoint in {"/api/start", "/api/duckdb-import/start", "/api/duckdb-direct/start", "/api/analysis/rerun", "/api/analysis/strategies", "/api/source-v6/analysis/start", "/api/source-v6/fresh/multiscope/start", "/api/source-v6/fresh/multiscope/analysis/start", "/api/v2/jobs", "/api/v2/surfaces/publish/start", "/api/v2/strategies/performance-v2/retest/start", "/api/v2/strategies/performance-v2/retest/import", "/api/v2/strategies/performance-v2/finalist-retest/start", "/api/v2/strategies/performance-v2/finalist-retest/import", "/api/v2/portfolio/campaigns"}
         self._json(202 if accepted else 200, result)
 
     def do_PATCH(self) -> None:

@@ -171,6 +171,14 @@ def _request(
 def _db(request: PerformanceV2ImportRequest) -> Path:
     target = performance_v2_database_path(request.config)
     target.parent.mkdir(parents=True, exist_ok=True)
+    repository_root = Path(__file__).resolve().parents[1]
+    known_production_targets = {
+        (repository_root / "data" / "performanceDB" / "strategy_performance.duckdb").resolve(),
+        (repository_root / "data" / "performance-v2" / "strategy_performance.duckdb").resolve(),
+    }
+    assert target.is_relative_to(request.config.database_root.resolve()), "writable importer target must be beneath its fixture root"
+    assert target.resolve() not in known_production_targets, "known production PerformanceDB paths are forbidden"
+    assert not target.resolve().is_relative_to(repository_root), "repository databases are read-only"
     with duckdb.connect(str(target)) as connection:
         initialize_performance_v2(connection)
     return target
@@ -1744,7 +1752,7 @@ def test_import_migrates_existing_v4_target_before_current_schema_gate(tmp_path:
     with duckdb.connect(str(target), read_only=True) as connection:
         assert connection.execute(
             "select value from schema_info where key = 'schema_version'"
-        ).fetchone() == ("8",)
+        ).fetchone() == ("9",)
 
 
 def test_bare_duckdb_target_is_not_initialized_by_import(tmp_path: Path) -> None:
@@ -2724,6 +2732,39 @@ def test_add_replaces_canonical_result_only_for_a_strict_interval_superset(tmp_p
         assert connection.execute("select count(*) from strategies").fetchone() == (1,)
         assert connection.execute("select count(*) from strategy_results").fetchone() == (1,)
         assert connection.execute("select report_end_utc from strategy_results").fetchone()[0].date().isoformat() == "2026-01-10"
+
+
+def test_add_equal_reimport_stays_deduped_after_detail_delete_then_wider_rebuilds_details(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path)
+    assert import_performance_v2(request).imported_count == 1
+    target = performance_v2_database_path(request.config)
+    with duckdb.connect(str(target)) as connection:
+        strategy_id, result_id = connection.execute(
+            "select strategy_id, current_result_id from strategies where strategy_name = 'alpha'"
+        ).fetchone()
+        # The importer rebuilds its action/equity facts; optimizer inputs are
+        # produced by a separate preparation path and are empty in this fixture.
+        for table in ("strategy_actions", "strategy_equity"):
+            assert connection.execute(f"select count(*) from {table} where result_id = ?", [result_id]).fetchone()[0] > 0
+            connection.execute(f"delete from {table} where result_id = ?", [result_id])
+
+    equal = import_performance_v2(request)
+    assert (equal.imported_count, equal.skipped_count) == (0, 1)
+    with duckdb.connect(str(target), read_only=True) as connection:
+        assert connection.execute("select current_result_id from strategies where strategy_id = ?", [strategy_id]).fetchone() == (result_id,)
+        for table in ("strategy_actions", "strategy_equity"):
+            assert connection.execute(f"select count(*) from {table} where result_id = ?", [result_id]).fetchone() == (0,)
+
+    wider = FIXTURE.read_bytes().replace(
+        b"2026-01-01 - 2026-01-09", b"2025-12-20 - 2026-01-10"
+    )
+    _rewrite_report(request, wider)
+    rebuilt = import_performance_v2(request)
+    assert (rebuilt.imported_count, rebuilt.skipped_count) == (1, 0)
+    with duckdb.connect(str(target), read_only=True) as connection:
+        assert connection.execute("select current_result_id from strategies where strategy_id = ?", [strategy_id]).fetchone() == (result_id,)
+        for table in ("strategy_actions", "strategy_equity"):
+            assert connection.execute(f"select count(*) from {table} where result_id = ?", [result_id]).fetchone()[0] > 0
 
 
 def test_add_superset_does_not_clear_a_retest_tag(tmp_path: Path) -> None:

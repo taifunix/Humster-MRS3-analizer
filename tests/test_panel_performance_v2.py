@@ -176,7 +176,15 @@ def test_normalization_30d_is_additive_to_window_document() -> None:
 
 def _db(tmp_path: Path) -> tuple[duckdb.DuckDBPyConnection, int]:
     tmp_path.mkdir(parents=True, exist_ok=True)
-    connection = duckdb.connect(str(tmp_path / "strategy_performance.duckdb"))
+    target = (tmp_path / "strategy_performance.duckdb").resolve()
+    known_production_targets = {
+        (Path(__file__).resolve().parents[1] / "data" / "performanceDB" / "strategy_performance.duckdb").resolve(),
+        (Path(__file__).resolve().parents[1] / "data" / "performance-v2" / "strategy_performance.duckdb").resolve(),
+    }
+    assert target.is_relative_to(tmp_path.resolve()), "writable database target must be beneath its test fixture root"
+    assert target not in known_production_targets, "known production PerformanceDB paths are forbidden"
+    assert not target.is_relative_to(Path(__file__).resolve().parents[1]), "repository databases are read-only"
+    connection = duckdb.connect(str(target))
     initialize_performance_v2(connection)
     now = datetime(2026, 1, 1, tzinfo=UTC)
     strategy_id = connection.execute(
@@ -1818,6 +1826,542 @@ def test_v2_catalog_and_windows_http_are_typed_and_repeatable(tmp_path: Path) ->
         assert connection.execute("select count(*) from window_metrics").fetchone() == (2,)
         for table, count in facts.items():
             assert connection.execute(f"select count(*) from {table}").fetchone() == (count,)
+
+
+def test_performance_v2_maintenance_http_preview_apply_and_reused_token(tmp_path: Path) -> None:
+    controller, database, _ = _controller_for_windows(tmp_path)
+    server, thread = _http_server(controller)
+    try:
+        connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+        status, catalog = _http_json(connection, "GET", "/api/v2/strategies/performance-v2/maintenance/catalog")
+        assert status == 200 and catalog["symbols"] == ["BTCUSDT"]
+
+        with duckdb.connect(str(database), read_only=True) as db:
+            before = db.execute("select count(*) from strategies").fetchone()[0]
+        status, bad = _http_json(connection, "POST", "/api/v2/strategies/performance-v2/maintenance/preview", {
+            "operation": "full", "symbols": ["BTCUSDT"], "strategy_ids": [1],
+        })
+        assert status == 400 and bad["error"]["code"] == "INVALID_REQUEST"
+
+        status, preview = _http_json(connection, "POST", "/api/v2/strategies/performance-v2/maintenance/preview", {
+            "operation": "full", "symbols": ["BTCUSDT"],
+        })
+        assert status == 200
+        assert preview["pairs"][0]["symbol"] == "BTCUSDT"
+        assert "token" in preview and "fingerprint" not in preview
+        assert preview["global_counts"]["import_files"] >= 0
+        with duckdb.connect(str(database), read_only=True) as db:
+            assert db.execute("select count(*) from strategies").fetchone()[0] == before
+
+        status, accepted = _http_json(connection, "POST", "/api/v2/strategies/performance-v2/maintenance/apply", {
+            "token": preview["token"],
+        })
+        assert status == 202 and accepted["job_id"]
+        job_id = accepted["job_id"]
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            status, job = _http_json(connection, "GET", f"/api/v2/strategies/performance-v2/maintenance/status?job_id={job_id}")
+            assert status == 200
+            if job["status"] in {"COMMITTED", "FAILED"}:
+                break
+            time.sleep(.02)
+        assert job["status"] == "COMMITTED"
+        assert job["pair_scoped_deleted"] == job["pair_scoped_total"]
+
+        status, reused = _http_json(connection, "POST", "/api/v2/strategies/performance-v2/maintenance/apply", {
+            "token": preview["token"],
+        })
+        assert status == 409 and reused["error"]["code"] == "PREVIEW_TOKEN_INVALID"
+        connection.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_performance_v2_maintenance_preview_tokens_expire_and_evict_oldest(tmp_path: Path) -> None:
+    controller, database, _ = _controller_for_windows(tmp_path)
+    payload = {"operation": "full", "symbols": ["BTCUSDT"]}
+    preview = controller.strategies_performance_v2_maintenance_preview(payload)
+    token = str(preview["token"])
+    created_at, saved_preview = controller._performance_v2_maintenance_previews[token]
+    controller._performance_v2_maintenance_previews[token] = (
+        created_at - panel_module._PERFORMANCE_V2_MAINTENANCE_PREVIEW_TTL_SECONDS - 1,
+        saved_preview,
+    )
+    with pytest.raises(PerformanceV2ApiError) as expired:
+        controller.strategies_performance_v2_maintenance_apply({"token": token})
+    assert expired.value.code == "PREVIEW_TOKEN_INVALID"
+
+    now = panel_module.perf_counter()
+    limit = panel_module._PERFORMANCE_V2_MAINTENANCE_MAX_PREVIEWS
+    controller._performance_v2_maintenance_previews = {
+        f"old-{index}": (now, {}) for index in range(limit)
+    }
+    newest = controller.strategies_performance_v2_maintenance_preview(payload)
+    assert len(controller._performance_v2_maintenance_previews) == limit
+    assert "old-0" not in controller._performance_v2_maintenance_previews
+    assert f"old-{limit - 1}" in controller._performance_v2_maintenance_previews
+    with pytest.raises(PerformanceV2ApiError) as evicted:
+        controller.strategies_performance_v2_maintenance_apply({"token": "old-0"})
+    assert evicted.value.code == "PREVIEW_TOKEN_INVALID"
+    assert database.is_file()
+
+
+def test_performance_v2_maintenance_plateau_recovery_expires_after_fifteen_minutes(tmp_path: Path) -> None:
+    controller, database, _ = _controller_for_windows(tmp_path)
+    preview = controller.strategies_performance_v2_maintenance_preview({
+        "operation": "full", "symbols": ["BTCUSDT"],
+    })
+    saved_preview = controller._performance_v2_maintenance_previews[preview["token"]][1]
+    with duckdb.connect(str(database)) as connection:
+        connection.execute("delete from strategy_orders")
+    controller._performance_v2_maintenance_recovery_preview = (
+        panel_module.perf_counter() - panel_module._PERFORMANCE_V2_MAINTENANCE_RECOVERY_TTL_SECONDS - 1,
+        saved_preview,
+    )
+
+    after_expiry = controller.strategies_performance_v2_maintenance_preview({
+        "operation": "full", "symbols": ["BTCUSDT"],
+    })
+
+    assert after_expiry["table_counts"]["analysis_plateaus"] == 0
+    assert controller._performance_v2_maintenance_recovery_preview is None
+
+
+def test_performance_v2_maintenance_apply_admission_is_atomic(tmp_path: Path, monkeypatch) -> None:
+    controller, _, _ = _controller_for_windows(tmp_path)
+    payload = {"operation": "full", "symbols": ["BTCUSDT"]}
+    tokens = [
+        controller.strategies_performance_v2_maintenance_preview(payload)["token"]
+        for _ in range(2)
+    ]
+    worker_entered = threading.Event()
+    release_worker = threading.Event()
+    worker_ids: list[str] = []
+
+    def blocked_worker(job_id, _preview, _started_at):
+        worker_ids.append(job_id)
+        worker_entered.set()
+        assert release_worker.wait(5)
+        with controller._performance_v2_maintenance_state_lock:
+            job = controller._performance_v2_maintenance_job
+            if job and job.get("job_id") == job_id:
+                job.update({"status": "COMMITTED", "phase": "committed", "elapsed_seconds": 0.0})
+                controller._performance_v2_maintenance_active_job = None
+
+    monkeypatch.setattr(controller, "_run_performance_v2_maintenance", blocked_worker)
+    start = threading.Barrier(3)
+    outcomes: list[tuple[int, str]] = []
+
+    def submit(token: str) -> None:
+        start.wait()
+        try:
+            result = controller.strategies_performance_v2_maintenance_apply({"token": token})
+            outcomes.append((202, str(result["job_id"])))
+        except PerformanceV2ApiError as error:
+            outcomes.append((error.status, error.code))
+
+    requests = [threading.Thread(target=submit, args=(token,)) for token in tokens]
+    try:
+        for request in requests:
+            request.start()
+        start.wait()
+        for request in requests:
+            request.join(timeout=3)
+        assert all(not request.is_alive() for request in requests)
+        assert worker_entered.wait(2)
+        assert sorted(status for status, _ in outcomes) == [202, 409]
+        assert sum(status == 409 and value == "PERFORMANCE_V2_MAINTENANCE_BUSY" for status, value in outcomes) == 1
+        assert len(worker_ids) == 1
+    finally:
+        release_worker.set()
+        for request in requests:
+            request.join(timeout=2)
+
+
+@pytest.mark.parametrize(
+    ("operation", "message", "expected_code", "expected_status"),
+    [
+        ("catalog", "Could not set lock on file", "PERFORMANCE_V2_LOCKED", 409),
+        ("catalog", "database page checksum mismatch", "PERFORMANCE_V2_DATABASE_ERROR", 500),
+        ("preview", "Could not set lock on file", "PERFORMANCE_V2_LOCKED", 409),
+        ("preview", "database page checksum mismatch", "PERFORMANCE_V2_DATABASE_ERROR", 500),
+    ],
+)
+def test_performance_v2_maintenance_reports_database_errors_by_cause(
+    tmp_path: Path, monkeypatch, operation: str, message: str,
+    expected_code: str, expected_status: int,
+) -> None:
+    controller, _, _ = _controller_for_windows(tmp_path)
+
+    def fail_connect(*_args, **_kwargs):
+        raise duckdb.IOException(message)
+
+    monkeypatch.setattr(panel_module.duckdb, "connect", fail_connect)
+    with pytest.raises(PerformanceV2ApiError) as raised:
+        if operation == "catalog":
+            controller.strategies_performance_v2_maintenance_catalog()
+        else:
+            controller.strategies_performance_v2_maintenance_preview(
+                {"operation": "full", "symbols": ["BTCUSDT"]}
+            )
+    assert raised.value.code == expected_code
+    assert raised.value.status == expected_status
+    assert message in str(raised.value)
+
+
+def test_performance_v2_maintenance_schema_errors_are_typed_for_catalog_and_preview(tmp_path: Path) -> None:
+    controller, database, _ = _controller_for_windows(tmp_path)
+    with duckdb.connect(str(database)) as db:
+        db.execute("create table unclassified_maintenance_table (id integer)")
+    server, thread = _http_server(controller)
+    try:
+        connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+        status, catalog = _http_json(connection, "GET", "/api/v2/strategies/performance-v2/maintenance/catalog")
+        assert status == 409
+        assert catalog["error"]["code"] == "PERFORMANCE_V2_SCHEMA_INVALID"
+        status, preview = _http_json(connection, "POST", "/api/v2/strategies/performance-v2/maintenance/preview", {
+            "operation": "full", "symbols": ["BTCUSDT"],
+        })
+        assert status == 409
+        assert preview["error"]["code"] == "PERFORMANCE_V2_SCHEMA_INVALID"
+        assert "unclassified_maintenance_table" in preview["error"]["message"]
+        connection.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_performance_v2_maintenance_catalog_and_preview_return_promptly_when_panel_writer_lock_is_held(tmp_path: Path) -> None:
+    controller, _, _ = _controller_for_windows(tmp_path)
+    lock_entered = threading.Event()
+    release_lock = threading.Event()
+
+    def hold_writer_lock() -> None:
+        with controller._performance_v2_writer_lock:
+            lock_entered.set()
+            assert release_lock.wait(5)
+
+    holder = threading.Thread(target=hold_writer_lock, daemon=True)
+    holder.start()
+    assert lock_entered.wait(2)
+    server, thread = _http_server(controller)
+    try:
+        connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+        status, catalog = _http_json(connection, "GET", "/api/v2/strategies/performance-v2/maintenance/catalog")
+        assert status == 409 and catalog["error"]["code"] == "PERFORMANCE_V2_LOCKED"
+        status, preview = _http_json(connection, "POST", "/api/v2/strategies/performance-v2/maintenance/preview", {
+            "operation": "full", "symbols": ["BTCUSDT"],
+        })
+        assert status == 409 and preview["error"]["code"] == "PERFORMANCE_V2_LOCKED"
+        connection.close()
+    finally:
+        release_lock.set()
+        holder.join(timeout=2)
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_performance_v2_maintenance_progress_callback_accepts_unpreviewed_symbol_and_table(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    controller, _, _ = _controller_for_windows(tmp_path)
+    preview = controller.strategies_performance_v2_maintenance_preview({
+        "operation": "full", "symbols": ["BTCUSDT"],
+    })
+
+    def report_committed_row(_connection, _preview, *, on_phase=None, on_commit=None):
+        if on_phase:
+            on_phase("unexpected_table")
+        if on_commit:
+            on_commit({
+                "table": "unexpected_table", "rows": 1,
+                "rows_by_symbol": {"UNPREVIEWED": 1}, "shared_plateau_rows": 0, "global": False,
+            })
+        return {
+            "pair_scoped_deleted": 1, "global_deleted": {},
+            "table_counts": {"unexpected_table": 1}, "shared_plateau_deleted": 0,
+        }
+
+    monkeypatch.setattr(panel_module, "apply_performance_v2_maintenance_preview", report_committed_row)
+    accepted = controller.strategies_performance_v2_maintenance_apply({"token": preview["token"]})
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        job = controller.strategies_performance_v2_maintenance_status(accepted["job_id"])
+        if job["status"] in {"COMMITTED", "FAILED"}:
+            break
+        time.sleep(.01)
+
+    assert job["status"] == "COMMITTED"
+    assert job["pair_counts"]["UNPREVIEWED"] == 1
+    assert job["pair_table_counts"]["UNPREVIEWED"]["unexpected_table"] == 1
+
+
+def test_performance_v2_maintenance_returns_conflicts_while_apply_runs(tmp_path: Path, monkeypatch) -> None:
+    controller, database, _ = _controller_for_windows(tmp_path)
+    existing_writer_entered = threading.Event()
+    release_existing_writer = threading.Event()
+    entered = threading.Event()
+    release = threading.Event()
+    real_apply = panel_module.apply_performance_v2_maintenance_preview
+
+    def existing_writer():
+        with controller._performance_v2_writer_guard(database):
+            existing_writer_entered.set()
+            assert release_existing_writer.wait(5)
+
+    def blocked_apply(connection, preview, *, on_phase=None, on_commit=None):
+        entered.set()
+        assert release.wait(5)
+        return real_apply(connection, preview, on_phase=on_phase, on_commit=on_commit)
+
+    monkeypatch.setattr(panel_module, "apply_performance_v2_maintenance_preview", blocked_apply)
+    server, thread = _http_server(controller)
+    try:
+        connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+        status, preview = _http_json(connection, "POST", "/api/v2/strategies/performance-v2/maintenance/preview", {
+            "operation": "rejected", "symbols": ["BTCUSDT"],
+        })
+        assert status == 200
+        existing_writer_thread = threading.Thread(target=existing_writer, daemon=True)
+        existing_writer_thread.start()
+        assert existing_writer_entered.wait(2)
+        status, accepted = _http_json(connection, "POST", "/api/v2/strategies/performance-v2/maintenance/apply", {"token": preview["token"]})
+        assert status == 202
+        status, waiting_job = _http_json(connection, "GET", f"/api/v2/strategies/performance-v2/maintenance/status?job_id={accepted['job_id']}")
+        assert status == 200 and waiting_job["status"] == "RUNNING"
+        assert not entered.is_set(), "apply must wait for an existing Panel writer"
+        release_existing_writer.set()
+        assert entered.wait(2)
+        def database_must_not_be_reopened():
+            raise AssertionError("status polling must use memory only")
+        monkeypatch.setattr(controller, "_performance_v2_maintenance_target", database_must_not_be_reopened)
+
+        status, catalog = _http_json(connection, "GET", "/api/v2/strategies/performance-v2/maintenance/catalog")
+        assert status == 409 and catalog["error"]["code"] == "PERFORMANCE_V2_MAINTENANCE_BUSY"
+        status, preview_busy = _http_json(connection, "POST", "/api/v2/strategies/performance-v2/maintenance/preview", {
+            "operation": "full", "symbols": ["BTCUSDT"],
+        })
+        assert status == 409 and preview_busy["error"]["code"] == "PERFORMANCE_V2_MAINTENANCE_BUSY"
+        status, job = _http_json(connection, "GET", f"/api/v2/strategies/performance-v2/maintenance/status?job_id={accepted['job_id']}")
+        assert status == 200 and job["status"] == "RUNNING"
+
+        new_writer_entered = threading.Event()
+        # Use a complete guard scope so this simulates a new writer path.
+        def new_writer():
+            with controller._performance_v2_writer_guard(database):
+                new_writer_entered.set()
+        new_writer_thread = threading.Thread(target=new_writer, daemon=True)
+        new_writer_thread.start()
+        assert not new_writer_entered.wait(.1), "new Panel writer must wait behind apply"
+
+        release.set()
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            status, job = _http_json(connection, "GET", f"/api/v2/strategies/performance-v2/maintenance/status?job_id={accepted['job_id']}")
+            if job["status"] in {"COMMITTED", "FAILED"}:
+                break
+            time.sleep(.02)
+        assert job["status"] == "COMMITTED"
+        assert new_writer_entered.wait(2)
+        existing_writer_thread.join(timeout=2)
+        new_writer_thread.join(timeout=2)
+        connection.close()
+    finally:
+        release.set()
+        release_existing_writer.set()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_performance_v2_maintenance_keeps_actual_counts_after_late_failure(tmp_path: Path, monkeypatch) -> None:
+    controller, database, _ = _controller_for_windows(tmp_path)
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    with duckdb.connect(str(database)) as db:
+        eth_strategy_id = db.execute(
+            """insert into strategies (strategy_name, symbol, side, timeframe, close_ma_len,
+                   order_count, analysis_run_id, candidate_identity, lifecycle_status,
+                   created_at_utc, updated_at_utc)
+               values ('beta', 'ETHUSDT', 'LONG', '1h', 3, 1, 'run', 'beta', 'ACTIVE', ?, ?)
+               returning strategy_id""",
+            [now, now],
+        ).fetchone()[0]
+        db.execute(
+            """insert into strategy_orders (strategy_id, order_id, open_ma_len, open_multiplier,
+                   shift_bp, lot_x, analysis_run_id, plateau_id, base_point_trades)
+               values (?, 1, 7, 0.995, 125, 1, 'run', 'P1', 8)""",
+            [eth_strategy_id],
+        )
+        import_run_id = db.execute(
+            """insert into import_runs (source_inbox_sha256, expected_report_count,
+                   imported_count, skipped_count, rejected_count, status, started_at_utc)
+               values ('maintenance-test-run', 1, 1, 0, 0, 'IMPORTED', ?)
+               returning import_run_id""",
+            [now],
+        ).fetchone()[0]
+        db.execute(
+            """insert into import_files (import_run_id, source_filename, source_html_sha256,
+                   source_size_bytes, status) values (?, 'report.html', 'maintenance-test-file', 1, 'IMPORTED')""",
+            [import_run_id],
+        )
+    real_apply = panel_module.apply_performance_v2_maintenance_preview
+
+    def fail_after_actions(connection, preview, *, on_phase=None, on_commit=None):
+        def phase(name):
+            if on_phase is not None:
+                on_phase(name)
+            if name == "import_runs":
+                raise RuntimeError("injected failure before import_runs")
+        return real_apply(connection, preview, on_phase=phase, on_commit=on_commit)
+
+    monkeypatch.setattr(panel_module, "apply_performance_v2_maintenance_preview", fail_after_actions)
+    server, thread = _http_server(controller)
+    try:
+        connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+        status, preview = _http_json(connection, "POST", "/api/v2/strategies/performance-v2/maintenance/preview", {
+            "operation": "full", "symbols": ["BTCUSDT", "ETHUSDT"],
+        })
+        assert status == 200
+        assert preview["shared_plateau_rows"] == 1
+        status, accepted = _http_json(connection, "POST", "/api/v2/strategies/performance-v2/maintenance/apply", {"token": preview["token"]})
+        assert status == 202
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            status, job = _http_json(connection, "GET", f"/api/v2/strategies/performance-v2/maintenance/status?job_id={accepted['job_id']}")
+            if job["status"] in {"COMMITTED", "FAILED"}:
+                break
+            time.sleep(.02)
+        assert status == 200 and job["status"] == "FAILED"
+        assert job["current_table"] == "import_runs"
+        assert "injected failure" in job["error"]
+        assert job["error"] == "injected failure before import_runs"
+        assert not any(word in job["error"].casefold() for word in ("rollback", "restored", "restore"))
+        assert job["table_counts"]["strategy_actions"] == 2
+        assert job["pair_table_counts"]["BTCUSDT"]["strategy_actions"] == 2
+        assert job["pair_counts"]["ETHUSDT"] >= 1
+        assert job["shared_plateau_deleted"] == 1
+        assert job["global_journal_counts"] == {"import_files": 1, "import_runs": 0}
+        assert job["pair_scoped_deleted"] == sum(job["pair_counts"].values())
+        assert job["pair_scoped_deleted"] + job["shared_plateau_deleted"] == sum(job["table_counts"].values())
+        assert job["elapsed_seconds"] > 0
+        assert 0 < job["pair_scoped_deleted"] < job["pair_scoped_total"]
+        with duckdb.connect(str(database), read_only=True) as db:
+            assert db.execute("select count(*) from strategy_actions").fetchone()[0] == 0
+            assert db.execute("select count(*) from strategy_equity").fetchone()[0] == 0
+            assert db.execute("select count(*) from import_files").fetchone()[0] == 0
+            assert db.execute("select count(*) from import_runs").fetchone()[0] == 1
+        connection.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_performance_v2_maintenance_retry_reuses_only_failed_job_plateau_keys(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    controller, database, _ = _controller_for_windows(tmp_path)
+    with duckdb.connect(str(database)) as db:
+        db.execute(
+            "insert into analysis_plateaus values ('run', 'UNUSED', 5, 7)"
+        )
+    real_apply = panel_module.apply_performance_v2_maintenance_preview
+    failed_once = False
+
+    class FailPlateauOnce:
+        def __init__(self, connection):
+            self.connection = connection
+
+        def execute(self, sql, parameters=None):
+            nonlocal failed_once
+            if not failed_once and sql.lstrip().casefold().startswith("delete from analysis_plateaus"):
+                failed_once = True
+                raise duckdb.IOException("injected failure at analysis_plateaus")
+            if parameters is None:
+                return self.connection.execute(sql)
+            return self.connection.execute(sql, parameters)
+
+    def fail_first_plateau_delete(connection, preview, *, on_phase=None, on_commit=None):
+        if not failed_once:
+            return real_apply(FailPlateauOnce(connection), preview, on_phase=on_phase, on_commit=on_commit)
+        return real_apply(connection, preview, on_phase=on_phase, on_commit=on_commit)
+
+    monkeypatch.setattr(panel_module, "apply_performance_v2_maintenance_preview", fail_first_plateau_delete)
+    server, thread = _http_server(controller)
+    try:
+        connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+        payload = {"operation": "full", "symbols": ["BTCUSDT"]}
+        status, first_preview = _http_json(connection, "POST", "/api/v2/strategies/performance-v2/maintenance/preview", payload)
+        assert status == 200 and first_preview["table_counts"]["analysis_plateaus"] == 1
+        status, accepted = _http_json(connection, "POST", "/api/v2/strategies/performance-v2/maintenance/apply", {"token": first_preview["token"]})
+        assert status == 202
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            status, first_job = _http_json(connection, "GET", f"/api/v2/strategies/performance-v2/maintenance/status?job_id={accepted['job_id']}")
+            if first_job["status"] in {"COMMITTED", "FAILED"}:
+                break
+            time.sleep(.02)
+        assert status == 200 and first_job["status"] == "FAILED"
+        assert "15 minutes" in first_job["recovery_warning"]
+        forbidden_sidecars = {".wal", ".bak", ".backup", ".snapshot"}
+        assert not [path.name for path in database.parent.iterdir() if path.suffix.casefold() in forbidden_sidecars]
+        status, reused = _http_json(connection, "POST", "/api/v2/strategies/performance-v2/maintenance/apply", {"token": first_preview["token"]})
+        assert status == 409 and reused["error"]["code"] == "PREVIEW_TOKEN_INVALID"
+        with duckdb.connect(str(database), read_only=True) as db:
+            assert db.execute("select count(*) from strategy_orders").fetchone() == (0,)
+
+        status, intervening_preview = _http_json(connection, "POST", "/api/v2/strategies/performance-v2/maintenance/preview", {
+            "operation": "rejected", "symbols": ["BTCUSDT"],
+        })
+        assert status == 200 and intervening_preview["pair_scoped_total"] == 0
+        status, intervening_job = _http_json(connection, "POST", "/api/v2/strategies/performance-v2/maintenance/apply", {
+            "token": intervening_preview["token"],
+        })
+        assert status == 202
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            status, next_job = _http_json(connection, "GET", f"/api/v2/strategies/performance-v2/maintenance/status?job_id={intervening_job['job_id']}")
+            if next_job["status"] in {"COMMITTED", "FAILED"}:
+                break
+            time.sleep(.02)
+        assert status == 200 and next_job["status"] == "COMMITTED"
+        status, forgotten_job = _http_json(connection, "GET", f"/api/v2/strategies/performance-v2/maintenance/status?job_id={accepted['job_id']}")
+        assert status == 404 and forgotten_job["error"]["code"] == "MAINTENANCE_JOB_NOT_FOUND"
+
+        status, retry_preview = _http_json(connection, "POST", "/api/v2/strategies/performance-v2/maintenance/preview", payload)
+        assert status == 200
+        assert retry_preview["table_counts"]["analysis_plateaus"] == 1
+        status, retry_job = _http_json(connection, "POST", "/api/v2/strategies/performance-v2/maintenance/apply", {"token": retry_preview["token"]})
+        assert status == 202
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            status, final_job = _http_json(connection, "GET", f"/api/v2/strategies/performance-v2/maintenance/status?job_id={retry_job['job_id']}")
+            if final_job["status"] in {"COMMITTED", "FAILED"}:
+                break
+            time.sleep(.02)
+        assert status == 200 and final_job["status"] == "COMMITTED"
+        assert controller._performance_v2_maintenance_recovery_preview is None
+        with duckdb.connect(str(database)) as db:
+            assert db.execute("select plateau_id from analysis_plateaus order by plateau_id").fetchall() == [("UNUSED",)]
+            db.execute("insert into analysis_plateaus values ('run', 'P1', 5, 7)")
+            db.execute(
+                """insert into strategies (strategy_name, symbol, side, timeframe, close_ma_len,
+                       order_count, analysis_run_id, candidate_identity, lifecycle_status,
+                       created_at_utc, updated_at_utc)
+                   values ('gamma', 'BTCUSDT', 'LONG', '1h', 3, 1, 'run', 'gamma', 'ACTIVE', current_timestamp, current_timestamp)"""
+            )
+        status, next_preview = _http_json(connection, "POST", "/api/v2/strategies/performance-v2/maintenance/preview", payload)
+        assert status == 200
+        assert next_preview["table_counts"]["analysis_plateaus"] == 0
+        connection.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
 
 
 def test_finalist_retest_preview_http_uses_server_owned_scope(tmp_path: Path, monkeypatch) -> None:
@@ -3802,6 +4346,47 @@ def test_v2_window_lock_maps_to_typed_conflict(tmp_path: Path, monkeypatch) -> N
         calculate_performance_v2_windows(database, 1, ("2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z"), ("2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z"))
     assert raised.value.status == 409
     assert raised.value.code == "PERFORMANCE_V2_LOCKED"
+
+
+def test_panel_window_writer_obeys_shared_file_lock(tmp_path: Path, monkeypatch) -> None:
+    controller, _, _ = _controller_for_windows(tmp_path)
+    import mrs3.panel as panel_module
+    from mrs3.performance_v2_store import PerformanceV2StoreError
+
+    class BusyWriterLock:
+        def __init__(self, _root: Path) -> None:
+            pass
+
+        def __enter__(self):
+            raise PerformanceV2StoreError("Performance v2 database writer is busy")
+
+        def __exit__(self, *_args):
+            return None
+
+    monkeypatch.setattr(panel_module, "PerformanceV2WriterLock", BusyWriterLock)
+    with pytest.raises(PerformanceV2ApiError) as raised:
+        controller.performance_v2_windows(
+            {
+                "strategy_id": 1,
+                "window_a": ["2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z"],
+                "window_b": ["2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z"],
+            }
+        )
+    assert raised.value.status == 409
+    assert raised.value.code == "PERFORMANCE_V2_LOCKED"
+
+
+def test_panel_writer_guard_preserves_store_errors_raised_by_body(tmp_path: Path) -> None:
+    controller, database, _ = _controller_for_windows(tmp_path)
+    from mrs3.performance_v2_equity_cache import EquitySourceChangedError
+    from mrs3.performance_v2_store import PerformanceV2StoreError
+
+    assert not issubclass(EquitySourceChangedError, PerformanceV2StoreError)
+    error = PerformanceV2StoreError("body failure code")
+    with pytest.raises(PerformanceV2StoreError, match="body failure code") as raised:
+        with controller._performance_v2_writer_guard(database):
+            raise error
+    assert raised.value is error
 
 
 def test_v2_window_non_transaction_failure_rolls_back_and_releases_db(tmp_path: Path) -> None:

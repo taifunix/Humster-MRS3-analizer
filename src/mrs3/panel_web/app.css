@@ -370,13 +370,28 @@ textarea { width: 100%; padding: 10px; border: 1px solid #cbd7e4; border-radius:
 .analysis-profile-pair > label { grid-column: 1 / -1; }
 .analysis-profile-pair-value { display: grid; gap: 4px; }
 .analysis-profile-pair:has(.analysis-profile-pair-value:only-of-type) { grid-template-columns: 1fr; }
+.performance-v2-maintenance-pairs { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px 12px; margin: 12px 0; }
+.performance-v2-maintenance-pair { width: 100%; min-width: 0; padding: 7px 9px; border: 1px solid var(--line); border-radius: 6px; }
+.performance-v2-maintenance-pair span { overflow-wrap: anywhere; }
+.performance-v2-maintenance-select-actions { margin-top: 12px; }
+.performance-v2-maintenance-actions { margin-bottom: 8px; }
+.performance-v2-maintenance-preview { display: grid; gap: 10px; margin-top: 14px; padding: 12px; border: 1px solid var(--line); border-radius: 7px; }
+.performance-v2-maintenance-preview h3 { margin: 0; color: var(--ink); font-size: .86rem; }
+.performance-v2-maintenance-table { width: 100%; border-collapse: collapse; font-size: .78rem; }
+.performance-v2-maintenance-table th, .performance-v2-maintenance-table td { padding: 7px 9px; border-bottom: 1px solid var(--line); text-align: left; }
+.performance-v2-maintenance-table td { text-align: right; font-variant-numeric: tabular-nums; }
+.performance-v2-maintenance-table tbody th { font-weight: 650; }
+.performance-v2-maintenance-table .performance-v2-maintenance-table-breakdown { text-align: left; overflow-wrap: anywhere; font-size: .7rem; }
+#performance-v2-maintenance-status[data-state="error"] { color: #8b2828; background: #fff2f1; }
 @media (max-width: 760px) {
   .portfolio-result-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .portfolio-result-bank-group .portfolio-result-metric-group-grid,
   .portfolio-result-drawdown-group .portfolio-result-metric-group-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .portfolio-result-capital-group .portfolio-result-metric-group-grid { grid-template-columns: 1fr; }
   .portfolio-result-candidate { overflow-x: auto; }
+  .performance-v2-maintenance-pairs { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
+@media (max-width: 440px) { .performance-v2-maintenance-pairs { grid-template-columns: 1fr; } }
 @media (max-width: 1279px) {
   .selection-preview-layout { grid-template-columns: 1fr; }
   .selection-stage { grid-template-columns: 24px minmax(0, 1fr); }

@@ -627,7 +627,7 @@ def test_strategy_dd5_performance_cards_have_the_exact_final_order_and_titles() 
     js = _read("app.js")
 
     strategies = html.split('id="strategies-dd5"', 1)[1].split('id="settings"', 1)[0]
-    for card in ("performance-v2-selection-card", "performance-v2-window-card", "performance-v2-finalist-retest-card", "performance-v2-retest-card", "performance-v2-export-card"):
+    for card in ("performance-v2-selection-card", "performance-v2-window-card", "performance-v2-finalist-retest-card", "performance-v2-retest-card", "performance-v2-export-card", "performance-v2-maintenance-card"):
         assert strategies.count(f'id="{card}"') == 1
     for title in (
         "4. Pareto and filters",
@@ -635,23 +635,75 @@ def test_strategy_dd5_performance_cards_have_the_exact_final_order_and_titles() 
         "6. Bulk RETEST current FINALIST",
         "7. CHECK & RETEST",
         "8. EXPORT FROM PERFORMANCEDB",
+        "9. Обслуживание PerformanceDB",
     ):
         assert js.count(f"textContent = '{title}'") == 1
-    assert "const v2CardOrder = ['performance-v2-selection-card', 'performance-v2-window-card', 'performance-v2-finalist-retest-card', 'performance-v2-retest-card', 'performance-v2-export-card'];" in js
+    assert "const v2CardOrder = ['performance-v2-selection-card', 'performance-v2-window-card', 'performance-v2-finalist-retest-card', 'performance-v2-retest-card', 'performance-v2-export-card', 'performance-v2-maintenance-card'];" in js
     assert ".map((id) => document.getElementById(id))" in js
     assert "v2Cards.length !== v2CardOrder.length" in js
     assert "Performance v2 cards are not in the expected Strategies and DD5 layout." in js
-    assert strategies.count("panel-performance-v2") == 5
+    assert strategies.count("panel-performance-v2") == 6
     for card, title in (
         ("performance-v2-selection-card", "4. Pareto and filters"),
         ("performance-v2-window-card", "5. A/B Performance analysis"),
         ("performance-v2-finalist-retest-card", "6. Bulk RETEST current FINALIST"),
         ("performance-v2-retest-card", "7. CHECK &amp; RETEST"),
         ("performance-v2-export-card", "8. EXPORT FROM PERFORMANCEDB"),
+        ("performance-v2-maintenance-card", "9. Обслуживание PerformanceDB"),
     ):
         assert f'<details id="{card}"' in strategies
         assert f'<b>{title}</b>' in strategies
     assert "#strategies-dd5 > .panel-performance-v2" not in js
+
+
+def test_performance_v2_maintenance_card_starts_with_catalog_and_requires_preview_confirmation() -> None:
+    html, js, css = _read("index.html"), _read("app.js"), _read("app.css")
+    card = html.split('id="performance-v2-maintenance-card"', 1)[1].split("</details>", 1)[0]
+
+    assert 'id="performance-v2-maintenance-catalog"' in card
+    assert ">Показать список пар</button>" in card
+    assert 'id="performance-v2-maintenance-catalog-content" hidden' in card
+    assert 'id="performance-v2-maintenance-pairs" class="performance-v2-maintenance-pairs"' in card
+    assert 'id="performance-v2-maintenance-select-all"' in card
+    assert 'id="performance-v2-maintenance-select-none"' in card
+    assert 'id="performance-v2-maintenance-rejected"' in card
+    assert 'id="performance-v2-maintenance-full"' in card
+    assert 'id="performance-v2-maintenance-confirm"' in card
+    assert 'id="performance-v2-maintenance-rejected-warning"' in card
+    assert "Тот же отчёт будет пропущен дедупликацией" in card
+    assert "отчёт с более узким периодом" in card
+    assert 'id="performance-v2-maintenance-progress" class="progress-block"' in card
+    assert 'id="performance-v2-maintenance-status" class="card-status" role="status"' in card
+    assert "grid-template-columns: repeat(4, minmax(0, 1fr))" in css
+    assert "maintenanceEndpoint}/catalog" in js
+    assert "maintenanceEndpoint}/preview" in js
+    assert "maintenanceEndpoint}/apply" in js
+    assert "maintenanceEndpoint}/status?job_id=" in js
+    assert "body: JSON.stringify({ operation, symbols })" in js
+    assert "body: JSON.stringify({ token: previewToken })" in js
+    assert "Удалено ${maintenanceCount(deleted)} из ${maintenanceCount(total)} строк выбранных пар" in js
+    assert "symbol.endsWith('USDT') ? symbol.slice(0, -4) : symbol" in js
+    assert "maintenanceRejectedWarning.hidden = result.operation !== 'rejected'" in js
+    assert "maintenancePreview.hidden = false" in js
+    assert "Object.entries(pair.table_counts || {})" in js
+    assert "Таблицы по паре" in html
+    assert "let maintenancePreviewGeneration = 0" in js
+    assert "if (generation !== maintenancePreviewGeneration) return" in js
+    assert "job.status === 'COMMITTED' ? 100 : 0" in js
+    assert "maintenanceSchedulePoll(jobId, 350)" in js
+    assert "maintenanceSchedulePoll(jobId, 1000)" in js
+    assert "Предварительный просмотр устарел; рассчитывается новый" in js
+    assert "const result = await requestJson(`${maintenanceEndpoint}/catalog`)" in js
+    assert "const maintenanceStopPolling" in js
+    assert "clearTimeout(maintenancePollTimer)" in js
+    assert "error?.code === 'MAINTENANCE_JOB_NOT_FOUND'" in js
+    assert "if (!maintenancePreview || !maintenancePreviewToken || !maintenancePreviewDocument) return" in js
+    assert "job.status === 'COMMITTED' && total === 0" in js
+    assert "global.hidden = job.operation !== 'full'" in js
+    failure_status = js.split("Ошибка на этапе ${job.current_table", 1)[1].split("`, true);", 1)[0]
+    assert "${job.error || 'операция завершилась с ошибкой'}" in failure_status
+    assert "Показаны уже подтверждённые изменения." in failure_status
+    assert "rollback" not in failure_status.casefold() and "restore" not in failure_status.casefold()
 
 
 def test_performance_v2_export_card_has_status_filters_and_accessible_status() -> None:
@@ -697,7 +749,7 @@ def test_performance_v2_export_handler_is_get_only_and_server_named_blob_downloa
     html = _read("index.html")
     js = _read("app.js")
     card = html.split('id="performance-v2-export-card"', 1)[1].split("</details>", 1)[0]
-    handler = js.split("performanceV2ExportButton?.addEventListener", 1)[1].split("const settingsStatus", 1)[0]
+    handler = js.split("performanceV2ExportButton?.addEventListener", 1)[1].split("const maintenanceEndpoint", 1)[0]
 
     assert "/api/v2/strategies/performance-v2/export" in js
     assert "method: 'GET'" in handler
@@ -717,7 +769,7 @@ def test_performance_v2_export_handler_is_get_only_and_server_named_blob_downloa
 
 def test_performance_v2_export_controls_enforce_all_active_mutual_exclusion() -> None:
     js = _read("app.js")
-    handler = js.split("const performanceV2ExportButton", 1)[1].split("const settingsStatus", 1)[0]
+    handler = js.split("const performanceV2ExportButton", 1)[1].split("const maintenanceEndpoint", 1)[0]
 
     assert "performanceV2ExportAllActive.checked = false" in handler
     assert "performanceV2ExportAllActive.checked" in handler

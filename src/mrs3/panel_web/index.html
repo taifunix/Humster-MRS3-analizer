@@ -233,6 +233,43 @@
               <p id="performance-v2-export-status" class="card-status" role="status" aria-live="polite">Выберите хотя бы один статус.</p>
             </div>
           </details>
+          <details id="performance-v2-maintenance-card" class="panel-card accordion panel-performance-v2">
+            <summary><span><b>9. Обслуживание PerformanceDB</b><small>Удаление данных PerformanceDB с предварительным расчётом</small></span><span class="state-badge state-ready">LOCAL</span></summary>
+            <div class="card-body details-content">
+              <button id="performance-v2-maintenance-catalog" type="button" class="button button-secondary">Показать список пар</button>
+              <div id="performance-v2-maintenance-catalog-content" hidden>
+                <div class="button-row performance-v2-maintenance-select-actions">
+                  <button id="performance-v2-maintenance-select-all" type="button" class="button button-secondary">Выделить все</button>
+                  <button id="performance-v2-maintenance-select-none" type="button" class="button button-secondary">Снять выделение</button>
+                </div>
+                <div id="performance-v2-maintenance-pairs" class="performance-v2-maintenance-pairs" role="group" aria-label="Пары PerformanceDB"></div>
+                <div class="button-row performance-v2-maintenance-actions">
+                  <button id="performance-v2-maintenance-rejected" type="button" class="button button-secondary" disabled>Удалить Rejected</button>
+                  <button id="performance-v2-maintenance-full" type="button" class="button button-primary" disabled>Удалить полностью</button>
+                </div>
+              </div>
+              <section id="performance-v2-maintenance-preview" class="performance-v2-maintenance-preview" aria-labelledby="performance-v2-maintenance-preview-title" hidden>
+                <h3 id="performance-v2-maintenance-preview-title">Предварительный просмотр</h3>
+                <div class="table-wrap"><table class="performance-v2-maintenance-table"><thead><tr><th scope="col">Пара</th><th scope="col">Всего строк</th><th scope="col">Таблицы по паре</th></tr></thead><tbody id="performance-v2-maintenance-preview-pairs"></tbody></table></div>
+                <p id="performance-v2-maintenance-shared"></p>
+                <p id="performance-v2-maintenance-global"></p>
+                <p id="performance-v2-maintenance-global-warning" class="helper" hidden>Полное удаление также очистит import_files и import_runs для всей базы, включая невыбранные пары.</p>
+                <p id="performance-v2-maintenance-rejected-warning" class="helper" hidden>Тот же отчёт будет пропущен дедупликацией, а отчёт с более узким периодом — правилом импорта, которое принимает только расширение периода. Для восстановления подробных строк нужен корректный отчёт с более широким периодом.</p>
+                <div class="button-row">
+                  <button id="performance-v2-maintenance-cancel" type="button" class="button button-secondary">Отмена</button>
+                  <button id="performance-v2-maintenance-confirm" type="button" class="button button-primary">Подтвердить удаление</button>
+                </div>
+              </section>
+              <div id="performance-v2-maintenance-progress" class="progress-block" hidden>
+                <p id="performance-v2-maintenance-phase">Ожидание подтверждения</p>
+                <div class="progress-track" role="progressbar" aria-label="Удалённые строки" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span></span></div>
+                <p id="performance-v2-maintenance-progress-counts" role="status" aria-live="polite"></p>
+                <p id="performance-v2-maintenance-global-counts"></p>
+                <p id="performance-v2-maintenance-elapsed"></p>
+              </div>
+              <p id="performance-v2-maintenance-status" class="card-status" role="status" aria-live="polite" hidden></p>
+            </div>
+          </details>
         </div>
       </section>
 

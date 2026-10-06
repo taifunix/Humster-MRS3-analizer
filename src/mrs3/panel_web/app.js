@@ -1871,7 +1871,7 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
     if (option) option.textContent = 'Select a newly committed Source DB';
   }
   const strategyStack = document.querySelector('#strategies-dd5 .stack');
-  const v2CardOrder = ['performance-v2-selection-card', 'performance-v2-window-card', 'performance-v2-finalist-retest-card', 'performance-v2-retest-card', 'performance-v2-export-card'];
+  const v2CardOrder = ['performance-v2-selection-card', 'performance-v2-window-card', 'performance-v2-finalist-retest-card', 'performance-v2-retest-card', 'performance-v2-export-card', 'performance-v2-maintenance-card'];
   const v2Cards = v2CardOrder
     .map((id) => document.getElementById(id))
     .filter((card) => card?.closest('#strategies-dd5'));
@@ -3015,11 +3015,13 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
   const performanceV2FinalistRetestTitle = document.querySelector('#performance-v2-finalist-retest-card summary b');
   const performanceV2RetestTitle = document.querySelector('#performance-v2-retest-card summary b');
   const performanceV2ExportTitle = document.querySelector('#performance-v2-export-card summary b');
+  const performanceV2MaintenanceTitle = document.querySelector('#performance-v2-maintenance-card summary b');
   if (performanceV2SelectionTitle) performanceV2SelectionTitle.textContent = '4. Pareto and filters';
   if (performanceV2WindowTitle) performanceV2WindowTitle.textContent = '5. A/B Performance analysis';
   if (performanceV2FinalistRetestTitle) performanceV2FinalistRetestTitle.textContent = '6. Bulk RETEST current FINALIST';
   if (performanceV2RetestTitle) performanceV2RetestTitle.textContent = '7. CHECK & RETEST';
   if (performanceV2ExportTitle) performanceV2ExportTitle.textContent = '8. EXPORT FROM PERFORMANCEDB';
+  if (performanceV2MaintenanceTitle) performanceV2MaintenanceTitle.textContent = '9. Обслуживание PerformanceDB';
   const performanceV2WindowStrategyField = performanceV2WindowSelect?.closest('.field-group');
   if (performanceV2WindowStrategyField && !document.querySelector('#performance-v2-window-pair')) {
     const filters = document.createElement('div');
@@ -3835,6 +3837,307 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
       if (performanceV2ExportStatus) performanceV2ExportStatus.textContent = `Ошибка экспорта: ${error?.message || 'запрос не выполнен'}.`;
     } finally {
       if (url) URL.revokeObjectURL(url);
+    }
+  });
+
+  const maintenanceEndpoint = '/api/v2/strategies/performance-v2/maintenance';
+  const maintenanceCatalogButton = document.querySelector('#performance-v2-maintenance-catalog');
+  const maintenanceCatalogContent = document.querySelector('#performance-v2-maintenance-catalog-content');
+  const maintenancePairs = document.querySelector('#performance-v2-maintenance-pairs');
+  const maintenanceStatus = document.querySelector('#performance-v2-maintenance-status');
+  const maintenancePreview = document.querySelector('#performance-v2-maintenance-preview');
+  const maintenancePreviewPairs = document.querySelector('#performance-v2-maintenance-preview-pairs');
+  const maintenanceRejectedWarning = document.querySelector('#performance-v2-maintenance-rejected-warning');
+  const maintenanceProgress = document.querySelector('#performance-v2-maintenance-progress');
+  let maintenanceSymbols = [];
+  let maintenancePreviewToken = '';
+  let maintenancePreviewDocument = null;
+  let maintenancePreviewGeneration = 0;
+  let maintenancePollTimer = 0;
+  let maintenancePollGeneration = 0;
+  let maintenancePollJobId = '';
+  let maintenanceJobActive = false;
+
+  const maintenanceStopPolling = () => {
+    if (maintenancePollTimer) window.clearTimeout(maintenancePollTimer);
+    maintenancePollTimer = 0;
+    maintenancePollJobId = '';
+    maintenancePollGeneration += 1;
+  };
+  const maintenanceSchedulePoll = (jobId, delay) => {
+    maintenanceStopPolling();
+    maintenancePollJobId = jobId;
+    const generation = maintenancePollGeneration;
+    maintenancePollTimer = window.setTimeout(() => {
+      maintenancePollTimer = 0;
+      if (generation === maintenancePollGeneration && maintenancePollJobId === jobId) maintenancePoll(jobId, generation);
+    }, delay);
+  };
+
+  const maintenanceSelectedSymbols = () => [...(maintenancePairs?.querySelectorAll('input[type="checkbox"]:checked') || [])].map((input) => input.value);
+  const maintenanceSetStatus = (message, isError = false) => {
+    if (!maintenanceStatus) return;
+    maintenanceStatus.hidden = !message;
+    maintenanceStatus.textContent = message;
+    maintenanceStatus.dataset.state = isError ? 'error' : 'ready';
+  };
+  const maintenanceClearPreview = () => {
+    maintenancePreviewGeneration += 1;
+    maintenancePreviewToken = '';
+    maintenancePreviewDocument = null;
+    if (maintenancePreview) maintenancePreview.hidden = true;
+  };
+  const maintenanceSyncActions = () => {
+    const hasSelection = maintenanceSelectedSymbols().length > 0;
+    const busy = maintenanceJobActive;
+    for (const id of ['performance-v2-maintenance-rejected', 'performance-v2-maintenance-full']) {
+      const button = document.querySelector(`#${id}`);
+      if (button) button.disabled = !hasSelection || busy;
+    }
+  };
+  const maintenanceRenderSymbols = () => {
+    if (!maintenancePairs) return;
+    maintenancePairs.replaceChildren(...maintenanceSymbols.map((symbol) => {
+      const label = document.createElement('label');
+      label.className = 'check performance-v2-maintenance-pair';
+      const input = document.createElement('input');
+      input.type = 'checkbox';
+      input.value = symbol;
+      input.addEventListener('change', () => {
+        maintenanceClearPreview();
+        maintenanceSyncActions();
+      });
+      const text = document.createElement('span');
+      text.textContent = symbol.endsWith('USDT') ? symbol.slice(0, -4) : symbol;
+      label.append(input, text);
+      return label;
+    }));
+    maintenanceSyncActions();
+  };
+  maintenanceCatalogButton?.addEventListener('click', async () => {
+    maintenanceClearPreview();
+    maintenanceCatalogButton.disabled = true;
+    maintenanceSetStatus('Загрузка списка пар…');
+    try {
+      const result = await requestJson(`${maintenanceEndpoint}/catalog`);
+      maintenanceSymbols = Array.isArray(result.symbols) ? result.symbols : [];
+      maintenanceRenderSymbols();
+      if (maintenanceCatalogContent) maintenanceCatalogContent.hidden = false;
+      maintenanceCatalogButton.textContent = 'Обновить список пар';
+      maintenanceSetStatus(`Загружено пар: ${maintenanceSymbols.length}.`);
+    } catch (error) {
+      maintenanceSetStatus(`Не удалось загрузить список пар: ${error?.message || 'ошибка запроса'}`, true);
+    } finally {
+      maintenanceCatalogButton.disabled = false;
+    }
+  });
+  document.querySelector('#performance-v2-maintenance-select-all')?.addEventListener('click', () => {
+    maintenancePairs?.querySelectorAll('input[type="checkbox"]').forEach((input) => { input.checked = true; });
+    maintenanceClearPreview();
+    maintenanceSyncActions();
+  });
+  document.querySelector('#performance-v2-maintenance-select-none')?.addEventListener('click', () => {
+    maintenancePairs?.querySelectorAll('input[type="checkbox"]').forEach((input) => { input.checked = false; });
+    maintenanceClearPreview();
+    maintenanceSyncActions();
+  });
+
+  const maintenanceCount = (value) => new Intl.NumberFormat('ru-RU').format(Number(value) || 0);
+  const maintenanceRenderPreview = (result) => {
+    if (!maintenancePreview || !maintenancePreviewPairs) return;
+    maintenancePreviewToken = String(result.token || '');
+    maintenancePreviewDocument = result;
+    maintenancePreviewPairs.replaceChildren(...(result.pairs || []).map((pair) => {
+      const row = document.createElement('tr');
+      const symbol = document.createElement('th');
+      symbol.scope = 'row';
+      symbol.textContent = pair.symbol;
+      const count = document.createElement('td');
+      count.textContent = maintenanceCount(pair.rows);
+      const breakdown = document.createElement('td');
+      breakdown.className = 'performance-v2-maintenance-table-breakdown';
+      breakdown.textContent = Object.entries(pair.table_counts || {})
+        .map(([table, rows]) => `${table}: ${maintenanceCount(rows)}`).join(' · ');
+      row.append(symbol, count, breakdown);
+      return row;
+    }));
+    const shared = document.querySelector('#performance-v2-maintenance-shared');
+    if (shared) shared.textContent = `Общие строки analysis_plateaus, удаляемые один раз: ${maintenanceCount(result.shared_plateau_rows)}.`;
+    const global = document.querySelector('#performance-v2-maintenance-global');
+    const globalCounts = result.global_counts || {};
+    if (global) global.textContent = Object.keys(globalCounts).length
+      ? `Глобальные записи: import_files — ${maintenanceCount(globalCounts.import_files)}, import_runs — ${maintenanceCount(globalCounts.import_runs)}.`
+      : 'Глобальные import_files и import_runs не затрагиваются.';
+    const warning = document.querySelector('#performance-v2-maintenance-global-warning');
+    if (warning) warning.hidden = result.operation !== 'full';
+    if (maintenanceRejectedWarning) maintenanceRejectedWarning.hidden = result.operation !== 'rejected';
+    const confirm = document.querySelector('#performance-v2-maintenance-confirm');
+    if (confirm) confirm.disabled = false;
+    maintenancePreview.hidden = false;
+  };
+  const requestMaintenancePreview = async (operation) => {
+    const symbols = maintenanceSelectedSymbols();
+    if (!symbols.length) return;
+    maintenanceClearPreview();
+    const generation = ++maintenancePreviewGeneration;
+    maintenanceSetStatus('Подсчёт строк для предварительного просмотра…');
+    for (const id of ['performance-v2-maintenance-rejected', 'performance-v2-maintenance-full']) {
+      const button = document.querySelector(`#${id}`);
+      if (button) button.disabled = true;
+    }
+    try {
+      const result = await requestJson(`${maintenanceEndpoint}/preview`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ operation, symbols }),
+      });
+      if (generation !== maintenancePreviewGeneration) return;
+      maintenanceRenderPreview(result);
+      maintenanceSetStatus(`Предварительный просмотр готов: ${maintenanceCount(result.pair_scoped_total)} строк выбранных пар.`);
+    } catch (error) {
+      if (generation !== maintenancePreviewGeneration) return;
+      maintenanceSetStatus(`Не удалось построить предварительный просмотр: ${error?.message || 'ошибка запроса'}`, true);
+    } finally {
+      if (generation === maintenancePreviewGeneration) maintenanceSyncActions();
+    }
+  };
+  document.querySelector('#performance-v2-maintenance-rejected')?.addEventListener('click', () => requestMaintenancePreview('rejected'));
+  document.querySelector('#performance-v2-maintenance-full')?.addEventListener('click', () => requestMaintenancePreview('full'));
+  document.querySelector('#performance-v2-maintenance-cancel')?.addEventListener('click', () => {
+    maintenanceClearPreview();
+    maintenanceSetStatus('Предварительный просмотр отменён.');
+  });
+
+  const maintenanceRenderJob = (job) => {
+    if (!maintenanceProgress) return;
+    maintenanceProgress.hidden = false;
+    const total = Number(job.pair_scoped_total) || 0;
+    const deleted = Number(job.pair_scoped_deleted) || 0;
+    const completed = job.status === 'COMMITTED' || job.status === 'FAILED';
+    const percent = total > 0 ? Math.min(100, (deleted / total) * 100) : (job.status === 'COMMITTED' ? 100 : 0);
+    const progressMax = total > 0 ? total : 1;
+    const progressNow = total > 0 ? Math.min(deleted, total) : (job.status === 'COMMITTED' ? 1 : 0);
+    const track = maintenanceProgress.querySelector('.progress-track');
+    const fill = track?.querySelector('span');
+    if (track) {
+      track.setAttribute('aria-valuemax', String(progressMax));
+      track.setAttribute('aria-valuenow', String(progressNow));
+    }
+    if (fill) fill.style.width = `${percent}%`;
+    const phase = document.querySelector('#performance-v2-maintenance-phase');
+    if (phase) phase.textContent = `Этап: ${job.phase || '—'}${job.current_table ? ` · таблица ${job.current_table}` : ''}`;
+    const counts = document.querySelector('#performance-v2-maintenance-progress-counts');
+    if (counts) counts.textContent = `Удалено ${maintenanceCount(deleted)} из ${maintenanceCount(total)} строк выбранных пар`;
+    const global = document.querySelector('#performance-v2-maintenance-global-counts');
+    if (global) global.hidden = job.operation !== 'full';
+    if (global) {
+      const values = job.global_journal_counts || {};
+      global.textContent = `Глобальные записи: import_files — ${maintenanceCount(values.import_files)}, import_runs — ${maintenanceCount(values.import_runs)} из ${maintenanceCount(job.global_journal_total)}.`;
+    }
+    const elapsed = document.querySelector('#performance-v2-maintenance-elapsed');
+    if (elapsed) elapsed.textContent = `Прошло: ${(Number(job.elapsed_seconds) || 0).toFixed(1)} с`;
+    if (completed) {
+      maintenanceStopPolling();
+      if (job.status === 'COMMITTED' && total === 0 && !(Number(job.global_journal_total) > 0)) maintenanceSetStatus('Нечего удалять: в выбранных парах нет строк. Обслуживание завершено.', false);
+      else if (job.status === 'COMMITTED') maintenanceSetStatus('Удаление завершено. Показаны подтверждённые количества строк.', false);
+      else maintenanceSetStatus(`Ошибка на этапе ${job.current_table || job.phase || 'неизвестно'}: ${job.error || 'операция завершилась с ошибкой'}. Показаны уже подтверждённые изменения.${job.recovery_warning ? ` ${job.recovery_warning}` : ''}`, true);
+      maintenanceJobActive = false;
+      if (maintenancePairs) maintenancePairs.querySelectorAll('input[type="checkbox"]').forEach((input) => { input.disabled = false; });
+      if (maintenanceCatalogButton) maintenanceCatalogButton.disabled = false;
+      for (const id of ['performance-v2-maintenance-select-all', 'performance-v2-maintenance-select-none']) {
+        const button = document.querySelector(`#${id}`);
+        if (button) button.disabled = false;
+      }
+      maintenanceSyncActions();
+      if (job.status === 'COMMITTED') {
+        window.setTimeout(async () => {
+          try {
+            const result = await requestJson(`${maintenanceEndpoint}/catalog`);
+            maintenanceSymbols = Array.isArray(result.symbols) ? result.symbols : [];
+            maintenanceRenderSymbols();
+            if (maintenanceCatalogContent) maintenanceCatalogContent.hidden = false;
+            if (maintenanceCatalogButton) {
+              maintenanceCatalogButton.textContent = 'Обновить список пар';
+              maintenanceCatalogButton.disabled = false;
+            }
+          } catch (error) {
+            maintenanceSetStatus(`Удаление завершено, но список пар не обновлён: ${error?.message || 'ошибка запроса'}`, true);
+          }
+        }, 100);
+      } else if (String(job.error || '').includes('preview is stale')) {
+        const operation = maintenancePreviewDocument?.operation;
+        const generation = maintenancePreviewGeneration;
+        maintenanceSetStatus('Предварительный просмотр устарел; рассчитывается новый перед повторным подтверждением.', true);
+        if (operation) window.setTimeout(() => {
+          if (generation === maintenancePreviewGeneration) requestMaintenancePreview(operation);
+        }, 150);
+      }
+    }
+  };
+  const maintenancePoll = async (jobId, generation) => {
+    try {
+      const job = await requestJson(`${maintenanceEndpoint}/status?job_id=${encodeURIComponent(jobId)}`);
+      if (generation !== maintenancePollGeneration || maintenancePollJobId !== jobId) return;
+      maintenanceRenderJob(job);
+      if (job.status === 'RUNNING') maintenanceSchedulePoll(jobId, 350);
+    } catch (error) {
+      if (generation !== maintenancePollGeneration || maintenancePollJobId !== jobId) return;
+      maintenanceSetStatus(`Не удалось получить состояние операции: ${error?.message || 'ошибка запроса'}`, true);
+      const missingJob = error?.code === 'MAINTENANCE_JOB_NOT_FOUND';
+      if (missingJob || error?.code) {
+        maintenanceStopPolling();
+        maintenanceJobActive = false;
+        if (maintenancePairs) maintenancePairs.querySelectorAll('input[type="checkbox"]').forEach((input) => { input.disabled = false; });
+        if (maintenanceCatalogButton) maintenanceCatalogButton.disabled = false;
+        for (const id of ['performance-v2-maintenance-select-all', 'performance-v2-maintenance-select-none']) {
+          const button = document.querySelector(`#${id}`);
+          if (button) button.disabled = false;
+        }
+        maintenanceSyncActions();
+        return;
+      }
+      maintenanceSchedulePoll(jobId, 1000);
+    }
+  };
+  document.querySelector('#performance-v2-maintenance-confirm')?.addEventListener('click', async () => {
+    if (!maintenancePreview || !maintenancePreviewToken || !maintenancePreviewDocument) return;
+    const previewDocument = maintenancePreviewDocument;
+    const previewToken = maintenancePreviewToken;
+    maintenanceStopPolling();
+    const confirm = document.querySelector('#performance-v2-maintenance-confirm');
+    if (confirm) confirm.disabled = true;
+    try {
+      const result = await requestJson(`${maintenanceEndpoint}/apply`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: previewToken }),
+      });
+      maintenancePreviewToken = '';
+      maintenancePreview.hidden = true;
+      maintenanceJobActive = true;
+      if (maintenanceCatalogButton) maintenanceCatalogButton.disabled = true;
+      if (maintenancePairs) maintenancePairs.querySelectorAll('input[type="checkbox"]').forEach((input) => { input.disabled = true; });
+      for (const id of ['performance-v2-maintenance-select-all', 'performance-v2-maintenance-select-none']) {
+        const button = document.querySelector(`#${id}`);
+        if (button) button.disabled = true;
+      }
+      maintenanceSyncActions();
+      maintenanceSetStatus('Удаление запущено. Состояние обновляется по подтверждённым данным.');
+      maintenanceRenderJob({
+        status: 'RUNNING', operation: previewDocument.operation, phase: 'waiting_for_writer', pair_scoped_total: Number(previewDocument.pair_scoped_total) || 0,
+        pair_scoped_deleted: 0, global_journal_total: Object.values(previewDocument.global_counts || {}).reduce((sum, count) => sum + (Number(count) || 0), 0),
+        global_journal_counts: {}, elapsed_seconds: 0,
+      });
+      maintenanceSchedulePoll(result.job_id, 350);
+    } catch (error) {
+      maintenanceSetStatus(`Удаление не запущено: ${error?.message || 'ошибка запроса'}`, true);
+      if (confirm) confirm.disabled = false;
+      if (error?.code === 'PREVIEW_TOKEN_INVALID') {
+        const operation = maintenancePreviewDocument?.operation;
+        maintenanceClearPreview();
+        const generation = maintenancePreviewGeneration;
+        if (operation) window.setTimeout(() => {
+          if (generation === maintenancePreviewGeneration) requestMaintenancePreview(operation);
+        }, 150);
+      }
     }
   });
 
