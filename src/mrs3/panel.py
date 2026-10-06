@@ -4904,6 +4904,7 @@ class PanelController:
                 "job_id": job_id, "status": "RUNNING", "phase": "waiting_for_writer",
                 "operation": str(public["operation"]),
                 "current_table": None, "symbols": list(public["symbols"]),
+                "strategy_total": sum(int(pair.get("strategy_count", 0)) for pair in public["pairs"]),
                 "pair_scoped_total": int(public["pair_scoped_total"]), "pair_scoped_deleted": 0,
                 "shared_plateau_total": int(public["shared_plateau_rows"]), "shared_plateau_deleted": 0,
                 "table_counts": table_counts, "pair_counts": pair_counts,

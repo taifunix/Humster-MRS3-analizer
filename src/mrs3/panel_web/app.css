@@ -381,7 +381,6 @@ textarea { width: 100%; padding: 10px; border: 1px solid #cbd7e4; border-radius:
 .performance-v2-maintenance-table th, .performance-v2-maintenance-table td { padding: 7px 9px; border-bottom: 1px solid var(--line); text-align: left; }
 .performance-v2-maintenance-table td { text-align: right; font-variant-numeric: tabular-nums; }
 .performance-v2-maintenance-table tbody th { font-weight: 650; }
-.performance-v2-maintenance-table .performance-v2-maintenance-table-breakdown { text-align: left; overflow-wrap: anywhere; font-size: .7rem; }
 #performance-v2-maintenance-status[data-state="error"] { color: #8b2828; background: #fff2f1; }
 @media (max-width: 760px) {
   .portfolio-result-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }

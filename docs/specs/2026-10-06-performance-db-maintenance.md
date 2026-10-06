@@ -12,9 +12,10 @@ ADR/spec text remains unchanged; a new ADR records the replacement decision.
 ## Goal
 
 Add an operator-controlled PerformanceDB maintenance card to the **Strategy
-and DD5** tab. The operator chooses symbols, previews the exact row counts per
-symbol, then either removes heavy facts for currently `REJECTED` strategies or
-fully removes all pair-scoped strategy and selection data for those symbols.
+and DD5** tab. The operator chooses symbols, previews the number of strategies
+to remove or clean per symbol, then either removes heavy facts for currently
+`REJECTED` strategies or fully removes all pair-scoped strategy and selection
+data for those symbols.
 
 ## User interface
 
@@ -26,14 +27,15 @@ the complete sorted pair catalog in four columns. Pair labels omit a trailing
 **Выделить все** and **Снять выделение**. Below it are **Удалить Rejected**
 and **Удалить полностью**.
 
-Either delete action first displays a preview containing the affected pairs
-and the total number of rows to remove for each pair. Pairs with no matching
-rows show zero and are not deleted. The full-delete preview also shows, once,
-the global `import_files` and `import_runs` row counts that will be cleared;
-these batch rows cannot be assigned to one pair. The preview has a separate
-confirmation action. The server recalculates the target set when confirmation
-arrives; if the database changed since preview, it refuses the stale
-confirmation and requires a new preview.
+Either delete action first displays the affected pairs and the number of
+strategies per pair: full deletion counts strategy rows; Rejected cleanup
+counts rejected strategies that still have at least one detailed fact to
+remove. Pairs with no matching strategies show zero. Do not show physical row
+breakdowns or global journal row counts in this preview. The full-delete
+preview may explain that global import journals are cleared. The preview has a
+separate confirmation action. The server recalculates the target set when
+confirmation arrives; if the database changed since preview, it refuses the
+stale confirmation and requires a new preview.
 
 Count physical rows only once. If a plateau row is shared by selected pairs and
 will become unreferenced after the whole selection is deleted, show it once in
@@ -43,12 +45,14 @@ rows targeted for deletion; global import-journal rows are counted separately.
 
 During each confirmed delete, show a live progress bar and status line using
 the same visual pattern as the existing Panel progress blocks. The status line
-names the current phase, reports the number of pair-scoped rows actually
-deleted out of the previewed total (`Удалено XX из NNN`), and shows total
-elapsed time since apply began. Update counts only after the corresponding
-delete has completed; do not animate estimated progress as completed work.
-Count each shared row once in this progress total and report the global
-import-journal row count separately from pair-scoped rows.
+puts the number of strategies first (full deletion: deleted strategies out of
+the previewed total; Rejected cleanup: strategies with details processed),
+then reports actual pair-scoped rows deleted out of the previewed total
+(`Удалено XX из NNN строк выбранных пар`). It also shows total elapsed time
+since apply began. Update counts only after the corresponding delete has
+completed; do not animate estimated progress as completed work. Count each
+shared row once in the row-progress total and report global import-journal row
+counts separately from pair-scoped rows.
 On completion, preserve the final counts and elapsed time. On failure, preserve
 the actual progress and elapsed time, identify the failing phase/table, and
 display the underlying database error message rather than replacing it with a
@@ -130,6 +134,16 @@ the row has no live order reference. After a Panel restart or expiry,
 unattributed plateau rows remain in the database and the failure status explains
 why; no persistent recovery map is written.
 
+The v6->v7 migration must recreate `strategy_results` under its final catalog
+name before restoring child tables, avoiding stale DuckDB foreign-key bindings.
+For existing v9 databases produced by the earlier rename-based migration, a
+full delete may fail only at the final `strategies` phase with a missing
+`__performance_v2_v7_strategy_results` catalog reference. In that exact case,
+the service may create a transactional compatibility table from the remaining
+`strategy_results` definition and rows, retry the strategy delete, then drop
+the compatibility table. Other catalog errors must remain visible and must not
+trigger this recovery.
+
 Do not run competing writer connections or parallel DELETE statements.
 Preview aggregation and DuckDB query execution should use the existing global
 `duckdb_import.workers` setting (capped at 16 for CPU/read pools under current
@@ -153,16 +167,19 @@ measured limit rather than making writes concurrent.
 - The card appears as card 9 in the correct tab, lists every supported pair in
   four columns, displays symbols without `USDT`, and preserves exact symbols in
   requests. Select-all and clear-selection affect the full catalog.
-- Preview counts match the exact rows deleted per selected pair; shared
-  plateau rows are shown once in their own subtotal. Pair-scoped totals count
-  each physical row once. Preview is read-only; changed targets invalidate
+- Preview shows only strategy counts per selected pair: strategies to be
+  deleted for full removal, and rejected strategies with detailed facts to be
+  cleaned for Rejected. Physical row breakdowns and global journal row counts
+  do not appear in the preview. Shared plateau rows are counted once in the
+  physical progress total. Preview is read-only; changed targets invalidate
   confirmation; invalid symbols fail closed.
 - While a confirmed delete runs, the existing Panel progress-block style shows
-  live progress. Its status line names the phase, reports actual deleted
-  pair-scoped rows out of the previewed total, reports global import-journal
-  rows separately, and shows total elapsed time. Final counts/time remain
-  visible after completion. Errors retain actual database diagnostics and
-  identify the failing phase/table instead of showing only a generic message.
+  live progress. Its status line names the phase and shows strategy progress
+  first, then actual deleted pair-scoped rows out of the previewed total; it
+  reports global import-journal rows separately and shows total elapsed time.
+  Final counts/time remain visible after completion. Errors retain actual
+  database diagnostics and identify the failing phase/table instead of showing
+  only a generic message.
 - `Удалить Rejected` changes only exact effective-`REJECTED` strategies,
   preserves the listed identity, settings, compact metrics and rejection/review
   evidence, and removes only the detailed facts listed above. Non-rejected and
@@ -175,6 +192,9 @@ measured limit rather than making writes concurrent.
 - Neither operation creates a backup, copy, cleanup marker, deletion time, or
   schema migration. Full-delete failure reporting states which deletes
   committed and does not claim automatic rollback.
+- The v6->v7 migration leaves no stale renamed results-table binding, and the
+  exact legacy missing-table catalog error at the final strategy phase is
+  recovered transactionally; unrelated errors are not masked.
 - Preview and apply use `duckdb_import.workers` without a second worker
   setting, retain one writer, use batched/grouped queries, and have measured
   timing/RSS evidence on fixtures at one and configured worker counts.

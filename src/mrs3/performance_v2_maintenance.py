@@ -23,6 +23,7 @@ _PAIR_TABLES = (
 _REJECTED_TABLES = ("strategy_actions", "strategy_equity", "optimizer_prepared_inputs")
 _GLOBAL_JOURNAL_TABLES = frozenset({"import_files", "import_runs"})
 _PRESERVED_METADATA_TABLES = frozenset({"schema_info"})
+_LEGACY_V7_RESULTS_TABLE = "__performance_v2_v7_strategy_results"
 _SCHEMA_TABLE_CLASSES = {
     "pair-scoped": _PAIR_TABLES,
     "global-journal": ("import_files", "import_runs"),
@@ -314,12 +315,30 @@ def create_preview(
     strategy_ids_by_symbol = _ids_by_symbol(connection, selected)
     strategy_ids = [identifier for identifiers in strategy_ids_by_symbol.values() for identifier in identifiers]
     rejected_ids: set[int] = set()
+    rejected_strategy_counts: Counter[str] = Counter()
     if operation == "rejected":
         decisions = effective_selection_decisions(connection)
         rejected_ids = {
             identifier for identifier in strategy_ids
             if decisions.get(identifier, (None, None, None))[0] == "REJECTED"
         }
+        for symbol, count in connection.execute(
+            """select strategies.symbol, count(distinct strategies.strategy_id)
+                 from strategies
+                where strategies.strategy_id in (select unnest(?::bigint[]))
+                  and exists (
+                      select 1 from strategy_results results
+                       where results.strategy_id = strategies.strategy_id
+                         and (
+                             exists (select 1 from strategy_actions where result_id = results.result_id)
+                             or exists (select 1 from strategy_equity where result_id = results.result_id)
+                             or exists (select 1 from optimizer_prepared_inputs where result_id = results.result_id)
+                         )
+                  )
+                group by strategies.symbol""",
+            [sorted(rejected_ids)],
+        ).fetchall():
+            rejected_strategy_counts[str(symbol)] = int(count)
     targets = {
         "operation": operation,
         "symbols": list(selected),
@@ -484,7 +503,13 @@ def create_preview(
     pair_documents = []
     for symbol in selected:
         counts = {table: int(pair_counts[symbol].get(table, 0)) for table in all_tables}
-        pair_documents.append({"symbol": symbol, "table_counts": counts, "rows": sum(counts.values())})
+        strategy_count = counts.get("strategies", 0) if operation == "full" else rejected_strategy_counts.get(symbol, 0)
+        pair_documents.append({
+            "symbol": symbol,
+            "strategy_count": int(strategy_count),
+            "table_counts": counts,
+            "rows": sum(counts.values()),
+        })
     pair_scoped_total = sum(int(pair["rows"]) for pair in pair_documents) + shared_plateau_rows
     all_table_counts = {table: int(table_counts.get(table, 0)) for table in all_tables}
     fingerprint_doc = {
@@ -557,6 +582,51 @@ def _target_predicate(table: str, targets: Mapping[str, object]) -> tuple[str, l
 
 def _count_where(connection: duckdb.DuckDBPyConnection, table: str, where: str, params: Sequence[object]) -> int:
     return int(connection.execute(f"select count(*) from {table} where {where}", list(params)).fetchone()[0])
+
+
+def _delete_strategies_after_legacy_v7_migration(
+    connection: duckdb.DuckDBPyConnection,
+    where: str,
+    params: Sequence[object],
+) -> None:
+    """Supply the renamed FK table name left behind by the old v6->v7 migration."""
+    exists = int(connection.execute(
+        """select count(*) from information_schema.tables
+             where table_schema = 'main' and table_name = ?""",
+        [_LEGACY_V7_RESULTS_TABLE],
+    ).fetchone()[0])
+    if exists:
+        raise PerformanceV2MaintenanceError(
+            f"legacy strategy_results compatibility name already exists: {_LEGACY_V7_RESULTS_TABLE}"
+        )
+    row = connection.execute(
+        "select sql from duckdb_tables() where schema_name = 'main' and table_name = 'strategy_results'"
+    ).fetchone()
+    table_sql = None if row is None else row[0]
+    prefix = "CREATE TABLE strategy_results("
+    if not isinstance(table_sql, str) or not table_sql.startswith(prefix):
+        raise PerformanceV2MaintenanceError(
+            "cannot recover legacy strategy_results foreign-key binding from its catalog definition"
+        )
+
+    compatibility_sql = table_sql.replace(
+        prefix, f"CREATE TABLE {_LEGACY_V7_RESULTS_TABLE}(", 1
+    )
+    connection.execute("begin transaction")
+    try:
+        connection.execute(compatibility_sql)
+        connection.execute(
+            f"insert into {_LEGACY_V7_RESULTS_TABLE} select * from strategy_results"
+        )
+        connection.execute(f"delete from strategies where {where}", list(params))
+        connection.execute(f"drop table {_LEGACY_V7_RESULTS_TABLE}")
+        connection.execute("commit")
+    except BaseException:
+        try:
+            connection.execute("rollback")
+        except Exception:
+            pass
+        raise
 
 
 def _count_by_symbol(connection: duckdb.DuckDBPyConnection, table: str, targets: Mapping[str, object]) -> tuple[dict[str, int], int]:
@@ -715,12 +785,25 @@ def apply_preview(
                 table = str(state["table"])
                 connection.execute(f"delete from {table} where {state['where']}", state["params"])
             connection.execute("commit")
-        except BaseException:
+        except BaseException as error:
             try:
                 connection.execute("rollback")
             except Exception:
                 pass
-            raise
+            error_text = str(error).casefold().replace('"', "").replace("'", "").replace("`", "")
+            legacy_v7_name_missing = (
+                len(states) == 1
+                and states[0]["table"] == "strategies"
+                and isinstance(error, duckdb.CatalogException)
+                and "table with name" in error_text
+                and _LEGACY_V7_RESULTS_TABLE.casefold() in error_text
+                and "does not exist" in error_text
+            )
+            if not legacy_v7_name_missing:
+                raise
+            _delete_strategies_after_legacy_v7_migration(
+                connection, str(states[0]["where"]), states[0]["params"],
+            )
 
         for state in states:
             table = str(state["table"])

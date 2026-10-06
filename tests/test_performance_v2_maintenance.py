@@ -377,6 +377,7 @@ def test_full_preview_counts_shared_plateau_once_and_global_journal_once(mainten
     assert preview["shared_plateau_rows"] == 1
     assert preview["global_counts"] == {"import_files": 1, "import_runs": 1}
     assert [pair["symbol"] for pair in preview["pairs"]] == ["BTCUSDT", "ETHUSDT", "XRPUSDT"]
+    assert [pair["strategy_count"] for pair in preview["pairs"]] == [1, 1, 0]
     assert [pair["rows"] for pair in preview["pairs"]] == [13, 11, 1]
     assert preview["pair_scoped_total"] == 26
 
@@ -558,6 +559,9 @@ def test_rejected_preview_uses_effective_review_and_sticky_equity_source(mainten
     assert {symbol: row["rows"] for symbol, row in by_symbol.items()} == {
         "BTCUSDT": 3, "ETHUSDT": 3, "SOLUSDT": 0, "XRPUSDT": 0,
     }
+    assert {symbol: row["strategy_count"] for symbol, row in by_symbol.items()} == {
+        "BTCUSDT": 1, "ETHUSDT": 1, "SOLUSDT": 0, "XRPUSDT": 0,
+    }
     assert preview["pair_scoped_total"] == 6
     assert preview["global_counts"] == {}
 
@@ -621,6 +625,7 @@ def test_rejected_apply_rejects_changed_effective_strategy_set_with_empty_facts(
 
         preview = create_preview(connection, ["BTCUSDT", "ETHUSDT"], "rejected")
         assert preview["_targets"]["rejected_strategy_ids"] == [1]
+        assert preview["pairs"][0]["strategy_count"] == 0
         assert preview["pair_scoped_total"] == 0
 
         connection.execute(
@@ -717,6 +722,114 @@ class _FailOnceOnDelete:
         if parameters is None:
             return self.connection.execute(sql)
         return self.connection.execute(sql, parameters)
+
+
+class _MissingMigratedResultsTableOnce:
+    def __init__(self, connection: duckdb.DuckDBPyConnection) -> None:
+        self.connection = connection
+        self.failed = False
+
+    def execute(self, sql: str, parameters=None):
+        if not self.failed and sql.lstrip().casefold().startswith("delete from strategies"):
+            self.failed = True
+            raise duckdb.CatalogException(
+                "Catalog Error: table with name '__performance_v2_v7_strategy_results' DOES NOT EXIST!"
+            )
+        if parameters is None:
+            return self.connection.execute(sql)
+        return self.connection.execute(sql, parameters)
+
+
+class _FailLegacyStrategyRetry:
+    def __init__(self, connection: duckdb.DuckDBPyConnection) -> None:
+        self.connection = connection
+        self.strategy_delete_attempts = 0
+
+    def execute(self, sql: str, parameters=None):
+        if sql.lstrip().casefold().startswith("delete from strategies"):
+            self.strategy_delete_attempts += 1
+            if self.strategy_delete_attempts == 1:
+                raise duckdb.CatalogException(
+                    "Catalog Error: Table with name __performance_v2_v7_strategy_results does not exist!"
+                )
+            raise duckdb.IOException("injected legacy strategy retry failure")
+        if parameters is None:
+            return self.connection.execute(sql)
+        return self.connection.execute(sql, parameters)
+
+
+class _FailOnStrategyDelete:
+    def __init__(self, connection: duckdb.DuckDBPyConnection, error: BaseException) -> None:
+        self.connection = connection
+        self.error = error
+
+    def execute(self, sql: str, parameters=None):
+        if sql.lstrip().casefold().startswith("delete from strategies"):
+            raise self.error
+        if parameters is None:
+            return self.connection.execute(sql)
+        return self.connection.execute(sql, parameters)
+
+
+def test_full_delete_recovers_from_legacy_migrated_strategy_results_reference(maintenance_db: Path) -> None:
+    with _writable_fixture(maintenance_db, maintenance_db.parent) as connection:
+        preview = create_preview(connection, ["BTCUSDT"], "full")
+        result = apply_preview(_MissingMigratedResultsTableOnce(connection), preview)
+
+        assert result["pair_scoped_deleted"] == preview["pair_scoped_total"]
+        assert result["global_deleted"] == preview["global_counts"]
+        for table, count in preview["table_counts"].items():
+            assert result["table_counts"].get(table, 0) == count
+        for table in maintenance._PAIR_TABLES:
+            where, params = maintenance._target_predicate(table, preview["_targets"])
+            assert maintenance._count_where(connection, table, where, params) == 0
+        assert connection.execute(
+            "select count(*) from strategies where symbol = 'BTCUSDT'"
+        ).fetchone() == (0,)
+        assert result["table_counts"]["strategies"] == 1
+        assert connection.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("9",)
+        assert connection.execute(
+            "select count(*) from information_schema.tables "
+            "where table_schema = 'main' and table_name = '__performance_v2_v7_strategy_results'"
+        ).fetchone() == (0,)
+
+
+def test_legacy_recovery_rolls_back_compatibility_table_when_strategy_retry_fails(maintenance_db: Path) -> None:
+    with _writable_fixture(maintenance_db, maintenance_db.parent) as connection:
+        preview = create_preview(connection, ["BTCUSDT"], "full")
+
+        with pytest.raises(duckdb.IOException, match="injected legacy strategy retry failure"):
+            apply_preview(_FailLegacyStrategyRetry(connection), preview)
+
+        assert connection.execute("select count(*) from strategies where symbol = 'BTCUSDT'").fetchone() == (1,)
+        assert connection.execute(
+            "select count(*) from information_schema.tables "
+            "where table_schema = 'main' and table_name = '__performance_v2_v7_strategy_results'"
+        ).fetchone() == (0,)
+        assert connection.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("9",)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        duckdb.CatalogException("Catalog Error: Table with name another_relation does not exist!"),
+        RuntimeError("injected strategy failure"),
+    ],
+)
+def test_unrelated_strategy_delete_errors_are_propagated_unchanged(
+    maintenance_db: Path, error: BaseException,
+) -> None:
+    with _writable_fixture(maintenance_db, maintenance_db.parent) as connection:
+        preview = create_preview(connection, ["BTCUSDT"], "full")
+
+        with pytest.raises(type(error)) as raised:
+            apply_preview(_FailOnStrategyDelete(connection, error), preview)
+
+        assert raised.value is error
+        assert connection.execute(
+            "select count(*) from information_schema.tables "
+            "where table_schema = 'main' and table_name = '__performance_v2_v7_strategy_results'"
+        ).fetchone() == (0,)
 
 
 @pytest.mark.parametrize("failure_table", _FULL_DELETE_FAILURE_POINTS)

@@ -1,5 +1,17 @@
 # MRS3 — current verification
 
+## PerformanceDB maintenance correction (2026-10-06)
+
+Full deletion exposed a stale DuckDB foreign-key catalog name left by the
+legacy v6-to-v7 `strategy_results` rename, at the final strategy-removal phase.
+The migration now rebuilds that table under its canonical name. Existing v9
+databases recover only from this exact missing-table condition by creating a
+transaction-scoped compatibility table for the final delete. Preview shows
+strategy counts per pair; progress reports strategy counts before physical row
+counts. Focused migration, maintenance, static UI and Panel HTTP checks passed
+from `.venv` with `PYTHONPATH` set to this repository's `src`. No live
+PerformanceDB was accessed or modified.
+
 ## Performance v2 Panel recalculation connection fix (2026-10-05)
 
 The live PerformanceDB on D: is schema v9, and the restarted Panel serves it on

@@ -1866,6 +1866,7 @@ def test_performance_v2_maintenance_http_preview_apply_and_reused_token(tmp_path
                 break
             time.sleep(.02)
         assert job["status"] == "COMMITTED"
+        assert job["strategy_total"] == preview["pairs"][0]["strategy_count"]
         assert job["pair_scoped_deleted"] == job["pair_scoped_total"]
 
         status, reused = _http_json(connection, "POST", "/api/v2/strategies/performance-v2/maintenance/apply", {

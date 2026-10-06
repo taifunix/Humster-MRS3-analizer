@@ -361,6 +361,7 @@ CREATE TABLE IF NOT EXISTS optimizer_prepared_inputs (
 
 _RESULT_CHILD_TABLES = (
     "strategy_actions", "strategy_equity", "window_metrics", "optimizer_prepared_inputs",
+    "equity_quality_metrics",
 )
 
 _SELECTION_SCHEMA = """
@@ -1140,6 +1141,7 @@ def _alter_v6_commission_with_children(connection: duckdb.DuckDBPyConnection) ->
         table_name: f"__performance_v2_v7_{table_name}"
         for table_name in _RESULT_CHILD_TABLES
     }
+    result_snapshot = "__performance_v2_v7_strategy_results_snapshot"
     table_sql = {
         table_name: connection.execute(
             """select sql from duckdb_tables()
@@ -1150,11 +1152,14 @@ def _alter_v6_commission_with_children(connection: duckdb.DuckDBPyConnection) ->
     }
     if any(not sql for sql in table_sql.values()):
         raise RuntimeError("v6 catalog is missing DuckDB table recreation SQL")
+    index_tables = ", ".join(
+        f"'{table_name}'" for table_name in (*_RESULT_CHILD_TABLES, "strategy_results")
+    )
     index_sql = dict(
         connection.execute(
-            """select index_name, sql from duckdb_indexes()
+            f"""select index_name, sql from duckdb_indexes()
                 where schema_name = 'main'
-                  and table_name in ('strategy_results', 'strategy_actions', 'strategy_equity')
+                  and table_name in ({index_tables})
                   and sql is not null"""
         ).fetchall()
     )
@@ -1173,13 +1178,9 @@ def _alter_v6_commission_with_children(connection: duckdb.DuckDBPyConnection) ->
     for table_name, snapshot in snapshots.items():
         connection.execute(f"create temp table {snapshot} as select * from {table_name}")
         connection.execute(f"drop table {table_name}")
-    parent_table = "__performance_v2_v7_strategy_results"
-    parent_sql = table_sql["strategy_results"].replace(
-        "CREATE TABLE strategy_results(", f"CREATE TABLE {parent_table}(", 1
-    )
-    if parent_sql == table_sql["strategy_results"]:
-        raise RuntimeError("v6 catalog has unexpected strategy_results recreation SQL")
-    connection.execute(parent_sql)
+    connection.execute(f"create temp table {result_snapshot} as select * from strategy_results")
+    connection.execute("drop table strategy_results")
+    connection.execute(table_sql["strategy_results"])
     result_columns = tuple(
         row[0]
         for row in connection.execute(
@@ -1190,12 +1191,10 @@ def _alter_v6_commission_with_children(connection: duckdb.DuckDBPyConnection) ->
     )
     result_column_list = ", ".join(result_columns)
     connection.execute(
-        f"insert into {parent_table} ({result_column_list}) "
-        f"select {result_column_list} from strategy_results"
+        f"insert into strategy_results ({result_column_list}) "
+        f"select {result_column_list} from {result_snapshot}"
     )
-    connection.execute("drop index strategy_results_strategy_id_idx")
-    connection.execute("drop table strategy_results")
-    connection.execute(f"alter table {parent_table} rename to strategy_results")
+    connection.execute(f"drop table {result_snapshot}")
     connection.execute("alter table strategy_results alter column commission_rate drop not null")
     for table_name, snapshot in snapshots.items():
         connection.execute(table_sql[table_name])

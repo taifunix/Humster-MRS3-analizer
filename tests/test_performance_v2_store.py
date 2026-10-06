@@ -1022,7 +1022,14 @@ def test_v6_to_v7_migration_preserves_decimal_and_child_facts() -> None:
     with duckdb.connect(":memory:") as connection:
         _initialize_v6_fixture(connection)
         result_id = _insert_result_with_children(connection, _strategy(connection, name="v6-row"))
-        tables = ("strategy_results", "strategy_actions", "strategy_equity", "window_metrics", "optimizer_prepared_inputs")
+        connection.execute(
+            "insert into equity_quality_metrics values (?, 'revision-v1', 'algo-v1', '{}', ?, now())",
+            [result_id, "a" * 64],
+        )
+        tables = (
+            "strategy_results", "strategy_actions", "strategy_equity", "window_metrics",
+            "optimizer_prepared_inputs", "equity_quality_metrics",
+        )
         before_rows = {
             table: connection.execute(f"select * from {table} where result_id = ?", [result_id]).fetchall()
             for table in tables
@@ -1109,6 +1116,19 @@ def test_v6_to_v7_migration_keeps_historical_marker_and_validator() -> None:
         _initialize_v6_fixture(connection)
         _migrate_schema_v6_to_v7(connection)
         assert connection.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("7",)
+
+
+def test_v6_to_v7_migration_keeps_strategy_deletable_after_parent_rebuild() -> None:
+    with duckdb.connect(":memory:") as connection:
+        _initialize_v6_fixture(connection)
+        strategy_id = _strategy(connection, name="delete-after-v7-migration")
+        _migrate_schema_v6_to_v7(connection)
+
+        connection.execute("delete from strategies where strategy_id = ?", [strategy_id])
+
+        assert connection.execute(
+            "select count(*) from strategies where strategy_id = ?", [strategy_id]
+        ).fetchone() == (0,)
 
 
 def test_reopened_disk_v6_to_v7_migration_preserves_decimal_and_child_facts(tmp_path: Path) -> None:

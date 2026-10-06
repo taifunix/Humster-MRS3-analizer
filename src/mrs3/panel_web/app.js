@@ -3947,27 +3947,23 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
     if (!maintenancePreview || !maintenancePreviewPairs) return;
     maintenancePreviewToken = String(result.token || '');
     maintenancePreviewDocument = result;
+    const strategyCountHeading = document.querySelector('#performance-v2-maintenance-strategy-count-heading');
+    if (strategyCountHeading) strategyCountHeading.textContent = result.operation === 'full'
+      ? 'Стратегий к удалению' : 'Стратегий к очистке';
     maintenancePreviewPairs.replaceChildren(...(result.pairs || []).map((pair) => {
       const row = document.createElement('tr');
       const symbol = document.createElement('th');
       symbol.scope = 'row';
       symbol.textContent = pair.symbol;
       const count = document.createElement('td');
-      count.textContent = maintenanceCount(pair.rows);
-      const breakdown = document.createElement('td');
-      breakdown.className = 'performance-v2-maintenance-table-breakdown';
-      breakdown.textContent = Object.entries(pair.table_counts || {})
-        .map(([table, rows]) => `${table}: ${maintenanceCount(rows)}`).join(' · ');
-      row.append(symbol, count, breakdown);
+      count.textContent = maintenanceCount(pair.strategy_count);
+      row.append(symbol, count);
       return row;
     }));
-    const shared = document.querySelector('#performance-v2-maintenance-shared');
-    if (shared) shared.textContent = `Общие строки analysis_plateaus, удаляемые один раз: ${maintenanceCount(result.shared_plateau_rows)}.`;
-    const global = document.querySelector('#performance-v2-maintenance-global');
-    const globalCounts = result.global_counts || {};
-    if (global) global.textContent = Object.keys(globalCounts).length
-      ? `Глобальные записи: import_files — ${maintenanceCount(globalCounts.import_files)}, import_runs — ${maintenanceCount(globalCounts.import_runs)}.`
-      : 'Глобальные import_files и import_runs не затрагиваются.';
+    const scopeNote = document.querySelector('#performance-v2-maintenance-preview-scope-note');
+    if (scopeNote) scopeNote.textContent = result.operation === 'full'
+      ? 'Полное удаление также очищает записи выбора и больше не используемые analysis_plateaus; они не входят в число стратегий.'
+      : 'Показаны стратегии с подробными данными для очистки. Сами стратегии и их настройки сохраняются.';
     const warning = document.querySelector('#performance-v2-maintenance-global-warning');
     if (warning) warning.hidden = result.operation !== 'full';
     if (maintenanceRejectedWarning) maintenanceRejectedWarning.hidden = result.operation !== 'rejected';
@@ -3992,7 +3988,9 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
       });
       if (generation !== maintenancePreviewGeneration) return;
       maintenanceRenderPreview(result);
-      maintenanceSetStatus(`Предварительный просмотр готов: ${maintenanceCount(result.pair_scoped_total)} строк выбранных пар.`);
+      const strategyCount = (result.pairs || []).reduce((total, pair) => total + Number(pair.strategy_count || 0), 0);
+      const action = operation === 'full' ? 'к удалению' : 'к очистке';
+      maintenanceSetStatus(`Предварительный просмотр готов: ${maintenanceCount(strategyCount)} стратегий ${action}.`);
     } catch (error) {
       if (generation !== maintenancePreviewGeneration) return;
       maintenanceSetStatus(`Не удалось построить предварительный просмотр: ${error?.message || 'ошибка запроса'}`, true);
@@ -4026,7 +4024,14 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
     const phase = document.querySelector('#performance-v2-maintenance-phase');
     if (phase) phase.textContent = `Этап: ${job.phase || '—'}${job.current_table ? ` · таблица ${job.current_table}` : ''}`;
     const counts = document.querySelector('#performance-v2-maintenance-progress-counts');
-    if (counts) counts.textContent = `Удалено ${maintenanceCount(deleted)} из ${maintenanceCount(total)} строк выбранных пар`;
+    const strategyTotal = Number(job.strategy_total) || 0;
+    const deletedStrategies = Number(job.table_counts?.strategies) || 0;
+    const strategyProgress = job.operation === 'full'
+      ? `Удалено стратегий ${maintenanceCount(deletedStrategies)} из ${maintenanceCount(strategyTotal)}`
+      : job.status === 'COMMITTED'
+        ? `Обработано стратегий ${maintenanceCount(strategyTotal)} из ${maintenanceCount(strategyTotal)}`
+        : `К очистке стратегий ${maintenanceCount(strategyTotal)}`;
+    if (counts) counts.textContent = `${strategyProgress}; удалено ${maintenanceCount(deleted)} из ${maintenanceCount(total)} строк выбранных пар`;
     const global = document.querySelector('#performance-v2-maintenance-global-counts');
     if (global) global.hidden = job.operation !== 'full';
     if (global) {
@@ -4038,7 +4043,12 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
     if (completed) {
       maintenanceStopPolling();
       if (job.status === 'COMMITTED' && total === 0 && !(Number(job.global_journal_total) > 0)) maintenanceSetStatus('Нечего удалять: в выбранных парах нет строк. Обслуживание завершено.', false);
-      else if (job.status === 'COMMITTED') maintenanceSetStatus('Удаление завершено. Показаны подтверждённые количества строк.', false);
+      else if (job.status === 'COMMITTED') {
+        const strategyOutcome = job.operation === 'full'
+          ? `Удалено стратегий: ${maintenanceCount(strategyTotal)}.`
+          : `Обработано стратегий: ${maintenanceCount(strategyTotal)}.`;
+        maintenanceSetStatus(`Обслуживание завершено. ${strategyOutcome} Показаны подтверждённые количества строк.`, false);
+      }
       else maintenanceSetStatus(`Ошибка на этапе ${job.current_table || job.phase || 'неизвестно'}: ${job.error || 'операция завершилась с ошибкой'}. Показаны уже подтверждённые изменения.${job.recovery_warning ? ` ${job.recovery_warning}` : ''}`, true);
       maintenanceJobActive = false;
       if (maintenancePairs) maintenancePairs.querySelectorAll('input[type="checkbox"]').forEach((input) => { input.disabled = false; });

@@ -681,12 +681,27 @@ def test_performance_v2_maintenance_card_starts_with_catalog_and_requires_previe
     assert "maintenanceEndpoint}/status?job_id=" in js
     assert "body: JSON.stringify({ operation, symbols })" in js
     assert "body: JSON.stringify({ token: previewToken })" in js
-    assert "Удалено ${maintenanceCount(deleted)} из ${maintenanceCount(total)} строк выбранных пар" in js
+    assert "Удалено стратегий ${maintenanceCount(deletedStrategies)} из ${maintenanceCount(strategyTotal)}" in js
+    assert "Обработано стратегий ${maintenanceCount(strategyTotal)} из ${maintenanceCount(strategyTotal)}" in js
+    assert "удалено ${maintenanceCount(deleted)} из ${maintenanceCount(total)} строк выбранных пар" in js
+    assert "`${strategyProgress}; удалено ${maintenanceCount(deleted)} из ${maintenanceCount(total)} строк выбранных пар`" in js
+    assert "job.global_journal_counts || {}" in js
+    assert 'id="performance-v2-maintenance-global-counts"' in card
+    assert '"strategy_total": sum(int(pair.get("strategy_count", 0)) for pair in public["pairs"])' in (
+        (Path(__file__).parents[1] / "src" / "mrs3" / "panel.py").read_text(encoding="utf-8")
+    )
     assert "symbol.endsWith('USDT') ? symbol.slice(0, -4) : symbol" in js
     assert "maintenanceRejectedWarning.hidden = result.operation !== 'rejected'" in js
     assert "maintenancePreview.hidden = false" in js
-    assert "Object.entries(pair.table_counts || {})" in js
-    assert "Таблицы по паре" in html
+    preview_renderer = js.split("const maintenanceRenderPreview = ", 1)[1].split("const requestMaintenancePreview = ", 1)[0]
+    assert "maintenanceCount(pair.strategy_count)" in preview_renderer
+    assert "pair.rows" not in preview_renderer and "pair.table_counts" not in preview_renderer
+    assert "result.global_counts" not in preview_renderer
+    assert "Стратегий к удалению" in js and "Стратегий к очистке" in js
+    maintenance_preview_markup = html.split('id="performance-v2-maintenance-preview"', 1)[1].split("</section>", 1)[0]
+    assert "Всего строк" not in maintenance_preview_markup
+    assert "Таблицы по паре" not in maintenance_preview_markup
+    assert "performance-v2-maintenance-table-breakdown" not in f"{html}{js}{css}"
     assert "let maintenancePreviewGeneration = 0" in js
     assert "if (generation !== maintenancePreviewGeneration) return" in js
     assert "job.status === 'COMMITTED' ? 100 : 0" in js
