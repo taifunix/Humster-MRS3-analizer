@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from copy import deepcopy
+from contextlib import contextmanager
 from hashlib import sha256
 from http.client import HTTPConnection
 from decimal import Decimal
@@ -3656,6 +3657,52 @@ def test_selection_review_import_maps_database_lock_to_api_error(tmp_path: Path,
 
     assert raised.value.code == "PERFORMANCE_V2_LOCKED"
     assert raised.value.status == 409
+
+
+def test_selection_review_workbook_import_runs_under_shared_writer_guard(tmp_path: Path, monkeypatch) -> None:
+    controller, database, _ = _controller_for_windows(tmp_path)
+    payload = {"symbol": "BTCUSDT", "side": "LONG", "stages": []}
+    controller.strategies_performance_v2_recalculate(payload)
+    _filename, workbook = controller.strategies_performance_v2_selection(payload)
+    review_workbook = load_workbook(BytesIO(workbook))
+    review_sheet = review_workbook["All candidates"]
+    review_headers = {cell.value: cell.column for cell in review_sheet[1]}
+    assert {"ID", "Стратегия", "User Status"}.issubset(review_headers)
+    assert review_sheet.cell(2, review_headers["Стратегия"]).value == "alpha"
+    review_sheet.cell(2, review_headers["User Status"], "FILTERED")
+    reviewed = BytesIO()
+    review_workbook.save(reviewed)
+    original_guard = controller._performance_v2_writer_guard
+    guard_events: list[str] = []
+    guard_depth = 0
+
+    @contextmanager
+    def observed_guard(target: Path):
+        with original_guard(target):
+            assert target.resolve() == database.resolve()
+            guard_events.append("enter")
+            nonlocal guard_depth
+            guard_depth += 1
+            try:
+                yield
+            finally:
+                guard_depth -= 1
+                guard_events.append("exit")
+
+    original_import = panel_module.import_selection_review
+
+    def observed_import(connection, data):
+        assert guard_depth == 1
+        guard_events.append("import")
+        return original_import(connection, data)
+
+    monkeypatch.setattr(controller, "_performance_v2_writer_guard", observed_guard)
+    monkeypatch.setattr(panel_module, "import_selection_review", observed_import)
+
+    imported = controller.strategies_performance_v2_selection_review_import(reviewed.getvalue())
+
+    assert imported["row_count"] == 1
+    assert guard_events == ["enter", "import", "exit"]
 
 
 @pytest.mark.parametrize("operation", ["selection", "cache_status", "recalculate"])
