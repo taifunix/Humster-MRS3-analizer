@@ -3283,11 +3283,12 @@ def run_selection(
                 result.at[index, "auto_status"] = "FILTERED"
                 result.at[index, "elimination_reason"] = result.at[index, "equity_regime_reasons"]
             for index in stalled:
+                result.at[index, column] = True
                 result.at[index, "finalist"] = False
                 result.at[index, "auto_status"] = "RESERVE"
                 result.at[index, "elimination_reason"] = "EQUITY_REGIME_STALLED_RESERVE"
             stage_counts[stage.id] = {
-                "enabled": True, "eliminated": len(eliminated),
+                "enabled": True, "eliminated": int(result[column].sum()),
                 "remaining": int(result["finalist"].sum()),
                 "not_evaluated": int(decisions.eq("NOT_EVALUATED").sum()),
                 "reserved": len(stalled),

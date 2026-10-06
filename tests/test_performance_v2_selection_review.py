@@ -42,7 +42,31 @@ from mrs3.performance_v2_selection_review import (
     new_run_metadata,
     persist_selection_snapshot,
     effective_selection_decisions,
+    _selection_rows,
+    automatic_filter_rejected_strategy_ids,
 )
+
+
+def test_selection_rows_does_not_copy_equity_evidence_for_each_column(monkeypatch) -> None:
+    frame = pd.DataFrame({"strategy_id": range(32), "result_id": range(32), "auto_status": ["FINALIST"] * 32})
+    evidence = {str(index): {"facts": "x" * 1000} for index in range(100)}
+    frame.attrs["equity_regime_evidence"] = evidence
+    original_deepcopy = pd.core.generic.deepcopy
+    evidence_copies = 0
+
+    def counted_deepcopy(value, *args, **kwargs):
+        nonlocal evidence_copies
+        if isinstance(value, dict) and value.get("equity_regime_evidence") is not None:
+            evidence_copies += 1
+        return original_deepcopy(value, *args, **kwargs)
+
+    monkeypatch.setattr(pd.core.generic, "deepcopy", counted_deepcopy)
+    rows = _selection_rows(frame)
+
+    assert len(rows) == 32
+    assert rows[0]["strategy_id"] == 0
+    assert 1 <= evidence_copies < 10
+    assert frame.attrs["equity_regime_evidence"] is evidence
 from mrs3.panel import PanelController
 from mrs3.performance_v2_store import initialize_performance_v2
 
@@ -131,6 +155,107 @@ def test_hard_cutoff_publication_tags_only_actual_exclusion(tmp_path: Path) -> N
     assert connection.execute(
         "select strategy_id, source, source_ref from strategy_tags where tag = 'REJECTED'"
     ).fetchall() == [(1, "SELECTION_HARD_CUTOFF", metadata["selection_run_id"])]
+
+
+@pytest.mark.parametrize(("stage_id", "column", "reason", "tag_source"), [
+    ("filter_lot_variant_redundancy", "eliminated_by_filter_lot_variant_redundancy", "LOT_VARIANT_FULL_DD5", "SELECTION_LOT_VARIANT"),
+    ("ab_deterioration", "eliminated_by_ab_deterioration", "AB_DETERIORATION;B_PNL30_FLOOR", "SELECTION_AB_DETERIORATION"),
+])
+def test_additional_filter_publication_tags_actual_exclusion_rejected(
+    tmp_path: Path, stage_id: str, column: str, reason: str, tag_source: str,
+) -> None:
+    connection = _database(tmp_path)
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": stage_id, "enabled": True, "scope": "pair_side_timeframe"},
+    ]})
+    result = _result()
+    result[column] = [True, False]
+    result.loc[0, "auto_status"] = "FILTERED"
+    result.loc[0, "finalist"] = False
+    result.loc[1, "auto_status"] = "FINALIST"
+    result.loc[1, "finalist"] = True
+    result.loc[0, "elimination_reason"] = "producer reason wording can evolve"
+    metadata = new_run_metadata(connection, request)
+
+    persist_selection_snapshot(connection, request, SelectionConfig(), result, metadata, b"workbook")
+
+    assert connection.execute(
+        "select strategy_id, source, source_ref from strategy_tags where tag = 'REJECTED'"
+    ).fetchall() == [(1, tag_source, metadata["selection_run_id"])]
+
+
+def test_equity_reserve_is_not_in_automatic_filter_rejection_ids(tmp_path: Path) -> None:
+    connection = _database(tmp_path)
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "filter_lot_variant_redundancy", "enabled": True, "scope": "pair_side_timeframe"},
+        {"id": "filter_hard_cutoffs", "enabled": True, "scope": "pair_side"},
+        {"id": "ab_deterioration", "enabled": True, "scope": "pair_side"},
+    ]})
+    result = _result()
+    result["eliminated_by_filter_equity_regime"] = [True, False]
+    result.loc[0, "auto_status"] = "RESERVE"
+    result.loc[0, "finalist"] = False
+    result.loc[0, "elimination_reason"] = "EQUITY_REGIME_STALLED_RESERVE"
+
+    assert automatic_filter_rejected_strategy_ids(result, request, SelectionConfig()) == set()
+
+    metadata = new_run_metadata(connection, request)
+    persist_selection_snapshot(connection, request, SelectionConfig(), result, metadata, b"reserve")
+    assert connection.execute("select count(*) from strategy_tags where tag = 'REJECTED'").fetchone() == (0,)
+
+
+def test_automatic_rejection_rejects_ambiguous_multiple_stage_flags() -> None:
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "filter_lot_variant_redundancy", "enabled": True, "scope": "pair_side_timeframe"},
+        {"id": "filter_hard_cutoffs", "enabled": True, "scope": "pair_side"},
+    ]})
+    result = _result()
+    result["eliminated_by_filter_lot_variant_redundancy"] = [True, False]
+    result["eliminated_by_filter_hard_cutoffs"] = [True, False]
+
+    with pytest.raises(SelectionReviewError, match="SELECTION_REVIEW_INVALID_SELECTION"):
+        automatic_filter_rejected_strategy_ids(result, request, SelectionConfig())
+
+
+def test_panel_xlsx_does_not_override_equity_reserve_user_status(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "panel"
+    database_root = root / "data"
+    database_root.mkdir(parents=True)
+    connection = _database(database_root, filename="strategy_performance.duckdb")
+    connection.close()
+    local_config = root / "config.local.json"
+    local_config.write_text(json.dumps({"panel_paths": {"performance_db_root": "legacy"}}), encoding="utf-8")
+    (root / "config.performance.json").write_text(
+        json.dumps({"unified_performance_v2": {"database_root": "data", "workers": 1}}), encoding="utf-8"
+    )
+    controller = PanelController(root, local_config)
+    monkeypatch.setattr(
+        "mrs3.panel.latest_user_reviews_by_strategy",
+        lambda *_args, **_kwargs: {1: {"user_status": "FINALIST"}},
+    )
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "filter_lot_variant_redundancy", "enabled": True, "scope": "pair_side_timeframe"},
+        {"id": "filter_hard_cutoffs", "enabled": True, "scope": "pair_side"},
+        {"id": "ab_deterioration", "enabled": True, "scope": "pair_side"},
+    ]})
+    result = _result()
+    result["eliminated_by_filter_equity_regime"] = [True, False]
+    result.loc[0, "auto_status"] = "RESERVE"
+    result.loc[0, "finalist"] = False
+    result.loc[0, "elimination_reason"] = "EQUITY_REGIME_STALLED_RESERVE"
+    monkeypatch.setattr(controller, "_performance_v2_selection_result", lambda _payload: (request, result))
+
+    _, data = controller.strategies_performance_v2_selection({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
+    sheet = load_workbook(BytesIO(data), data_only=True)["All candidates"]
+    headers = {cell.value: cell.column for cell in sheet[1]}
+    exported = next(
+        (sheet.cell(row, headers["User Status"]).value, sheet.cell(row, headers["Auto Status"]).value)
+        for row in range(2, sheet.max_row + 1)
+        if sheet.cell(row, headers["ID"]).value == 1
+    )
+
+    assert exported == ("FINALIST", "RESERVE")
+    assert result.loc[0, "auto_status"] == "RESERVE"
 
 
 def test_hard_cutoff_engine_result_publishes_tag_and_reason(tmp_path: Path) -> None:
@@ -244,7 +369,14 @@ def test_catalog_exposes_selection_thresholds_without_database(tmp_path: Path) -
     assert catalog["selection_config"]["hard_dd_profit_multiplier"] == "4"
 
 
-def test_panel_xlsx_shows_pending_hard_rejection_after_publication(tmp_path: Path, monkeypatch) -> None:
+@pytest.mark.parametrize(("stage_id", "scope", "column", "reason", "tag_source"), [
+    ("filter_lot_variant_redundancy", "pair_side_timeframe", "eliminated_by_filter_lot_variant_redundancy", "LOT_VARIANT_FULL_DD5", "SELECTION_LOT_VARIANT"),
+    ("filter_hard_cutoffs", "pair_side", "eliminated_by_filter_hard_cutoffs", 'FILTER_HARD_CUTOFFS:{"triggered":["PNL30_FLOOR"]}', "SELECTION_HARD_CUTOFF"),
+    ("ab_deterioration", "pair_side", "eliminated_by_ab_deterioration", "AB_DETERIORATION;B_PNL30_FLOOR", "SELECTION_AB_DETERIORATION"),
+])
+def test_panel_xlsx_shows_pending_automatic_filter_rejection(
+    tmp_path: Path, monkeypatch, stage_id: str, scope: str, column: str, reason: str, tag_source: str,
+) -> None:
     root = tmp_path / "panel"
     database_root = root / "data"
     database_root.mkdir(parents=True)
@@ -256,14 +388,18 @@ def test_panel_xlsx_shows_pending_hard_rejection_after_publication(tmp_path: Pat
         json.dumps({"unified_performance_v2": {"database_root": "data", "workers": 1}}), encoding="utf-8"
     )
     controller = PanelController(root, local_config)
+    monkeypatch.setattr(
+        "mrs3.panel.latest_user_reviews_by_strategy",
+        lambda *_args, **_kwargs: {1: {"user_status": "FINALIST"}},
+    )
     request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
-        {"id": "filter_hard_cutoffs", "enabled": True, "scope": "pair_side"},
+        {"id": stage_id, "enabled": True, "scope": scope},
     ]})
     result = _result()
-    result["eliminated_by_filter_hard_cutoffs"] = [True, False]
+    result[column] = [True, False]
     result.loc[0, "auto_status"] = "FILTERED"
     result.loc[0, "finalist"] = False
-    result.loc[0, "elimination_reason"] = 'FILTER_HARD_CUTOFFS:{"triggered":["PNL30_FLOOR"]}'
+    result.loc[0, "elimination_reason"] = reason
     monkeypatch.setattr(controller, "_performance_v2_selection_result", lambda _payload: (request, result))
 
     _, data = controller.strategies_performance_v2_selection({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
@@ -277,10 +413,11 @@ def test_panel_xlsx_shows_pending_hard_rejection_after_publication(tmp_path: Pat
         for row in range(2, sheet.max_row + 1)
     }
     assert values[1] == ("REJECTED", "FILTERED")
+    assert result.loc[0, "auto_status"] == "FILTERED"
     with duckdb.connect(str(database_root / "strategy_performance.duckdb"), read_only=True) as check:
         assert check.execute(
             "select source from strategy_tags where strategy_id = 1 and tag = 'REJECTED'"
-        ).fetchone() == ("SELECTION_HARD_CUTOFF",)
+        ).fetchone() == (tag_source,)
 
 
 def _export(connection: duckdb.DuckDBPyConnection, tmp_path: Path) -> tuple[Path, dict[str, str]]:

@@ -11,12 +11,14 @@ order sections of the earlier finalist-selection, lot-variant and A/B specs.
 
 Inputs are the current ACTIVE Performance v2 strategies, their current result,
 versioned windows/equity facts and reliably completed action cycles. Outputs
-are a disposable preview, a finished XLSX, an immutable selection snapshot and,
-only for stage 3 exclusions in a published selection, a durable `REJECTED` tag.
+are a disposable preview, a finished XLSX, an immutable selection snapshot,
+durable equity rejection evidence, and `REJECTED` tags for published exclusions
+at stages 2–4.
 
-The approved source is the [filter decision ledger](../superpowers/plans/2026-10-01-performance-v2-filter-review.md)
-and [ADR-0052](../decisions/0052-performance-v2-hard-cutoff-rejected.md),
-as amended for the DD branch by [ADR-0053](../decisions/0053-performance-v2-dd-profit-guard.md).
+The approved source is the [filter decision ledger](../superpowers/plans/2026-10-01-performance-v2-filter-review.md),
+[ADR-0052](../decisions/0052-performance-v2-hard-cutoff-rejected.md),
+[ADR-0053](../decisions/0053-performance-v2-dd-profit-guard.md), and
+[ADR-0058](../decisions/0058-performance-v2-filter-rejected-status.md).
 Research XLSX PnL/30 cutoffs, later Pareto redesign, tester runs, deletion,
 portfolio simulation and historical snapshot rewriting are outside scope.
 
@@ -35,6 +37,12 @@ enabled stage only evaluates survivors of its predecessors. Missing facts do
 not become zero or cause exclusion. Every request has one stage entry per ID;
 legacy requests without a stage retain existing default handling. Server
 order is authoritative, and snapshots preserve the effective order and config.
+
+For each enabled stage, `eliminated` counts incoming rows that do not continue
+to the next stage, including rows assigned `RESERVE`; `remaining` counts only
+rows passed forward. Thus incoming rows equal `eliminated + remaining`, and
+`reserved` is a diagnostic subset of `eliminated`. In particular, equity
+`STALLED` rows remain `RESERVE` for review but are excluded from later stages.
 
 The agreed numbers are the defaults in `SelectionConfig` and
 `config.performance.json`. Explicit local numeric overrides remain possible
@@ -96,20 +104,8 @@ independently; incomplete ratio evidence cannot suppress an available DD or
 full-PnL failure. Persist every triggered rule with its measured values in
 the selection result reason; config and effective request are in the run.
 
-Preview is read-only. On explicit XLSX selection publication, atomically
-insert the immutable run/results and upsert `strategy_tags` with tag `REJECTED`,
-source `SELECTION_HARD_CUTOFF` and source_ref pointing to that run. Only rows
-actually eliminated by an enabled stage 3 are tagged. Recheck current result
-IDs and equity source revision before publication. A stale result or failed
-transaction publishes neither run nor tag. Repeated publication does not
-duplicate the tag. Disabling the filter does not clear old tags. The current
-XLSX displays `User Status = REJECTED` for newly tagged rows even though its
-bytes are built before transaction commit. `Auto Status` remains `FILTERED`.
-
-A present `REJECTED` tag wins over an older manual status when resolving the
-current effective status. An explicit later review import may clear that tag
-through the existing review workflow. Numeric User Rank is unchanged. No
-strategy is deleted or changed to lifecycle `DISCARDED`.
+Preview is read-only. The common durable-tag publication rule for stages 2–4
+is specified after the A/B criteria below.
 
 ## 4. A/B deterioration
 
@@ -134,6 +130,30 @@ used, never B Trades/30. Each branch evaluates independently with its own
 required facts. Record triggered conditions and distinguish incomplete
 evaluation from a complete pass. Remove the old trade-frequency decline and
 unconditional 58% win-rate checks.
+
+## Published REJECTED status for stages 2–4
+
+On explicit selection snapshot publication, atomically insert the immutable
+run/results and upsert the existing `strategy_tags` row for each strategy
+actually excluded by an enabled stage 2, 3, or 4. The source is
+`SELECTION_LOT_VARIANT`, `SELECTION_HARD_CUTOFF`, or
+`SELECTION_AB_DETERIORATION`, respectively; `source_ref` is the selection run
+ID. Stage trace flags are the exclusion evidence. A passing row, a skipped
+stage, a row excluded elsewhere, or an equity `RESERVE` row receives no tag
+from these stages. Ambiguous evidence that attributes one row to multiple of
+these stages fails publication.
+
+Recheck current result IDs and equity source revision before publication. A
+stale result or failed transaction publishes neither run nor tag. Repeated
+publication upserts the existing tag; disabling a filter or passing a later
+selection does not clear an older tag. Newly tagged rows display
+`User Status = REJECTED` in the current XLSX even though its bytes are built
+before transaction commit; `Auto Status` remains `FILTERED`. A present
+`REJECTED` tag wins over an older manual status when resolving the effective
+status. An explicit later review import may clear the tag through the existing
+review workflow. Numeric User Rank is unchanged. These tags do not delete a
+strategy or change its lifecycle to `DISCARDED`. Hard equity rejection
+provenance continues to use its separate existing rejection-source contract.
 
 ## 5. Top-five profitable trades
 

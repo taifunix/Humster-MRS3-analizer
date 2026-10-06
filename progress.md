@@ -4719,13 +4719,10 @@ The synthetic workers=1/8 comparison produced identical final SHA-256, per-table
 
 Final review-fix verification: the combined synthetic maintenance/importer/Panel/static-UI suite passed **458 tests**, with **4 symlink capability skips** and 78 existing pandas fragmentation warnings, in 745.19 s. `node --check` and `git diff --cached --check` passed; the dedicated `C:\TEMP` test directory was removed. The former schema-v8 expectation was verified to fail against the unchanged schema-v9 source; the current v9 expectation passes. Independent Claude Opus 5 re-review returned `CODE_REVIEW_PASS`; a separate scoped feature commit is recorded in local `main`.
 
-## PerformanceDB maintenance final gate (2026-10-06)
+## Selection RESERVE counts and filter rejection tags (2026-10-06)
 
-Independent Claude Opus 5 re-review returned `CODE_REVIEW_PASS` for the final
-Panel recovery/progress fixes; service review packets S1-S3 also passed. After
-the last fixes, the targeted Panel maintenance/static UI set passed **15 tests**;
-the maintenance service suite passed **42 tests**. The broader combined feature
-suite had passed **458 tests with 4 symlink capability skips** before these
-focused corrections. Tests used synthetic databases under C: TEMP, which was
-removed. Schema remains v9; no live PerformanceDB was opened for writing. A
-separate scoped feature commit in local `main` is the remaining action.
+Equity regime STALLED rows remain `RESERVE`, are marked as excluded at that stage, and do not reach later stages. Stage counts reconcile as `eliminated + remaining = incoming`; `reserved` is a diagnostic subset of `eliminated`. Published exclusions from Lot variant redundancy, Hard performance cutoffs, and A/B deterioration receive durable `REJECTED` tags with stage source and selection run ID. Pending XLSX marks these rows `REJECTED`; an equity RESERVE row does not receive that override.
+
+Verification on an isolated clean HEAD snapshot with these changes and the updated RESERVE regression: 599 passed, 4 symlink skips, 116 existing warnings. Focused local tests: 11 passed. `git diff --check` passed; Git reported only existing LF/CRLF normalization warnings.
+
+Panel restart is deferred while tester job `69d044bc73784bfba8a0bce4b466c8de` remains RUNNING in REPORT_COLLECTION (2978/2978). After it reaches a terminal state, restart Panel and verify stage counts and XLSX behavior in the live UI.

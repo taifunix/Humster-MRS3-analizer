@@ -41,6 +41,7 @@ from mrs3.performance_v2_selection import (
     retest_cohort_request,
 )
 from mrs3.performance_v2_store import initialize_performance_v2
+from mrs3.performance_v2_selection_review import automatic_filter_rejected_strategy_ids
 from mrs3.performance_v2_windows import METRICS_VERSION, WindowMetrics, _calculate, _cached
 from mrs3.performance_v2_equity_cache import (
     EquityQualityCacheError,
@@ -704,25 +705,51 @@ def test_equity_regime_filter_applies_classifier_decisions_and_technical_reasons
         assert result.loc[0, "elimination_reason"] == "EQUITY_REGIME_STALLED_RESERVE"
 
 
-def test_stalled_equity_reserve_survives_later_stages_with_separate_trace_and_count() -> None:
+def test_stalled_equity_reserve_survives_later_stages_with_separate_trace_and_count(tmp_path: Path) -> None:
     request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
         {"id": "filter_equity_regime", "enabled": True, "scope": "pair_side"},
-        {"id": "pareto_primary", "enabled": True, "scope": "pair_side"},
+        {"id": "filter_hard_cutoffs", "enabled": True, "scope": "pair_side"},
     ]})
-    result = run_selection(pd.DataFrame([
-        _selection_row("stalled", strategy_id=1, _equity_state="STALLED"),
+    candidates = pd.DataFrame([
+        _selection_row(
+            "stalled", strategy_id=1, _equity_state="STALLED",
+            max_drawdown_pct=24, pnl_30d_pct=5, history_days=30, completed_cycle_count=0,
+        ),
         _selection_row("growing", strategy_id=2, _equity_state="GROWING"),
-    ]), request).set_index("strategy_name")
+    ])
+    control_request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "filter_hard_cutoffs", "enabled": True, "scope": "pair_side"},
+    ]})
+    control = run_selection(candidates, control_request).set_index("strategy_name")
+    result = run_selection(candidates, request).set_index("strategy_name")
 
     stalled = result.loc["stalled"]
+    assert control.loc["stalled", "eliminated_by_filter_hard_cutoffs"]
     assert not stalled["finalist"]
     assert stalled["auto_status"] == "RESERVE"
     assert stalled["elimination_reason"] == "EQUITY_REGIME_STALLED_RESERVE"
-    assert not stalled["eliminated_by_filter_equity_regime"]
-    assert not stalled["eliminated_by_pareto_primary"]
+    assert stalled["eliminated_by_filter_equity_regime"]
+    assert not stalled["eliminated_by_filter_hard_cutoffs"]
+    assert 1 not in automatic_filter_rejected_strategy_ids(result, request, SelectionConfig())
     assert result.attrs["stage_counts"]["filter_equity_regime"] == {
-        "enabled": True, "eliminated": 0, "remaining": 1, "not_evaluated": 0, "reserved": 1,
+        "enabled": True, "eliminated": 1, "remaining": 1, "not_evaluated": 0, "reserved": 1,
     }
+    count = result.attrs["stage_counts"]["filter_equity_regime"]
+    assert count["eliminated"] >= count["reserved"]
+    assert count["eliminated"] + count["remaining"] == len(result)
+    sheet = load_workbook(
+        write_selection_workbook(result.reset_index(), tmp_path / "reserve.xlsx", request),
+        data_only=True,
+    )["All candidates"]
+    headers = {cell.value: cell.column for cell in sheet[1]}
+    statuses = {
+        sheet.cell(row, headers["ID"]).value: (
+            sheet.cell(row, headers["Auto Status"]).value,
+            sheet.cell(row, headers["Причина"]).value,
+        )
+        for row in range(2, sheet.max_row + 1)
+    }
+    assert statuses[1] == ("RESERVE", "EQUITY_REGIME_STALLED_RESERVE")
 
 
 def test_run_selection_maps_fresh_equity_facts_after_duplicate_input_index() -> None:

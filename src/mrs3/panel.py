@@ -272,8 +272,9 @@ from .performance_v2_selection import (
 )
 from .performance_v2_selection_review import (
     SelectionReviewError,
+    _selection_rows,
     apply_prior_rejected,
-    hard_cutoff_rejected_ids,
+    automatic_filter_rejected_strategy_ids,
     _current_equity_revisions,
     import_retest_tags,
     import_selection_review,
@@ -5934,10 +5935,14 @@ class PanelController:
                     user_review_rows = latest_user_reviews_by_strategy(
                         connection, [int(strategy_id) for strategy_id in result["strategy_id"]]
                     )
-                    pending_rejected = hard_cutoff_rejected_ids(result, request, selection_config)
-                    for row in result.to_dict(orient="records"):
+                    pending_rejected = automatic_filter_rejected_strategy_ids(
+                        result, request, selection_config,
+                    )
+                    for row in _selection_rows(result):
                         strategy_id = int(row["strategy_id"])
-                        if row.get("prior_rejected") is True or strategy_id in pending_rejected:
+                        if row.get("prior_rejected") is True:
+                            user_review_rows.setdefault(strategy_id, {})["user_status"] = "REJECTED"
+                        if strategy_id in pending_rejected:
                             user_review_rows.setdefault(strategy_id, {})["user_status"] = "REJECTED"
                 workbook = write_selection_workbook(
                     result, Path(directory) / "finalists.xlsx", request, metadata, user_review_rows

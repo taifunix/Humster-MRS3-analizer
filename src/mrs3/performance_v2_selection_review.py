@@ -434,21 +434,60 @@ def apply_prior_rejected(connection: duckdb.DuckDBPyConnection, candidates: pd.D
     return output
 
 
+def _selection_rows(result: pd.DataFrame) -> list[dict[str, object]]:
+    """Materialize rows without copying publication evidence for each column."""
+    rows = result.copy(deep=False)
+    rows.attrs.clear()
+    return rows.to_dict(orient="records")
+
+
+_AUTOMATIC_REJECTION_FILTERS = (
+    ("filter_lot_variant_redundancy", "eliminated_by_filter_lot_variant_redundancy", "SELECTION_LOT_VARIANT"),
+    ("filter_hard_cutoffs", "eliminated_by_filter_hard_cutoffs", "SELECTION_HARD_CUTOFF"),
+    ("ab_deterioration", "eliminated_by_ab_deterioration", "SELECTION_AB_DETERIORATION"),
+)
+
+
+def automatic_filter_rejected_ids(
+    result: pd.DataFrame, request: SelectionRequest, config: SelectionConfig,
+) -> dict[str, set[int]]:
+    enabled = {
+        stage.id for stage in effective_selection_stages(request, config) if stage.enabled
+    }
+    rows = _selection_rows(result)
+    # The stage-specific trace flag is the exclusion evidence. Auto status and
+    # reason are presentation fields and may be normalized after the stages run.
+    rejected_by_source = {
+        source: {
+            int(row["strategy_id"])
+            for row in rows
+            if bool(row.get(column))
+        }
+        for stage_id, column, source in _AUTOMATIC_REJECTION_FILTERS
+        if stage_id in enabled and column in result
+    }
+    owner_by_strategy: dict[int, str] = {}
+    for source, strategy_ids in rejected_by_source.items():
+        for strategy_id in strategy_ids:
+            if strategy_id in owner_by_strategy:
+                raise SelectionReviewError("SELECTION_REVIEW_INVALID_SELECTION")
+            owner_by_strategy[strategy_id] = source
+    return rejected_by_source
+
+
+def automatic_filter_rejected_strategy_ids(
+    result: pd.DataFrame, request: SelectionRequest, config: SelectionConfig,
+) -> set[int]:
+    return set().union(*automatic_filter_rejected_ids(result, request, config).values())
+
+
 def hard_cutoff_rejected_ids(
     result: pd.DataFrame, request: SelectionRequest, config: SelectionConfig,
 ) -> set[int]:
-    if not any(
-        stage.id == "filter_hard_cutoffs" and stage.enabled
-        for stage in effective_selection_stages(request, config)
-    ) or "eliminated_by_filter_hard_cutoffs" not in result:
-        return set()
-    return {
-        int(row["strategy_id"])
-        for row in result.to_dict(orient="records")
-        if row.get("eliminated_by_filter_hard_cutoffs") is True
-        and row.get("auto_status") == "FILTERED"
-        and str(row.get("elimination_reason") or "").startswith("FILTER_HARD_CUTOFFS:")
-    }
+    """Compatibility wrapper for callers that only need hard-cutoff IDs."""
+    return automatic_filter_rejected_ids(result, request, config).get(
+        "SELECTION_HARD_CUTOFF", set()
+    )
 
 
 def _cell(value: object) -> object:
@@ -624,7 +663,7 @@ def persist_selection_snapshots(
             "run_id": run_id, "request_json": request_json, "request_hash": request_hash,
             "config_json": config_json, "config_hash": config_hash, "expected": expected,
             "source_revisions": source_revisions,
-            "hard_rejected_ids": hard_cutoff_rejected_ids(result, request, config),
+            "rejected_ids_by_source": automatic_filter_rejected_ids(result, request, config),
             "top_n": top_n, "representative_count": representative_count, "run_hash": run_hash,
         })
 
@@ -716,15 +755,16 @@ def persist_selection_snapshots(
                        on conflict (strategy_id, source_kind, reason_code) do nothing""",
                     item["rejection_sources"],
                 )
-            for strategy_id in sorted(item["hard_rejected_ids"]):
-                connection.execute(
-                    """insert into strategy_tags (strategy_id, tag, source, source_ref, updated_at_utc)
-                       values (?, 'REJECTED', 'SELECTION_HARD_CUTOFF', ?, ?)
-                       on conflict (strategy_id, tag) do update set
-                           source = excluded.source, source_ref = excluded.source_ref,
-                           updated_at_utc = excluded.updated_at_utc""",
-                    [strategy_id, item["run_id"], now],
-                )
+            for source, strategy_ids in item["rejected_ids_by_source"].items():
+                for strategy_id in sorted(strategy_ids):
+                    connection.execute(
+                        """insert into strategy_tags (strategy_id, tag, source, source_ref, updated_at_utc)
+                           values (?, 'REJECTED', ?, ?, ?)
+                           on conflict (strategy_id, tag) do update set
+                               source = excluded.source, source_ref = excluded.source_ref,
+                               updated_at_utc = excluded.updated_at_utc""",
+                        [strategy_id, source, item["run_id"], now],
+                    )
         connection.execute("commit")
     except duckdb.ConstraintException as error:
         _rollback_quietly(connection)
