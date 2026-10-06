@@ -166,26 +166,62 @@ def test_filter_drop_publishes_canonical_assessment_and_each_hard_reason():
     ]
 
 
-def test_filter_drop_from_preview_cache_miss_publishes_without_warming_cache():
+def test_filter_drop_from_preview_cache_miss_requires_explicit_cache_warm():
     connection = _database()
     request = _request()
     result = _result(connection, _assessment(), filter_enabled=True, cache=False)
     metadata = new_run_metadata(connection, request)
-    payload = result.attrs["equity_regime_evidence"]["1"]["equity_regime_json"]
 
-    persist_selection_snapshot(connection, request, SelectionConfig(), result, metadata, b"preview-miss")
+    with pytest.raises(SelectionReviewError) as raised:
+        persist_selection_snapshot(connection, request, SelectionConfig(), result, metadata, b"preview-miss")
 
+    assert raised.value.code == "SELECTION_CACHE_INCOMPLETE"
     assert connection.execute(
         "select count(*) from equity_quality_metrics where algo_version = ?",
         [ALGORITHM_VERSION],
     ).fetchone() == (0,)
+    assert connection.execute("select count(*) from selection_results").fetchone() == (0,)
+    assert connection.execute("select count(*) from strategy_rejection_sources").fetchone() == (0,)
+
+
+def test_filter_publication_uses_verified_current_regime_cache_without_raw_recalculation():
+    connection = _database()
+    request = _request()
+    result = _result(connection, _assessment(), filter_enabled=True)
+    metadata = new_run_metadata(connection, request)
+    class NoRawEquityRead:
+        def __getattr__(self, name):
+            return getattr(connection, name)
+
+        def execute(self, sql, *args, **kwargs):
+            assert "from strategy_equity" not in sql.lower(), "raw equity read during publication"
+            return connection.execute(sql, *args, **kwargs)
+
+    persist_selection_snapshot(NoRawEquityRead(), request, SelectionConfig(), result, metadata, b"cached")
+
     assert connection.execute(
-        "select equity_regime_json from selection_results where selection_run_id = ?",
+        "select count(*) from selection_results where selection_run_id = ?",
         [metadata["selection_run_id"]],
-    ).fetchone() == (payload,)
-    assert connection.execute(
-        "select count(*) from strategy_rejection_sources where strategy_id = 1"
-    ).fetchone() == (2,)
+    ).fetchone() == (1,)
+
+
+def test_filter_publication_rejects_tampered_cached_facts_without_partial_rows():
+    connection = _database()
+    request = _request()
+    result = _result(connection, _assessment(), filter_enabled=True)
+    metadata = new_run_metadata(connection, request)
+    connection.execute(
+        "update equity_quality_metrics set facts_json = '{}' where result_id = 101 and algo_version = ?",
+        [ALGORITHM_VERSION],
+    )
+
+    with pytest.raises(SelectionReviewError) as raised:
+        persist_selection_snapshot(connection, request, SelectionConfig(), result, metadata, b"tampered")
+
+    assert raised.value.code == "SELECTION_CACHE_INCOMPLETE"
+    assert connection.execute("select count(*) from selection_runs").fetchone() == (0,)
+    assert connection.execute("select count(*) from selection_results").fetchone() == (0,)
+    assert connection.execute("select count(*) from strategy_rejection_sources").fetchone() == (0,)
 
 
 def test_stale_assessment_digest_aborts_every_publication_table():

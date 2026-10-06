@@ -20,13 +20,12 @@ from .performance_v2_equity_cache import equity_source_revision
 from .performance_v2_equity_quality import ALGORITHM_VERSION
 from .performance_v2_equity_regime import (
     ALGORITHM_VERSION as EQUITY_REGIME_ALGORITHM_VERSION,
-    EquityRegimeSample,
     assess_equity_regime,
-    calculate_equity_regime_facts,
 )
 from .performance_v2_equity_regime_cache import (
     EquityRegimeCacheError,
     decode_equity_regime_assessment,
+    decode_equity_regime_facts,
     encode_equity_regime_facts,
 )
 from .performance_v2_selection import (
@@ -180,32 +179,10 @@ def _equity_regime_publication_data(
         raise SelectionReviewError("SELECTION_REVIEW_STALE_RESULTS", details=sorted(stale))
 
     result_ids = sorted(records_by_result)
-    report_bounds = {
-        int(row[0]): (row[1], row[2])
-        for row in connection.execute(
-            """select result_id, report_start_utc, report_end_utc from strategy_results
-               where result_id in (select unnest(?::bigint[]))""",
-            [result_ids],
-        ).fetchall()
-    } if result_ids else {}
     assessments: dict[int, str] = {}
     rejection_sources: list[list[object]] = []
 
-    def validate_result(result_id: int, samples: list[EquityRegimeSample]) -> None:
-        bounds = report_bounds.get(result_id)
-        if (
-            bounds is None
-            or not isinstance(bounds[0], datetime) or bounds[0].tzinfo is None
-            or not isinstance(bounds[1], datetime) or bounds[1].tzinfo is None
-        ):
-            stale.update(record[0] for record in records_by_result[result_id])
-            return
-        facts = calculate_equity_regime_facts(
-            result_id,
-            bounds[0].astimezone(timezone.utc),
-            bounds[1].astimezone(timezone.utc),
-            samples,
-        )
+    def validate_facts(result_id: int, facts: object) -> None:
         facts_payload = encode_equity_regime_facts(facts)
         actual_facts_sha256 = sha256(facts_payload.encode("utf-8")).hexdigest()
         for strategy_id, source_revision, facts_sha256, payload in records_by_result[result_id]:
@@ -233,39 +210,41 @@ def _equity_regime_publication_data(
                     for reason in assessment.reasons
                 ])
 
-    sample_cursor = connection.execute(
-        """select result_id, sample_index, timestamp_utc, equity from strategy_equity
-           where result_id in (select unnest(?::bigint[]))
-           order by result_id, sample_index, timestamp_utc""",
-        [result_ids],
-    ) if result_ids else None
-    seen_results: set[int] = set()
-    active_result_id: int | None = None
-    active_samples: list[EquityRegimeSample] = []
-    while sample_cursor is not None:
-        batch = sample_cursor.fetchmany(4096)
-        if not batch:
-            break
-        for raw_result_id, sample_index, timestamp_utc, equity in batch:
-            result_id = int(raw_result_id)
-            if active_result_id is not None and result_id != active_result_id:
-                validate_result(active_result_id, active_samples)
-                active_samples = []
-            active_result_id = result_id
-            seen_results.add(result_id)
-            if (
-                not isinstance(timestamp_utc, datetime) or timestamp_utc.tzinfo is None
-                or timestamp_utc.utcoffset() is None
-            ):
-                raise SelectionReviewError("SELECTION_REVIEW_SCHEMA_MISMATCH")
-            active_samples.append(EquityRegimeSample(
-                result_id, int(sample_index), timestamp_utc.astimezone(timezone.utc), equity,
-            ))
-    if active_result_id is not None:
-        validate_result(active_result_id, active_samples)
+    cached_rows = connection.execute(
+        """select result_id, source_revision, facts_json, facts_sha256
+             from equity_quality_metrics
+            where algo_version = ? and result_id in (select unnest(?::bigint[]))""",
+        [EQUITY_REGIME_ALGORITHM_VERSION, result_ids],
+    ).fetchall() if result_ids else []
+    cache_by_result = {int(row[0]): row for row in cached_rows}
     for result_id in result_ids:
-        if result_id not in seen_results:
-            validate_result(result_id, [])
+        cached = cache_by_result.get(result_id)
+        if cached is None or any(
+            cached[1] != source_revision
+            for _, source_revision, _, _ in records_by_result[result_id]
+        ):
+            raise SelectionReviewError(
+                "SELECTION_CACHE_INCOMPLETE",
+                "Selection cache is incomplete; recalculate it before exporting",
+                details={"result_ids": [result_id]},
+            )
+        if any(
+            cached[3] != facts_sha256
+            for _, _, facts_sha256, _ in records_by_result[result_id]
+        ):
+            stale.update(record[0] for record in records_by_result[result_id])
+            continue
+        try:
+            facts = decode_equity_regime_facts(
+                cached[2], cached[3], expected_result_id=result_id,
+            )
+        except EquityRegimeCacheError:
+            raise SelectionReviewError(
+                "SELECTION_CACHE_INCOMPLETE",
+                "Selection cache is invalid; recalculate it before exporting",
+                details={"result_ids": [result_id]},
+            ) from None
+        validate_facts(result_id, facts)
     if stale:
         raise SelectionReviewError("SELECTION_REVIEW_STALE_RESULTS", details=sorted(stale))
     return assessments, rejection_sources

@@ -4092,6 +4092,47 @@ def test_equity_regime_workbook_displays_rank_only_when_regime_is_enabled(tmp_pa
     assert "Regime rank" not in [cell.value for cell in legacy_sheet[1]]
 
 
+def test_selection_workbook_does_not_copy_equity_evidence_into_row_formatting(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
+    rows = []
+    for index in range(32):
+        row = _selection_row(f"legacy-{index}")
+        row["strategy_id"] = index + 1
+        row["result_id"] = index + 1
+        rows.append(row)
+    result = run_selection(pd.DataFrame(rows), request)
+    evidence = {str(index): {"facts": "x" * 1000} for index in range(100)}
+    result.attrs["equity_regime_evidence"] = evidence
+    original_apply = pd.DataFrame.apply
+    original_deepcopy = pd.core.generic.deepcopy
+    evidence_copies = 0
+    apply_calls = 0
+
+    def counted_deepcopy(value, *args, **kwargs):
+        nonlocal evidence_copies
+        if isinstance(value, dict) and value.get("equity_regime_evidence") is not None:
+            evidence_copies += 1
+        return original_deepcopy(value, *args, **kwargs)
+
+    def guarded_apply(frame, *args, **kwargs):
+        nonlocal apply_calls
+        apply_calls += 1
+        assert not frame.attrs, "XLSX row formatting inherited full equity evidence"
+        return original_apply(frame, *args, **kwargs)
+
+    monkeypatch.setattr(pd.DataFrame, "apply", guarded_apply)
+    monkeypatch.setattr(pd.core.generic, "deepcopy", counted_deepcopy)
+    workbook = write_selection_workbook(result, tmp_path / "no-evidence-copy.xlsx", request)
+    assert workbook.is_file()
+    assert apply_calls > 0
+    assert 1 <= evidence_copies < 10
+    sheet = load_workbook(workbook, read_only=True, data_only=True)["All candidates"]
+    assert sheet.max_row == 33
+    assert result.attrs["equity_regime_evidence"] is evidence
+
+
 def test_equity_method_metadata_without_review_preserves_existing_score_comment(
     tmp_path: Path, monkeypatch,
 ) -> None:

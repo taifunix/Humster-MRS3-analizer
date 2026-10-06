@@ -3612,19 +3612,22 @@ def test_performance_v2_catalog_rejects_existing_bare_database_without_initializ
         ).fetchone() == (0,)
 
 
-def test_selection_xlsx_maps_stale_snapshot_to_api_error(tmp_path: Path, monkeypatch) -> None:
+@pytest.mark.parametrize("error_code", ["SELECTION_REVIEW_STALE_RESULTS", "SELECTION_CACHE_INCOMPLETE"])
+def test_selection_xlsx_maps_snapshot_conflicts_to_api_error(
+    tmp_path: Path, monkeypatch, error_code: str,
+) -> None:
     controller, _, _ = _controller_for_windows(tmp_path)
     controller.strategies_performance_v2_recalculate({"symbol": "BTCUSDT", "side": "LONG"})
     import mrs3.panel as panel_module
 
     def stale(*_args, **_kwargs):
-        raise panel_module.SelectionReviewError("SELECTION_REVIEW_STALE_RESULTS", details=[1])
+        raise panel_module.SelectionReviewError(error_code, details=[1])
 
     monkeypatch.setattr(panel_module, "persist_selection_snapshot", stale)
     with pytest.raises(PerformanceV2ApiError) as raised:
         controller.strategies_performance_v2_selection({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
 
-    assert raised.value.code == "SELECTION_REVIEW_STALE_RESULTS"
+    assert raised.value.code == error_code
     assert raised.value.status == 409
 
 

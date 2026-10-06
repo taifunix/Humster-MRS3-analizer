@@ -5952,7 +5952,8 @@ class PanelController:
                     persist_selection_snapshot(connection, request, selection_config, result, metadata, data)
         except SelectionReviewError as error:
             status = 409 if error.code in {
-                "SELECTION_REVIEW_NOT_LATEST_RUN", "SELECTION_REVIEW_STALE_RESULTS", "SELECTION_REVIEW_ALREADY_IMPORTED"
+                "SELECTION_REVIEW_NOT_LATEST_RUN", "SELECTION_REVIEW_STALE_RESULTS", "SELECTION_REVIEW_ALREADY_IMPORTED",
+                "SELECTION_CACHE_INCOMPLETE",
             } else 400
             details = f": {error.details}" if error.details else ""
             raise PerformanceV2ApiError(error.code, status=status, message=f"{error}{details}") from error

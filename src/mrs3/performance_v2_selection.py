@@ -3471,6 +3471,8 @@ def write_selection_workbook(
         "daily_log_return", "_equity_cache", "equity_regime_json",
         *(column for column in result.columns if column.startswith("equity_regime_") and not equity_regime_display_enabled),
     ], errors="ignore").copy()
+    # Display rows must not inherit equity evidence; result keeps it for snapshot publication.
+    display.attrs.clear()
     equity_block_enabled = equity_request_enabled or any(column in display for column in equity_columns)
     if equity_block_enabled:
         for column in equity_columns:

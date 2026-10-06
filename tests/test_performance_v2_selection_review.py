@@ -29,6 +29,7 @@ from mrs3.performance_v2_equity_regime_cache import (
     encode_equity_regime_assessment,
     encode_equity_regime_facts,
     equity_regime_source_revision,
+    upsert_equity_regime_facts_checked,
 )
 from mrs3.performance_v2_selection_review import (
     META_SHEET,
@@ -126,6 +127,7 @@ def _equity_regime_cache_entry(
     facts = calculate_equity_regime_facts(
         result_id, source["report_start_utc"], source["report_end_utc"], samples,
     )
+    upsert_equity_regime_facts_checked(connection, source, facts, calculated_at_utc=datetime.now(UTC))
     assessment = assess_equity_regime(facts)
     facts_json = encode_equity_regime_facts(facts)
     return {
@@ -973,8 +975,10 @@ def test_equity_quality_review_revision_is_stable_in_non_utc_connection_timezone
 def test_equity_quality_review_v2_round_trips_cached_decision_evidence(tmp_path: Path) -> None:
     connection = _database(tmp_path)
     request, result = _equity_ranked_result(connection)
+    regime_evidence = result.attrs["equity_regime_evidence"]
     metadata = new_run_metadata(connection, request)
     path = write_selection_workbook(result, tmp_path / "equity-review.xlsx", request, metadata, _review_rows(result))
+    assert result.attrs["equity_regime_evidence"] is regime_evidence
     persist_selection_snapshot(connection, request, SelectionConfig(), result, metadata, path.read_bytes())
     request_json, contract_version = connection.execute(
         "select request_json, selection_contract_version from selection_runs"
@@ -994,7 +998,7 @@ def test_equity_quality_review_v2_round_trips_cached_decision_evidence(tmp_path:
     assert import_selection_review(connection, path.read_bytes())["row_count"] == 2
 
 
-def test_equity_quality_rank_publishes_in_memory_facts_on_r73_cache_miss(tmp_path: Path) -> None:
+def test_equity_quality_rank_blocks_publication_when_required_cache_is_missing(tmp_path: Path) -> None:
     connection = _database(tmp_path)
     request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
         {"id": "rank_robust_top_n", "enabled": True, "scope": "pair_side", "top_n": 1,
@@ -1009,16 +1013,14 @@ def test_equity_quality_rank_publishes_in_memory_facts_on_r73_cache_miss(tmp_pat
     metadata = new_run_metadata(connection, request)
     path = write_selection_workbook(result, tmp_path / "r73-cache-miss.xlsx", request, metadata, _review_rows(result))
 
-    persist_selection_snapshot(connection, request, SelectionConfig(), result, metadata, path.read_bytes())
+    with pytest.raises(SelectionReviewError) as raised:
+        persist_selection_snapshot(connection, request, SelectionConfig(), result, metadata, path.read_bytes())
 
-    stored = json.loads(connection.execute(
-        "select request_json from selection_runs where selection_run_id = ?",
+    assert raised.value.code == "SELECTION_CACHE_INCOMPLETE"
+    assert connection.execute(
+        "select count(*) from selection_runs where selection_run_id = ?",
         [metadata["selection_run_id"]],
-    ).fetchone()[0])
-    snapshot = stored["equity_quality_snapshot"]
-    assert set(snapshot["sources"]) == {"1", "2"}
-    assert "fallback_strategy_ids" not in snapshot
-    assert import_selection_review(connection, path.read_bytes())["row_count"] == 2
+    ).fetchone() == (0,)
 
 
 def test_equity_review_import_accepts_historical_retired_time_stage(tmp_path: Path) -> None:
@@ -1176,6 +1178,7 @@ def test_mixed_equity_retest_cohort_keeps_rejected_pass_candidate_as_reserve(tmp
                 for sample_index in range(113)
             ],
         )
+        _equity_regime_cache_entry(connection, result_id)
 
     base_request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
         {"id": "rank_robust_top_n", "enabled": True, "scope": "pair_side", "top_n": 1,
