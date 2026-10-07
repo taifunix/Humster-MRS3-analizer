@@ -835,6 +835,52 @@ def test_interrupted_single_mode_commit_is_recovered_from_durable_inbox(tmp_path
     assert recovered["inbox_ready"] is True
 
 
+def test_interrupted_finalist_retest_releases_resource_and_keeps_frozen_cohort(tmp_path: Path, monkeypatch) -> None:
+    config = tmp_path / "config.local.json"
+    config.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(
+        "mrs3.panel.RunnerConfig.from_json",
+        lambda _path: SimpleNamespace(inbox_root=tmp_path / "inbox"),
+    )
+    controller = PanelController(tmp_path, config, analysis_config_loader=lambda _: AlgorithmConfig.defaults())
+    job = controller._panel_jobs.submit(
+        "strategies.performance.v2.finalist-retest", {"scope": "ALL"}, "bulk-finalist",
+        ("strategies.tester", "performance-v2-finalist-retest"), job_id="bulk-finalist",
+    )
+    controller._panel_jobs.transition(job["job_id"], "RUNNING", phase="BOT_RUN")
+    frozen_runtime = {
+        "bulk_retest": True,
+        "cohort_members": [{"strategy_id": 7, "result_id": 71, "strategy_name": "S7"}],
+    }
+    controller._panel_jobs.sync(
+        job["job_id"], {"state": "RUNNING", "phase": "BOT_RUN"}, runtime=frozen_runtime,
+    )
+    controller._record_special_job({
+        "job_id": job["job_id"], "state": "RUNNING", "phase": "BOT_RUN",
+        "progress": {"current": 72, "total": 250, "unit": "reports"},
+        "progress_publication_error": "temporary panel journal write failed",
+    })
+    assert controller._panel_jobs.get(job["job_id"])["progress"]["current"] == 72
+    assert controller._panel_jobs.progress_directory.is_dir()
+
+    restarted = PanelController(tmp_path, config, analysis_config_loader=lambda _: AlgorithmConfig.defaults())
+
+    recovered = restarted._panel_jobs.get(job["job_id"])
+    assert recovered["state"] == "FAILED"
+    assert recovered["phase"] == "FAILED"
+    assert recovered["error"] == {"code": "INTERRUPTED"}
+    assert recovered["progress"]["current"] == 72
+    assert "publication_error" not in recovered["progress"]
+    assert list(restarted._panel_jobs.progress_directory.glob("*.json")) == []
+    assert restarted._panel_jobs.runtime(job["job_id"]) == frozen_runtime
+    replacement = restarted._panel_jobs.submit(
+        "strategies.tester.start", {}, "after-interrupted-finalist",
+        ("strategies.tester",), job_id="after-interrupted-finalist",
+    )
+    assert replacement["state"] == "QUEUED"
+    assert restarted._panel_jobs.transition(replacement["job_id"], "RUNNING")["state"] == "RUNNING"
+
+
 def test_single_mode_verify_routes_through_existing_performance_inbox_button(tmp_path: Path, monkeypatch) -> None:
     config = tmp_path / "config.local.json"
     config.write_text("{}", encoding="utf-8")

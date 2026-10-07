@@ -2878,23 +2878,40 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
     if (!finalistRetestJobId) return;
     try {
       const job = await requestJson(`/api/v2/strategies/performance-v2/finalist-retest/status?job_id=${encodeURIComponent(finalistRetestJobId)}`);
-      const terminal = ['FAILED', 'CANCELLED'].includes(job.state) || job.outcomes_finalized === true;
+      const importPending = job.import_pending === true;
+      const terminal = !importPending && (
+        ['FAILED', 'CANCELLED'].includes(job.state)
+        || (job.state === 'COMMITTED' && (!job.import_job_id || job.outcomes_finalized === true))
+      );
       if (finalistRetestCount) finalistRetestCount.textContent = String(job.cohort_count ?? 0);
       if (finalistRetestSuccesses) finalistRetestSuccesses.textContent = String(job.success_count ?? 0);
       if (finalistRetestFailures) finalistRetestFailures.textContent = String(job.failure_count ?? 0);
-      if (job.import_job_id) finalistRetestImportJobId = job.import_job_id;
-      if (finalistRetestImportJobId) {
+      finalistRetestImportJobId = typeof job.import_job_id === 'string' ? job.import_job_id : '';
+      const progress = job.progress || {};
+      const current = Number(progress.current || 0);
+      const total = Number(progress.total || 0);
+      const nativeStatus = progress.native_status ? ` · ${progress.native_status}` : '';
+      const publicationWarning = progress.publication_error ? ` · Panel progress update: ${formatErrorReason(progress.publication_error)}` : '';
+      const error = job.error ? ` · ${formatErrorReason(job.error)}` : '';
+      const cleanupError = job.error?.cleanup_error ? ` · cleanup: ${formatErrorReason(job.error.cleanup_error)}` : '';
+      const failureDetails = Array.isArray(job.failures)
+        ? job.failures.slice(0, 8).map((failure) => `#${failure.strategy_id ?? '?'} ${failure.strategy_name || 'strategy'}: ${failure.reason || 'IMPORT_FAILED'}`).join('; ')
+        : '';
+      const remainingFailures = Math.max(0, (Array.isArray(job.failures) ? job.failures.length : 0) - 8);
+      const importTotals = `imported ${job.imported_count ?? job.success_count ?? 0}, skipped ${job.skipped_count ?? 0}, rejected ${job.rejected_count ?? job.failure_count ?? 0} of ${job.expected_count ?? job.cohort_count ?? 0}`;
+      const memberSummary = failureDetails ? `; ${failureDetails}${remainingFailures ? `; and ${remainingFailures} more` : ''}` : '';
+      if (importPending) {
+        if (finalistRetestStatus) finalistRetestStatus.textContent = 'IMPORT & REPLACE handoff is pending; do not click again.';
+      } else if (finalistRetestImportJobId) {
         const imported = await requestJson(`/api/v2/strategies/performance-v2/import/status?job_id=${encodeURIComponent(finalistRetestImportJobId)}`);
         const p = imported.progress || {};
         const current = Number(p.current || 0);
         const total = Number(p.total || 0);
         const failed = Array.isArray(imported.evidence?.failed_names) ? imported.evidence.failed_names.length : Number(p.failed || 0);
-        if (finalistRetestStatus) finalistRetestStatus.textContent = `IMPORT & REPLACE: ${imported.phase || imported.state || 'IMPORTING'} · ${current}/${total} · batch ${p.batch_number || 0}/${p.batch_total || 0} · retries ${p.retries || 0} · failed ${failed}${imported.error ? ` · ${formatErrorReason(imported.error)}` : ''}`;
-        if (finalistRetestImport) finalistRetestImport.disabled = imported.state !== 'FAILED' && imported.state !== 'CANCELLED';
-      } else if (finalistRetestStatus) finalistRetestStatus.textContent = job.error?.code
-        ? `Global finalist retest: ${job.error.code}`
-        : `Global finalist retest: ${job.phase || job.state || 'RUNNING'}`;
-      if (finalistRetestImport && !finalistRetestImportJobId) finalistRetestImport.disabled = !(job.state === 'COMMITTED' && job.inbox_ready === true);
+        if (finalistRetestStatus) finalistRetestStatus.textContent = `IMPORT & REPLACE: ${imported.phase || imported.state || 'IMPORTING'} · ${current}/${total} · batch ${p.batch_number || 0}/${p.batch_total || 0} · retries ${p.retries || 0} · failed ${failed}; ${importTotals}${memberSummary}${imported.error ? ` · ${formatErrorReason(imported.error)}` : ''}`;
+        if (finalistRetestImport) finalistRetestImport.disabled = !['FAILED', 'CANCELLED'].includes(imported.state);
+      } else if (finalistRetestStatus) finalistRetestStatus.textContent = `Global finalist retest: ${job.phase || job.state || 'RUNNING'} · ${current}/${total}${nativeStatus}${publicationWarning}${error}${cleanupError}`;
+      if (finalistRetestImport && !finalistRetestImportJobId) finalistRetestImport.disabled = job.state !== 'COMMITTED' || importPending;
       if (job.success_count > 0) finalistRetestHasSuccessfulExport = true;
       updateFinalistRetestExport();
       if (terminal) { window.clearInterval(finalistRetestTimer); if (finalistRetestStart) finalistRetestStart.disabled = false; }
@@ -2927,7 +2944,7 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
       const snapshot = await requestJson('/api/v2/jobs');
       const jobs = Array.isArray(snapshot.jobs) ? snapshot.jobs : [];
       const recovered = jobs
-        .filter((job) => job?.kind === 'strategies.performance.v2.finalist-retest' && job.state === 'COMMITTED' && job.inbox_ready === true && typeof job.job_id === 'string')
+        .filter((job) => job?.kind === 'strategies.performance.v2.finalist-retest' && job.state === 'COMMITTED' && typeof job.job_id === 'string')
         .sort((left, right) => String(right.created_at_utc || '').localeCompare(String(left.created_at_utc || '')))[0];
       if (!recovered) return;
       finalistRetestJobId = recovered.job_id;
@@ -2981,7 +2998,12 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
       finalistRetestTimer = window.setInterval(pollFinalistRetest, 1000);
       pollFinalistRetest();
     }
-    catch (error) { if (finalistRetestStatus) finalistRetestStatus.textContent = `Global finalist import failed: ${error?.message || 'request failed'}.`; finalistRetestImport.disabled = false; }
+    catch (error) {
+      if (finalistRetestStatus) finalistRetestStatus.textContent = `Global finalist import failed: ${error?.message || 'request failed'}.`;
+      window.clearInterval(finalistRetestTimer);
+      finalistRetestTimer = window.setInterval(pollFinalistRetest, 1000);
+      await pollFinalistRetest();
+    }
   });
   finalistRetestControlImport?.addEventListener('click', () => finalistRetestControlFile?.click());
   finalistRetestControlFile?.addEventListener('change', async () => {

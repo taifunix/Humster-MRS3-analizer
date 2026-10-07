@@ -11,6 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import mrs3.panel as panel_module
 import mrs3.panel_fast_strategy_test as fast_strategy_module
 from mrs3.panel_fast_strategy_test import LocalFastStrategyTestService, LocalSingleModeStrategyTestService
 from mrs3.panel_fast_strategy_test import FastStrategyTestError
@@ -18,6 +19,7 @@ from mrs3.panel_fast_strategy_test import _has_current_performance_v2_layout
 from mrs3.panel_fast_strategy_test import _write_fast_tester_config
 from mrs3.panel_fast_strategy_test import parse_initial_balance
 from mrs3.locking import TesterTargetLock
+from mrs3.panel import PanelController
 from mrs3.performance_v2_html import parse_current_performance_v2_html
 from mrs3.performance_v2_store import PerformanceV2Config
 from mrs3.runner.config import RunnerConfig
@@ -603,6 +605,399 @@ def test_native_idle_stall_timeout_is_independent_of_batch_timeout(tmp_path: Pat
         service._wait_for_native_idle(job, Client(), config, 1, 1, ("S0",))
 
 
+def test_native_progress_callback_failure_does_not_stop_live_tester(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    manifest, _ = _generation(tmp_path, 1)
+    config = replace(
+        _config(tmp_path), poll_interval_seconds=0.001, batch_timeout_seconds=1,
+        stall_timeout_seconds=0.5, report_stability_polls=2,
+    )
+    active = False
+    polls = 0
+    callback_failed_while_active = []
+    report: Path | None = None
+
+    def start_bot(_: RunnerConfig) -> None:
+        nonlocal active
+        active = True
+
+    def stop_bot(_: RunnerConfig) -> None:
+        nonlocal active
+        active = False
+
+    class Client:
+        def run_tester(self) -> None:
+            nonlocal report
+            config.report_dir.mkdir(parents=True, exist_ok=True)
+            report = config.report_dir / "S0.html"
+            report.write_text("native report", encoding="utf-8")
+
+        def tester_status(self) -> str:
+            nonlocal polls
+            polls += 1
+            return "running"
+
+        def close(self) -> None:
+            pass
+
+    class Updates:
+        failed = False
+        fail_terminal = False
+
+        def __call__(self, snapshot: dict[str, object]) -> None:
+            if (
+                not self.failed
+                and snapshot.get("phase") == "BOT_RUN"
+                and "native_status" in snapshot.get("progress", {})
+            ):
+                self.failed = True
+                callback_failed_while_active.append(active)
+                raise OSError("temporary progress journal failure")
+            if self.fail_terminal and snapshot["state"] == "COMMITTED":
+                raise OSError("terminal progress save failed")
+
+    updates = Updates()
+    service = LocalSingleModeStrategyTestService(
+        config, start_bot=start_bot, stop_bot=stop_bot,
+        client_factory=lambda _: Client(), on_update=updates,
+    )
+    monkeypatch.setattr(
+        LocalSingleModeStrategyTestService,
+        "_native_result_evidence",
+        staticmethod(lambda _job, _config, expected: set(expected)),
+    )
+
+    def reports(report_dir: Path, expected: set[str], **_kwargs: object) -> dict[str, Path]:
+        return {name: report_dir / f"{name}.html" for name in expected}
+
+    service._native_reports = reports
+    started = service.start(
+        manifest, analysis_run_id="a" * 64, start_date="2026-08-01",
+        end_date="2026-08-31", job_id="progress-callback-live",
+    )
+    status = _wait(service, str(started["job_id"]))
+
+    assert updates.failed is True
+    assert callback_failed_while_active == [True]
+    assert polls >= 2
+    assert status["state"] == "COMMITTED"
+    assert status["progress_publication_error"] is None
+    assert status["evidence"]["verified_reports"] == {"S0": "S0.html"}
+    assert active is False
+    assert report is not None and report.is_file()
+    updates.fail_terminal = True
+    with pytest.raises(OSError, match="terminal progress save failed"):
+        service._emit(service._jobs[str(started["job_id"])])
+
+
+def test_native_batch_failure_retains_already_created_valid_reports(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    manifest, names = _generation(tmp_path, 2)
+    config = _config(tmp_path)
+    reports: list[Path] = []
+
+    class Client:
+        def run_tester(self) -> None:
+            config.report_dir.mkdir(parents=True, exist_ok=True)
+            source = CURRENT_REPORT.read_text(encoding="utf-8")
+            valid = source.replace('"name":"MRS3 Current v2"', '"name":"S0"', 1).replace("ONUSDT", "BTCUSDT")
+            invalid = source.replace('"name":"MRS3 Current v2"', '"name":"S1"', 1).replace("ONUSDT", "ETHUSDT")
+            valid = valid.replace("2026-01-01 - 2026-01-09", "2026-08-01 - 2026-08-31")
+            invalid = invalid.replace("2026-01-01 - 2026-01-09", "2026-08-01 - 2026-08-31")
+            for name, content in (("S0", valid), ("S1", invalid)):
+                path = config.report_dir / f"{name}.html"
+                path.write_text(content, encoding="utf-8")
+                reports.append(path)
+
+        def close(self) -> None:
+            pass
+
+    service = LocalSingleModeStrategyTestService(
+        config, start_bot=lambda _: None, stop_bot=lambda _: None,
+        client_factory=lambda _: Client(),
+    )
+
+    def fail_after_one_report(*_args: object, **_kwargs: object) -> None:
+        raise TimeoutError("native tester stopped making progress")
+
+    monkeypatch.setattr(service, "_wait_for_native_idle", fail_after_one_report)
+    started = service.start(
+        manifest, analysis_run_id="a" * 64, start_date="2026-08-01",
+        end_date="2026-08-31", job_id="partial-native-reports",
+    )
+    status = _wait(service, str(started["job_id"]))
+
+    assert status["state"] == "FAILED"
+    assert status["progress"]["current"] == 1
+    assert status["progress"]["failed"] == 1
+    assert status["evidence"]["verified_reports"] == {"S0": "S0.html"}
+    assert status["evidence"]["failed_names"] == ["S1"]
+    assert status["inbox_ready"] is False
+    with pytest.raises(FastStrategyTestError, match="reports are incomplete"):
+        service.capture_inbox(str(started["job_id"]))
+    assert len(reports) == 2 and all(report.is_file() for report in reports)
+
+
+def test_emit_uses_captured_live_snapshot_when_callback_mutates_job(tmp_path: Path) -> None:
+    manifest_path, names = _generation(tmp_path, 1)
+    manifest = fast_strategy_module.validate_strategy_manifest(manifest_path)
+    config = _config(tmp_path)
+    job = fast_strategy_module._Job(
+        "snapshot-progress", manifest_path, manifest, names, names,
+        "2026-01-01", "2026-01-09", config.report_dir, config.strategy_dir,
+        single_mode=True,
+    )
+    job.phase = "BOT_RUN"
+    service = LocalSingleModeStrategyTestService(config)
+    service._on_update = lambda snapshot: (
+        setattr(job, "state", "FAILED"),
+        (_ for _ in ()).throw(OSError("transient progress save failure")),
+    )
+
+    service._emit(job)
+
+    assert job.progress_publication_error == "transient progress save failure"
+    assert service._snapshot(job)["progress_publication_error"] == "transient progress save failure"
+
+
+def test_emit_publishes_then_clears_progress_publication_warning_in_panel_registry(tmp_path: Path) -> None:
+    manifest_path, names = _generation(tmp_path, 1)
+    manifest = fast_strategy_module.validate_strategy_manifest(manifest_path)
+    config = _config(tmp_path)
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
+    job_id = "progress-publication-warning"
+    controller._panel_jobs.submit(
+        "strategies.performance.v2.finalist-retest", {}, job_id,
+        ("strategies.tester", "performance-v2-finalist-retest"), job_id=job_id,
+    )
+    controller._panel_jobs.transition(job_id, "RUNNING", phase="BOT_RUN")
+    job = fast_strategy_module._Job(
+        job_id, manifest_path, manifest, names, names,
+        "2026-08-01", "2026-08-31", config.report_dir, config.strategy_dir,
+        single_mode=True,
+    )
+    job.phase = "BOT_RUN"
+    job.progress = {"current": 0, "total": 1}
+    service = LocalSingleModeStrategyTestService(config)
+    callback_failed = False
+
+    def publish(snapshot: dict[str, object]) -> None:
+        nonlocal callback_failed
+        if not callback_failed:
+            callback_failed = True
+            raise OSError("temporary progress journal failure")
+        controller._record_special_job(snapshot)
+
+    service._on_update = publish
+    service._emit(job)
+    assert job.progress_publication_error == "temporary progress journal failure"
+
+    service._emit(job)
+    assert controller._panel_jobs.get(job_id)["progress"]["publication_error"] == "temporary progress journal failure"
+    assert job.progress_publication_error is None
+
+    service._emit(job)
+    assert "publication_error" not in controller._panel_jobs.get(job_id)["progress"]
+
+
+def test_emit_does_not_suppress_terminal_callback_failure_from_live_worker_snapshot(tmp_path: Path) -> None:
+    manifest_path, names = _generation(tmp_path, 1)
+    manifest = fast_strategy_module.validate_strategy_manifest(manifest_path)
+    config = _config(tmp_path)
+    job = fast_strategy_module._Job(
+        "snapshot-terminal", manifest_path, manifest, names, names,
+        "2026-01-01", "2026-01-09", config.report_dir, config.strategy_dir,
+        single_mode=True,
+    )
+    release = Event()
+    worker = fast_strategy_module.Thread(target=release.wait, daemon=True)
+    worker.start()
+    job.thread = worker
+    job.state = job.phase = "COMMITTED"
+    job.target_finalized = True
+    service = LocalSingleModeStrategyTestService(config)
+
+    def fail_terminal(_snapshot: dict[str, object]) -> None:
+        job.state = "RUNNING"
+        job.phase = "BOT_RUN"
+        raise OSError("terminal persistence failed")
+
+    service._on_update = fail_terminal
+    try:
+        with pytest.raises(OSError, match="terminal persistence failed"):
+            service._emit(job)
+    finally:
+        release.set()
+        worker.join(1)
+
+
+def test_single_mode_primary_failure_survives_cleanup_failure_and_keeps_job_failed(tmp_path: Path) -> None:
+    manifest, _ = _generation(tmp_path, 1)
+    config = _config(tmp_path)
+    stop_calls = 0
+
+    def stop_bot(_: RunnerConfig) -> None:
+        nonlocal stop_calls
+        stop_calls += 1
+        if stop_calls > 2:
+            raise RuntimeError("tester stop failed")
+
+    service = LocalSingleModeStrategyTestService(
+        config,
+        start_bot=lambda _: None,
+        stop_bot=stop_bot,
+        client_factory=lambda _: SimpleNamespace(run_tester=lambda: None, close=lambda: None),
+    )
+    service._start_native_bot = lambda *_args: None
+
+    def fail_native(_job: object, *_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("primary native error")
+
+    service._wait_for_native_idle = fail_native
+    started = service.start(
+        manifest, analysis_run_id="a" * 64, start_date="2026-08-01",
+        end_date="2026-08-31", job_id="primary-error-cleanup-failure",
+    )
+    worker = service._jobs[str(started["job_id"])].thread
+    assert worker is not None
+    worker.join(2)
+    assert not worker.is_alive()
+
+    status = service.status(str(started["job_id"]))
+    assert status["state"] == "FAILED"
+    assert status["phase"] == "FAILED"
+    assert status["error"]["code"] == "SINGLE_MODE_TEST_FAILED"
+    assert status["error"]["message"] == "primary native error"
+    assert "tester stop failed" in status["error"]["cleanup_error"]
+    assert (config.bot_root / ".mrs3-tester-target.lock").is_file()
+    with pytest.raises(FastStrategyTestError, match="cleanup remains pending"):
+        service.start(
+            manifest, analysis_run_id="a" * 64, start_date="2026-08-01",
+            end_date="2026-08-31", job_id="must-wait-for-cleanup",
+        )
+
+
+def test_cancelled_cleanup_keeps_already_recorded_primary_failure(tmp_path: Path) -> None:
+    manifest_path, names = _generation(tmp_path, 1)
+    manifest = fast_strategy_module.validate_strategy_manifest(manifest_path)
+    config = _config(tmp_path)
+    service = LocalSingleModeStrategyTestService(config, stop_bot=lambda _: None)
+    job = fast_strategy_module._Job(
+        "cancel-primary-cleanup", manifest_path, manifest, names, names,
+        "2026-08-01", "2026-08-31", config.report_dir, config.strategy_dir,
+        single_mode=True,
+    )
+    job.error = {"code": "SINGLE_MODE_TEST_FAILED", "message": "native failure"}
+    job.cancel.set()
+    service._jobs[job.job_id] = job
+
+    def pending_cleanup(_job: object) -> None:
+        raise fast_strategy_module._FastCleanupUnconfirmed("cleanup still pending")
+
+    service._run_owned = pending_cleanup
+    service._run(job)
+
+    status = service.status(job.job_id)
+    assert status["state"] == "CANCELLED"
+    assert status["error"]["code"] == "SINGLE_MODE_TEST_FAILED"
+    assert status["error"]["message"] == "native failure"
+    assert status["error"]["cleanup_error"] == "cleanup still pending"
+    assert (config.bot_root / ".mrs3-tester-target.lock").is_file()
+
+    service._reconcile_pending_cleanup(job)
+    assert not (config.bot_root / ".mrs3-tester-target.lock").exists()
+
+
+def test_successful_native_batch_stop_failure_blocks_until_cleanup_reconciles(tmp_path: Path) -> None:
+    manifest, names = _generation(tmp_path, 2)
+    config = replace(_config(tmp_path), strategy_batch_size=1)
+    report = config.report_dir / f"{names[0]}.html"
+    stop_calls = 0
+    allow_recovery = False
+
+    def stop_bot(_: RunnerConfig) -> None:
+        nonlocal stop_calls
+        stop_calls += 1
+        if stop_calls >= 3 and not allow_recovery:
+            raise RuntimeError("native batch stop failed")
+
+    class Client:
+        def run_tester(self) -> None:
+            config.report_dir.mkdir(parents=True, exist_ok=True)
+            report.write_text("verified native report", encoding="utf-8")
+
+        def close(self) -> None:
+            pass
+
+    service = LocalSingleModeStrategyTestService(
+        config, start_bot=lambda _: None, stop_bot=stop_bot,
+        client_factory=lambda _: Client(),
+    )
+    service._start_native_bot = lambda *_args: None
+    service._wait_for_native_idle = lambda *_args, **_kwargs: None
+    service._native_reports = lambda _dir, expected, **_kwargs: {name: report for name in expected}
+
+    started = service.start(
+        manifest, analysis_run_id="a" * 64, start_date="2026-08-01",
+        end_date="2026-08-31", job_id="successful-batch-stop-failure",
+    )
+    worker = service._jobs[str(started["job_id"])].thread
+    assert worker is not None
+    worker.join(2)
+    assert not worker.is_alive()
+
+    status = service.status(str(started["job_id"]))
+    assert status["state"] == "FAILED"
+    assert status["error"]["code"] == "RESTORE_OR_RELEASE_FAILED"
+    assert "native batch stop failed" in status["error"]["cleanup_error"]
+    assert status["progress"]["current"] == 1
+    assert status["progress"]["failed"] == 0
+    assert status["evidence"]["verified_reports"] == {names[0]: report.name}
+    assert status["inbox_ready"] is False
+    assert (config.bot_root / ".mrs3-tester-target.lock").is_file()
+    with pytest.raises(FastStrategyTestError, match="cleanup remains pending"):
+        service.start(
+            manifest, analysis_run_id="a" * 64, start_date="2026-08-01",
+            end_date="2026-08-31", job_id="blocked-by-stop-failure",
+        )
+
+    allow_recovery = True
+    service.reconcile_pending_cleanup()
+    assert not (config.bot_root / ".mrs3-tester-target.lock").exists()
+
+
+def test_finalist_cancelling_checkpoint_write_error_is_reported_as_progress_warning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest_path, names = _generation(tmp_path, 1)
+    manifest = fast_strategy_module.validate_strategy_manifest(manifest_path)
+    config = _config(tmp_path)
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
+    job_id = "cancelling-checkpoint-warning"
+    controller._panel_jobs.submit(
+        "strategies.performance.v2.finalist-retest", {}, "cancelling-checkpoint-warning",
+        ("strategies.tester",), job_id=job_id,
+    )
+    controller._panel_jobs.transition(job_id, "RUNNING")
+
+    def fail_checkpoint(_job_id: str, _progress: dict[str, object]) -> None:
+        raise OSError("checkpoint disk write failed")
+
+    monkeypatch.setattr(controller._panel_jobs, "_write_progress_checkpoint", fail_checkpoint)
+    service = LocalSingleModeStrategyTestService(config)
+    service._on_update = controller._record_special_job
+    job = fast_strategy_module._Job(
+        job_id, manifest_path, manifest, names, names,
+        "2026-08-01", "2026-08-31", config.report_dir, config.strategy_dir,
+        single_mode=True,
+    )
+    job.state = "RUNNING"
+    job.phase = "CANCELLING"
+
+    service._emit(job)
+
+    assert job.progress_publication_error == "checkpoint disk write failed"
+    assert controller._panel_jobs.get(job_id)["phase"] == "CANCELLING"
+
+
 @pytest.mark.parametrize(
     "duplicate_header",
     ("Fee", "Side"),
@@ -731,7 +1126,7 @@ def test_single_mode_reconciles_pending_cancel_cleanup_before_relaunch(tmp_path:
     assert worker is not None
     worker.join(1)
     assert not worker.is_alive()
-    assert service.status(str(first["job_id"]))["state"] == "RUNNING"
+    assert service.status(str(first["job_id"]))["state"] == "CANCELLED"
     assert (config.bot_root / ".mrs3-tester-target.lock").is_file()
 
     service._run_native = lambda _job: (_ for _ in ()).throw(RuntimeError("second run"))
@@ -790,7 +1185,7 @@ def test_single_mode_pending_cleanup_failure_blocks_relaunch_without_releasing_l
             end_date="2026-08-31",
             job_id="single-must-stay-blocked",
         )
-    assert service.status(str(first["job_id"]))["state"] == "RUNNING"
+    assert service.status(str(first["job_id"]))["state"] == "CANCELLED"
     assert (config.bot_root / ".mrs3-tester-target.lock").is_file()
     assert "single-must-stay-blocked" not in service._jobs
 
@@ -859,7 +1254,7 @@ def test_single_mode_reconciles_release_failure_before_relaunch(
     assert worker is not None
     worker.join(1)
     assert not worker.is_alive()
-    assert service.status(str(first["job_id"]))["state"] == "RUNNING"
+    assert service.status(str(first["job_id"]))["state"] == "FAILED"
     assert (config.bot_root / ".mrs3-tester-target.lock").is_file()
 
     second = service.start(
@@ -908,7 +1303,7 @@ def test_single_mode_persistent_release_failure_blocks_relaunch_without_releasin
     assert worker is not None
     worker.join(1)
     assert not worker.is_alive()
-    assert service.status(str(first["job_id"]))["state"] == "RUNNING"
+    assert service.status(str(first["job_id"]))["state"] == "FAILED"
     with pytest.raises(FastStrategyTestError, match="cleanup remains pending"):
         service.start(
             manifest,
@@ -956,7 +1351,7 @@ def test_single_mode_retry_reconciles_pending_release_before_admission(
     assert worker is not None
     worker.join(1)
     assert not worker.is_alive()
-    assert service.status(str(first["job_id"]))["state"] == "RUNNING"
+    assert service.status(str(first["job_id"]))["state"] == "FAILED"
 
     retry = service.retry(str(first["job_id"]), job_id="single-retry-after-cleanup")
 
@@ -1100,6 +1495,95 @@ def test_single_mode_captures_finished_reports_after_panel_restart(tmp_path: Pat
     inbox_manifest = json.loads((inbox / "inbox_manifest.json").read_text(encoding="utf-8"))
 
     assert inbox_manifest["expected_strategy_names"] == list(names)
+
+
+def test_finalist_import_click_captures_persisted_html_then_starts_replace_after_panel_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    generation_manifest, names = _generation(tmp_path / "Output", 1)
+    name = names[0]
+    config = _config(tmp_path)
+    config.report_dir.mkdir(parents=True)
+    report = config.report_dir / f"{name}.html"
+    report.write_text(
+        CURRENT_REPORT.read_text(encoding="utf-8")
+        .replace('"name":"MRS3 Current v2"', f'"name":"{name}"', 1)
+        .replace('"symbol":"ONUSDT"', '"symbol":"BTCUSDT"', 1),
+        encoding="utf-8",
+    )
+    tester_manifest = {
+        "job_id": "finalist-import-after-restart",
+        "mode": "SINGLE_MODE",
+        "phase": "COMMITTED",
+        "generation_manifest_path": str(generation_manifest),
+        "expected_names": list(names),
+        "start_date": "2026-01-01",
+        "end_date": "2026-01-09",
+        "attempt_counts": {name: 1},
+        "verified_reports": {name: report.name},
+        "failed_names": [],
+    }
+    (config.report_dir / "tester_manifest.json").write_text(
+        json.dumps(tester_manifest), encoding="utf-8",
+    )
+    config_path = tmp_path / "config.local.json"
+    config_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(
+        panel_module.RunnerConfig, "from_json", staticmethod(lambda _path: config),
+    )
+
+    first_panel = PanelController(tmp_path, config_path)
+    tester_job_id = str(tester_manifest["job_id"])
+    first_panel._panel_jobs.submit(
+        "strategies.performance.v2.finalist-retest", {}, "persist-finalist-job",
+        ("strategies.tester",), job_id=tester_job_id,
+    )
+    first_panel._panel_jobs.transition(tester_job_id, "RUNNING", phase="BOT_RUN")
+    first_panel._panel_jobs.sync(
+        tester_job_id,
+        {"state": "COMMITTED", "phase": "COMMITTED", "progress": {"current": 1, "total": 1}},
+        runtime={
+            "bulk_retest": True,
+            "scope": "FINALIST",
+            "test_start": "2026-01-01",
+            "test_end": "2026-01-09",
+            "cohort_members": [{"strategy_id": 7, "strategy_name": name, "result_id": 17}],
+        },
+    )
+    controller = PanelController(tmp_path, config_path)
+    tester_service = LocalSingleModeStrategyTestService(config)
+    monkeypatch.setattr(controller, "_single_mode_strategy_test", lambda: tester_service)
+    queued: list[dict[str, object]] = []
+
+    def start_import(
+        payload: dict[str, object], *, _internal: bool = False, job_id: str | None = None,
+    ) -> dict[str, object]:
+        assert _internal is True
+        assert job_id is not None
+        assert payload["tester_job_id"] == tester_job_id
+        assert payload["mode"] == "REPLACE"
+        assert payload["replacement_strategy_ids"] == {name: 7}
+        assert payload["_expected_current_result_ids"] == {name: 17}
+        inbox = controller._tester_inbox(tester_job_id)
+        inbox_manifest = json.loads((inbox / "inbox_manifest.json").read_text(encoding="utf-8"))
+        assert inbox_manifest["expected_strategy_names"] == list(names)
+        assert inbox_manifest["source_mode"] == "metadata_only"
+        child = controller._panel_jobs.submit(
+            "strategies.performance.v2.import", {}, "persist-import-child",
+            ("performance-v2-db",), job_id=job_id,
+        )
+        controller._panel_jobs.transition(child["job_id"], "RUNNING")
+        queued.append(payload)
+        return {"job_id": child["job_id"]}
+
+    monkeypatch.setattr(controller, "strategies_performance_v2_import", start_import)
+
+    result = controller.strategies_performance_v2_finalist_retest_import({"tester_job_id": tester_job_id})
+
+    assert result["job_id"] == controller._panel_jobs.runtime(tester_job_id)["bulk_import_job_id"]
+    assert len(queued) == 1
+    assert controller._panel_jobs.get(tester_job_id)["inbox_ready"] is True
+    assert controller._panel_jobs.runtime(tester_job_id)["inbox_path"] == str((config.inbox_root / tester_job_id).resolve())
 
 
 @pytest.mark.parametrize(

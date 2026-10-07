@@ -1,6 +1,6 @@
 # MRS3 Current Status
 
-Last updated: 2026-10-06
+Last updated: 2026-10-07
 
 This file is a current-status snapshot, not a session log. Earlier progress notes remain in Git history; feature contracts and detailed evidence belong in the linked specs, reports, and plans.
 
@@ -16,6 +16,8 @@ The researched selection stages and the equity-regime cache are implemented. Sel
 
 Card 6 now restores User Status and User Rank from partial selection XLSX folders and shows per-file progress, applied/unchanged counts, and actual API errors in Panel. Blank statuses are skipped; only nonblank decisions are checked against the database and written through the existing review ledger. FINALIST ranks are optional and unique within a run; RESERVE and REJECTED ranks must be blank. Focused partial-import/API/UI checks passed (19 tests), the full selection-review module passed (102 tests), and blank FINALIST rank clearing passed separately. Independent Claude Opus review passed. No live PerformanceDB was accessed or modified.
 
+The 250-member global finalist retest now completes and its 250 verified reports remain in the tester manifest. The live Panel had not captured a metadata inbox, so its import button stayed blocked. Local changes make the explicit import action capture an inbox for exactly the frozen cohort, validate it, and then start `IMPORT & REPLACE`; they also restore the action after Panel reload, retain report progress after restart, and recover interrupted handoffs. The live database's schema v9 catalog passed a read-only check; no live import or database write was performed. Six related modules pass 616 tests (4 platform-dependent real-symlink cases skipped); independent review and Panel restart are pending.
+
 A read-only replay classified 30,940 frozen rows twice with identical output SHA-256 `870C88D293067C2CB1E8A58B4A297E2C4234E7AC87DA509E225EA374F6CCE0AF`. This verifies frozen summary facts; it does not re-extract all raw equity points. Evidence is in [the production replay report](docs/reports/2026-10-04-equity-regime-production-replay.md) and [the M3 research report](docs/reports/2026-10-04-equity-regime-m3-research.md). Current status rules and cleanup policy are in the [status-map specification](docs/specs/2026-10-03-equity-regime-status-map.md), [ADR-0055](docs/decisions/0055-equity-filter-rejected-and-manual-fact-cleanup.md), [ADR-0056](docs/decisions/0056-equity-rejection-source-lifecycle.md), and [ADR-0057](docs/decisions/0057-performance-db-manual-maintenance.md); later decisions supersede the initial cleanup-marker proposal.
 
 ## Other verified Panel changes
@@ -28,7 +30,7 @@ The Source v6 fresh compact multi-scope pipeline is marked complete in [PRD.md](
 
 ## Blockers and open tracks
 
-- Live PerformanceDB: the code targets schema v9. At the last recorded live check on 2026-10-05, the database was schema v8 and a tester writer was active. The Panel returned `PERFORMANCE_V2_MIGRATION_REQUIRED`. No live migration or research-status backfill was performed. Recheck writer activity and prepare a verified offline copy before planning any migration.
+- Live PerformanceDB: a read-only check on 2026-10-07 validated the schema v9 catalog and required tables. The live finalist retest is `COMMITTED` at 250/250, but its metadata inbox was not captured; reviewed local changes will capture and validate it when `IMPORT & REPLACE` is clicked, then enqueue the import. No live schema migration or result import was performed.
 - READY JSON: at the last diagnostic on 2026-10-04, the tester job journal showed `RUNNING / BOT_RUN` with zero of 2,418 completed, and the Panel process had not been restarted. Reload the Panel and confirm that no tester process is active. The recovery procedure for this exact journal state is not linked or verified here. Do not edit the journal; identify and verify the supported Panel recovery action before recovering the job.
 - Live PURR recalculation: as of 2026-10-06, no confirmation is recorded after the controller-lock change.
 - MRS3 performance evidence: real tester tick-test results and DD5 retesting are still required before making final performance claims. Source metrics alone do not establish realized strategy performance; see [PRD.md](PRD.md).
@@ -40,7 +42,7 @@ The Source v6 fresh compact multi-scope pipeline is marked complete in [PRD.md](
 
 ## Next steps
 
-1. Recheck the live PerformanceDB schema and active writers before planning any migration.
+1. Finish independent review, restart Panel, and verify the committed finalist job is ready for the explicit inbox-capture and import action; do not start it during verification.
 2. Confirm the live PURR recalculation after the Panel lock change.
 3. Verify the READY JSON job state and identify the supported recovery procedure; do not edit the journal.
 4. Keep the remaining Performance v2, database profiling, collector, and Portfolio Optimizer gates within their linked plans and specifications.

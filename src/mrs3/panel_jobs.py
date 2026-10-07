@@ -35,8 +35,89 @@ class PanelJobRegistry:
         self.recover_on_load = bool(recover_on_load)
         self._journal_dirty = False
         self.jobs: dict[str, dict] = self._load()
+        self._restore_progress_checkpoints()
         if self.recover_on_load:
             self.recover_interrupted()
+
+    @property
+    def progress_directory(self) -> Path:
+        return self.journal.with_name(f"{self.journal.stem}.progress")
+
+    def _progress_path(self, job_id: str) -> Path:
+        digest = hashlib.sha256(job_id.encode("utf-8")).hexdigest()
+        return self.progress_directory / f"{digest}.json"
+
+    def _remove_progress_checkpoint(self, job_id: str) -> None:
+        try:
+            self._progress_path(job_id).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def _write_progress_checkpoint(self, job_id: str, progress: dict) -> None:
+        self.progress_directory.mkdir(parents=True, exist_ok=True)
+        checkpoint = dict(progress)
+        checkpoint.pop("publication_error", None)
+        temporary: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=self.progress_directory, delete=False) as handle:
+                json.dump(checkpoint, handle, sort_keys=True, separators=(",", ":"))
+                handle.flush()
+                os.fsync(handle.fileno())
+                temporary = Path(handle.name)
+            os.replace(temporary, self._progress_path(job_id))
+            temporary = None
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+
+    def _restore_progress_checkpoints(self) -> None:
+        active_paths = set()
+        for job_id, job in self.jobs.items():
+            if job.get("kind") != "strategies.performance.v2.finalist-retest" or job.get("state") in TERMINAL:
+                continue
+            path = self._progress_path(job_id)
+            active_paths.add(path)
+            try:
+                progress = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if (
+                isinstance(progress, dict)
+                and type(progress.get("current")) is int
+                and type(progress.get("total")) is int
+                and progress["current"] >= 0
+                and progress["total"] >= progress["current"]
+            ):
+                progress.pop("publication_error", None)
+                current = job.get("progress")
+                current_is_valid = (
+                    isinstance(current, dict)
+                    and type(current.get("current")) is int
+                    and type(current.get("total")) is int
+                    and current["current"] >= 0
+                    and current["total"] >= current["current"]
+                )
+                current_is_placeholder = (
+                    current_is_valid
+                    and current["current"] == 0
+                    and current["total"] == 0
+                    and progress["total"] > 0
+                )
+                checkpoint_is_newer = (
+                    current_is_valid
+                    and current.get("total") == progress["total"]
+                    and current.get("unit") == progress.get("unit")
+                    and progress["current"] >= current["current"]
+                )
+                if not current_is_valid or current_is_placeholder or checkpoint_is_newer:
+                    job["progress"] = progress
+                    self._journal_dirty = True
+        try:
+            for path in self.progress_directory.glob("*.json"):
+                if path not in active_paths:
+                    path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
     def _load(self) -> dict[str, dict]:
         try:
@@ -156,7 +237,14 @@ class PanelJobRegistry:
             try: return dict(self.jobs[job_id])
             except KeyError: raise PanelJobError("NOT_FOUND") from None
 
-    def volatile_sync(self, job_id: str, status: dict, *, expected: dict | None = None) -> None:
+    def volatile_sync(
+        self,
+        job_id: str,
+        status: dict,
+        *,
+        expected: dict | None = None,
+        runtime: dict | None = None,
+    ) -> None:
         """Update live progress without a checkpoint.
 
         Callers must not retain or mutate nested progress/error/evidence values
@@ -207,8 +295,21 @@ class PanelJobRegistry:
                     job.pop("evidence", None)
                 elif isinstance(evidence, dict):
                     job["evidence"] = dict(evidence)
+            if status.get("inbox_ready") is True and job.get("state") == "COMMITTED":
+                job["inbox_ready"] = True
+            if runtime is not None:
+                if not isinstance(runtime, dict):
+                    raise PanelJobError("INVALID_REQUEST")
+                if job.get("runtime") != runtime:
+                    job["runtime"] = json.loads(json.dumps(runtime))
             if job != before:
                 self._journal_dirty = True
+            if (
+                job.get("kind") == "strategies.performance.v2.finalist-retest"
+                and job.get("state") in {"RUNNING", "CANCELLING"}
+                and isinstance(job.get("progress"), dict)
+            ):
+                self._write_progress_checkpoint(job_id, job["progress"])
 
     def list(self) -> list[dict]:
         with self.lock:
@@ -228,7 +329,10 @@ class PanelJobRegistry:
                 raise PanelJobError("INVALID_REQUEST")
             job["state"] = state; job["phase"] = phase or state
             if state == "CANCELLED": job["error"] = None
-            self._save(); return self._copy(job)
+            self._save()
+            if state in TERMINAL and job.get("kind") == "strategies.performance.v2.finalist-retest":
+                self._remove_progress_checkpoint(job_id)
+            return self._copy(job)
 
     def cancel(self, job_id: str) -> dict:
         state = self.get(job_id)["state"]
@@ -288,7 +392,7 @@ class PanelJobRegistry:
             result = status.get("result")
             if isinstance(result, dict):
                 candidate["result"] = json.loads(json.dumps(result))
-            if status.get("inbox_ready") is True:
+            if status.get("inbox_ready") is True and candidate.get("state") == "COMMITTED":
                 candidate["inbox_ready"] = True
             if runtime is not None:
                 if not isinstance(runtime, dict):
@@ -300,6 +404,8 @@ class PanelJobRegistry:
             job.update(candidate)
             self._journal_dirty = True
             self._save()
+            if job.get("kind") == "strategies.performance.v2.finalist-retest" and job.get("state") in TERMINAL:
+                self._remove_progress_checkpoint(job_id)
             return self._copy(job)
 
     def runtime(self, job_id: str) -> dict:
@@ -318,8 +424,24 @@ class PanelJobRegistry:
                 if job.get("state") not in TERMINAL:
                     job.update(state="FAILED", error={"code": "INTERRUPTED"})
                     changed = True
+            for job in self.jobs.values():
+                if job.get("kind") != "strategies.performance.v2.finalist-retest":
+                    continue
+                runtime = job.get("runtime")
+                marker = runtime.get("bulk_import_job_id") if isinstance(runtime, dict) else None
+                if not isinstance(marker, str) or not marker.startswith("pending:"):
+                    continue
+                child_id = marker.removeprefix("pending:")
+                if not child_id or child_id not in self.jobs:
+                    runtime.pop("bulk_import_job_id", None)
+                    if not runtime:
+                        job.pop("runtime", None)
+                    changed = True
             if changed:
                 self._save()
+                for job_id, job in self.jobs.items():
+                    if job.get("kind") == "strategies.performance.v2.finalist-retest" and job.get("state") in TERMINAL:
+                        self._remove_progress_checkpoint(job_id)
             self.recover_on_load = True
             return changed
 
@@ -359,8 +481,18 @@ class PanelJobRegistry:
             recoverable = job is not None and (job.get("state") == "FAILED" or (job.get("state") == "RUNNING" and job.get("phase") == "RECOVERING_INBOX"))
             if not recoverable:
                 raise PanelJobError("INVALID_REQUEST")
-            job.update(state="COMMITTED", phase="COMMITTED", error=None, runtime=json.loads(json.dumps(runtime)))
+            inbox_path = runtime.get("inbox_path") if isinstance(runtime, dict) else None
+            job.update(
+                state="COMMITTED",
+                phase="COMMITTED",
+                error=None,
+                runtime=json.loads(json.dumps(runtime)),
+            )
+            if isinstance(inbox_path, str) and inbox_path.strip():
+                job["inbox_ready"] = True
             self._save()
+            if job.get("kind") == "strategies.performance.v2.finalist-retest":
+                self._remove_progress_checkpoint(job_id)
             return self._copy(job)
 
     def recover_running(self, job_id: str) -> dict:

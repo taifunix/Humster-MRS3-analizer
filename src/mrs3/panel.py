@@ -1358,6 +1358,7 @@ class PanelController:
         self._lock = threading.RLock()
         self._selection_candidate_cache_lock = threading.RLock()
         self._performance_v2_writer_lock = threading.RLock()
+        self._bulk_retest_import_lock = threading.RLock()
         self._performance_v2_maintenance_state_lock = threading.RLock()
         self._performance_v2_maintenance_active_job: str | None = None
         self._performance_v2_maintenance_previews: dict[str, tuple[float, dict[str, object]]] = {}
@@ -2052,8 +2053,9 @@ class PanelController:
         start: Callable[[str], dict[str, object]],
         runtime: dict[str, object] | None = None,
         before_start: Callable[[str], None] | None = None,
+        job_id: str | None = None,
     ) -> dict[str, object]:
-        job_id = uuid.uuid4().hex
+        job_id = uuid.uuid4().hex if job_id is None else job_id
         self._panel_jobs.submit(kind, request, f"panel:{job_id}", resource_keys, job_id=job_id)
         self._panel_jobs.transition(job_id, "RUNNING")
         if runtime:
@@ -2097,6 +2099,17 @@ class PanelController:
             if document.get("mode") == "SINGLE_MODE":
                 runtime["mode"] = "SINGLE_MODE"
         public = {key: value for key, value in document.items() if key in {"state", "phase", "progress", "error", "evidence"}}
+        if document.get("state") == "COMMITTED" and document.get("inbox_ready") is True:
+            public["inbox_ready"] = True
+        publication_error = document.get("progress_publication_error")
+        if (
+            isinstance(publication_error, str)
+            and publication_error
+            and public.get("state") not in {"COMMITTED", "FAILED", "CANCELLED"}
+        ):
+            progress = dict(public.get("progress")) if isinstance(public.get("progress"), Mapping) else {}
+            progress["publication_error"] = publication_error
+            public["progress"] = progress
         try:
             tracked = self._panel_jobs._peek(job_id)
         except PanelJobError:
@@ -2110,6 +2123,14 @@ class PanelController:
                 saved_runtime = {}
             saved_runtime.update(runtime)
             runtime = saved_runtime
+        callback_runtime = document.get("runtime")
+        if isinstance(callback_runtime, Mapping):
+            if not runtime:
+                try:
+                    runtime = self._panel_jobs.runtime(job_id)
+                except PanelJobError:
+                    runtime = {}
+            runtime.update(callback_runtime)
         if (
             tracked.get("kind") in {"strategies.tester.runs", "strategies.tester.start", "strategies.tester.native.start", "strategies.tester.retry", "strategies.performance.v2.finalist-retest"}
             and document.get("state") == "COMMITTED"
@@ -2128,6 +2149,20 @@ class PanelController:
         ):
             try:
                 self._panel_jobs.volatile_sync(job_id, public, expected=tracked)
+            except PanelJobError:
+                pass
+            return
+        if (
+            tracked.get("kind") == "strategies.performance.v2.finalist-retest"
+            and document.get("state") == "RUNNING"
+        ):
+            try:
+                self._panel_jobs.volatile_sync(
+                    job_id,
+                    public,
+                    expected=tracked,
+                    runtime=runtime if runtime else None,
+                )
             except PanelJobError:
                 pass
             return
@@ -2882,6 +2917,23 @@ class PanelController:
         except Exception:
             return
         for job in self._panel_jobs.list():
+            if job.get("kind") == "strategies.performance.v2.finalist-retest":
+                job_id = job.get("job_id")
+                if isinstance(job_id, str) and (
+                    job.get("state") not in {"COMMITTED", "CANCELLED", "FAILED"}
+                    or (
+                        job.get("error") == {"code": "INTERRUPTED"}
+                        and job.get("phase") != "FAILED"
+                    )
+                ):
+                    try:
+                        self._panel_jobs.sync(
+                            job_id,
+                            {"state": "FAILED", "phase": "FAILED", "error": {"code": "INTERRUPTED"}},
+                        )
+                    except PanelJobError:
+                        pass
+                continue
             if job.get("kind") not in {"strategies.tester", "strategies.tester.start", "strategies.tester.native.start", "strategies.tester.retry", "strategies.tester.runs"}:
                 continue
             job_id = job.get("job_id")
@@ -3665,10 +3717,12 @@ class PanelController:
         return result if is_retest_native else {key: value for key, value in result.items() if key != "inbox_path"}
 
     def strategies_tester_verify_inbox(self, job_id: str) -> dict[str, object]:
-        config = RunnerConfig.from_json(self.default_config)
-        inbox_root = Path(config.inbox_root).resolve()
         tracked = self._panel_jobs.get(job_id)
         runtime = self._panel_jobs.runtime(job_id)
+        if tracked.get("kind") == "strategies.performance.v2.finalist-retest":
+            return self._capture_bulk_finalist_retest_inbox(job_id, tracked=tracked, runtime=runtime)
+        config = RunnerConfig.from_json(self.default_config)
+        inbox_root = Path(config.inbox_root).resolve()
         if tracked.get("kind") == "strategies.tester.collection":
             return {
                 "job_id": job_id,
@@ -3854,6 +3908,83 @@ class PanelController:
             if self._panel_jobs.get(job_id).get("state") != "COMMITTED":
                 raise
         return self.strategies_tester_status(job_id)
+
+    def _capture_bulk_finalist_retest_inbox(
+        self,
+        job_id: str,
+        *,
+        tracked: Mapping[str, object] | None = None,
+        runtime: Mapping[str, object] | None = None,
+    ) -> dict[str, object]:
+        tracked = self._panel_jobs.get(job_id) if tracked is None else tracked
+        saved_runtime = self._panel_jobs.runtime(job_id) if runtime is None else dict(runtime)
+        if tracked.get("kind") != "strategies.performance.v2.finalist-retest" or saved_runtime.get("bulk_retest") is not True:
+            raise ValueError("job is not a bulk finalist RETEST")
+        if tracked.get("state") != "COMMITTED":
+            raise ValueError("bulk RETEST tester job is not committed")
+        config = RunnerConfig.from_json(self.default_config)
+        inbox_root = Path(config.inbox_root).resolve()
+        raw_inbox = saved_runtime.get("inbox_path")
+        if tracked.get("inbox_ready") is True or saved_runtime.get("inbox_ready") is True:
+            if not isinstance(raw_inbox, str) or not raw_inbox.strip():
+                raise ValueError("committed bulk RETEST inbox path is unavailable")
+            inbox = Path(raw_inbox).resolve()
+        else:
+            service = self._single_mode_strategy_test()
+            inbox = service.capture_inbox(job_id, force_single_mode=True).resolve()
+
+        if inbox == inbox_root:
+            raise ValueError("committed bulk RETEST inbox path is unavailable")
+        try:
+            inbox.relative_to(inbox_root)
+        except ValueError as error:
+            raise ValueError("committed bulk RETEST inbox path is outside the configured inbox root") from error
+        manifest_path = inbox / "inbox_manifest.json"
+        if manifest_path.is_symlink() or not manifest_path.is_file():
+            raise ValueError("committed bulk RETEST inbox manifest is unavailable")
+        if manifest_path.stat().st_size > 16 * 1024 * 1024:
+            raise ValueError("committed bulk RETEST inbox manifest is too large")
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ValueError("committed bulk RETEST inbox manifest is invalid") from error
+        members = saved_runtime.get("cohort_members")
+        cohort_names = {
+            str(member.get("strategy_name"))
+            for member in members
+            if isinstance(member, Mapping) and isinstance(member.get("strategy_name"), str)
+        } if isinstance(members, list) else set()
+        expected_names = manifest.get("expected_strategy_names") if isinstance(manifest, Mapping) else None
+        entries = manifest.get("entries") if isinstance(manifest, Mapping) else None
+        entry_names = [entry.get("strategy_name") for entry in entries if isinstance(entry, Mapping)] if isinstance(entries, list) else []
+        if (
+            not isinstance(manifest, Mapping)
+            or manifest.get("schema_version") != 1
+            or manifest.get("run_mode") != "SINGLE_MODE"
+            or manifest.get("source_mode") != "metadata_only"
+            or manifest.get("inbox_ready") is not True
+            or ("batch_id" in manifest and manifest.get("batch_id") != job_id)
+            or not cohort_names
+            or not isinstance(expected_names, list)
+            or len(expected_names) != len(cohort_names)
+            or set(expected_names) != cohort_names
+            or not isinstance(entries, list)
+            or len(entries) != len(cohort_names)
+            or len(entry_names) != len(cohort_names)
+            or set(entry_names) != cohort_names
+        ):
+            raise ValueError("committed bulk RETEST inbox does not match its frozen cohort")
+        self._validate_metadata_inbox(inbox)
+        service = self._single_mode_strategy_test()
+        service.mark_inbox_ready(job_id, inbox)
+        saved_runtime.update({"inbox_path": str(inbox), "inbox_ready": True, "mode": "SINGLE_MODE"})
+        self._panel_jobs.sync(
+            job_id,
+            {"state": "COMMITTED", "phase": "COMMITTED", "inbox_ready": True},
+            runtime=saved_runtime,
+        )
+        self._strategy_batch_inboxes[job_id] = inbox
+        return self._panel_jobs.get(job_id)
 
     def strategies_tester_cancel(self, job_id: str) -> dict[str, object]:
         try:
@@ -4564,7 +4695,13 @@ class PanelController:
             raise ValueError("Output strategy root is redirected")
         return resolved
 
-    def strategies_performance_v2_import(self, payload: Mapping[str, object], *, _internal: bool = False) -> dict[str, object]:
+    def strategies_performance_v2_import(
+        self,
+        payload: Mapping[str, object],
+        *,
+        _internal: bool = False,
+        job_id: str | None = None,
+    ) -> dict[str, object]:
         allowed = {
             "tester_job_id", "mode", "replacement_strategy_ids", "window_a", "window_b",
             "clear_retest_on_success", "test_start", "test_end", "listing_dates_path", "_retest",
@@ -4576,6 +4713,8 @@ class PanelController:
             key in payload for key in ("replacement_strategy_ids", "clear_retest_on_success", "_retest", "_expected_current_result_ids")
         ):
             raise ValueError("Performance v2 replacement controls are internal only")
+        if job_id is not None and not _internal:
+            raise ValueError("Performance v2 import job ID is internal only")
         if not _internal and payload.get("mode") == "REPLACE":
             raise ValueError("Performance v2 REPLACE is internal only")
         tester_job_id = self._required(payload, "tester_job_id")
@@ -4733,6 +4872,7 @@ class PanelController:
             start_import,
             runtime={"report_collection_id": tester_job_id} if collection_service is not None else None,
             before_start=claim_collection_import if collection_service is not None else None,
+            job_id=job_id,
         )
 
     def strategies_performance_v2_import_status(self, job_id: str) -> dict[str, object]:
@@ -5244,6 +5384,25 @@ class PanelController:
     # that call the feature "bulk retest".
     strategies_performance_v2_bulk_retest_start = strategies_performance_v2_finalist_retest_start
 
+    def _reconcile_bulk_retest_import(
+        self, parent_job_id: str, runtime: dict[str, object],
+    ) -> tuple[str | None, bool, dict[str, object] | None]:
+        """Resolve a preallocated pending child ID once its job is durable."""
+        marker = runtime.get("bulk_import_job_id")
+        if not isinstance(marker, str) or not marker:
+            return None, False, None
+        pending = marker.startswith("pending:")
+        child_id = marker.removeprefix("pending:") if pending else marker
+        try:
+            child = self._panel_jobs.get(child_id)
+        except PanelJobError:
+            return (None, True, None) if pending else (marker, False, None)
+        if pending:
+            runtime["bulk_import_job_id"] = child_id
+            parent_state = self._panel_jobs.get(parent_job_id).get("state", "COMMITTED")
+            self._panel_jobs.sync(parent_job_id, {"state": parent_state}, runtime=runtime)
+        return child_id, False, child
+
     def _bulk_retest_status_document(self, job_id: str) -> dict[str, object]:
         tracked = self._panel_jobs.get(job_id)
         runtime = self._panel_jobs.runtime(job_id)
@@ -5257,6 +5416,7 @@ class PanelController:
             runtime = self._panel_jobs.runtime(job_id)
         except (KeyError, ValueError):
             pass
+        import_job_id, import_pending, import_job = self._reconcile_bulk_retest_import(job_id, runtime)
         self._refresh_bulk_retest_outcomes(job_id)
         tracked = self._panel_jobs.get(job_id)
         runtime = self._panel_jobs.runtime(job_id)
@@ -5264,13 +5424,26 @@ class PanelController:
         if runtime.get("outcomes_finalized") is True and not runtime.get("successful_replacements"):
             bulk_error = {"code": "RETEST_COHORT_NO_SUCCESSFUL_MEMBERS", "message": "no finalist cohort member imported successfully"}
             runtime["error_code"] = bulk_error["code"]
-        import_job_id = runtime.get("bulk_import_job_id")
-        if not isinstance(import_job_id, str) or not import_job_id or import_job_id.startswith("pending:"):
+        if import_pending:
             import_job_id = None
+            import_job = None
+        cohort_count = len(runtime.get("cohort_members", [])) if isinstance(runtime.get("cohort_members"), list) else 0
+        imported_count = runtime.get("imported_count")
+        skipped_count = runtime.get("skipped_count")
+        rejected_count = runtime.get("rejected_count")
+        has_import_counts = any(type(count) is int and count >= 0 for count in (imported_count, skipped_count, rejected_count))
+        expected_count = sum(
+            int(count) for count in (imported_count, skipped_count, rejected_count)
+            if type(count) is int and count >= 0
+        ) if has_import_counts else cohort_count
         return {
             **tracked,
             "scope": runtime.get("scope"), "cohort_sha256": runtime.get("cohort_sha256"),
-            "cohort_count": len(runtime.get("cohort_members", [])) if isinstance(runtime.get("cohort_members"), list) else 0,
+            "cohort_count": cohort_count,
+            "expected_count": expected_count,
+            "imported_count": imported_count if type(imported_count) is int else len(runtime.get("successful_replacements", [])) if isinstance(runtime.get("successful_replacements"), list) else 0,
+            "skipped_count": skipped_count if type(skipped_count) is int else 0,
+            "rejected_count": rejected_count if type(rejected_count) is int else len(runtime.get("failures", [])) if isinstance(runtime.get("failures"), list) else 0,
             "success_count": len(runtime.get("successful_replacements", [])) if isinstance(runtime.get("successful_replacements"), list) else 0,
             "failure_count": len(runtime.get("failures", [])) if isinstance(runtime.get("failures"), list) else 0,
             "test_start": runtime.get("test_start"), "test_end": runtime.get("test_end"),
@@ -5279,6 +5452,9 @@ class PanelController:
             "successful_replacements": runtime.get("successful_replacements", []),
             "failures": runtime.get("failures", []),
             "import_job_id": import_job_id,
+            "import_job_state": import_job.get("state") if isinstance(import_job, Mapping) else None,
+            "import_job_error": import_job.get("error") if isinstance(import_job, Mapping) else None,
+            "import_pending": import_pending,
             "error": bulk_error or tracked.get("error"),
         }
 
@@ -5304,6 +5480,12 @@ class PanelController:
         failures = [dict(item) for item in runtime.get("exclusions", []) if isinstance(item, Mapping)]
         imported_successes = child_runtime.get("successful_replacements")
         imported_failures = child_runtime.get("failures")
+        child_result = child.get("result")
+        if isinstance(child_result, Mapping):
+            for key in ("imported_count", "skipped_count", "rejected_count"):
+                count = child_result.get(key)
+                if type(count) is int and count >= 0:
+                    runtime[key] = count
         if isinstance(imported_successes, list) and isinstance(imported_failures, list):
             runtime["successful_replacements"] = [dict(item) for item in imported_successes if isinstance(item, Mapping)]
             runtime["failures"] = failures + [dict(item) for item in imported_failures if isinstance(item, Mapping)]
@@ -5363,6 +5545,10 @@ class PanelController:
     strategies_performance_v2_bulk_retest_status = strategies_performance_v2_finalist_retest_status
 
     def strategies_performance_v2_finalist_retest_import(self, payload: Mapping[str, object]) -> dict[str, object]:
+        with self._bulk_retest_import_lock:
+            return self._strategies_performance_v2_finalist_retest_import_locked(payload)
+
+    def _strategies_performance_v2_finalist_retest_import_locked(self, payload: Mapping[str, object]) -> dict[str, object]:
         if not isinstance(payload, Mapping) or set(payload) != {"tester_job_id"}:
             raise ValueError("bulk RETEST import accepts only tester_job_id")
         tester_job_id = self._required(payload, "tester_job_id")
@@ -5370,9 +5556,21 @@ class PanelController:
         runtime = self._panel_jobs.runtime(tester_job_id)
         if tracked.get("kind") != "strategies.performance.v2.finalist-retest" or runtime.get("bulk_retest") is not True:
             raise ValueError("tester job is not a bulk finalist RETEST")
-        if tracked.get("state") != "COMMITTED" or tracked.get("inbox_ready") is not True:
+        if tracked.get("state") != "COMMITTED":
+            raise ValueError("bulk RETEST tester job is not committed")
+        if tracked.get("inbox_ready") is not True and runtime.get("inbox_ready") is not True:
+            self.strategies_tester_verify_inbox(tester_job_id)
+            tracked = self._panel_jobs.get(tester_job_id)
+            runtime = self._panel_jobs.runtime(tester_job_id)
+        if tracked.get("inbox_ready") is not True and runtime.get("inbox_ready") is not True:
             raise ValueError("bulk RETEST tester inbox is not committed")
         previous = runtime.get("bulk_import_job_id")
+        if isinstance(previous, str) and previous.startswith("pending:"):
+            previous, unresolved, _child = self._reconcile_bulk_retest_import(tester_job_id, runtime)
+            if unresolved:
+                raise PanelJobError("RUNTIME_BUSY")
+            runtime = self._panel_jobs.runtime(tester_job_id)
+        retrying_import = False
         if isinstance(previous, str) and previous and not previous.startswith("pending:"):
             try:
                 previous_job = self._panel_jobs.get(previous)
@@ -5380,21 +5578,34 @@ class PanelController:
                 previous_job = None
             if isinstance(previous_job, Mapping) and previous_job.get("state") not in {"FAILED", "CANCELLED"}:
                 return previous_job
+            if isinstance(previous_job, Mapping):
+                self._panel_jobs.clear_runtime(tester_job_id, "bulk_import_job_id", value=previous)
+                retrying_import = True
         names = {str(member["strategy_name"]): int(member["strategy_id"]) for member in runtime.get("cohort_members", []) if isinstance(member, Mapping)}
         expected_results = {str(member["strategy_name"]): int(member["result_id"]) for member in runtime.get("cohort_members", []) if isinstance(member, Mapping)}
         start, end = runtime.get("test_start"), runtime.get("test_end")
         if not isinstance(start, str) or not isinstance(end, str) or not names:
             raise ValueError("bulk RETEST provenance is incomplete")
-        pending = f"pending:{uuid.uuid4().hex}"
+        child_id = uuid.uuid4().hex
+        pending = f"pending:{child_id}"
+        queued_child_id: str | None = None
         try:
             self._panel_jobs.reserve_runtime(tester_job_id, "bulk_import_job_id", pending)
+            if retrying_import:
+                runtime = self._panel_jobs.runtime(tester_job_id)
+                runtime["outcomes_finalized"] = False
+                runtime["successful_replacements"] = []
+                runtime["failures"] = [
+                    dict(item) for item in runtime.get("exclusions", []) if isinstance(item, Mapping)
+                ]
+                self._panel_jobs.sync(tester_job_id, {"state": "COMMITTED"}, runtime=runtime)
             result = self.strategies_performance_v2_import({
                 "tester_job_id": tester_job_id, "mode": "REPLACE", "replacement_strategy_ids": names,
                 "clear_retest_on_success": False, "test_start": start, "test_end": end, "_retest": True,
                 "_expected_current_result_ids": expected_results,
-            }, _internal=True)
-            child_id = result.get("job_id") if isinstance(result, Mapping) else None
-            if not isinstance(child_id, str) or not child_id:
+            }, _internal=True, job_id=child_id)
+            queued_child_id = result.get("job_id") if isinstance(result, Mapping) else None
+            if queued_child_id != child_id:
                 raise ValueError("bulk RETEST import returned an invalid job")
             runtime = self._panel_jobs.runtime(tester_job_id)
             runtime["bulk_import_job_id"] = child_id
@@ -5402,9 +5613,15 @@ class PanelController:
             return result
         except BaseException:
             try:
-                self._panel_jobs.clear_runtime(tester_job_id, "bulk_import_job_id", value=pending)
+                self._panel_jobs.get(child_id)
+                child_exists = True
             except PanelJobError:
-                pass
+                child_exists = False
+            if not child_exists and queued_child_id is None:
+                try:
+                    self._panel_jobs.clear_runtime(tester_job_id, "bulk_import_job_id", value=pending)
+                except PanelJobError:
+                    pass
             raise
 
     strategies_performance_v2_bulk_retest_import = strategies_performance_v2_finalist_retest_import

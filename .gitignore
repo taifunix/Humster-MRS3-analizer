@@ -15,6 +15,7 @@ config.local.json.bak
 portfolio_optimizer.local.json
 .portfolio-results/
 .panel-jobs.json
+.panel-jobs.progress/
 data/
 output/
 [Dd]ata/

@@ -30,6 +30,24 @@ def test_registry_can_defer_restart_recovery_until_owner_migrates(tmp_path):
     assert registry.recover_interrupted() is False
 
 
+def test_startup_recovery_clears_preallocated_pending_import_when_child_was_never_created(tmp_path):
+    path = tmp_path / "jobs.json"
+    registry = PanelJobRegistry(path, recover_on_load=False)
+    parent = registry.submit(
+        "strategies.performance.v2.finalist-retest", {}, "pending-no-child", job_id="bulk-parent",
+    )
+    registry.transition(parent["job_id"], "RUNNING")
+    registry.sync(parent["job_id"], {"state": "COMMITTED"}, runtime={
+        "bulk_retest": True, "bulk_import_job_id": "pending:never-created-child",
+    })
+
+    restarted = PanelJobRegistry(path)
+
+    assert "bulk_import_job_id" not in restarted.runtime("bulk-parent")
+    persisted = json.loads(path.read_text(encoding="utf-8"))
+    assert "bulk_import_job_id" not in persisted["bulk-parent"]["runtime"]
+
+
 def test_registry_recovery_is_durable_before_identical_terminal_import_poll(tmp_path, monkeypatch):
     path = tmp_path / "jobs.json"
     registry = PanelJobRegistry(path)
@@ -58,6 +76,21 @@ def test_registry_recovery_is_durable_before_identical_terminal_import_poll(tmp_
     assert json.loads(path.read_text(encoding="utf-8"))[job["job_id"]] == recovered.jobs[job["job_id"]]
 
 
+def test_recover_committed_marks_owner_validated_inbox_ready(tmp_path):
+    registry = PanelJobRegistry(tmp_path / "jobs.json")
+    job = registry.submit("strategies.tester.start", {}, "recover-inbox")
+    registry.transition(job["job_id"], "RUNNING")
+    registry.transition(job["job_id"], "FAILED")
+
+    recovered = registry.recover_committed(
+        job["job_id"], runtime={"inbox_path": str(tmp_path / "verified-inbox")},
+    )
+
+    assert recovered["state"] == "COMMITTED"
+    assert recovered["inbox_ready"] is True
+    assert registry.runtime(job["job_id"])["inbox_path"] == str(tmp_path / "verified-inbox")
+
+
 def test_registry_rejected_runtime_reservation_leaves_journal_clean(tmp_path):
     path = tmp_path / "jobs.json"
     registry = PanelJobRegistry(path)
@@ -78,6 +111,67 @@ def test_registry_cancel_transition_and_bounded_logs(tmp_path):
     for index in range(205): registry.append_log(job["job_id"], str(index))
     assert len(registry.get(job["job_id"])["logs"]) == 200
     assert registry.cancel(job["job_id"])["state"] == "CANCELLING"
+
+
+def test_finalist_progress_checkpoint_is_removed_when_job_becomes_terminal(tmp_path):
+    registry = PanelJobRegistry(tmp_path / ".panel-jobs.json", recover_on_load=False)
+    job = registry.submit(
+        "strategies.performance.v2.finalist-retest", {}, "finalist-checkpoint",
+        ("strategies.tester",), job_id="finalist-checkpoint",
+    )
+    registry.transition(job["job_id"], "RUNNING")
+    registry.volatile_sync(job["job_id"], {
+        "state": "RUNNING", "progress": {"current": 9, "total": 10, "unit": "reports"},
+    })
+    checkpoint = registry._progress_path(job["job_id"])
+    assert checkpoint.is_file()
+
+    registry.cancel(job["job_id"])
+    registry.transition(job["job_id"], "CANCELLED")
+
+    assert not checkpoint.exists()
+
+
+def test_finalist_checkpoint_does_not_replace_newer_journal_progress(tmp_path):
+    path = tmp_path / ".panel-jobs.json"
+    registry = PanelJobRegistry(path, recover_on_load=False)
+    job = registry.submit(
+        "strategies.performance.v2.finalist-retest", {}, "newer-journal-progress",
+        ("strategies.tester",), job_id="newer-journal-progress",
+    )
+    registry.transition(job["job_id"], "RUNNING")
+    registry.volatile_sync(job["job_id"], {
+        "state": "RUNNING", "progress": {"current": 72, "total": 250, "unit": "reports"},
+    })
+    registry._save()
+    registry.sync(job["job_id"], {
+        "state": "RUNNING", "progress": {"current": 100, "total": 250, "unit": "reports"},
+    })
+
+    restored = PanelJobRegistry(path, recover_on_load=False)
+
+    assert restored.get(job["job_id"])["progress"]["current"] == 100
+
+
+def test_finalist_checkpoint_write_failure_keeps_volatile_change_dirty(tmp_path, monkeypatch):
+    registry = PanelJobRegistry(tmp_path / ".panel-jobs.json", recover_on_load=False)
+    job = registry.submit(
+        "strategies.performance.v2.finalist-retest", {}, "checkpoint-write-failure",
+        ("strategies.tester",), job_id="checkpoint-write-failure",
+    )
+    registry.transition(job["job_id"], "RUNNING")
+
+    def fail_checkpoint(_job_id, _progress):
+        raise OSError("checkpoint write failed")
+
+    monkeypatch.setattr(registry, "_write_progress_checkpoint", fail_checkpoint)
+    with pytest.raises(OSError, match="checkpoint write failed"):
+        registry.volatile_sync(job["job_id"], {
+            "state": "RUNNING", "progress": {"current": 7, "total": 10, "unit": "reports"},
+        })
+
+    assert registry.get(job["job_id"])["progress"]["current"] == 7
+    assert registry._journal_dirty is True
 
 
 def test_registry_discards_only_queued_job(tmp_path):

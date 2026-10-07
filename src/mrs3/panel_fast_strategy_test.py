@@ -76,6 +76,8 @@ class _Job:
     target_owner: TesterTargetLock | None = None
     target_snapshot: object | None = None
     cleanup_pending: bool = False
+    cleanup_error: str | None = None
+    progress_publication_error: str | None = None
     report_baseline: dict[str, tuple[int, int, ...]] = field(default_factory=dict)
     verified_report_evidence: dict[str, tuple[int, int]] = field(default_factory=dict)
     tester_config_bytes: bytes | None = None
@@ -438,8 +440,10 @@ class LocalFastStrategyTestService:
         with self._lock:
             state = (
                 "RUNNING"
-                if job.cleanup_pending
-                or not job.target_finalized and job.thread is not None and job.thread.is_alive()
+                if not job.cleanup_pending
+                and not job.target_finalized
+                and job.thread is not None
+                and job.thread.is_alive()
                 else job.state
             )
             return {
@@ -454,12 +458,25 @@ class LocalFastStrategyTestService:
                     "verified_reports": dict(sorted(job.verified_reports.items())),
                 },
                 "error": dict(job.error) if job.error else None,
+                "progress_publication_error": job.progress_publication_error,
                 **({"inbox_path": str(job.inbox_path)} if job.inbox_path is not None else {}),
             }
 
     def _emit(self, job: _Job) -> None:
         if self._on_update is not None:
-            self._on_update(self._snapshot(job))
+            snapshot = self._snapshot(job)
+            try:
+                self._on_update(snapshot)
+            except Exception as error:
+                if snapshot["mode"] != "SINGLE_MODE" or snapshot["state"] != "RUNNING":
+                    raise
+                with self._lock:
+                    job.progress_publication_error = _safe_error_message(error)
+            else:
+                if snapshot["progress_publication_error"] is not None:
+                    with self._lock:
+                        if job.progress_publication_error == snapshot["progress_publication_error"]:
+                            job.progress_publication_error = None
 
     def _set_progress(self, job: _Job, **values: object) -> None:
         with self._lock:
@@ -527,13 +544,28 @@ class LocalFastStrategyTestService:
                 job.target_finalized = True
                 job.state = job.phase = "FAILED"
                 job.error = {"code": code, "message": _safe_error_message(error)}
+                if job.cleanup_error is not None:
+                    job.error["cleanup_error"] = job.cleanup_error
             self._emit(job)
 
         def cleanup_pending(error: BaseException) -> None:
             with self._lock:
                 job.cleanup_pending = True
                 job.target_finalized = False
-                job.error = {"code": "RESTORE_OR_RELEASE_FAILED", "message": _safe_error_message(error)}
+                if job.cancel.is_set():
+                    job.state = job.phase = "CANCELLED"
+                    if job.error is not None and job.error.get("code") != "RESTORE_OR_RELEASE_FAILED":
+                        job.error.setdefault("cleanup_error", _safe_error_message(error))
+                    else:
+                        job.error = {"code": "RESTORE_OR_RELEASE_FAILED", "message": _safe_error_message(error)}
+                elif job.error is None or job.error.get("code") == "RESTORE_OR_RELEASE_FAILED":
+                    job.state = job.phase = "FAILED"
+                    job.error = {"code": "RESTORE_OR_RELEASE_FAILED", "message": _safe_error_message(error)}
+                else:
+                    job.state = job.phase = "FAILED"
+                    job.error.setdefault("cleanup_error", _safe_error_message(error))
+                if job.error is not None and job.cleanup_error is not None:
+                    job.error.setdefault("cleanup_error", job.cleanup_error)
             self._emit(job)
 
         try:
@@ -755,7 +787,16 @@ class LocalFastStrategyTestService:
                     job.state = "FAILED"
                     job.phase = "FAILED"
                     if job.single_mode:
-                        job.failed_names.update(name for name in job.expected_names if name not in job.verified_reports)
+                        if isinstance(error, _FastCleanupUnconfirmed):
+                            job.failed_names.update(
+                                name
+                                for name in job.expected_names
+                                if job.attempt_counts.get(name, 0) > 0 and name not in job.verified_reports
+                            )
+                        else:
+                            job.failed_names.update(
+                                name for name in job.expected_names if name not in job.verified_reports
+                            )
                     job.progress.update(
                         current=len(job.verified_reports),
                         active=0,
@@ -764,11 +805,15 @@ class LocalFastStrategyTestService:
                     code = (
                         "SINGLE_MODE_RETRIES_EXHAUSTED"
                         if job.single_mode and isinstance(error, BatchRetryExhausted)
+                        else "RESTORE_OR_RELEASE_FAILED"
+                        if isinstance(error, _FastCleanupUnconfirmed)
                         else "SINGLE_MODE_TEST_FAILED"
                         if job.single_mode
                         else "FAST_TEST_FAILED"
                     )
                     job.error = {"code": code, "message": _safe_error_message(error)}
+                    if job.cleanup_error is not None:
+                        job.error["cleanup_error"] = job.cleanup_error
                 try:
                     self._write_manifest(job)
                 except BaseException:
@@ -1496,6 +1541,9 @@ class LocalSingleModeStrategyTestService(LocalFastStrategyTestService):
 
     def _run_native_batch(self, job: _Job, names: tuple[str, ...], config: RunnerConfig, batch_number: int, batch_total: int) -> dict[str, Path]:
         client: object | None = None
+        execution_failed = False
+        expected_settings: dict[str, Mapping[str, object]] = {}
+        validated_reports: dict[str, Path] = {}
         try:
             self._stop_bot(config)
             _clear_directory(job.strategy_dir, expected=self.config.bot_root / "settings_strategy")
@@ -1513,10 +1561,6 @@ class LocalSingleModeStrategyTestService(LocalFastStrategyTestService):
             self._set_phase(job, "BOT_RUN", batch_number=batch_number, batch_total=batch_total)
             for name in names:
                 job.attempt_counts[name] = job.attempt_counts.get(name, 0) + 1
-            client.run_tester()
-            self._wait_for_native_idle(job, client, config, batch_number, batch_total, names, batch_baseline=batch_baseline)
-            self._set_phase(job, "REPORT_COLLECTION", batch_number=batch_number, batch_total=batch_total)
-            expected_settings: dict[str, Mapping[str, object]] = {}
             for name in names:
                 try:
                     value = json.loads(_strategy_json_path(job.manifest.strategy_source, name).read_text(encoding="utf-8"))
@@ -1525,7 +1569,10 @@ class LocalSingleModeStrategyTestService(LocalFastStrategyTestService):
                 if not isinstance(value, Mapping):
                     raise FastStrategyTestError(f"expected strategy settings are invalid for {name}")
                 expected_settings[name] = value
-            return self._native_reports(
+            client.run_tester()
+            self._wait_for_native_idle(job, client, config, batch_number, batch_total, names, batch_baseline=batch_baseline)
+            self._set_phase(job, "REPORT_COLLECTION", batch_number=batch_number, batch_total=batch_total)
+            validated_reports = self._native_reports(
                 job.report_dir,
                 set(names),
                 expected_settings=expected_settings,
@@ -1533,9 +1580,59 @@ class LocalSingleModeStrategyTestService(LocalFastStrategyTestService):
                 end=job.end_date,
                 baseline=batch_baseline,
             )
+            return validated_reports
+        except BaseException:
+            execution_failed = True
+            if set(expected_settings) == set(names):
+                for name in names:
+                    try:
+                        reports = self._native_reports(
+                            job.report_dir,
+                            {name},
+                            expected_settings={name: expected_settings[name]},
+                            start=job.start_date,
+                            end=job.end_date,
+                            baseline=batch_baseline,
+                        )
+                        report = reports.get(name)
+                        if report is None:
+                            continue
+                        stat = report.stat()
+                    except Exception:
+                        continue
+                    with self._lock:
+                        job.verified_reports[name] = report.name
+                        job.verified_report_evidence[name] = (stat.st_mtime_ns, stat.st_size)
+                        job.failed_names.discard(name)
+            raise
         finally:
             try:
                 self._stop_bot(config)
+            except BaseException as error:
+                with self._lock:
+                    job.cleanup_error = _safe_error_message(error)
+                if not execution_failed:
+                    for name, report in validated_reports.items():
+                        try:
+                            stat = report.stat()
+                        except OSError:
+                            continue
+                        with self._lock:
+                            job.verified_reports[name] = report.name
+                            job.verified_report_evidence[name] = (stat.st_mtime_ns, stat.st_size)
+                            job.failed_names.discard(name)
+                    attempted_missing = sum(
+                        1
+                        for name in job.expected_names
+                        if job.attempt_counts.get(name, 0) > 0 and name not in job.verified_reports
+                    )
+                    self._set_progress(
+                        job,
+                        current=len(job.verified_reports),
+                        active=0,
+                        failed=attempted_missing,
+                    )
+                    raise _FastCleanupUnconfirmed("tester stop was not confirmed") from error
             finally:
                 if client is not None and hasattr(client, "close"):
                     try:

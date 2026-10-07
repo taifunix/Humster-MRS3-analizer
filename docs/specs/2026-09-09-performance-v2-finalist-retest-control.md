@@ -186,6 +186,29 @@ Panel показывает frozen cohort count, даты, прогресс, чи
 и failure count. Нельзя молча переключить scope или переиспользовать inbox
 другого cohort/периода.
 
+### Native tester reliability and status
+
+- While native `SINGLE_MODE` is producing reports, Panel status shows the
+  current report count, frozen cohort total, tester status, and phase.
+- Live progress updates are transient and must not rewrite the complete Panel
+  job journal on every poll. Failure to publish one transient progress update
+  must not stop an otherwise running tester.
+- Batch and stall timeouts apply only when their configured conditions are
+  actually met. New report-file evidence resets the stall timer.
+- A real tester failure preserves the primary error even when stop, settings
+  restore, or lock release also fails. Cleanup failure is reported separately
+  and must not turn a failed job back into public `RUNNING` state.
+- Before publishing a failed state, Panel retains the greatest observed native
+  report progress. A partial cohort is never accepted for `IMPORT & REPLACE`.
+- A completed finalist retest can be imported even when Panel has not yet
+  captured its metadata inbox. The explicit import action captures it in
+  `SINGLE_MODE`, verifies the inbox belongs to the frozen cohort, then starts
+  the normal replacement import. The committed job remains recoverable after a
+  Panel reload, and the UI offers its import action from the committed state.
+- After a Panel restart, an orphaned nonterminal bulk-retest job becomes a
+  terminal interrupted failure and releases the shared tester resource. Panel
+  never resumes or imports that partial batch automatically.
+
 ## Non-goals
 
 - отдельная база или сохранение копий каждого результата ретеста;

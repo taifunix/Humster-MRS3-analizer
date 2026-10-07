@@ -1456,7 +1456,14 @@ def _publish(
                 raise PerformanceV2ImportError(
                     "REPLACE requires an expected typed identity for every strategy"
                 )
+            eligible_names = {
+                entry.strategy_name
+                for entry, report in zip(prepared.entries, parsed, strict=True)
+                if report is not None
+            }
             for name, strategy_id in request.replacement_strategy_ids.items():
+                if name not in eligible_names:
+                    continue
                 row = existing.get(name)
                 if row is None or int(row[1]) != int(strategy_id) or str(row[9]) != "ACTIVE":
                     raise PerformanceV2ImportError(f"replacement mapping does not match active strategy {name!r}")
@@ -1991,20 +1998,37 @@ def import_performance_v2(
         # Bulk finalist retests freeze the old current Result ID.  A member
         # that diverged while the tester was running is rejected independently
         # so its sibling replacements can still commit.
-        if request.mode == "REPLACE" and request.expected_current_result_ids:
+        if request.mode == "REPLACE" and request.expected_current_result_ids is not None:
             parsed_list = list(parsed)
             current_rows = connection.execute(
-                "select strategy_name, current_result_id from strategies where strategy_name in (select unnest(?::varchar[]))",
-                [list(request.expected_current_result_ids)],
+                "select strategy_id, current_result_id from strategies where strategy_id in (select unnest(?::bigint[]))",
+                [list(request.replacement_strategy_ids.values())],
             ).fetchall()
-            current_by_name = {str(name): None if result_id is None else int(result_id) for name, result_id in current_rows}
+            current_by_id = {int(strategy_id): None if result_id is None else int(result_id) for strategy_id, result_id in current_rows}
             for index, (entry, report) in enumerate(zip(prepared.entries, parsed_list, strict=True)):
                 expected = request.expected_current_result_ids.get(entry.strategy_name)
-                if report is None or expected is None:
+                if report is None:
                     continue
-                if current_by_name.get(entry.strategy_name) != expected:
+                strategy_id = request.replacement_strategy_ids.get(entry.strategy_name)
+                if expected is None:
                     parsed_list[index] = None
                     failure_rows.append({
+                        "strategy_id": strategy_id,
+                        "strategy_name": entry.strategy_name, "symbol": entry.identity.symbol,
+                        "reason": "MISSING_EXPECTED_RESULT",
+                    })
+                    continue
+                if strategy_id is None or strategy_id not in current_by_id or current_by_id[strategy_id] is None:
+                    parsed_list[index] = None
+                    failure_rows.append({
+                        "strategy_id": strategy_id,
+                        "strategy_name": entry.strategy_name, "symbol": entry.identity.symbol,
+                        "reason": "MISSING_CURRENT_RESULT",
+                    })
+                elif current_by_id[strategy_id] != expected:
+                    parsed_list[index] = None
+                    failure_rows.append({
+                        "strategy_id": strategy_id,
                         "strategy_name": entry.strategy_name, "symbol": entry.identity.symbol,
                         "reason": "STALE_RESULT",
                     })

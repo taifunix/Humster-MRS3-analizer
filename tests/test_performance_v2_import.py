@@ -988,6 +988,200 @@ def test_replace_preserves_user_finalist_status_rank_and_comment(tmp_path: Path)
         ).fetchone() == (None,)
 
 
+def _change_all_inbox_reports(request: PerformanceV2ImportRequest) -> None:
+    manifest_path = request.inbox / "inbox_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    changed = FIXTURE.read_bytes().replace(b"1009.9", b"1019.9")
+    assert changed != FIXTURE.read_bytes()
+    for entry in manifest["entries"]:
+        report_path = Path(entry["report_path"])
+        report_path.write_bytes(changed)
+        entry["source_report_sha256"] = sha256(changed).hexdigest()
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+
+def _current_strategy_map(request: PerformanceV2ImportRequest) -> tuple[dict[str, int], dict[str, int]]:
+    target = performance_v2_database_path(request.config)
+    with duckdb.connect(str(target), read_only=True) as connection:
+        rows = connection.execute(
+            "select strategy_name, strategy_id, current_result_id from strategies"
+        ).fetchall()
+    return (
+        {str(name): int(strategy_id) for name, strategy_id, _result_id in rows},
+        {str(name): int(result_id) for name, _strategy_id, result_id in rows},
+    )
+
+
+def _current_final_balances(request: PerformanceV2ImportRequest) -> dict[str, float]:
+    target = performance_v2_database_path(request.config)
+    with duckdb.connect(str(target), read_only=True) as connection:
+        rows = connection.execute(
+            "select s.strategy_name, r.final_balance from strategies s "
+            "join strategy_results r on r.result_id = s.current_result_id"
+        ).fetchall()
+    return {str(name): float(balance) for name, balance in rows}
+
+
+def test_replace_rejects_parsed_entry_missing_expected_result_id(tmp_path: Path) -> None:
+    initial, _ = _request(tmp_path, names=("alpha", "beta"))
+    assert import_performance_v2(initial).imported_count == 2
+    strategy_ids, expected = _current_strategy_map(initial)
+    before_balances = _current_final_balances(initial)
+    replacement = PerformanceV2ImportRequest(
+        initial.inbox, initial.report_root, initial.config, mode="REPLACE",
+        replacement_strategy_ids=strategy_ids, expected_current_result_ids=expected,
+        listing_dates_path=initial.listing_dates_path,
+    )
+    # The request constructor enforces complete coverage.  Simulate corrupt
+    # persisted/internal state to verify the importer itself also fails closed.
+    object.__setattr__(replacement, "expected_current_result_ids", {"beta": expected["beta"]})
+    _change_all_inbox_reports(replacement)
+
+    result = import_performance_v2(replacement)
+
+    assert result.imported_count == 1
+    assert result.rejected_count == 1
+    assert any(
+        failure["strategy_id"] == strategy_ids["alpha"]
+        and failure["strategy_name"] == "alpha"
+        and failure["reason"] == "MISSING_EXPECTED_RESULT"
+        for failure in result.failures
+    )
+    target = performance_v2_database_path(replacement.config)
+    with duckdb.connect(str(target), read_only=True) as connection:
+        assert connection.execute(
+            "select current_result_id from strategies where strategy_id = ?", [strategy_ids["alpha"]]
+        ).fetchone() == (expected["alpha"],)
+        assert connection.execute(
+            "select count(*) from strategy_results where strategy_id = ?", [strategy_ids["alpha"]]
+        ).fetchone() == (1,)
+        after_balances = dict(connection.execute(
+            "select s.strategy_name, r.final_balance from strategies s "
+            "join strategy_results r on r.result_id = s.current_result_id"
+        ).fetchall())
+        assert float(after_balances["alpha"]) == before_balances["alpha"]
+        assert float(after_balances["beta"]) != before_balances["beta"]
+
+
+def test_replace_stale_guard_resolves_current_result_by_frozen_strategy_id(tmp_path: Path) -> None:
+    initial, _ = _request(tmp_path, names=("alpha", "beta"))
+    assert import_performance_v2(initial).imported_count == 2
+    strategy_ids, expected = _current_strategy_map(initial)
+    before_balances = _current_final_balances(initial)
+    # A stale name-to-ID mapping must not borrow alpha's current Result ID
+    # from a name lookup.  The wrong frozen ID points at beta, so only alpha
+    # is isolated as stale and beta remains eligible to replace.
+    replacement_ids = {"alpha": strategy_ids["beta"], "beta": strategy_ids["beta"]}
+    replacement = PerformanceV2ImportRequest(
+        initial.inbox, initial.report_root, initial.config, mode="REPLACE",
+        replacement_strategy_ids=replacement_ids, expected_current_result_ids=expected,
+        listing_dates_path=initial.listing_dates_path,
+    )
+    _change_all_inbox_reports(replacement)
+
+    result = import_performance_v2(replacement)
+
+    assert result.imported_count == 1
+    assert result.rejected_count == 1
+    assert any(
+        failure["strategy_id"] == replacement_ids["alpha"]
+        and failure["strategy_name"] == "alpha"
+        and failure["reason"] == "STALE_RESULT"
+        for failure in result.failures
+    )
+    target = performance_v2_database_path(replacement.config)
+    with duckdb.connect(str(target), read_only=True) as connection:
+        assert connection.execute(
+            "select current_result_id from strategies where strategy_id = ?", [strategy_ids["alpha"]]
+        ).fetchone() == (expected["alpha"],)
+        after_balances = dict(connection.execute(
+            "select s.strategy_name, r.final_balance from strategies s "
+            "join strategy_results r on r.result_id = s.current_result_id"
+        ).fetchall())
+        assert float(after_balances["alpha"]) == before_balances["alpha"]
+        assert float(after_balances["beta"]) != before_balances["beta"]
+
+
+def test_replace_missing_current_guard_row_fails_only_that_strategy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    initial, _ = _request(tmp_path, names=("alpha", "beta"))
+    assert import_performance_v2(initial).imported_count == 2
+    strategy_ids, expected = _current_strategy_map(initial)
+    before_balances = _current_final_balances(initial)
+    replacement = PerformanceV2ImportRequest(
+        initial.inbox, initial.report_root, initial.config, mode="REPLACE",
+        replacement_strategy_ids=strategy_ids, expected_current_result_ids=expected,
+        listing_dates_path=initial.listing_dates_path,
+    )
+    _change_all_inbox_reports(replacement)
+    target = performance_v2_database_path(replacement.config)
+    real_connect = import_module.duckdb.connect
+    guard_queries = 0
+
+    class ResultRows:
+        def __init__(self, rows: list[tuple[object, ...]]) -> None:
+            self.rows = rows
+
+        def fetchall(self) -> list[tuple[object, ...]]:
+            return self.rows
+
+        def fetchone(self) -> tuple[object, ...] | None:
+            return self.rows[0] if self.rows else None
+
+    class GuardConnection:
+        def __init__(self, raw) -> None:
+            self.raw = raw
+
+        def execute(self, sql, parameters=None):
+            nonlocal guard_queries
+            compact = " ".join(str(sql).casefold().split())
+            if guard_queries == 0 and "select strategy_id" in compact and "unnest" in compact and "from strategies" in compact:
+                guard_queries += 1
+                rows = self.raw.execute(sql, parameters).fetchall()
+                return ResultRows([row for row in rows if int(row[0]) != strategy_ids["alpha"]])
+            return self.raw.execute(sql, parameters) if parameters is not None else self.raw.execute(sql)
+
+        def executemany(self, sql, parameters):
+            return self.raw.executemany(sql, parameters)
+
+        def append(self, table, frame):
+            return self.raw.append(table, frame)
+
+        def close(self) -> None:
+            self.raw.close()
+
+        def __getattr__(self, name: str):
+            return getattr(self.raw, name)
+
+    monkeypatch.setattr(
+        import_module.duckdb, "connect",
+        lambda *args, **kwargs: GuardConnection(real_connect(*args, **kwargs)),
+    )
+
+    result = import_performance_v2(replacement)
+
+    assert guard_queries == 1
+    assert (result.imported_count, result.rejected_count) == (1, 1)
+    assert result.imported_count + result.rejected_count == len(strategy_ids)
+    assert result.successful_replacements == ({
+        "strategy_id": strategy_ids["beta"],
+        "old_result_id": expected["beta"],
+        "new_result_id": expected["beta"],
+    },)
+    assert result.failures == ({
+        "strategy_id": strategy_ids["alpha"],
+        "strategy_name": "alpha",
+        "symbol": "ONUSDT",
+        "reason": "MISSING_CURRENT_RESULT",
+    },)
+    with real_connect(str(target), read_only=True) as connection:
+        after_balances = dict(connection.execute(
+            "select s.strategy_name, r.final_balance from strategies s "
+            "join strategy_results r on r.result_id = s.current_result_id"
+        ).fetchall())
+    assert float(after_balances["alpha"]) == before_balances["alpha"]
+    assert float(after_balances["beta"]) != before_balances["beta"]
+
+
 def test_add_accepts_tester_report_order_ids_outside_mrs3_order_slots(tmp_path: Path) -> None:
     request, _ = _request(tmp_path)
     report = FIXTURE.read_bytes().replace(b"<td>1</td><td>opened</td>", b"<td>2</td><td>opened</td>", 1)
@@ -1181,9 +1375,12 @@ def test_replace_readback_batches_multiple_strategy_ids_and_keeps_manifest_order
         }
         for name in ("alpha", "beta", "gamma")
     )
-    assert len(batch_queries) == 1
+    assert len(batch_queries) == 2
     assert scalar_queries == []
-    assert batch_queries[0][1] == [list(strategy_ids.values())]
+    assert [query[1] for query in batch_queries] == [
+        [list(strategy_ids.values())],
+        [list(strategy_ids.values())],
+    ]
 
 
 def test_replace_timestamp_batch_updates_only_admitted_strategies_with_one_now(
@@ -1441,7 +1638,7 @@ def test_replace_readback_omits_missing_and_null_rows_and_filtered_reports(
         (0, [], 0, False, False, 0, False, None), (1, [], 1, False, False, 0, False, None),
         (2, [2], 0, False, False, 0, False, None), (3, [3], 0, False, False, 0, False, None),
         (409, [409], 0, False, False, 0, False, None), (1025, [1024, 1], 0, False, False, 0, False, None),
-        (2, [], 1, True, False, 0, False, None), (2, [2], 0, False, True, 100, False, None),
+        (2, [], 1, True, False, 0, False, None), (2, [2, 2], 0, False, True, 100, False, None),
         (2, [], 0, False, False, 0, True, None), (3, [2], 0, False, False, 0, False, "candidate-1"),
     ],
 )
@@ -1471,7 +1668,10 @@ def test_replace_readback_query_counts_cover_scalar_and_chunk_boundaries(
         listing_dates_path=base.listing_dates_path,
     )
     prepared = SimpleNamespace(
-        entries=tuple(SimpleNamespace(strategy_name=name) for name in names),
+        entries=tuple(
+            SimpleNamespace(strategy_name=name, identity=SimpleNamespace(symbol="BTCUSDT"))
+            for name in names
+        ),
         test_start=None,
         test_end=None,
         inbox_snapshot_sha256=None,
@@ -1492,7 +1692,9 @@ def test_replace_readback_query_counts_cover_scalar_and_chunk_boundaries(
 
     raw_connect = import_module.duckdb.connect
     batch_sizes: list[int] = []
+    batch_ids: list[list[int]] = []
     scalar_queries = 0
+    batch_query_count = 0
 
     class _Result:
         def __init__(self, rows: list[tuple[object, ...]]) -> None:
@@ -1509,15 +1711,18 @@ def test_replace_readback_query_counts_cover_scalar_and_chunk_boundaries(
             self._raw = raw
 
         def execute(self, sql: str, parameters=None):
-            nonlocal scalar_queries
+            nonlocal scalar_queries, batch_query_count
             compact = " ".join(str(sql).casefold().split())
             if "selectstrategy_name,current_result_idfromstrategies" in compact.replace(" ", ""):
                 return _Result([(name, expected[name]) for name in names])
             if "selectstrategy_id,current_result_idfromstrategies" in compact.replace(" ", ""):
                 ids = list(parameters[0])
                 batch_sizes.append(len(ids))
+                batch_ids.append(ids)
+                batch_query_count += 1
+                query_delta = 0 if explicit_expected and batch_query_count == 1 else result_delta
                 return _Result([(strategy_id, expected_result) for strategy_id, expected_result in (
-                        (strategy_ids[name], expected[name] + result_delta)
+                        (strategy_ids[name], expected[name] + query_delta)
                         for name in names if strategy_ids[name] in ids
                 )])
             if "select current_result_id from strategies where strategy_id = ?" in compact:
@@ -1548,6 +1753,8 @@ def test_replace_readback_query_counts_cover_scalar_and_chunk_boundaries(
     assert batch_sizes == expected_batch_sizes
     assert scalar_queries == expected_scalar_queries
     if explicit_expected:
+        expected_ids = list(strategy_ids.values())
+        assert batch_ids == [expected_ids, expected_ids]
         assert [row["old_result_id"] for row in result.successful_replacements] == [expected[name] for name in names]
         assert [row["new_result_id"] for row in result.successful_replacements] == [expected[name] + result_delta for name in names]
 

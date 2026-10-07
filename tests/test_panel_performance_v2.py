@@ -504,6 +504,84 @@ def test_v2_panel_service_passes_frozen_result_ids_directly(tmp_path: Path) -> N
     assert captured["expected"] == {"P1": 11}
 
 
+def test_v2_panel_service_real_importer_isolates_frozen_result_mismatch(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path)
+    assert LocalPerformanceV2Service().run(request).imported_count == 2
+    target = performance_v2_database_path(request.config)
+    with duckdb.connect(str(target), read_only=True) as connection:
+        old = {
+            str(name): (int(strategy_id), int(result_id), final_balance)
+            for name, strategy_id, result_id, final_balance in connection.execute(
+                "select s.strategy_name, s.strategy_id, s.current_result_id, r.final_balance "
+                "from strategies s join strategy_results r using (strategy_id) order by s.strategy_name"
+            ).fetchall()
+        }
+
+    changed_report = FIXTURE.read_bytes().replace(b"1009.9", b"1019.9")
+    manifest_path = request.inbox / "inbox_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    for entry in manifest["entries"]:
+        Path(entry["report_path"]).write_bytes(changed_report)
+        entry["source_report_sha256"] = sha256(changed_report).hexdigest()
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    result = LocalPerformanceV2Service().run(replace(
+        request,
+        mode="REPLACE",
+        replacement_strategy_ids={name: identity[0] for name, identity in old.items()},
+        expected_current_result_ids={"P1": old["P1"][1] + 1, "P2": old["P2"][1]},
+    ))
+
+    assert result.status == "COMMITTED"
+    assert result.imported_count == 1
+    assert result.rejected_count == 1
+    assert result.failures == ({
+        "strategy_id": old["P1"][0],
+        "strategy_name": "P1",
+        "symbol": "ONUSDT",
+        "reason": "STALE_RESULT",
+    },)
+    assert result.failure_report_path is not None
+    assert "STALE_RESULT" in result.failure_report_path.read_text(encoding="utf-8")
+    with duckdb.connect(str(target), read_only=True) as connection:
+        rows = connection.execute(
+            "select s.strategy_name, s.current_result_id, r.final_balance "
+            "from strategies s join strategy_results r using (strategy_id)"
+        ).fetchall()
+        result_counts = dict(connection.execute(
+            "select s.strategy_name, count(*) from strategies s "
+            "join strategy_results r using (strategy_id) group by s.strategy_name"
+        ).fetchall())
+    current = {str(name): (int(result_id), balance) for name, result_id, balance in rows}
+    assert current["P1"] == (old["P1"][1], old["P1"][2])
+    assert result_counts == {"P1": 1, "P2": 1}
+    assert current["P2"][0] == old["P2"][1]
+    assert current["P2"][1] != old["P2"][2]
+
+
+@pytest.mark.parametrize(
+    "private_controls",
+    [
+        {"_retest": True},
+        {"_expected_current_result_ids": {"P1": 11}},
+    ],
+)
+def test_v2_panel_controller_rejects_external_retest_import_controls(
+    tmp_path: Path, private_controls: dict[str, object],
+) -> None:
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
+
+    with pytest.raises(ValueError, match="internal only"):
+        controller.strategies_performance_v2_import({"tester_job_id": "unused", **private_controls})
+
+
+def test_v2_panel_controller_rejects_external_import_job_id(tmp_path: Path) -> None:
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
+
+    with pytest.raises(ValueError, match="job ID is internal only"):
+        controller.strategies_performance_v2_import({"tester_job_id": "unused"}, job_id="caller-chosen")
+
+
 def test_v2_panel_service_passes_collection_consumption_expectations(tmp_path: Path) -> None:
     request, _ = _request(tmp_path)
     request = replace(
@@ -907,6 +985,46 @@ def test_metadata_inbox_accepts_its_validated_published_fresh_batch(tmp_path: Pa
     controller._validate_metadata_inbox(inbox)
 
 
+def test_metadata_inbox_rejects_symlinked_artifact_without_creating_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    analysis_id = "a" * 64
+    inbox, report_root, strategy_path = _write_fresh_metadata_inbox(
+        tmp_path,
+        analysis_id=analysis_id,
+        batch_name=f"{'b' * 64}-{'c' * 32}",
+    )
+    config = tmp_path / "config.local.json"
+    config.write_text("{}", encoding="utf-8")
+    controller = PanelController(tmp_path, config)
+    monkeypatch.setattr(
+        panel_module.RunnerConfig,
+        "from_json",
+        lambda _path: SimpleNamespace(
+            strategy_dir=tmp_path / "bot" / "settings_strategy",
+            report_dir=report_root,
+        ),
+    )
+    monkeypatch.setattr(
+        controller,
+        "_performance_v2_config",
+        lambda: SimpleNamespace(strategy_root=tmp_path / "Output" / "strategies"),
+    )
+    real_is_symlink = Path.is_symlink
+    inspected: list[Path] = []
+
+    def report_symlink(path: Path) -> bool:
+        inspected.append(path)
+        return path == strategy_path or real_is_symlink(path)
+
+    monkeypatch.setattr(Path, "is_symlink", report_symlink)
+
+    with pytest.raises(ValueError, match="strategy_path is missing"):
+        controller._validate_metadata_inbox(inbox)
+
+    assert strategy_path in inspected
+
+
 def test_metadata_inbox_accepts_strategy_anywhere_under_output(tmp_path: Path, monkeypatch) -> None:
     analysis_id = "a" * 64
     inbox, report_root, _strategy_path = _write_fresh_metadata_inbox(
@@ -1223,6 +1341,154 @@ def test_running_performance_import_progress_never_serializes_the_journal(tmp_pa
     assert controller._panel_jobs.get(job_id)["progress"]["current"] == 136
 
 
+def test_running_finalist_retest_progress_is_volatile_and_terminal_state_is_durable(tmp_path, monkeypatch):
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
+    job_id = "volatile-finalist-retest"
+    controller._panel_jobs.submit(
+        "strategies.performance.v2.finalist-retest", {}, job_id,
+        ("strategies.tester", "performance-v2-finalist-retest"), job_id=job_id,
+    )
+    controller._panel_jobs.transition(job_id, "RUNNING", phase="BOT_RUN")
+    frozen_runtime = {
+        "bulk_retest": True,
+        "cohort_members": [{"strategy_id": 1, "result_id": 11}],
+    }
+    controller._panel_jobs.sync(
+        job_id, {"state": "RUNNING", "phase": "BOT_RUN"}, runtime=frozen_runtime,
+    )
+    saves = []
+    save = controller._panel_jobs._save
+
+    def count_save() -> None:
+        saves.append(True)
+        save()
+
+    monkeypatch.setattr(controller._panel_jobs, "_save", count_save)
+
+    for current in (71, 72, 73):
+        controller._record_special_job({
+            "job_id": job_id,
+            "state": "RUNNING",
+            "phase": "BOT_RUN",
+            "progress": {"current": current, "total": 250, "unit": "reports"},
+            "error": None,
+            **({"runtime": frozen_runtime, "inbox_ready": False} if current == 71 else {}),
+        })
+
+    assert saves == []
+    assert controller._panel_jobs.jobs[job_id]["progress"]["current"] == 73
+    assert controller._panel_jobs._journal_dirty is True
+    assert controller._panel_jobs.runtime(job_id) == frozen_runtime
+
+    controller._record_special_job({
+        "job_id": job_id,
+        "state": "FAILED",
+        "phase": "FAILED",
+        "progress": {"current": 73, "total": 250, "unit": "reports"},
+        "error": {"code": "SINGLE_MODE_TEST_FAILED", "message": "tester failed"},
+    })
+
+    assert saves == [True]
+    assert controller._panel_jobs.get(job_id)["state"] == "FAILED"
+    assert controller._panel_jobs._journal_dirty is False
+    restored = PanelJobRegistry(controller._panel_jobs.journal, recover_on_load=False)
+    assert restored.get(job_id)["state"] == "FAILED"
+    assert restored.get(job_id)["progress"]["current"] == 73
+
+
+def test_finalist_retest_commit_merges_runtime_and_only_committed_inbox_is_ready(tmp_path):
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
+    job_id = "runtime-finalist-retest"
+    controller._panel_jobs.submit(
+        "strategies.performance.v2.finalist-retest", {}, job_id,
+        ("strategies.tester", "performance-v2-finalist-retest"), job_id=job_id,
+    )
+    controller._panel_jobs.transition(job_id, "RUNNING", phase="BOT_RUN")
+    controller._panel_jobs.sync(
+        job_id, {"state": "RUNNING", "phase": "BOT_RUN"},
+        runtime={"bulk_retest": True, "cohort_members": [{"strategy_id": 7}]},
+    )
+
+    controller._record_special_job({
+        "job_id": job_id, "state": "RUNNING", "phase": "BOT_RUN",
+        "progress": {"current": 1, "total": 250, "unit": "reports"},
+        "inbox_ready": True,
+    })
+    assert "inbox_ready" not in controller._panel_jobs.get(job_id)
+
+    inbox_path = str(tmp_path / "inbox")
+    controller._record_special_job({
+        "job_id": job_id, "state": "COMMITTED", "phase": "COMMITTED",
+        "mode": "SINGLE_MODE", "inbox_path": inbox_path,
+        "runtime": {"import_job_id": "import-1"}, "inbox_ready": True,
+    })
+
+    stored = controller._panel_jobs.get(job_id)
+    runtime = controller._panel_jobs.runtime(job_id)
+    assert stored["inbox_ready"] is True
+    assert runtime["inbox_path"] == inbox_path
+    assert runtime["mode"] == "SINGLE_MODE"
+    assert runtime["import_job_id"] == "import-1"
+    assert runtime["cohort_members"] == [{"strategy_id": 7}]
+
+    failed_id = "failed-finalist-inbox"
+    controller._panel_jobs.submit(
+        "strategies.performance.v2.finalist-retest", {}, failed_id,
+        ("strategies.tester", "performance-v2-finalist-retest"), job_id=failed_id,
+    )
+    controller._panel_jobs.transition(failed_id, "RUNNING", phase="BOT_RUN")
+    controller._record_special_job({
+        "job_id": failed_id, "state": "FAILED", "phase": "FAILED",
+        "progress": {"current": 2, "total": 250, "unit": "reports"},
+        "inbox_ready": True,
+    })
+    assert "inbox_ready" not in controller._panel_jobs.get(failed_id)
+
+
+def test_terminal_finalist_callback_does_not_keep_transient_progress_warning(tmp_path):
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
+    job_id = "terminal-clears-progress-warning"
+    controller._panel_jobs.submit(
+        "strategies.performance.v2.finalist-retest", {}, "terminal-warning",
+        ("strategies.tester",), job_id=job_id,
+    )
+    controller._panel_jobs.transition(job_id, "RUNNING")
+    controller._record_special_job({
+        "job_id": job_id,
+        "state": "RUNNING",
+        "phase": "BOT_RUN",
+        "progress": {"current": 1, "total": 2, "unit": "reports"},
+        "progress_publication_error": "temporary journal failure",
+    })
+    assert controller._panel_jobs.get(job_id)["progress"]["publication_error"] == "temporary journal failure"
+
+    controller._record_special_job({
+        "job_id": job_id,
+        "state": "COMMITTED",
+        "phase": "COMMITTED",
+        "progress": {"current": 2, "total": 2, "unit": "reports"},
+        "progress_publication_error": "temporary journal failure",
+    })
+
+    assert "publication_error" not in controller._panel_jobs.get(job_id)["progress"]
+
+
+def test_tester_reconciliation_runs_once_during_controller_startup(tmp_path, monkeypatch):
+    calls = []
+    original = PanelController._reconcile_interrupted_tester_jobs
+
+    def counted(controller):
+        calls.append(controller)
+        original(controller)
+
+    monkeypatch.setattr(PanelController, "_reconcile_interrupted_tester_jobs", counted)
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
+    assert calls == [controller]
+
+    controller._panel_jobs.submit("strategies.performance.v2.finalist-retest", {}, "live-after-startup")
+    assert calls == [controller]
+
+
 def test_j5_nonterminal_import_callback_reloads_full_snapshot_and_skips_repeats(tmp_path, monkeypatch):
     controller = PanelController(tmp_path, tmp_path / "config.local.json")
     job_id = "running-import"
@@ -1379,7 +1645,7 @@ def test_j5_missing_error_and_evidence_save_once_and_retain_runtime(tmp_path, mo
     assert len(replacements) == 1
     assert saved["error"] == initial["error"]
     assert saved["evidence"] == initial["evidence"]
-    assert saved["inbox_ready"] is True
+    assert "inbox_ready" not in saved
     assert controller._panel_jobs.runtime(job_id) == {
         "existing": "value", "inbox_path": str(tmp_path / "inbox"),
     }
@@ -2722,6 +2988,387 @@ def test_finalist_retest_status_exposes_started_import_job(tmp_path: Path, monke
     monkeypatch.setattr(controller, "_single_mode_strategy_test", lambda: SimpleNamespace(status=lambda _job_id: (_ for _ in ()).throw(KeyError())))
 
     assert controller.strategies_performance_v2_finalist_retest_status("bulk-job")["import_job_id"] == "import-job"
+
+
+def test_finalist_retest_status_exposes_pending_import_handoff(tmp_path: Path, monkeypatch) -> None:
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
+    controller._panel_jobs.submit(
+        "strategies.performance.v2.finalist-retest", {}, "pending-test", job_id="pending-bulk-job",
+    )
+    controller._panel_jobs.transition("pending-bulk-job", "RUNNING")
+    controller._panel_jobs.transition("pending-bulk-job", "COMMITTED")
+    controller._panel_jobs.sync(
+        "pending-bulk-job", {"state": "COMMITTED", "phase": "COMMITTED", "inbox_ready": True},
+        runtime={
+            "bulk_retest": True, "scope": "FINALIST", "cohort_sha256": "cohort",
+            "cohort_members": [], "successful_replacements": [], "failures": [],
+            "bulk_import_job_id": "pending:child-link-not-saved",
+        },
+    )
+    monkeypatch.setattr(
+        controller, "_single_mode_strategy_test",
+        lambda: SimpleNamespace(status=lambda _job_id: (_ for _ in ()).throw(KeyError())),
+    )
+
+    status = controller.strategies_performance_v2_finalist_retest_status("pending-bulk-job")
+
+    assert status["import_job_id"] is None
+    assert status["import_pending"] is True
+
+
+def test_finalist_retest_import_captures_committed_inbox_before_import(tmp_path: Path, monkeypatch) -> None:
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
+    job_id = "bulk-inbox-before-import"
+    registry = controller._panel_jobs
+    registry.submit(
+        "strategies.performance.v2.finalist-retest", {}, "bulk-inbox-before-import",
+        ("strategies.tester", "performance-v2-finalist-retest"), job_id=job_id,
+    )
+    registry.transition(job_id, "RUNNING")
+    runtime = {
+        "bulk_retest": True,
+        "scope": "FINALIST",
+        "test_start": "2026-01-01",
+        "test_end": "2026-10-01",
+        "cohort_members": [{"strategy_id": 7, "strategy_name": "alpha", "result_id": 17}],
+    }
+    registry.sync(job_id, {"state": "COMMITTED", "phase": "COMMITTED"}, runtime=runtime)
+    inbox_root = tmp_path / "inbox"
+    inbox = inbox_root / job_id
+    captured: list[tuple[str, dict[str, object]]] = []
+
+    class TesterService:
+        def capture_inbox(self, captured_job_id: str, *, force_single_mode: bool = False) -> Path:
+            captured.append((captured_job_id, {"force_single_mode": force_single_mode}))
+            inbox.mkdir(parents=True)
+            (inbox / "inbox_manifest.json").write_text(json.dumps({
+                "schema_version": 1,
+                "run_mode": "SINGLE_MODE",
+                "source_mode": "metadata_only",
+                "inbox_ready": True,
+                "batch_id": job_id,
+                "expected_strategy_names": ["alpha"],
+                "entries": [{
+                    "strategy_name": "alpha",
+                    "strategy_path": "alpha.json",
+                    "report_path": "alpha.html",
+                }],
+            }), encoding="utf-8")
+            return inbox
+
+        def mark_inbox_ready(self, captured_job_id: str, path: Path) -> None:
+            assert captured_job_id == job_id
+            assert path == inbox
+
+    service = TesterService()
+    monkeypatch.setattr(panel_module.RunnerConfig, "from_json", staticmethod(lambda _path: SimpleNamespace(inbox_root=inbox_root)))
+    monkeypatch.setattr(controller, "_single_mode_strategy_test", lambda: service)
+    monkeypatch.setattr(controller, "_validate_metadata_inbox", lambda _path: None)
+    import_calls: list[tuple[dict[str, object], bool]] = []
+
+    child_ids: list[str] = []
+
+    def start_import(
+        payload: dict[str, object], *, _internal: bool = False, job_id: str | None = None,
+    ) -> dict[str, object]:
+        import_calls.append((payload, _internal))
+        assert job_id is not None
+        child_ids.append(job_id)
+        assert registry.get("bulk-inbox-before-import")["inbox_ready"] is True
+        child = registry.submit(
+            "strategies.performance.v2.import", {}, f"bulk-inbox-import-child:{job_id}",
+            ("performance-v2-db",), job_id=job_id,
+        )
+        registry.transition(child["job_id"], "RUNNING")
+        return {"job_id": child["job_id"]}
+
+    monkeypatch.setattr(controller, "strategies_performance_v2_import", start_import)
+
+    result = controller.strategies_performance_v2_finalist_retest_import({"tester_job_id": job_id})
+
+    assert result["job_id"] == child_ids[0]
+    assert captured == [(job_id, {"force_single_mode": True})]
+    assert len(import_calls) == 1
+    import_payload, internal = import_calls[0]
+    assert internal is True
+    assert import_payload["replacement_strategy_ids"] == {"alpha": 7}
+    assert import_payload["test_start"] == "2026-01-01"
+    assert import_payload["test_end"] == "2026-10-01"
+    assert registry.runtime(job_id)["inbox_path"] == str(inbox.resolve())
+    assert registry.get(job_id)["inbox_ready"] is True
+    repeated = controller.strategies_performance_v2_finalist_retest_import({"tester_job_id": job_id})
+    assert repeated["job_id"] == result["job_id"]
+    assert len(import_calls) == 1
+    assert sum(job["kind"] == "strategies.performance.v2.import" for job in registry.list()) == 1
+
+
+def test_finalist_retest_import_serializes_concurrent_handoffs(tmp_path: Path, monkeypatch) -> None:
+    controller, registry = _bulk_import_controller(tmp_path, "concurrent-handoff")
+    import_entered = threading.Event()
+    release_import = threading.Event()
+    second_waiting_for_lock = threading.Event()
+    second_thread_id: list[int] = []
+    starts: list[str] = []
+    results: list[dict[str, object]] = []
+    errors: list[BaseException] = []
+
+    class ObservedLock:
+        def __init__(self) -> None:
+            self.lock = threading.RLock()
+
+        def acquire(self):
+            if second_thread_id and threading.get_ident() == second_thread_id[0]:
+                second_waiting_for_lock.set()
+            return self.lock.acquire()
+
+        def release(self) -> None:
+            self.lock.release()
+
+        def __enter__(self):
+            self.acquire()
+            return self
+
+        def __exit__(self, *_args) -> None:
+            self.release()
+
+    controller._bulk_retest_import_lock = ObservedLock()  # type: ignore[attr-defined]
+
+    def start_import(
+        _payload: dict[str, object], *, _internal: bool = False, job_id: str | None = None,
+    ) -> dict[str, object]:
+        assert _internal and job_id
+        starts.append(job_id)
+        import_entered.set()
+        assert release_import.wait(5)
+        child = registry.submit(
+            "strategies.performance.v2.import", {}, f"concurrent-child:{job_id}",
+            ("performance-v2-db",), job_id=job_id,
+        )
+        registry.transition(job_id, "RUNNING")
+        return {"job_id": child["job_id"]}
+
+    monkeypatch.setattr(controller, "strategies_performance_v2_import", start_import)
+
+    def call_import(*, second: bool = False) -> None:
+        if second:
+            second_thread_id.append(threading.get_ident())
+        try:
+            results.append(controller.strategies_performance_v2_finalist_retest_import({
+                "tester_job_id": "concurrent-handoff",
+            }))
+        except BaseException as error:
+            errors.append(error)
+
+    first = threading.Thread(target=call_import)
+    second = threading.Thread(target=call_import, kwargs={"second": True})
+    first.start()
+    try:
+        assert import_entered.wait(5)
+        second.start()
+        assert second_waiting_for_lock.wait(5)
+    finally:
+        release_import.set()
+        first.join(timeout=5)
+        if second.ident is not None:
+            second.join(timeout=5)
+
+    assert not first.is_alive() and not second.is_alive()
+    assert not errors
+    assert len(results) == 2
+    assert results[0]["job_id"] == results[1]["job_id"]
+    assert starts == [results[0]["job_id"]]
+    assert len([job for job in registry.list() if job["kind"] == "strategies.performance.v2.import"]) == 1
+
+
+def _bulk_import_controller(tmp_path: Path, job_id: str) -> tuple[PanelController, PanelJobRegistry]:
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
+    registry = controller._panel_jobs
+    registry.submit(
+        "strategies.performance.v2.finalist-retest", {}, f"bulk-import-{job_id}",
+        ("strategies.tester", "performance-v2-finalist-retest"), job_id=job_id,
+    )
+    registry.transition(job_id, "RUNNING")
+    registry.sync(job_id, {"state": "COMMITTED", "phase": "COMMITTED", "inbox_ready": True}, runtime={
+        "bulk_retest": True,
+        "scope": "FINALIST",
+        "test_start": "2026-01-01",
+        "test_end": "2026-10-01",
+        "cohort_members": [{"strategy_id": 7, "strategy_name": "alpha", "result_id": 17}],
+    })
+    return controller, registry
+
+
+@pytest.mark.parametrize("child_state", ["COMMITTED", "FAILED", "CANCELLED"])
+def test_finalist_retest_import_recovers_preallocated_child_after_parent_link_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, child_state: str,
+) -> None:
+    controller, registry = _bulk_import_controller(tmp_path, "link-save-failure")
+    starts: list[str] = []
+
+    def start_import(
+        _payload: dict[str, object], *, _internal: bool = False, job_id: str | None = None,
+    ) -> dict[str, object]:
+        assert _internal is True
+        assert job_id is not None
+        starts.append(job_id)
+        child_id = job_id
+        active_registry = controller._panel_jobs
+        child = active_registry.submit(
+            "strategies.performance.v2.import", {}, f"link-save-child:{job_id}",
+            ("performance-v2-db",), job_id=job_id,
+        )
+        active_registry.transition(child["job_id"], "RUNNING")
+        if len(starts) == 1:
+            if child_state == "COMMITTED":
+                active_registry.sync(child_id, {"state": "COMMITTED"}, runtime={
+                    "successful_replacements": [{"strategy_id": 7, "old_result_id": 17, "new_result_id": 18}],
+                    "failures": [],
+                })
+            elif child_state == "CANCELLED":
+                active_registry.transition(child_id, "CANCELLING")
+                active_registry.transition(child_id, "CANCELLED")
+            else:
+                active_registry.transition(child_id, "FAILED")
+        return {"job_id": job_id}
+
+    monkeypatch.setattr(controller, "strategies_performance_v2_import", start_import)
+    real_sync = registry.sync
+
+    fail_once = [True]
+
+    def fail_parent_link(job_id: str, status: dict[str, object], *, runtime: dict[str, object] | None = None, **kwargs: object) -> dict[str, object]:
+        if fail_once[0] and job_id == "link-save-failure" and runtime and runtime.get("bulk_import_job_id") in starts:
+            fail_once[0] = False
+            raise OSError("parent link persistence failed")
+        return real_sync(job_id, status, runtime=runtime, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(registry, "sync", fail_parent_link)
+
+    with pytest.raises(OSError, match="parent link persistence failed"):
+        controller.strategies_performance_v2_finalist_retest_import({"tester_job_id": "link-save-failure"})
+
+    child_id = starts[0]
+    marker = registry.runtime("link-save-failure").get("bulk_import_job_id")
+    assert marker == f"pending:{child_id}"
+    assert registry.get(child_id)["state"] == child_state
+    assert len([job for job in registry.list() if job["kind"] == "strategies.performance.v2.import"]) == 1
+    recovered_registry = PanelJobRegistry(registry.journal)
+    controller._panel_jobs = recovered_registry
+    monkeypatch.setattr(
+        controller, "_performance_v2_config",
+        lambda: PerformanceV2Config(tmp_path / "performance-v2"),
+    )
+    monkeypatch.setattr(
+        controller, "_single_mode_strategy_test",
+        lambda: SimpleNamespace(status=lambda _job_id: (_ for _ in ()).throw(KeyError())),
+    )
+    status = controller.strategies_performance_v2_finalist_retest_status("link-save-failure")
+    assert status["import_pending"] is False
+    assert status["import_job_id"] == child_id
+    assert status["import_job_state"] == child_state
+    assert recovered_registry.runtime("link-save-failure")["bulk_import_job_id"] == child_id
+    assert recovered_registry.get(child_id)["state"] == child_state
+    if child_state == "COMMITTED":
+        assert status["successful_replacements"] == [{
+            "strategy_id": 7, "old_result_id": 17, "new_result_id": 18,
+        }]
+        repeated = controller.strategies_performance_v2_finalist_retest_import({"tester_job_id": "link-save-failure"})
+        assert repeated["job_id"] == child_id
+        assert starts == [child_id]
+    else:
+        retry = controller.strategies_performance_v2_finalist_retest_import({"tester_job_id": "link-save-failure"})
+        assert retry["job_id"] != child_id
+        assert starts == [child_id, retry["job_id"]]
+    assert len([job for job in recovered_registry.list() if job["kind"] == "strategies.performance.v2.import"]) == len(starts)
+
+
+def test_finalist_retest_parent_status_preserves_member_outcomes_and_import_totals(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
+    registry = controller._panel_jobs
+    parent_id, child_id = "bulk-outcome-parent", "bulk-outcome-child"
+    registry.submit("strategies.performance.v2.finalist-retest", {}, "bulk-outcome-parent", job_id=parent_id)
+    registry.transition(parent_id, "RUNNING")
+    registry.transition(parent_id, "COMMITTED")
+    members = [
+        {"strategy_id": 7, "strategy_name": "alpha", "result_id": 17},
+        {"strategy_id": 8, "strategy_name": "beta", "result_id": 18},
+    ]
+    registry.sync(parent_id, {"state": "COMMITTED"}, runtime={
+        "bulk_retest": True, "scope": "FINALIST", "cohort_members": members,
+        "bulk_import_job_id": child_id, "failures": [], "successful_replacements": [],
+    })
+    registry.submit("strategies.performance.v2.import", {}, "bulk-outcome-child", job_id=child_id)
+    registry.transition(child_id, "RUNNING")
+    registry.sync(child_id, {
+        "state": "COMMITTED",
+        "result": {"imported_count": 1, "skipped_count": 0, "rejected_count": 1},
+    }, runtime={
+        "successful_replacements": [{"strategy_id": 8, "old_result_id": 18, "new_result_id": 28}],
+        "failures": [{
+            "strategy_id": 7, "strategy_name": "alpha", "symbol": "BTCUSDT",
+            "reason": "MISSING_CURRENT_RESULT",
+        }],
+    })
+    monkeypatch.setattr(
+        controller, "_single_mode_strategy_test",
+        lambda: SimpleNamespace(status=lambda _job_id: (_ for _ in ()).throw(KeyError())),
+    )
+
+    status = controller.strategies_performance_v2_finalist_retest_status(parent_id)
+
+    assert status["successful_replacements"] == [{
+        "strategy_id": 8, "old_result_id": 18, "new_result_id": 28,
+    }]
+    assert status["failures"] == [{
+        "strategy_id": 7, "strategy_name": "alpha", "symbol": "BTCUSDT",
+        "reason": "MISSING_CURRENT_RESULT",
+    }]
+    assert (status["imported_count"], status["rejected_count"], status["expected_count"]) == (1, 1, 2)
+    assert (status["success_count"], status["failure_count"]) == (1, 1)
+    assert status["import_job_state"] == "COMMITTED"
+
+
+@pytest.mark.parametrize("terminal_state", ["FAILED", "CANCELLED"])
+def test_finalist_retest_import_retries_after_terminal_failed_child(
+    tmp_path: Path, terminal_state: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller, registry = _bulk_import_controller(tmp_path, f"retry-{terminal_state.lower()}")
+    starts: list[str] = []
+
+    def start_import(
+        _payload: dict[str, object], *, _internal: bool = False, job_id: str | None = None,
+    ) -> dict[str, object]:
+        assert job_id is not None
+        child_id = job_id
+        starts.append(child_id)
+        child = registry.submit(
+            "strategies.performance.v2.import", {}, child_id,
+            ("performance-v2-db",), job_id=child_id,
+        )
+        registry.transition(child["job_id"], "RUNNING")
+        return {"job_id": child_id}
+
+    monkeypatch.setattr(controller, "strategies_performance_v2_import", start_import)
+    job_id = f"retry-{terminal_state.lower()}"
+    first = controller.strategies_performance_v2_finalist_retest_import({"tester_job_id": job_id})
+    assert first["job_id"] == starts[0]
+    if terminal_state == "CANCELLED":
+        registry.transition(starts[0], "CANCELLING")
+        registry.transition(starts[0], "CANCELLED")
+    else:
+        registry.transition(starts[0], "FAILED")
+    runtime = registry.runtime(job_id)
+    runtime["outcomes_finalized"] = True
+    runtime["failures"] = [{"strategy_id": 7, "strategy_name": "alpha", "reason": "IMPORT_FAILED"}]
+    registry.sync(job_id, {"state": "COMMITTED"}, runtime=runtime)
+
+    second = controller.strategies_performance_v2_finalist_retest_import({"tester_job_id": job_id})
+
+    assert second["job_id"] == starts[1]
+    assert registry.runtime(job_id).get("outcomes_finalized") is False
+    assert len(starts) == 2 and starts[0] != starts[1]
 
 
 def test_selection_http_downloads_xlsx_and_persists_exact_selection_state(tmp_path: Path) -> None:

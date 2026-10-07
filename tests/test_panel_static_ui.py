@@ -875,9 +875,53 @@ def test_finalist_retest_import_reports_its_own_progress() -> None:
     assert "IMPORT & REPLACE unavailable: run the retest from this panel first." in block
     assert "finalistRetestImportJobId = '';" in block
     assert "const recoverFinalistRetestJob = async () =>" in block
-    assert "strategies.performance.v2.finalist-retest' && job.state === 'COMMITTED' && job.inbox_ready === true" in block
+    assert "strategies.performance.v2.finalist-retest' && job.state === 'COMMITTED'" in block
+    assert "finalistRetestImport.disabled = job.state !== 'COMMITTED'" in block
     assert "Recovering latest global finalist retest..." in block
     assert "recoverFinalistRetestJob();" in block
+    assert "finalistRetestImport?.addEventListener('click'" in block
+    assert "remoteRequest('/api/v2/strategies/performance-v2/finalist-retest/import', { tester_job_id: finalistRetestJobId })" in block
+
+
+def test_finalist_retest_pending_import_handoff_stays_disabled_and_polling() -> None:
+    js = _read("app.js")
+    poll = js.split("const pollFinalistRetest = async", 1)[1].split("finalistRetestStart?.addEventListener", 1)[0]
+    handler = js.split("finalistRetestImport?.addEventListener('click'", 1)[1].split(
+        "finalistRetestControlImport?.addEventListener", 1,
+    )[0]
+
+    assert "job.import_pending === true" in poll
+    assert "handoff is pending; do not click again" in poll
+    assert "finalistRetestImport.disabled = job.state !== 'COMMITTED' || importPending" in poll
+    assert "const terminal = !importPending" in poll
+    assert "window.setInterval(pollFinalistRetest, 1000)" in handler
+    assert "await pollFinalistRetest();" in handler
+    assert "finalistRetestImport.disabled = false" not in handler
+
+
+def test_finalist_retest_recovery_shows_member_failures_and_only_click_posts_import() -> None:
+    js = _read("app.js")
+    poll = js.split("const pollFinalistRetest = async", 1)[1].split(
+        "finalistRetestStart?.addEventListener", 1,
+    )[0]
+    recovery = js.split("const recoverFinalistRetestJob = async", 1)[1].split(
+        "finalistRetestExport?.addEventListener", 1,
+    )[0]
+    click = js.split("finalistRetestImport?.addEventListener('click'", 1)[1].split(
+        "finalistRetestControlImport?.addEventListener", 1,
+    )[0]
+
+    assert "handoff is pending; do not click again" in poll
+    assert "job.failures.slice(0, 8)" in poll
+    assert "failure.strategy_id" in poll
+    assert "failure.reason" in poll
+    assert "job.imported_count" in poll and "job.skipped_count" in poll
+    assert "job.rejected_count" in poll and "job.expected_count" in poll
+    assert "['FAILED', 'CANCELLED'].includes(imported.state)" in poll
+    assert "/api/v2/strategies/performance-v2/finalist-retest/import" not in poll
+    assert "/api/v2/strategies/performance-v2/finalist-retest/import" not in recovery
+    assert "await pollFinalistRetest();" in recovery
+    assert "remoteRequest('/api/v2/strategies/performance-v2/finalist-retest/import'" in click
 
 
 def test_finalist_retest_card_is_only_on_strategies_dd5_screen() -> None:
@@ -2608,6 +2652,20 @@ def test_finalist_retest_ui_loads_server_defaults_without_member_ids() -> None:
     assert "strategy_ids" not in block and "result_ids" not in block
     assert "job.outcomes_finalized === true" in block
     assert "finalistRetestTimer = window.setInterval(pollFinalistRetest, 1000)" in block
+
+
+def test_finalist_retest_poll_renders_tester_progress_and_error_reason() -> None:
+    js = _read("app.js")
+    poll = js.split("const pollFinalistRetest = async () => {", 1)[1].split("\n  finalistRetestStart?.addEventListener", 1)[0]
+
+    assert "const progress = job.progress || {};" in poll
+    assert "const current = Number(progress.current || 0);" in poll
+    assert "const total = Number(progress.total || 0);" in poll
+    assert "progress.native_status" in poll
+    assert "progress.publication_error" in poll
+    assert "formatErrorReason(job.error)" in poll
+    assert "job.error?.cleanup_error" in poll
+    assert "Global finalist retest: ${job.phase || job.state || 'RUNNING'} · ${current}/${total}${nativeStatus}${publicationWarning}${error}${cleanupError}" in poll
 
 
 def test_performance_v2_window_analysis_renders_server_normalization_in_one_four_column_table() -> None:
