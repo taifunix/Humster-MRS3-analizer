@@ -851,6 +851,17 @@ def test_finalist_retest_card_exposes_current_control_export_before_retest() -> 
     assert "finalistRetestStatus.textContent" in export_handler
 
 
+def test_finalist_retest_card_exposes_explicit_equity_filter_after_import() -> None:
+    html = _read("index.html")
+    js = _read("app.js")
+    card = html.split('id="performance-v2-finalist-retest-card"', 1)[1].split("</details>", 1)[0]
+
+    assert 'id="performance-v2-finalist-retest-equity-filter-button"' in card
+    assert "Применить эквити фильтр" in card
+    assert "/api/v2/strategies/performance-v2/finalist-retest/equity-filter" in js
+    assert "{ job_id: finalistRetestJobId }" in js
+
+
 def test_finalist_retest_card_can_clear_reports_before_testing() -> None:
     html = _read("index.html")
     js = _read("app.js")
@@ -875,7 +886,7 @@ def test_finalist_retest_import_reports_its_own_progress() -> None:
     assert "IMPORT & REPLACE unavailable: run the retest from this panel first." in block
     assert "finalistRetestImportJobId = '';" in block
     assert "const recoverFinalistRetestJob = async () =>" in block
-    assert "strategies.performance.v2.finalist-retest' && job.state === 'COMMITTED'" in block
+    assert "strategies.performance.v2.finalist-retest' && ['QUEUED', 'RUNNING', 'COMMITTED'].includes(job.state)" in block
     assert "finalistRetestImport.disabled = job.state !== 'COMMITTED'" in block
     assert "Recovering latest global finalist retest..." in block
     assert "recoverFinalistRetestJob();" in block
@@ -893,10 +904,21 @@ def test_finalist_retest_pending_import_handoff_stays_disabled_and_polling() -> 
     assert "job.import_pending === true" in poll
     assert "handoff is pending; do not click again" in poll
     assert "finalistRetestImport.disabled = job.state !== 'COMMITTED' || importPending" in poll
-    assert "const terminal = !importPending" in poll
+    assert "const terminal = !equityActive && !importPending" in poll
     assert "window.setInterval(pollFinalistRetest, 1000)" in handler
     assert "await pollFinalistRetest();" in handler
     assert "finalistRetestImport.disabled = false" not in handler
+
+
+def test_finalist_retest_polling_waits_for_active_equity_filter_child() -> None:
+    js = _read("app.js")
+    poll = js.split("const pollFinalistRetest = async", 1)[1].split(
+        "finalistRetestStart?.addEventListener", 1,
+    )[0]
+
+    assert "const equityState = job.equity_filter?.state" in poll
+    assert "const equityActive = equityState && !['IDLE', 'COMMITTED', 'FAILED', 'CANCELLED'].includes(equityState)" in poll
+    assert "!equityActive && !importPending" in poll
 
 
 def test_finalist_retest_recovery_shows_member_failures_and_only_click_posts_import() -> None:

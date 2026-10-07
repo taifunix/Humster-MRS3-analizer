@@ -34,6 +34,8 @@ _PANEL_WEB = Path(__file__).with_name("panel_web")
 _PERFORMANCE_V2_MAINTENANCE_PREVIEW_TTL_SECONDS = 15 * 60
 _PERFORMANCE_V2_MAINTENANCE_RECOVERY_TTL_SECONDS = 15 * 60
 _PERFORMANCE_V2_MAINTENANCE_MAX_PREVIEWS = 32
+_BULK_RETEST_EQUITY_FILTER_LEASE_SECONDS = 20 * 60
+_BULK_RETEST_EQUITY_FILTER_MAX_ATTEMPTS = 8
 _LOGGER = logging.getLogger(__name__)
 _RETEST_INBOX_PATH_UNAVAILABLE = "committed RETEST inbox path is unavailable"
 _RETEST_INBOX_MANIFEST_UNAVAILABLE = "committed RETEST inbox manifest is unavailable"
@@ -259,6 +261,8 @@ from .performance_v2_selection import (
     EquitySchemaUpgradeRequiredError,
     PerformanceV2SelectionError,
     SelectionRequest,
+    SelectionStage,
+    SelectionConfig,
     load_selection_candidates,
     load_selection_config,
     parse_selection_request,
@@ -269,6 +273,10 @@ from .performance_v2_selection import (
     selection_equity_facts_token,
     write_selection_workbook,
     retest_cohort_request,
+)
+from .performance_v2_equity_regime import (
+    ALGORITHM_VERSION as _EQUITY_REGIME_ALGORITHM_VERSION,
+    equity_regime_policy_snapshot,
 )
 from .performance_v2_selection_review import (
     SelectionReviewError,
@@ -1359,6 +1367,7 @@ class PanelController:
         self._selection_candidate_cache_lock = threading.RLock()
         self._performance_v2_writer_lock = threading.RLock()
         self._bulk_retest_import_lock = threading.RLock()
+        self._bulk_retest_equity_filter_lock = threading.RLock()
         self._performance_v2_maintenance_state_lock = threading.RLock()
         self._performance_v2_maintenance_active_job: str | None = None
         self._performance_v2_maintenance_previews: dict[str, tuple[float, dict[str, object]]] = {}
@@ -5289,6 +5298,14 @@ class PanelController:
         except Exception as error:
             raise FinalistRetestError("LISTING_DATE_INVALID", "listing dates are invalid") from error
         config = self._performance_v2_config()
+        try:
+            selection_config = load_selection_config(self.default_config.with_name("config.performance.json"))
+        except PerformanceV2SelectionError:
+            # A legacy/test installation may not have the optional panel config;
+            # freeze the same library defaults used by the selection pipeline.
+            selection_config = SelectionConfig()
+        regime_policy = equity_regime_policy_snapshot()
+        cache_workers = max(1, min(int(getattr(config, "workers", 16)), 16))
         target = performance_v2_database_path(config)
         if not target.is_file():
             raise FinalistRetestError("PERFORMANCE_V2_NOT_FOUND", "Performance v2 database is unavailable")
@@ -5343,6 +5360,16 @@ class PanelController:
             "manifest_path": str(batch.manifest_path), "cohort_members": _json_value([dict(member) for member in batch.cohort.members]),
             "exclusions": [item.as_dict() for item in batch.cohort.exclusions],
             "successful_replacements": [], "failures": [item.as_dict() for item in batch.cohort.exclusions],
+            "equity_filter_snapshot": {
+                "schema_version": 1,
+                "request": {"stages": [{"id": "filter_equity_regime", "enabled": True, "scope": "pair_side"}]},
+                "selection_config": _json_value(asdict(selection_config)),
+                "selection_config_sha256": canonical_digest(asdict(selection_config)),
+                "regime_policy": _json_value(regime_policy),
+                "regime_policy_sha256": canonical_digest(regime_policy),
+                "algorithm_version": _EQUITY_REGIME_ALGORITHM_VERSION,
+                "cache_workers": cache_workers,
+            },
         }
         request = {"scope": batch.cohort.scope, "test_start": start, "test_end": end, "retest": True, "clear_reports": clear_reports, "initial_balance": initial_balance}
         return self._start_tracked_panel_job(
@@ -5436,7 +5463,7 @@ class PanelController:
             int(count) for count in (imported_count, skipped_count, rejected_count)
             if type(count) is int and count >= 0
         ) if has_import_counts else cohort_count
-        return {
+        document = {
             **tracked,
             "scope": runtime.get("scope"), "cohort_sha256": runtime.get("cohort_sha256"),
             "cohort_count": cohort_count,
@@ -5457,6 +5484,101 @@ class PanelController:
             "import_pending": import_pending,
             "error": bulk_error or tracked.get("error"),
         }
+        equity_filter = self._equity_filter_child_status(job_id, runtime)
+        document["equity_filter"] = equity_filter
+        document["equity_filter_job_id"] = equity_filter.get("job_id") if equity_filter else None
+        document["equity_filter_state"] = equity_filter.get("state") if equity_filter else None
+        document["equity_filter_phase"] = equity_filter.get("phase") if equity_filter else None
+        document["equity_filter_progress"] = equity_filter.get("progress") if equity_filter else None
+        document["equity_filter_result"] = equity_filter.get("result") if equity_filter else None
+        document["equity_filter_error"] = equity_filter.get("error") if equity_filter else None
+        return document
+
+    def _equity_filter_child_status(
+        self, parent_job_id: str, runtime: Mapping[str, object] | None = None,
+    ) -> dict[str, object]:
+        current = runtime if isinstance(runtime, Mapping) else self._panel_jobs.runtime(parent_job_id)
+        raw_id = current.get("equity_filter_job_id")
+        attempt = current.get("equity_filter_attempt")
+        attempt = int(attempt) if isinstance(attempt, int) and not isinstance(attempt, bool) and attempt > 0 else 0
+        application_key = current.get("equity_filter_application_key")
+        if not isinstance(application_key, str) or not application_key:
+            application_key = None
+            if (
+                current.get("outcomes_finalized") is True
+                and isinstance(current.get("successful_replacements"), list)
+                and current.get("successful_replacements")
+                and isinstance(current.get("equity_filter_source_revision_digest"), str)
+                and current.get("equity_filter_source_revision_digest")
+            ):
+                seed = self._equity_filter_identity_seed(current)
+                application_key = sha256(f"bulk-retest-equity-filter-v1:{parent_job_id}:{seed}".encode()).hexdigest()
+        eligible = True
+        reason: str | None = None
+        if current.get("equity_filter_published") is True:
+            eligible, reason = False, "ACTION_COMMITTED"
+        elif current.get("outcomes_finalized") is not True:
+            eligible, reason = False, "IMPORT_NOT_FINALIZED"
+        elif not isinstance(current.get("successful_replacements"), list) or not current.get("successful_replacements"):
+            eligible, reason = False, "NO_SUCCESSFUL_MEMBERS"
+        elif not isinstance(current.get("equity_filter_snapshot"), Mapping):
+            eligible, reason = False, "CONFIG_MISSING"
+        try:
+            parent = self._panel_jobs.get(parent_job_id)
+            if parent.get("state") != "COMMITTED":
+                eligible, reason = False, "RETEST_COHORT_JOB_NOT_COMMITTED"
+        except PanelJobError:
+            eligible, reason = False, "RETEST_COHORT_JOB_NOT_FOUND"
+        default = {
+            "job_id": raw_id if isinstance(raw_id, str) and raw_id else None,
+            "application_key": application_key,
+            "attempt": attempt,
+            "eligible": eligible,
+            "ineligible_reason": reason,
+            "reason": reason,
+            "state": "IDLE",
+            "phase": None,
+            "progress": {"total_pairs": 0, "completed_pairs": 0, "total_strategies": len(current.get("successful_replacements", [])) if isinstance(current.get("successful_replacements"), list) else 0, "processed_strategies": 0, "ready_cache_count": 0, "warmed_strategy_count": 0, "current_pair": None},
+            "result": None,
+            "error": None,
+        }
+        if not isinstance(raw_id, str) or not raw_id:
+            return default
+        try:
+            child = self._panel_jobs.get(raw_id)
+        except PanelJobError:
+            default.update({"state": "FAILED", "phase": "FAILED", "error": {"code": "RETEST_EQUITY_FILTER_FAILED", "message": "equity filter child job is unavailable"}, "eligible": not bool(current.get("equity_filter_published")), "ineligible_reason": None})
+            return default
+        state = child.get("state") if isinstance(child.get("state"), str) else "FAILED"
+        raw_progress = child.get("progress") if isinstance(child.get("progress"), Mapping) else {}
+        if {"total_pairs", "completed_pairs", "total_strategies", "processed_strategies"}.issubset(raw_progress):
+            progress = dict(raw_progress)
+        else:
+            progress = dict(default["progress"])
+            unit = raw_progress.get("unit")
+            current_units = int(raw_progress.get("current") or 0)
+            total = int(raw_progress.get("total") or 0)
+            if unit == "strategies":
+                progress.update(total_strategies=total, processed_strategies=current_units)
+            else:
+                progress.update(total_pairs=total, completed_pairs=current_units)
+            progress.update(current=current_units, total=total, unit=unit or "pairs")
+            if isinstance(raw_progress.get("current_pair"), str):
+                progress["current_pair"] = raw_progress["current_pair"]
+        default.update({
+            "state": state,
+            "phase": child.get("phase") if isinstance(child.get("phase"), str) else state,
+            "progress": progress,
+            "result": child.get("result") if isinstance(child.get("result"), Mapping) else None,
+            "error": child.get("error") if isinstance(child.get("error"), Mapping) else None,
+        })
+        if state in {"QUEUED", "RUNNING", "CANCELLING"}:
+            default.update({"eligible": False, "reason": "ACTION_RUNNING", "ineligible_reason": "ACTION_RUNNING"})
+        elif state == "COMMITTED":
+            default.update({"eligible": False, "reason": "ACTION_COMMITTED", "ineligible_reason": "ACTION_COMMITTED"})
+        elif state in {"FAILED", "CANCELLED"} and current.get("equity_filter_published") is not True:
+            default.update({"eligible": True, "reason": None, "ineligible_reason": None})
+        return default
 
     def _refresh_bulk_retest_outcomes(self, job_id: str) -> None:
         """Persist redacted per-member outcomes after the native import worker ends."""
@@ -5625,6 +5747,586 @@ class PanelController:
             raise
 
     strategies_performance_v2_bulk_retest_import = strategies_performance_v2_finalist_retest_import
+
+    @staticmethod
+    def _equity_filter_positive_int(value: object, field: str) -> int:
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise FinalistRetestError("RETEST_COHORT_INVALID", f"{field} must be a positive integer")
+        return value
+
+    @staticmethod
+    def _equity_filter_snapshot_config(raw: Mapping[str, object]) -> object:
+        if raw.get("schema_version") != 1:
+            raise FinalistRetestError("RETEST_EQUITY_CONFIG_UNSUPPORTED", "frozen equity configuration schema is unsupported")
+        expected_request = {"stages": [{"id": "filter_equity_regime", "enabled": True, "scope": "pair_side"}]}
+        if raw.get("request") != expected_request:
+            raise FinalistRetestError("RETEST_EQUITY_CONFIG_INVALID", "frozen equity request is invalid")
+        if raw.get("algorithm_version") != _EQUITY_REGIME_ALGORITHM_VERSION:
+            raise FinalistRetestError("RETEST_EQUITY_CONFIG_UNSUPPORTED", "frozen equity algorithm is unsupported")
+        policy = raw.get("regime_policy")
+        if not isinstance(policy, Mapping) or raw.get("regime_policy_sha256") != canonical_digest(policy):
+            raise FinalistRetestError("RETEST_EQUITY_CONFIG_INVALID", "frozen equity policy digest is invalid")
+        if dict(policy) != equity_regime_policy_snapshot():
+            raise FinalistRetestError("RETEST_EQUITY_CONFIG_UNSUPPORTED", "frozen equity policy is unsupported")
+        snapshot = raw.get("selection_config")
+        if not isinstance(snapshot, Mapping):
+            raise FinalistRetestError("RETEST_EQUITY_CONFIG_INVALID", "bulk retest has no frozen equity configuration")
+        if raw.get("selection_config_sha256") != canonical_digest(snapshot):
+            raise FinalistRetestError("RETEST_EQUITY_CONFIG_INVALID", "frozen selection configuration digest is invalid")
+        defaults = SelectionConfig()
+        values: dict[str, object] = {}
+        for name, default in asdict(defaults).items():
+            value = snapshot.get(name, default)
+            if isinstance(default, Decimal):
+                try:
+                    value = Decimal(str(value))
+                except (InvalidOperation, TypeError, ValueError) as error:
+                    raise FinalistRetestError("EQUITY_SCHEMA_UPGRADE_REQUIRED", "frozen equity configuration is invalid") from error
+            elif isinstance(default, bool):
+                if type(value) is not bool:
+                    raise FinalistRetestError("EQUITY_SCHEMA_UPGRADE_REQUIRED", "frozen equity configuration is invalid")
+            elif isinstance(default, int):
+                if isinstance(value, bool) or not isinstance(value, int):
+                    raise FinalistRetestError("EQUITY_SCHEMA_UPGRADE_REQUIRED", "frozen equity configuration is invalid")
+            values[name] = value
+        try:
+            return SelectionConfig(**values)
+        except (TypeError, ValueError) as error:
+            raise FinalistRetestError("RETEST_EQUITY_CONFIG_INVALID", "frozen equity configuration is invalid") from error
+
+    def _equity_filter_validate_cohort(
+        self, bulk_job_id: str, runtime: Mapping[str, object], target: Path,
+    ) -> tuple[dict[tuple[str, str], dict[int, dict[str, object]]], dict[int, tuple[int, str]], str]:
+        if runtime.get("outcomes_finalized") is not True:
+            raise FinalistRetestError("RETEST_IMPORT_NOT_FINALIZED", "bulk RETEST import outcomes are not finalized")
+        raw_members = runtime.get("cohort_members")
+        raw_successes = runtime.get("successful_replacements")
+        if not isinstance(raw_members, list) or not isinstance(raw_successes, list):
+            raise FinalistRetestError("RETEST_COHORT_INVALID", "bulk RETEST cohort provenance is invalid")
+        members: dict[int, dict[str, object]] = {}
+        for raw in raw_members:
+            if not isinstance(raw, Mapping):
+                raise FinalistRetestError("RETEST_COHORT_INVALID", "cohort member is invalid")
+            strategy_id = self._equity_filter_positive_int(raw.get("strategy_id"), "strategy_id")
+            result_id = self._equity_filter_positive_int(raw.get("result_id"), "result_id")
+            symbol, side = raw.get("symbol"), raw.get("side")
+            if not isinstance(symbol, str) or not symbol or side not in {"LONG", "SHORT"}:
+                raise FinalistRetestError("RETEST_COHORT_INVALID", "cohort member pair is invalid")
+            if strategy_id in members:
+                raise FinalistRetestError("RETEST_COHORT_INVALID", "cohort contains duplicate strategies")
+            members[strategy_id] = {**dict(raw), "strategy_id": strategy_id, "result_id": result_id, "symbol": symbol, "side": side}
+        if not members:
+            raise FinalistRetestError("RETEST_COHORT_NO_SUCCESSFUL_MEMBERS", "bulk RETEST cohort is empty")
+        successes: dict[int, dict[str, object]] = {}
+        for raw in raw_successes:
+            if not isinstance(raw, Mapping):
+                raise FinalistRetestError("RETEST_COHORT_INVALID", "successful replacement is invalid")
+            strategy_id = self._equity_filter_positive_int(raw.get("strategy_id"), "strategy_id")
+            new_result_id = self._equity_filter_positive_int(raw.get("new_result_id", raw.get("result_id")), "new_result_id")
+            member = members.get(strategy_id)
+            if member is None:
+                raise FinalistRetestError("RETEST_COHORT_INVALID", "successful replacement is outside the frozen cohort")
+            if strategy_id in successes:
+                raise FinalistRetestError("RETEST_COHORT_INVALID", "successful replacements contain duplicate strategies")
+            old_result_id = raw.get("old_result_id")
+            if old_result_id is not None and (
+                isinstance(old_result_id, bool) or not isinstance(old_result_id, int) or old_result_id != member["result_id"]
+            ):
+                raise FinalistRetestError("RETEST_COHORT_STALE_RESULTS", "successful replacement has a stale old result")
+            successes[strategy_id] = {**dict(raw), "strategy_id": strategy_id, "new_result_id": new_result_id}
+        if not successes:
+            raise FinalistRetestError("RETEST_COHORT_NO_SUCCESSFUL_MEMBERS", "bulk RETEST has no successful replacements")
+        grouped: dict[tuple[str, str], dict[int, dict[str, object]]] = {}
+        with self._performance_v2_writer_lock, duckdb.connect(str(target), read_only=True) as connection:
+            require_performance_v2(connection)
+            ids = sorted(successes)
+            current_rows = connection.execute(
+                "select strategy_id, current_result_id from strategies where strategy_id in (select unnest(?::bigint[])) and lifecycle_status = 'ACTIVE'",
+                [ids],
+            ).fetchall()
+            current = {int(row[0]): (None if row[1] is None else int(row[1])) for row in current_rows}
+            if set(current) != set(ids):
+                raise FinalistRetestError("RETEST_COHORT_STALE_RESULTS", "successful strategy is missing or inactive")
+            result_rows = connection.execute(
+                "select result_id, strategy_id from strategy_results where result_id in (select unnest(?::bigint[]))",
+                [[int(item["new_result_id"]) for item in successes.values()]],
+            ).fetchall()
+            result_by_id = {int(row[0]): int(row[1]) for row in result_rows}
+            for strategy_id, outcome in successes.items():
+                result_id = int(outcome["new_result_id"])
+                if result_by_id.get(result_id) != strategy_id or current[strategy_id] != result_id:
+                    raise FinalistRetestError("RETEST_COHORT_STALE_RESULTS", "current strategy result does not match the imported replacement")
+                member = members[strategy_id]
+                grouped.setdefault((str(member["symbol"]), str(member["side"])), {})[strategy_id] = member
+            try:
+                source_revisions = _current_equity_revisions(connection, ids)
+            except (SelectionReviewError, EquitySourceChangedError, duckdb.Error) as error:
+                raise FinalistRetestError("EQUITY_SOURCE_CHANGED", "equity source revision is unreadable") from error
+            if set(source_revisions) != set(ids):
+                raise FinalistRetestError("EQUITY_SOURCE_CHANGED", "equity source revision is unavailable")
+        identity = canonical_digest({
+            "bulk_job_id": bulk_job_id,
+            "scope": runtime.get("scope"),
+            "cohort_sha256": runtime.get("cohort_sha256"),
+            "pairs": [[strategy_id, int(successes[strategy_id]["new_result_id"])] for strategy_id in sorted(successes)],
+            "source_revisions": {str(strategy_id): list(source_revisions[strategy_id]) for strategy_id in sorted(source_revisions)},
+        })
+        return grouped, source_revisions, identity
+
+    def _equity_filter_assert_owner(
+        self, bulk_job_id: str, child_id: str, *, warm_deadline: float | None = None,
+    ) -> None:
+        with self._bulk_retest_equity_filter_lock:
+            runtime = self._panel_jobs.runtime(bulk_job_id)
+            if runtime.get("equity_filter_lock_holder") != child_id:
+                raise FinalistRetestError("RETEST_EQUITY_ACTION_SUPERSEDED", "equity filter action was superseded")
+            raw_expiry = runtime.get("equity_filter_lock_expires_at")
+            try:
+                expired = not isinstance(raw_expiry, str) or datetime.fromisoformat(raw_expiry).timestamp() <= datetime.now(timezone.utc).timestamp()
+            except ValueError:
+                expired = True
+            if expired:
+                raise FinalistRetestError("RETEST_EQUITY_ACTION_SUPERSEDED", "equity filter action lease expired")
+            if warm_deadline is not None and perf_counter() > warm_deadline:
+                raise FinalistRetestError("RETEST_EQUITY_CACHE_WARM_TIMEOUT", "equity cache warming exceeded its deadline")
+            heartbeat = datetime.now(timezone.utc)
+            runtime["equity_filter_heartbeat_at"] = heartbeat.isoformat()
+            runtime["equity_filter_lock_expires_at"] = (heartbeat + timedelta(seconds=_BULK_RETEST_EQUITY_FILTER_LEASE_SECONDS)).isoformat()
+            parent = self._panel_jobs.get(bulk_job_id)
+            if runtime.get("equity_filter_lock_holder") != child_id:
+                raise FinalistRetestError("RETEST_EQUITY_ACTION_SUPERSEDED", "equity filter action was superseded")
+            self._panel_jobs.sync(
+                bulk_job_id,
+                {"state": parent.get("state", "COMMITTED"), "phase": parent.get("phase", "COMMITTED")},
+                runtime=runtime,
+            )
+
+    def _run_bulk_retest_equity_filter(self, child_id: str, bulk_job_id: str) -> dict[str, object]:
+        parent = self._panel_jobs.get(bulk_job_id)
+        runtime = self._panel_jobs.runtime(bulk_job_id)
+        if runtime.get("scope") not in {"FINALIST", "FINALIST_RESERVE"}:
+            raise FinalistRetestError("RETEST_COHORT_INVALID", "bulk RETEST scope is not a finalist cohort")
+        snapshot = runtime.get("equity_filter_snapshot")
+        if not isinstance(snapshot, Mapping):
+            raise FinalistRetestError("RETEST_EQUITY_CONFIG_MISSING", "bulk RETEST has no frozen equity snapshot")
+        selection_config = self._equity_filter_snapshot_config(snapshot)
+        workers = snapshot.get("cache_workers")
+        if isinstance(workers, bool) or not isinstance(workers, int) or not 1 <= workers <= 16:
+            raise FinalistRetestError("RETEST_EQUITY_CONFIG_INVALID", "frozen cache worker limit is invalid")
+        target = performance_v2_database_path(self._performance_v2_config())
+        if not target.is_file():
+            raise FinalistRetestError("PERFORMANCE_V2_NOT_FOUND", "Performance v2 database is unavailable")
+        self._equity_filter_assert_owner(bulk_job_id, child_id)
+        self._panel_jobs.sync(child_id, {"state": "RUNNING", "phase": "VALIDATING_COHORT", "progress": {"current": 0, "total": 0, "unit": "pairs"}})
+        grouped, source_revisions, identity = self._equity_filter_validate_cohort(bulk_job_id, runtime, target)
+        current_source_digest = canonical_digest({str(strategy_id): list(source_revisions[strategy_id]) for strategy_id in sorted(source_revisions)})
+        if runtime.get("equity_filter_source_revision_digest") != current_source_digest:
+            raise FinalistRetestError("EQUITY_SOURCE_CHANGED", "equity source revision changed after action was queued")
+        expected_application_key = sha256(
+            f"bulk-retest-equity-filter-v1:{bulk_job_id}:{self._equity_filter_identity_seed(runtime)}".encode()
+        ).hexdigest()
+        if runtime.get("equity_filter_application_key") != expected_application_key:
+            raise FinalistRetestError("RETEST_EQUITY_CONFIG_INVALID", "equity filter application identity is invalid")
+        pair_total = len(grouped)
+        strategy_total = sum(len(group) for group in grouped.values())
+        request_stage = SelectionStage("filter_equity_regime", True, "pair_side")
+        successful_by_id: dict[int, Mapping[str, object]] = {}
+        for raw_item in runtime.get("successful_replacements", []):
+            if not isinstance(raw_item, Mapping):
+                raise FinalistRetestError("RETEST_COHORT_INVALID", "successful replacement is invalid")
+            raw_strategy_id = raw_item.get("strategy_id")
+            if isinstance(raw_strategy_id, bool) or not isinstance(raw_strategy_id, int) or raw_strategy_id <= 0:
+                raise FinalistRetestError("RETEST_COHORT_INVALID", "successful replacement strategy id is invalid")
+            if raw_strategy_id in successful_by_id:
+                raise FinalistRetestError("RETEST_COHORT_INVALID", "successful replacements contain duplicate strategies")
+            successful_by_id[raw_strategy_id] = raw_item
+
+        grouped_strategy_ids = {strategy_id for members in grouped.values() for strategy_id in members}
+        replacement_result_ids: dict[int, int] = {}
+        for strategy_id in sorted(grouped_strategy_ids):
+            item = successful_by_id.get(strategy_id)
+            if item is None:
+                raise FinalistRetestError("RETEST_COHORT_STALE_RESULTS", "successful replacement is missing from the frozen cohort")
+            raw_result_id = item.get("new_result_id", item.get("result_id"))
+            if isinstance(raw_result_id, bool) or not isinstance(raw_result_id, int) or raw_result_id <= 0:
+                raise FinalistRetestError("RETEST_COHORT_STALE_RESULTS", "successful replacement result id is invalid")
+            replacement_result_ids[strategy_id] = raw_result_id
+        requests: dict[tuple[str, str], SelectionRequest] = {
+            key: retest_cohort_request(
+                SelectionRequest(key[0], key[1], (request_stage,)), bulk_job_id,
+                {strategy_id: replacement_result_ids[strategy_id] for strategy_id in members},
+            )
+            for key, members in grouped.items()
+        }
+        self._panel_jobs.sync(child_id, {"state": "RUNNING", "phase": "SCANNING_CACHE", "progress": {"current": 0, "total": pair_total, "unit": "pairs"}})
+        cache_info: dict[tuple[str, str], tuple[dict[str, object], tuple[int, ...]]] = {}
+        ready_cache_count = 0
+        warmed = 0
+        for index, key in enumerate(sorted(requests), start=1):
+            self._equity_filter_assert_owner(bulk_job_id, child_id)
+            request = requests[key]
+            with self._performance_v2_writer_lock, duckdb.connect(str(target), read_only=True) as connection:
+                status = selection_cache_status(connection, request, selection_config, include_readiness_breakdown=True)
+                missing = selection_cache_missing_strategy_ids(connection, request, selection_config, include_equity_regime=True)
+            cache_info[key] = (status, missing)
+            ready_cache_count += max(0, len(grouped[key]) - len(missing))
+            self._panel_jobs.sync(child_id, {"state": "RUNNING", "phase": "SCANNING_CACHE", "progress": {"current": index, "total": pair_total, "unit": "pairs", "current_pair": f"{key[0]}/{key[1]}"}})
+        self._panel_jobs.sync(child_id, {"state": "RUNNING", "phase": "WARMING_CACHE", "progress": {"current": 0, "total": strategy_total, "unit": "strategies"}})
+        warmed_done = 0
+        warm_deadline = perf_counter() + 15 * 60
+        for key in sorted(requests):
+            missing = cache_info[key][1]
+            if not missing:
+                continue
+            try:
+                self._equity_filter_assert_owner(bulk_job_id, child_id, warm_deadline=warm_deadline)
+                def on_cache_batch(count: int, *, base: int = warmed_done, pair: tuple[str, str] = key) -> None:
+                    self._equity_filter_assert_owner(bulk_job_id, child_id, warm_deadline=warm_deadline)
+                    self._panel_jobs.sync(
+                        child_id,
+                        {"state": "RUNNING", "phase": "WARMING_CACHE", "progress": {"current": min(strategy_total, base + count), "total": strategy_total, "unit": "strategies", "current_pair": f"{pair[0]}/{pair[1]}"}},
+                    )
+                with self._performance_v2_writer_guard(target):
+                    prepare_selection_window_cache(
+                        target, requests[key], selection_config, workers, missing,
+                        include_equity_regime=True,
+                        deadline_monotonic=warm_deadline,
+                        on_batch_complete=on_cache_batch,
+                    )
+                warmed += len(missing)
+                warmed_done += len(missing)
+                self._equity_filter_assert_owner(bulk_job_id, child_id, warm_deadline=warm_deadline)
+            except TimeoutError as error:
+                raise FinalistRetestError("RETEST_EQUITY_CACHE_WARM_TIMEOUT", "equity cache warming exceeded its deadline") from error
+            except EquitySourceChangedError as error:
+                raise FinalistRetestError("EQUITY_SOURCE_CHANGED", str(error)) from error
+            except (EquitySchemaUpgradeRequiredError, EquityCacheSchemaInvalidError):
+                raise
+            except (OSError, duckdb.Error) as error:
+                raise FinalistRetestError("RETEST_EQUITY_CACHE_WARM_FAILED", "equity cache warming failed") from error
+        run_specs: list[dict[str, object]] = []
+        counts = {"PASS": 0, "DROP": 0, "RESERVED": 0, "NOT_EVALUATED": 0}
+        self._panel_jobs.sync(child_id, {"state": "RUNNING", "phase": "APPLYING_FILTER", "progress": {"current": 0, "total": pair_total, "unit": "pairs"}})
+        for index, key in enumerate(sorted(requests), start=1):
+            self._equity_filter_assert_owner(bulk_job_id, child_id)
+            request = requests[key]
+            with self._performance_v2_writer_lock, duckdb.connect(str(target), read_only=True) as connection:
+                status = selection_cache_status(connection, request, selection_config, include_readiness_breakdown=True)
+                if not status.get("ready"):
+                    raise FinalistRetestError("EQUITY_CACHE_INCOMPLETE", "equity cache remains incomplete after warming")
+                result = run_selection(
+                    apply_prior_rejected(connection, load_selection_candidates(connection, request, selection_config, cache_only=True)),
+                    request, selection_config,
+                )
+                result.attrs["source_revisions"] = _current_equity_revisions(connection, [int(row["strategy_id"]) for row in result.to_dict(orient="records")])
+                rows: list[dict[str, object]] = []
+                for raw in result.to_dict(orient="records"):
+                    strategy_id = int(raw["strategy_id"])
+                    member = grouped[key][strategy_id]
+                    raw.update({
+                        "symbol": key[0], "side": key[1], "user_status": member.get("effective_status"),
+                        "user_rank": None, "retest": None, "comment": None,
+                        "user_analog_of_strategy_id": None,
+                        "auto_status": raw.get("auto_status"), "auto_rank": _control_score(raw.get("final_rank")),
+                        "auto_reason": raw.get("elimination_reason"), "score": _control_score(raw.get("final_score")),
+                        "final_score": _control_score(raw.get("final_score")), "finalist": bool(raw.get("finalist")),
+                        "effective_start": member.get("effective_start"), "effective_end": member.get("effective_end"),
+                    })
+                    decision = str(raw.get("equity_regime_decision") or "NOT_EVALUATED")
+                    state = str(raw.get("equity_regime_state") or "")
+                    if decision == "DROP": counts["DROP"] += 1
+                    elif state == "STALLED": counts["RESERVED"] += 1
+                    elif decision == "NOT_EVALUATED": counts["NOT_EVALUATED"] += 1
+                    elif decision == "PASS": counts["PASS"] += 1
+                    else:
+                        raise FinalistRetestError("RETEST_EQUITY_FILTER_FAILED", "equity filter returned an unknown disposition")
+                    rows.append(raw)
+                if len(rows) != len(grouped[key]):
+                    raise FinalistRetestError("RETEST_EQUITY_GROUP_EMPTY", "equity filter returned an incomplete pair group")
+                run_specs.append({"symbol": key[0], "side": key[1], "rows": rows, "result": result, "request": request, "run_id": str(uuid.uuid4())})
+            self._panel_jobs.sync(child_id, {"state": "RUNNING", "phase": "APPLYING_FILTER", "progress": {"current": index, "total": pair_total, "unit": "pairs", "current_pair": f"{key[0]}/{key[1]}"}})
+        candidates = [row for spec in run_specs for row in spec["rows"]]
+        if not run_specs or not candidates:
+            raise FinalistRetestError("RETEST_EQUITY_GROUP_EMPTY", "equity filter produced no publishable cohort members")
+        if sum(counts.values()) != strategy_total or ready_cache_count + warmed != strategy_total:
+            raise FinalistRetestError("RETEST_EQUITY_FILTER_FAILED", "equity filter count invariant failed")
+        group_run_ids = {f"{spec['symbol']}|{spec['side']}": spec["run_id"] for spec in run_specs}
+        exact_rowsets = {
+            f"{spec['symbol']}|{spec['side']}": [
+                {name: row.get(source) for name, source in {
+                    "Pair": "symbol", "Direction": "side", "Strategy ID": "strategy_id", "Result ID": "result_id",
+                    "Auto Status": "auto_status", "Auto Rank": "auto_rank", "Auto Analog Of ID": "auto_analog_of_strategy_id",
+                    "Auto Reason": "auto_reason", "Score": "score",
+                }.items()}
+                for row in sorted(spec["rows"], key=lambda item: int(item["strategy_id"]))
+            ] for spec in run_specs
+        }
+        groups = [{
+            "symbol": spec["symbol"], "side": spec["side"], "frozen_count": len(spec["rows"]),
+            "success_count": len(spec["rows"]), "failure_count": 0,
+            "auto_status_count": len({str(row.get("auto_status") or "") for row in spec["rows"]}),
+        } for spec in run_specs]
+        immutable = [row for key in sorted(exact_rowsets) for row in exact_rowsets[key]]
+        metadata: dict[str, object] = {
+            "database_instance_id": None, "publication_kind": "BULK_RETEST_EQUITY_FILTER", "publication_version": 1,
+            "application_key": str(runtime.get("equity_filter_application_key") or ""),
+            "equity_filter_job_id": child_id, "identity_digest": identity,
+            "ranking_scope": "RETEST_COHORT", "bulk_retest_job_id": bulk_job_id,
+            "scope": runtime.get("scope"), "cohort_sha256": runtime.get("cohort_sha256"),
+            "manifest_sha256": runtime.get("manifest_sha256"), "config_sha256": runtime.get("config_sha256"),
+            "selection_config_sha256": snapshot.get("selection_config_sha256"),
+            "group_run_ids_json": group_run_ids, "exact_rowsets_json": exact_rowsets,
+            "exact_rowsets_sha256": canonical_digest(exact_rowsets), "immutable_content_sha256": canonical_digest(immutable),
+            "groups_sha256": canonical_digest(groups), "failures_sha256": canonical_digest([]),
+            "source_revisions_sha256": canonical_digest(source_revisions),
+        }
+        if not metadata["application_key"]:
+            raise FinalistRetestError("RETEST_EQUITY_CONFIG_INVALID", "equity filter application identity is missing")
+        with self._performance_v2_writer_lock, duckdb.connect(str(target), read_only=True) as connection:
+            metadata["database_instance_id"] = connection.execute("select value from schema_info where key='database_instance_id'").fetchone()[0]
+        self._panel_jobs.sync(child_id, {"state": "RUNNING", "phase": "PERSISTING", "progress": {"current": 0, "total": pair_total, "unit": "pairs"}})
+        self._equity_filter_assert_owner(bulk_job_id, child_id)
+        candidate_workbook = self._finalist_control_candidate_workbook(candidates, SelectionRequest(str(candidates[0]["symbol"]), str(candidates[0]["side"]), (request_stage,)))
+        workbook = combined_control_workbook_bytes(candidates, groups, (), metadata, candidate_workbook=candidate_workbook)
+        snapshots = [{
+            "request": spec["request"], "config": selection_config, "result": spec["result"],
+            "metadata": {"selection_run_id": spec["run_id"], "database_instance_id": metadata["database_instance_id"], "selection_contract_version": "performance-v2-selection-review-v1"},
+            "request_json_extra": {
+                "publication_kind": "BULK_RETEST_EQUITY_FILTER", "publication_version": 1, "application_key": metadata["application_key"],
+                "bulk_retest_job_id": bulk_job_id, "equity_filter_job_id": child_id, "identity_digest": identity,
+                "ranking_scope": "RETEST_COHORT", "cohort_sha256": runtime.get("cohort_sha256"),
+                "manifest_sha256": runtime.get("manifest_sha256"), "config_sha256": runtime.get("config_sha256"),
+                "selection_config_sha256": snapshot.get("selection_config_sha256"), "equity_filter_snapshot_sha256": canonical_digest(snapshot),
+            },
+        } for spec in run_specs]
+        replayed = False
+        try:
+            with self._performance_v2_writer_guard(target), duckdb.connect(str(target)) as connection:
+                self._equity_filter_assert_owner(bulk_job_id, child_id)
+                try:
+                    latest_revisions = _current_equity_revisions(connection, sorted(grouped_strategy_ids))
+                except (SelectionReviewError, EquitySourceChangedError, duckdb.Error) as error:
+                    raise FinalistRetestError("EQUITY_SOURCE_CHANGED", "equity source revision is unreadable before publication") from error
+                latest_source_digest = canonical_digest({
+                    str(strategy_id): list(latest_revisions[strategy_id]) for strategy_id in sorted(latest_revisions)
+                })
+                if set(latest_revisions) != grouped_strategy_ids or latest_source_digest != runtime.get("equity_filter_source_revision_digest"):
+                    raise FinalistRetestError("EQUITY_SOURCE_CHANGED", "equity source revision changed before publication")
+                existing_rows = connection.execute(
+                    """select selection_run_id, symbol, side
+                         from selection_runs
+                        where json_extract_string(request_json, '$.publication_kind') = 'BULK_RETEST_EQUITY_FILTER'
+                          and json_extract_string(request_json, '$.application_key') = ?""",
+                    [metadata["application_key"]],
+                ).fetchall()
+                expected_groups = {(str(spec["symbol"]), str(spec["side"])) for spec in run_specs}
+                existing_groups = {(str(row[1]), str(row[2])) for row in existing_rows}
+                if existing_rows:
+                    if existing_groups != expected_groups or len(existing_rows) != len(expected_groups):
+                        raise FinalistRetestError("RETEST_EQUITY_PUBLICATION_INVALID", "existing equity filter publication is incomplete")
+                    run_ids = tuple(str(row[0]) for row in existing_rows)
+                    replayed = True
+                else:
+                    run_ids = persist_selection_snapshots(connection, snapshots, workbook_bytes=workbook)
+        except SelectionReviewError as error:
+            if error.code in {"SELECTION_REVIEW_STALE_RESULTS", "SELECTION_REVIEW_SCHEMA_MISMATCH"}:
+                raise FinalistRetestError("RETEST_COHORT_STALE_RESULTS", str(error), details=error.details) from error
+            raise FinalistRetestError(error.code, str(error), details=error.details) from error
+        result = {
+            "pairs": pair_total, "strategies": strategy_total, "ready_cache_count": ready_cache_count,
+            "warmed_strategies": warmed, "PASS": counts["PASS"], "DROP": counts["DROP"], "RESERVED": counts["RESERVED"],
+            "NOT_EVALUATED": counts["NOT_EVALUATED"], "run_ids": list(run_ids),
+            "application_key": metadata["application_key"], "identity_digest": identity, "replayed": replayed,
+        }
+        return result
+
+    def strategies_performance_v2_finalist_retest_equity_filter(self, payload: Mapping[str, object]) -> dict[str, object]:
+        if not isinstance(payload, Mapping) or set(payload) != {"job_id"} or not isinstance(payload.get("job_id"), str) or not payload["job_id"].strip():
+            raise PerformanceV2ApiError("INVALID_REQUEST", status=400, message="equity filter accepts exactly a nonempty job_id")
+        bulk_job_id = str(payload["job_id"]).strip()
+        with self._bulk_retest_equity_filter_lock:
+            try:
+                parent = self._panel_jobs.get(bulk_job_id)
+                runtime = self._panel_jobs.runtime(bulk_job_id)
+            except PanelJobError as error:
+                raise PerformanceV2ApiError("RETEST_COHORT_JOB_NOT_FOUND", status=404, message="bulk RETEST job was not found") from error
+            if parent.get("kind") != "strategies.performance.v2.finalist-retest" or runtime.get("bulk_retest") is not True:
+                raise PerformanceV2ApiError("RETEST_COHORT_INVALID", status=409, message="job is not a bulk finalist RETEST")
+            if runtime.get("scope") not in {"FINALIST", "FINALIST_RESERVE"}:
+                raise PerformanceV2ApiError("RETEST_COHORT_INVALID", status=409, message="bulk RETEST scope is not a finalist cohort")
+            if parent.get("state") != "COMMITTED":
+                raise PerformanceV2ApiError("RETEST_COHORT_JOB_NOT_COMMITTED", status=409, message="bulk RETEST is not committed")
+            if runtime.get("outcomes_finalized") is not True:
+                raise PerformanceV2ApiError("RETEST_IMPORT_NOT_FINALIZED", status=409, message="bulk RETEST import outcomes are not finalized")
+            if not isinstance(runtime.get("successful_replacements"), list) or not runtime.get("successful_replacements"):
+                raise PerformanceV2ApiError("RETEST_COHORT_NO_SUCCESSFUL_MEMBERS", status=409, message="bulk RETEST has no successful replacements")
+            raw_successes = runtime.get("successful_replacements")
+            ids = sorted(
+                int(item["strategy_id"])
+                for item in raw_successes
+                if isinstance(item, Mapping) and isinstance(item.get("strategy_id"), int) and not isinstance(item.get("strategy_id"), bool)
+            ) if isinstance(raw_successes, list) else []
+            target = performance_v2_database_path(self._performance_v2_config())
+            try:
+                with self._performance_v2_writer_lock, duckdb.connect(str(target), read_only=True) as connection:
+                    require_performance_v2(connection)
+                    revisions = _current_equity_revisions(connection, ids)
+            except (OSError, duckdb.Error, SelectionReviewError) as error:
+                raise PerformanceV2ApiError("EQUITY_SOURCE_CHANGED", status=409, message="equity source revision is unavailable") from error
+            if set(revisions) != set(ids):
+                raise PerformanceV2ApiError("EQUITY_SOURCE_CHANGED", status=409, message="equity source revision is unavailable")
+            source_digest = canonical_digest({str(strategy_id): list(revisions[strategy_id]) for strategy_id in sorted(revisions)})
+            runtime = dict(runtime)
+            runtime["equity_filter_source_revision_digest"] = source_digest
+            identity_runtime = dict(runtime)
+            identity_runtime["equity_filter_source_revision_digest"] = source_digest
+            identity_seed = self._equity_filter_identity_seed(identity_runtime)
+            application_key = sha256(f"bulk-retest-equity-filter-v1:{bulk_job_id}:{identity_seed}".encode()).hexdigest()
+            current_attempt = runtime.get("equity_filter_attempt")
+            attempt = current_attempt if isinstance(current_attempt, int) and not isinstance(current_attempt, bool) and current_attempt >= 0 else 0
+            existing_id = runtime.get("equity_filter_job_id")
+            same_identity = runtime.get("equity_filter_application_key") == application_key
+            if isinstance(existing_id, str) and existing_id:
+                try:
+                    existing = self._panel_jobs.get(existing_id)
+                except PanelJobError:
+                    existing = None
+                if existing is not None:
+                    if existing.get("state") == "COMMITTED":
+                        if same_identity:
+                            return {"job_id": existing_id, "job": existing, "application_key": application_key, "replayed": True}
+                    if existing.get("state") in {"QUEUED", "RUNNING", "CANCELLING"}:
+                        lease_expired = False
+                        raw_expiry = runtime.get("equity_filter_lock_expires_at")
+                        if isinstance(raw_expiry, str):
+                            try:
+                                lease_expired = datetime.fromisoformat(raw_expiry).timestamp() <= datetime.now(timezone.utc).timestamp()
+                            except ValueError:
+                                lease_expired = True
+                        if not lease_expired:
+                            if same_identity:
+                                return {"job_id": existing_id, "job": existing, "application_key": application_key, "replayed": True}
+                            raise PerformanceV2ApiError(
+                                "RETEST_EQUITY_ACTION_ACTIVE", status=409,
+                                message="equity filter action is already running for this RETEST cohort",
+                            )
+                        # A crashed/stalled worker may leave a live child behind. Reclaim
+                        # its durable lease before submitting the replacement child.
+                        try:
+                            self._panel_jobs.sync(existing_id, {
+                                "state": "FAILED", "phase": "FAILED",
+                                "error": {"code": "PERFORMANCE_V2_LOCKED", "message": "equity filter lease expired and was reclaimed"},
+                            })
+                        except PanelJobError:
+                            pass
+            try:
+                while attempt < _BULK_RETEST_EQUITY_FILTER_MAX_ATTEMPTS:
+                    attempt += 1
+                    child_id = uuid.uuid4().hex
+                    registry_key = f"{application_key}:attempt:{attempt}"
+                    child = self._panel_jobs.submit(
+                        "strategies.performance.v2.finalist-retest.equity-filter",
+                        {"bulk_job_id": bulk_job_id, "application_key": application_key, "identity_seed_digest": identity_seed}, registry_key,
+                        ("performance-v2-equity-filter",), job_id=child_id,
+                    )
+                    actual_child_id = str(child.get("job_id") or child_id)
+                    if actual_child_id != child_id:
+                        existing_state = child.get("state")
+                        if existing_state in {"QUEUED", "RUNNING", "CANCELLING", "COMMITTED"}:
+                            runtime = dict(runtime)
+                            runtime.update({"equity_filter_job_id": actual_child_id, "equity_filter_application_key": application_key, "equity_filter_attempt": attempt})
+                            self._panel_jobs.sync(bulk_job_id, {"state": "COMMITTED", "phase": parent.get("phase", "COMMITTED")}, runtime=runtime)
+                            return {"job_id": actual_child_id, "job": child, "application_key": application_key, "replayed": True}
+                        continue
+                    runtime = dict(runtime)
+                    runtime.update({
+                        "equity_filter_job_id": child_id, "equity_filter_application_key": application_key,
+                        "equity_filter_idempotency_key": application_key, "equity_filter_registry_key": registry_key,
+                        "equity_filter_identity_seed_digest": identity_seed,
+                        "equity_filter_attempt": attempt,
+                        "equity_filter_lock_holder": child_id,
+                        "equity_filter_lock_expires_at": (datetime.now(timezone.utc) + timedelta(seconds=_BULK_RETEST_EQUITY_FILTER_LEASE_SECONDS)).isoformat(),
+                        "equity_filter_published": False,
+                        "equity_filter_source_revision_digest": source_digest,
+                    })
+                    self._panel_jobs.sync(bulk_job_id, {"state": "COMMITTED", "phase": parent.get("phase", "COMMITTED")}, runtime=runtime)
+                    break
+                else:
+                    raise PerformanceV2ApiError(
+                        "RETEST_EQUITY_ACTION_RETRY_EXHAUSTED",
+                        status=409,
+                        message="equity filter retry allocation exhausted",
+                    )
+            except PanelJobError as error:
+                raise PerformanceV2ApiError("PERFORMANCE_V2_LOCKED", status=409, message="equity filter is already running") from error
+            threading.Thread(target=self._run_bulk_retest_equity_filter_job, args=(bulk_job_id, child_id), daemon=True, name="mrs3-panel-equity-filter").start()
+            return {"job_id": child_id, "job": child, "application_key": application_key}
+
+    def _run_bulk_retest_equity_filter_job(self, bulk_job_id: str, child_id: str) -> None:
+        succeeded = False
+        failure_code = "RETEST_EQUITY_FILTER_FAILED"
+        failure_message = "bulk RETEST equity filter failed"
+        try:
+            with self._bulk_retest_equity_filter_lock:
+                runtime = self._panel_jobs.runtime(bulk_job_id)
+                if runtime.get("equity_filter_lock_holder") != child_id:
+                    return
+            result = self._run_bulk_retest_equity_filter(child_id, bulk_job_id)
+            with self._bulk_retest_equity_filter_lock:
+                runtime = self._panel_jobs.runtime(bulk_job_id)
+                if runtime.get("equity_filter_lock_holder") != child_id:
+                    return
+                committed_result = {
+                    "scope": runtime.get("scope"), "pair_count": result["pairs"], "processed_count": result["strategies"],
+                    "ready_cache_count": result.get("ready_cache_count", 0), "warmed_strategy_count": result.get("warmed_strategies", 0),
+                    "pass_count": result.get("PASS", 0), "drop_count": result.get("DROP", 0),
+                    "reserved_count": result.get("RESERVED", 0), "not_evaluated_count": result.get("NOT_EVALUATED", 0),
+                    "selection_run_ids": result.get("run_ids", []), "application_key": result.get("application_key"),
+                }
+                self._panel_jobs.sync(child_id, {"state": "COMMITTED", "phase": "COMMITTED", "progress": {"current": result["pairs"], "total": result["pairs"], "unit": "pairs", "total_pairs": result["pairs"], "completed_pairs": result["pairs"], "total_strategies": result["strategies"], "processed_strategies": result["strategies"], "ready_cache_count": result.get("ready_cache_count", 0), "warmed_strategy_count": result.get("warmed_strategies", 0), "current_pair": None}, "result": committed_result})
+                runtime.update({"equity_filter_published": True, "equity_filter_identity_digest": result.get("identity_digest"), "equity_filter_lock_holder": None, "equity_filter_lock_expires_at": None})
+                self._panel_jobs.sync(bulk_job_id, {"state": "COMMITTED", "phase": self._panel_jobs.get(bulk_job_id).get("phase", "COMMITTED")}, runtime=runtime)
+                succeeded = True
+        except Exception as error:
+            if isinstance(error, FinalistRetestError):
+                failure_code, failure_message = error.code, str(error)
+            elif isinstance(error, (EquitySchemaUpgradeRequiredError, EquityCacheSchemaInvalidError)):
+                failure_code, failure_message = getattr(error, "code", "PERFORMANCE_V2_SCHEMA_INVALID"), str(error)
+            else:
+                _LOGGER.exception("bulk finalist retest equity filter failed")
+        finally:
+            try:
+                with self._bulk_retest_equity_filter_lock:
+                    runtime = self._panel_jobs.runtime(bulk_job_id)
+                    if runtime.get("equity_filter_lock_holder") == child_id and not succeeded:
+                        try:
+                            child_state = self._panel_jobs.get(child_id).get("state")
+                            if child_state not in {"FAILED", "CANCELLED", "COMMITTED"}:
+                                self._panel_jobs.sync(child_id, {"state": "FAILED", "phase": "FAILED", "error": {"code": failure_code, "message": failure_message}})
+                        except BaseException:
+                            _LOGGER.exception("failed to publish bulk equity filter child failure")
+                        runtime.update({"equity_filter_lock_holder": None, "equity_filter_lock_expires_at": None})
+                        try:
+                            self._panel_jobs.sync(bulk_job_id, {"state": "COMMITTED", "phase": self._panel_jobs.get(bulk_job_id).get("phase", "COMMITTED")}, runtime=runtime)
+                        except BaseException:
+                            _LOGGER.exception("failed to clear bulk equity filter lease")
+            except BaseException:
+                _LOGGER.exception("failed to publish bulk equity filter failure")
+
+    @staticmethod
+    def _equity_filter_identity_seed(runtime: Mapping[str, object]) -> str:
+        """Stable request identity used before the async worker reads the DB."""
+        snapshot = runtime.get("equity_filter_snapshot")
+        members = runtime.get("cohort_members")
+        successes = runtime.get("successful_replacements")
+        return canonical_digest({
+            "scope": runtime.get("scope"),
+            "cohort_sha256": runtime.get("cohort_sha256"),
+            "members": members if isinstance(members, list) else [],
+            "successful_replacements": successes if isinstance(successes, list) else [],
+            "equity_filter_snapshot_sha256": canonical_digest(snapshot) if isinstance(snapshot, Mapping) else None,
+            "source_revision_digest": runtime.get("equity_filter_source_revision_digest"),
+        })
 
     def _finalist_control_candidate_workbook(
         self,
@@ -9248,6 +9950,9 @@ class _PanelHandler(BaseHTTPRequestHandler):
             except (KeyError, ValueError):
                 self._json(400, {"error": {"code": "INVALID_REQUEST", "message": "invalid bulk RETEST request"}})
             return
+        if parsed.path == "/api/v2/strategies/performance-v2/finalist-retest/equity-filter":
+            self._json(405, {"error": {"code": "INVALID_REQUEST", "message": "equity filter requires POST"}})
+            return
         if parsed.path == "/api/v2/strategies/performance-v2/finalist-retest/preview":
             raw = parse_qs(parsed.query).get("include_reserve", ["false"])[0].casefold()
             if raw not in {"true", "false"}:
@@ -9452,6 +10157,7 @@ class _PanelHandler(BaseHTTPRequestHandler):
             "/api/v2/strategies/performance-v2/finalist-retest/start",
             "/api/v2/strategies/performance-v2/finalist-retest/import",
         } else None
+        equity_filter_endpoint = endpoint == "/api/v2/strategies/performance-v2/finalist-retest/equity-filter"
         if bulk_retest_endpoint is not None:
             endpoint = "/api/v2/strategies/performance-v2/retest/start" if bulk_retest_endpoint.endswith("/start") else "/api/v2/strategies/performance-v2/retest/import"
         bulk_control_import_endpoint = urlparse(self.path).path == "/api/v2/strategies/performance-v2/finalist-retest/control-import"
@@ -9476,7 +10182,9 @@ class _PanelHandler(BaseHTTPRequestHandler):
         portfolio_route = portfolio_preparation_route or endpoint == "/api/v2/portfolio/campaigns" or bool(re.fullmatch(r"/api/v2/portfolio/jobs/[^/]+/cancel", endpoint)) or bool(re.fullmatch(r"/api/v2/portfolio/campaigns/[^/]+/tester-submissions", endpoint))
         portfolio_cancel_route = bool(re.fullmatch(r"/api/v2/portfolio/jobs/[^/]+/cancel", endpoint))
         portfolio_submission_route = bool(re.fullmatch(r"/api/v2/portfolio/campaigns/[^/]+/tester-submissions", endpoint))
-        if bulk_retest_endpoint is None and endpoint != "/api/v2/strategies/performance-v2/selection-settings" and endpoint not in {"/api/start", "/api/browse", "/api/duckdb-import/settings", "/api/duckdb-import/preflight", "/api/duckdb-import/start", "/api/duckdb-import/cancel", "/api/duckdb-import/migrate", "/api/duckdb-direct/coverage", "/api/duckdb-direct/preflight", "/api/duckdb-direct/start", "/api/duckdb-direct/cancel", "/api/analysis/library", "/api/analysis/initialize", "/api/analysis/rerun", "/api/analysis/compare", "/api/analysis/export", "/api/analysis/shortlist", "/api/analysis/filter-export", "/api/analysis/strategies", "/api/source-v6/preflight", "/api/source-v6/start", "/api/source-v6/fresh/multiscope/start", "/api/source-v6/fresh/multiscope/analysis/start", "/api/source-v6/cancel", "/api/source-v6/merge", "/api/v2/panel/restart", "/api/v2/settings/validate", "/api/v2/settings/save", "/api/v2/settings/analysis-profile", "/api/v2/jobs", "/api/v2/strategies/tester/verify-inbox", "/api/v2/strategies/tester/report-collection/clear", "/api/v2/testing/local/fill", "/api/v2/testing/local/start", "/api/v2/testing/local/stop", "/api/v2/testing/screener/fill", "/api/v2/testing/screener/start", "/api/v2/testing/screener/stop", "/api/v2/testing/screener/evaluate", "/api/v2/testing/remote/check-paths", "/api/v2/testing/remote/prepare", "/api/v2/testing/remote/fill", "/api/v2/testing/remote/start", "/api/v2/source/local/import/preflight", "/api/v2/source/local/import/start", "/api/v2/source/local/merge/preflight", "/api/v2/source/local/merge/start", "/api/v2/source/local/cancel", "/api/v2/source/remote/start", "/api/v2/source/remote/cancel", "/api/v2/surfaces/preflight", "/api/v2/surfaces/select", "/api/v2/surfaces/publish", "/api/v2/surfaces/publish/start", "/api/v2/strategies/fresh/analyze", "/api/v2/strategies/fresh/generate", "/api/v2/strategies/fresh/runs", "/api/v2/strategies/fresh/shortlist", "/api/v2/strategies/fresh/open", "/api/v2/strategies/performance-v2/windows", "/api/v2/strategies/performance-v2/selection", "/api/v2/strategies/performance-v2/selection-preview", "/api/v2/strategies/performance-v2/selection-cache-status", "/api/v2/strategies/performance-v2/recalculate", "/api/v2/strategies/performance-v2/recalculate-all", "/api/v2/strategies/performance-v2/selection-review-import", "/api/v2/strategies/performance-v2/selection-user-fields-import", "/api/v2/strategies/performance-v2/retest-tags-import", "/api/v2/strategies/performance-v2/retest/start", "/api/v2/strategies/performance-v2/retest/import"} and not portfolio_route and not performance_v2_maintenance_endpoint:
+        if equity_filter_endpoint:
+            pass
+        elif bulk_retest_endpoint is None and endpoint != "/api/v2/strategies/performance-v2/selection-settings" and endpoint not in {"/api/start", "/api/browse", "/api/duckdb-import/settings", "/api/duckdb-import/preflight", "/api/duckdb-import/start", "/api/duckdb-import/cancel", "/api/duckdb-import/migrate", "/api/duckdb-direct/coverage", "/api/duckdb-direct/preflight", "/api/duckdb-direct/start", "/api/duckdb-direct/cancel", "/api/analysis/library", "/api/analysis/initialize", "/api/analysis/rerun", "/api/analysis/compare", "/api/analysis/export", "/api/analysis/shortlist", "/api/analysis/filter-export", "/api/analysis/strategies", "/api/source-v6/preflight", "/api/source-v6/start", "/api/source-v6/fresh/multiscope/start", "/api/source-v6/fresh/multiscope/analysis/start", "/api/source-v6/cancel", "/api/source-v6/merge", "/api/v2/panel/restart", "/api/v2/settings/validate", "/api/v2/settings/save", "/api/v2/settings/analysis-profile", "/api/v2/jobs", "/api/v2/strategies/tester/verify-inbox", "/api/v2/strategies/tester/report-collection/clear", "/api/v2/testing/local/fill", "/api/v2/testing/local/start", "/api/v2/testing/local/stop", "/api/v2/testing/screener/fill", "/api/v2/testing/screener/start", "/api/v2/testing/screener/stop", "/api/v2/testing/screener/evaluate", "/api/v2/testing/remote/check-paths", "/api/v2/testing/remote/prepare", "/api/v2/testing/remote/fill", "/api/v2/testing/remote/start", "/api/v2/source/local/import/preflight", "/api/v2/source/local/import/start", "/api/v2/source/local/merge/preflight", "/api/v2/source/local/merge/start", "/api/v2/source/local/cancel", "/api/v2/source/remote/start", "/api/v2/source/remote/cancel", "/api/v2/surfaces/preflight", "/api/v2/surfaces/select", "/api/v2/surfaces/publish", "/api/v2/surfaces/publish/start", "/api/v2/strategies/fresh/analyze", "/api/v2/strategies/fresh/generate", "/api/v2/strategies/fresh/runs", "/api/v2/strategies/fresh/shortlist", "/api/v2/strategies/fresh/open", "/api/v2/strategies/performance-v2/windows", "/api/v2/strategies/performance-v2/selection", "/api/v2/strategies/performance-v2/selection-preview", "/api/v2/strategies/performance-v2/selection-cache-status", "/api/v2/strategies/performance-v2/recalculate", "/api/v2/strategies/performance-v2/recalculate-all", "/api/v2/strategies/performance-v2/selection-review-import", "/api/v2/strategies/performance-v2/selection-user-fields-import", "/api/v2/strategies/performance-v2/retest-tags-import", "/api/v2/strategies/performance-v2/retest/start", "/api/v2/strategies/performance-v2/retest/import"} and not portfolio_route and not performance_v2_maintenance_endpoint:
             self._json(404, {"error": "not found"})
             return
         if endpoint in {"/api/v2/strategies/performance-v2/selection-review-import", "/api/v2/strategies/performance-v2/selection-user-fields-import", "/api/v2/strategies/performance-v2/retest-tags-import"}:
@@ -9552,6 +10260,10 @@ class _PanelHandler(BaseHTTPRequestHandler):
                 else:
                     result = self.server.controller.strategies_performance_v2_finalist_retest_import(document)
                 self._json(200, result if isinstance(result, Mapping) else {"result": result})
+                return
+            if equity_filter_endpoint:
+                result = self.server.controller.strategies_performance_v2_finalist_retest_equity_filter(document)
+                self._json(202, result)
                 return
             if direct_retest_endpoint is not None:
                 document = {

@@ -2961,6 +2961,14 @@ def test_finalist_retest_replays_only_exact_cohort_and_config(tmp_path: Path, mo
     monkeypatch.setattr(controller, "_single_mode_strategy_test", lambda: SimpleNamespace(start=lambda *_args, **kwargs: started.update(kwargs)))
     assert controller.strategies_performance_v2_finalist_retest_start({"clear_reports": True, "initial_balance": "2500.5"})["job_id"] == "new"
     assert captured["runtime"]["cohort_members"] == [{"strategy_id": 1, "effective_start": "2026-01-01T00:00:00Z"}]
+    snapshot = captured["runtime"]["equity_filter_snapshot"]
+    assert snapshot["schema_version"] == 1
+    assert snapshot["request"]["stages"] == [{"id": "filter_equity_regime", "enabled": True, "scope": "pair_side"}]
+    assert 1 <= snapshot["cache_workers"] <= 16
+    assert snapshot["selection_config"]
+    assert snapshot["regime_policy"]
+    assert snapshot["selection_config_sha256"]
+    assert snapshot["regime_policy_sha256"]
     captured["submit"]("new")
     assert captured["request"]["clear_reports"] is True
     assert captured["request"]["initial_balance"] == 2500.5
@@ -2987,7 +2995,203 @@ def test_finalist_retest_status_exposes_started_import_job(tmp_path: Path, monke
     )
     monkeypatch.setattr(controller, "_single_mode_strategy_test", lambda: SimpleNamespace(status=lambda _job_id: (_ for _ in ()).throw(KeyError())))
 
-    assert controller.strategies_performance_v2_finalist_retest_status("bulk-job")["import_job_id"] == "import-job"
+    status = controller.strategies_performance_v2_finalist_retest_status("bulk-job")
+    assert status["import_job_id"] == "import-job"
+    assert status["equity_filter"]["state"] == "IDLE"
+    assert status["equity_filter"]["eligible"] is False
+    assert status["equity_filter"]["ineligible_reason"] == "IMPORT_NOT_FINALIZED"
+    assert {"application_key", "attempt", "progress", "result", "error"}.issubset(status["equity_filter"])
+
+
+def test_finalist_retest_equity_filter_status_allows_retry_after_failed_child(tmp_path: Path) -> None:
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
+    registry = controller._panel_jobs
+    registry.submit(
+        "strategies.performance.v2.finalist-retest", {}, "equity-status-parent", job_id="equity-status-parent",
+    )
+    registry.transition("equity-status-parent", "RUNNING")
+    registry.transition("equity-status-parent", "COMMITTED")
+    registry.submit(
+        "strategies.performance.v2.finalist-retest.equity-filter", {}, "equity-status-child",
+        ("performance-v2-equity-filter",), job_id="equity-status-child",
+    )
+    registry.transition("equity-status-child", "FAILED")
+    registry.sync("equity-status-parent", {"state": "COMMITTED"}, runtime={
+        "bulk_retest": True,
+        "outcomes_finalized": True,
+        "successful_replacements": [{"strategy_id": 1, "new_result_id": 2}],
+        "equity_filter_job_id": "equity-status-child",
+        "equity_filter_published": False,
+    })
+
+    status = controller._equity_filter_child_status("equity-status-parent")
+
+    assert status["state"] == "FAILED"
+    assert status["eligible"] is True
+
+
+def test_finalist_retest_equity_filter_retries_failed_child_with_new_registry_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
+    registry = controller._panel_jobs
+    parent_id = "equity-retry-parent"
+    registry.submit(
+        "strategies.performance.v2.finalist-retest", {}, "equity-retry-parent", job_id=parent_id,
+    )
+    registry.transition(parent_id, "RUNNING")
+    registry.transition(parent_id, "COMMITTED")
+    registry.sync(parent_id, {"state": "COMMITTED"}, runtime={
+        "bulk_retest": True,
+        "scope": "FINALIST",
+        "outcomes_finalized": True,
+        "successful_replacements": [{"strategy_id": 1, "new_result_id": 2}],
+        "cohort_members": [{"strategy_id": 1, "result_id": 1, "symbol": "BTCUSDT", "side": "LONG"}],
+        "equity_filter_snapshot": {"schema_version": 1},
+    })
+
+    class Connection:
+        def __enter__(self): return self
+        def __exit__(self, *_args): return None
+
+    monkeypatch.setattr(controller, "_performance_v2_config", lambda: SimpleNamespace())
+    monkeypatch.setattr(panel_module, "performance_v2_database_path", lambda _config: tmp_path / "performance.duckdb")
+    monkeypatch.setattr(panel_module.duckdb, "connect", lambda *_args, **_kwargs: Connection())
+    monkeypatch.setattr(panel_module, "require_performance_v2", lambda _connection: None)
+    monkeypatch.setattr(panel_module, "_current_equity_revisions", lambda _connection, _ids: {1: (2, "source")})
+    monkeypatch.setattr(
+        controller, "_run_bulk_retest_equity_filter_job",
+        lambda bulk_job_id, child_id: None,
+    )
+
+    first = controller.strategies_performance_v2_finalist_retest_equity_filter({"job_id": parent_id})
+    first_id = first["job_id"]
+    registry.transition(first_id, "FAILED")
+
+    second = controller.strategies_performance_v2_finalist_retest_equity_filter({"job_id": parent_id})
+
+    assert second["job_id"] != first_id
+    assert registry.get(second["job_id"])["idempotency_key"].endswith(":attempt:2")
+
+
+def test_finalist_retest_equity_filter_bounds_retry_child_allocation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
+    registry = controller._panel_jobs
+    parent_id = "equity-retry-exhausted-parent"
+    registry.submit("strategies.performance.v2.finalist-retest", {}, parent_id, job_id=parent_id)
+    registry.transition(parent_id, "RUNNING")
+    registry.transition(parent_id, "COMMITTED")
+    registry.sync(parent_id, {"state": "COMMITTED"}, runtime={
+        "bulk_retest": True,
+        "scope": "FINALIST",
+        "outcomes_finalized": True,
+        "successful_replacements": [{"strategy_id": 1, "new_result_id": 2}],
+        "cohort_members": [{"strategy_id": 1, "result_id": 1, "symbol": "BTCUSDT", "side": "LONG"}],
+        "equity_filter_snapshot": {"schema_version": 1},
+    })
+
+    class Connection:
+        def __enter__(self): return self
+        def __exit__(self, *_args): return None
+
+    monkeypatch.setattr(controller, "_performance_v2_config", lambda: SimpleNamespace())
+    monkeypatch.setattr(panel_module, "performance_v2_database_path", lambda _config: tmp_path / "performance.duckdb")
+    monkeypatch.setattr(panel_module.duckdb, "connect", lambda *_args, **_kwargs: Connection())
+    monkeypatch.setattr(panel_module, "require_performance_v2", lambda _connection: None)
+    monkeypatch.setattr(panel_module, "_current_equity_revisions", lambda _connection, _ids: {1: (2, "source")})
+    calls = 0
+
+    def return_terminal_child(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return {"job_id": f"terminal-{calls}", "state": "FAILED"}
+
+    monkeypatch.setattr(registry, "submit", return_terminal_child)
+
+    with pytest.raises(PerformanceV2ApiError) as error:
+        controller.strategies_performance_v2_finalist_retest_equity_filter({"job_id": parent_id})
+
+    assert error.value.code == "RETEST_EQUITY_ACTION_RETRY_EXHAUSTED"
+    assert calls == 8
+
+
+@pytest.mark.parametrize(
+    ("parent_state", "scope", "outcomes_finalized", "successes", "expected"),
+    [
+        ("RUNNING", "FINALIST", True, [{"strategy_id": 1, "new_result_id": 2}], "RETEST_COHORT_JOB_NOT_COMMITTED"),
+        ("COMMITTED", "FINALIST", False, [{"strategy_id": 1, "new_result_id": 2}], "RETEST_IMPORT_NOT_FINALIZED"),
+        ("COMMITTED", "FINALIST", True, [], "RETEST_COHORT_NO_SUCCESSFUL_MEMBERS"),
+        ("COMMITTED", "OTHER", True, [{"strategy_id": 1, "new_result_id": 2}], "RETEST_COHORT_INVALID"),
+    ],
+)
+def test_finalist_retest_equity_filter_rejects_invalid_frozen_cohort_metadata(
+    tmp_path: Path, parent_state: str, scope: str, outcomes_finalized: bool,
+    successes: list[dict[str, int]], expected: str,
+) -> None:
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
+    parent_id = f"equity-invalid-cohort-{expected.lower()}"
+    registry = controller._panel_jobs
+    registry.submit("strategies.performance.v2.finalist-retest", {}, parent_id, job_id=parent_id)
+    registry.transition(parent_id, "RUNNING")
+    if parent_state == "COMMITTED":
+        registry.transition(parent_id, "COMMITTED")
+    registry.sync(parent_id, {"state": parent_state}, runtime={
+        "bulk_retest": True,
+        "scope": scope,
+        "outcomes_finalized": outcomes_finalized,
+        "successful_replacements": successes,
+    })
+
+    with pytest.raises(PerformanceV2ApiError) as error:
+        controller.strategies_performance_v2_finalist_retest_equity_filter({"job_id": parent_id})
+
+    assert error.value.code == expected
+
+
+def test_finalist_retest_equity_filter_rejects_changed_request_while_child_is_active(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
+    registry = controller._panel_jobs
+    parent_id = "equity-active-conflict-parent"
+    child_id = "equity-active-conflict-child"
+    registry.submit("strategies.performance.v2.finalist-retest", {}, parent_id, job_id=parent_id)
+    registry.transition(parent_id, "RUNNING")
+    registry.transition(parent_id, "COMMITTED")
+    registry.submit(
+        "strategies.performance.v2.finalist-retest.equity-filter", {}, child_id,
+        ("performance-v2-equity-filter",), job_id=child_id,
+    )
+    registry.transition(child_id, "RUNNING")
+    registry.sync(parent_id, {"state": "COMMITTED"}, runtime={
+        "bulk_retest": True,
+        "scope": "FINALIST",
+        "outcomes_finalized": True,
+        "successful_replacements": [{"strategy_id": 1, "new_result_id": 2}],
+        "cohort_members": [{"strategy_id": 1, "result_id": 1, "symbol": "BTCUSDT", "side": "LONG"}],
+        "equity_filter_snapshot": {"schema_version": 1},
+        "equity_filter_job_id": child_id,
+        "equity_filter_application_key": "previous-application",
+        "equity_filter_lock_expires_at": (datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
+    })
+
+    class Connection:
+        def __enter__(self): return self
+        def __exit__(self, *_args): return None
+
+    monkeypatch.setattr(controller, "_performance_v2_config", lambda: SimpleNamespace())
+    monkeypatch.setattr(panel_module, "performance_v2_database_path", lambda _config: tmp_path / "performance.duckdb")
+    monkeypatch.setattr(panel_module.duckdb, "connect", lambda *_args, **_kwargs: Connection())
+    monkeypatch.setattr(panel_module, "require_performance_v2", lambda _connection: None)
+    monkeypatch.setattr(panel_module, "_current_equity_revisions", lambda _connection, _ids: {1: (2, "source")})
+
+    with pytest.raises(PerformanceV2ApiError) as error:
+        controller.strategies_performance_v2_finalist_retest_equity_filter({"job_id": parent_id})
+
+    assert error.value.code == "RETEST_EQUITY_ACTION_ACTIVE"
+    assert "equity_filter_attempt" not in registry.runtime(parent_id)
 
 
 def test_finalist_retest_status_exposes_pending_import_handoff(tmp_path: Path, monkeypatch) -> None:
@@ -3369,6 +3573,92 @@ def test_finalist_retest_import_retries_after_terminal_failed_child(
     assert second["job_id"] == starts[1]
     assert registry.runtime(job_id).get("outcomes_finalized") is False
     assert len(starts) == 2 and starts[0] != starts[1]
+
+
+@pytest.mark.parametrize("payload", [{}, {"job_id": ""}, {"job_id": 7}, {"job_id": "bulk", "extra": True}])
+def test_finalist_retest_equity_filter_requires_exact_parent_job_payload(
+    tmp_path: Path, payload: dict[str, object],
+) -> None:
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
+    with pytest.raises(PerformanceV2ApiError) as error:
+        controller.strategies_performance_v2_finalist_retest_equity_filter(payload)
+    assert error.value.code == "INVALID_REQUEST"
+
+
+def test_finalist_retest_equity_filter_identity_includes_frozen_snapshot() -> None:
+    base = {
+        "scope": "FINALIST",
+        "cohort_sha256": "cohort",
+        "cohort_members": [{"strategy_id": 1, "result_id": 2}],
+        "successful_replacements": [{"strategy_id": 1, "new_result_id": 3}],
+        "equity_filter_source_revision_digest": "source",
+        "equity_filter_snapshot": {"selection_config_sha256": "config-a", "regime_policy_sha256": "policy"},
+    }
+    changed = deepcopy(base)
+    changed["equity_filter_snapshot"]["selection_config_sha256"] = "config-b"
+
+    assert PanelController._equity_filter_identity_seed(base) != PanelController._equity_filter_identity_seed(changed)
+
+
+def test_finalist_retest_equity_filter_status_reads_live_child_progress(tmp_path: Path) -> None:
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
+    registry = controller._panel_jobs
+    parent_id = "equity-live-status-parent"
+    child_id = "equity-live-status-child"
+    registry.submit("strategies.performance.v2.finalist-retest", {}, parent_id, job_id=parent_id)
+    registry.transition(parent_id, "RUNNING")
+    registry.transition(parent_id, "COMMITTED")
+    registry.submit(
+        "strategies.performance.v2.finalist-retest.equity-filter", {}, child_id,
+        ("performance-v2-equity-filter",), job_id=child_id,
+    )
+    registry.transition(child_id, "RUNNING")
+    registry.sync(child_id, {"state": "RUNNING", "phase": "WARMING_CACHE", "progress": {"current": 2, "total": 5, "unit": "pairs"}})
+    registry.sync(parent_id, {"state": "COMMITTED"}, runtime={
+        "bulk_retest": True,
+        "outcomes_finalized": True,
+        "successful_replacements": [{"strategy_id": 1, "new_result_id": 2}],
+        "equity_filter_snapshot": {"schema_version": 1},
+        "equity_filter_job_id": child_id,
+    })
+
+    status = controller._equity_filter_child_status(parent_id)
+
+    assert status["state"] == "RUNNING"
+    assert status["phase"] == "WARMING_CACHE"
+    assert status["progress"]["current"] == 2
+    assert status["progress"]["total"] == 5
+
+
+def test_finalist_retest_equity_filter_clears_lease_on_base_exception(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
+    registry = controller._panel_jobs
+    parent_id = "equity-base-exception-parent"
+    child_id = "equity-base-exception-child"
+    registry.submit("strategies.performance.v2.finalist-retest", {}, parent_id, job_id=parent_id)
+    registry.transition(parent_id, "RUNNING")
+    registry.transition(parent_id, "COMMITTED")
+    registry.submit(
+        "strategies.performance.v2.finalist-retest.equity-filter", {}, child_id,
+        ("performance-v2-equity-filter",), job_id=child_id,
+    )
+    registry.sync(parent_id, {"state": "COMMITTED"}, runtime={
+        "equity_filter_lock_holder": child_id,
+        "equity_filter_lock_expires_at": (datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
+    })
+
+    def interrupt(*_args, **_kwargs):
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(controller, "_run_bulk_retest_equity_filter", interrupt)
+
+    with pytest.raises(KeyboardInterrupt):
+        controller._run_bulk_retest_equity_filter_job(parent_id, child_id)
+
+    assert registry.get(child_id)["state"] == "FAILED"
+    assert registry.runtime(parent_id)["equity_filter_lock_holder"] is None
 
 
 def test_selection_http_downloads_xlsx_and_persists_exact_selection_state(tmp_path: Path) -> None:

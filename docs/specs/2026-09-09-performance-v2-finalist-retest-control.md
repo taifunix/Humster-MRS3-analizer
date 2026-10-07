@@ -301,3 +301,13 @@ Panel показывает frozen cohort count, даты, прогресс, чи
 массовый ретест. Полноценный typed-контракт аналитики и расчёт нормализованных
 рядов остаются следующими задачами. Price/Cost характеризуют исполнение и не
 выдаются за расчётный полный размер всех уровней позиции.
+
+## Explicit equity-filter application after bulk retest (2026-10-07)
+
+The screen 6 button `Применить эквити фильтр` is an explicit, asynchronous action. Import completion and page recovery never invoke it automatically. The browser sends exactly `{ "job_id": "<committed bulk retest job>" }`.
+
+At bulk-retest start the job freezes the equity request, the complete `SelectionConfig`, the equity-regime algorithm/policy version and a cache worker limit clamped to 1..16. The action uses only finalized successful replacements from that frozen cohort. The frozen scope (FINALIST or FINALIST+RESERVE) is authoritative; the current checkbox is ignored.
+
+For each successful `(Pair, Direction)` group the worker verifies current ACTIVE strategy/result identity and equity source revisions, warms only missing equity cache rows, then runs only `filter_equity_regime` at `pair_side`. All group selection snapshots and rejection sources are published atomically. The application key includes the bulk job, frozen configuration digest and sorted current `(strategy_id, result_id, source_revision)` identities. An identical key is idempotent; changed identities create a new application. Failed or stale cohorts never publish partial selection results.
+
+The existing bulk-retest status endpoint always exposes an `equity_filter` object containing eligibility, ineligibility reason, application key, child job, attempt, state, phase, numeric progress, result and typed error. The UI shows the live phase/counts and the exact error code/message. Cache warming is bounded by a 15-minute action deadline; warming failure, timeout and post-warm incompleteness remain distinct errors. Child allocation retries are bounded at eight attempts and report `RETEST_EQUITY_ACTION_RETRY_EXHAUSTED` if no fresh child can be allocated. The Panel process is not restarted by this feature.

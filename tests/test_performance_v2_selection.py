@@ -2572,6 +2572,10 @@ def test_selection_preparation_caps_queued_jobs_at_twice_worker_count(tmp_path: 
         def __exit__(self, *_args):
             return False
 
+        def shutdown(self, *, wait=True, cancel_futures=False):
+            assert wait is True
+            assert cancel_futures is False
+
         def submit(self, function, args):
             nonlocal pending_count, max_pending
             submitted.append(args)
@@ -2593,6 +2597,35 @@ def test_selection_preparation_caps_queued_jobs_at_twice_worker_count(tmp_path: 
     assert len(submitted) == 5
     assert max_pending == 4
     assert pending_count == 0
+
+
+def test_selection_preparation_skips_executor_when_no_rows_match(tmp_path: Path, monkeypatch) -> None:
+    connection = _candidate_db(tmp_path)
+    database = tmp_path / "strategy_performance.duckdb"
+    connection.close()
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
+
+    def unexpected_executor(*_args, **_kwargs):
+        raise AssertionError("executor must not be created for an empty row set")
+
+    monkeypatch.setattr(selection_module, "ThreadPoolExecutor", unexpected_executor)
+    prepare_selection_window_cache(database, request, SelectionConfig(), workers=99, strategy_ids=(999999,))
+
+
+def test_selection_preparation_timeout_stops_before_cache_publication(tmp_path: Path) -> None:
+    connection = _candidate_db(tmp_path)
+    database = tmp_path / "strategy_performance.duckdb"
+    connection.close()
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
+
+    with pytest.raises(TimeoutError, match="RETEST_EQUITY_CACHE_WARM_TIMEOUT"):
+        prepare_selection_window_cache(
+            database, request, SelectionConfig(), workers=99,
+            include_equity=True, deadline_monotonic=0,
+        )
+
+    with duckdb.connect(str(database), read_only=True) as check:
+        assert check.execute("select count(*) from window_metrics").fetchone()[0] == 0
 
 
 def test_earlier_preparation_batch_remains_committed_after_later_batch_fails(

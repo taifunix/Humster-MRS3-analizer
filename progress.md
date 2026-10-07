@@ -63,3 +63,9 @@ The Source v6 fresh compact multi-scope pipeline is marked complete in [PRD.md](
 3. Verify the READY JSON job state and identify the supported recovery procedure; do not edit the journal.
 4. Keep the remaining Performance v2, database profiling, collector, and Portfolio Optimizer gates within their linked plans and specifications.
 5. Do not make final MRS3 performance claims until real tick-test results and DD5 retesting are available.
+
+## Bulk finalist equity-filter application (2026-10-07)
+
+Card 6 now has an explicit `Применить эквити фильтр` action. It is asynchronous, uses only finalized successful replacements from the frozen FINALIST or FINALIST+RESERVE cohort, warms only missing equity cache rows, runs only the `filter_equity_regime` pair-side stage, and publishes all group snapshots atomically. The parent status includes an always-present `equity_filter` object with eligibility, application identity, attempt, phase, numeric progress, result counts, and typed errors. Import completion and recovery never start this action automatically. The Panel was not restarted.
+
+Verification so far: `tests/test_panel_performance_v2.py` 200 passed, 4 skipped; `tests/test_panel_static_ui.py` 163 passed; equity-regime and publication suites 43 passed; selection suite 224 passed; targeted equity-filter tests 16 passed; `node --check src/mrs3/panel_web/app.js` and `git diff --check` passed. The current finalist-retest module has 18 passed and one pre-existing reason-alias expectation failure in `PARETO_PLATEAU_POINTS_PER_ORDER`; an exact clean-HEAD baseline checkout reproduced the same 18/1 result. No live database, tester, or Panel process was used. The retry allocation is bounded at eight attempts, the UI treats unknown child states as active, the cache worker limit is capped at 16, and worker cleanup runs from `finally`.

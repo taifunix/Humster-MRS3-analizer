@@ -10,6 +10,7 @@ from colorsys import hls_to_rgb
 from hashlib import sha256
 import json
 from pathlib import Path
+from time import monotonic
 from typing import Callable, Literal, Mapping, Sequence
 
 import duckdb
@@ -1482,6 +1483,7 @@ def prepare_selection_window_cache(
     strategy_ids: Sequence[int] | None = None, *, include_equity: bool = False,
     include_equity_regime: bool | None = None,
     on_batch_complete: Callable[[int], None] | None = None,
+    deadline_monotonic: float | None = None,
 ) -> None:
     """Warm bounded result batches in independent readers and one checked writer."""
     selected_ids = None if strategy_ids is None else tuple(dict.fromkeys(int(strategy_id) for strategy_id in strategy_ids))
@@ -1509,7 +1511,7 @@ def prepare_selection_window_cache(
         ).fetchall()
     if not rows:
         return
-    worker_count = max(1, min(int(workers), len(rows)))
+    worker_count = max(1, min(int(workers), 16, len(rows)))
     batch_size = 2 * worker_count
     if include_equity_regime is None:
         include_equity_regime = _selection_requires_equity_regime(request)
@@ -1520,15 +1522,27 @@ def prepare_selection_window_cache(
         )
         for result_id, report_start, report_end in rows
     ]
-    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+    executor = ThreadPoolExecutor(max_workers=worker_count)
+    try:
         for offset in range(0, len(jobs), batch_size):
+            if deadline_monotonic is not None and monotonic() > deadline_monotonic:
+                raise TimeoutError("RETEST_EQUITY_CACHE_WARM_TIMEOUT")
             pending = {
                 executor.submit(_selection_window_job_from_args, job): job
                 for job in jobs[offset : offset + batch_size]
             }
             completed: list[_SelectionWindowJobResult] = []
             while pending:
-                done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                if deadline_monotonic is not None and monotonic() > deadline_monotonic:
+                    for future in pending:
+                        future.cancel()
+                    raise TimeoutError("RETEST_EQUITY_CACHE_WARM_TIMEOUT")
+                timeout = None if deadline_monotonic is None else max(0.0, deadline_monotonic - monotonic())
+                done, _ = wait(pending, timeout=timeout, return_when=FIRST_COMPLETED)
+                if not done:
+                    for future in pending:
+                        future.cancel()
+                    raise TimeoutError("RETEST_EQUITY_CACHE_WARM_TIMEOUT")
                 for future in done:
                     pending.pop(future)
                     completed.append(future.result())
@@ -1579,6 +1593,20 @@ def prepare_selection_window_cache(
                     raise
             if on_batch_complete is not None:
                 on_batch_complete(len(completed))
+    except TimeoutError:
+        # Already-running workers only calculate private read-only results.
+        # This thread is the sole cache writer, so discarded results cannot
+        # publish after the hard deadline.
+        # Fence running readers before the retry can allocate another pool;
+        # this keeps repeated timeouts from accumulating Panel threads or
+        # open read connections after the hard deadline.
+        executor.shutdown(wait=True, cancel_futures=True)
+        raise
+    except BaseException:
+        executor.shutdown(wait=True)
+        raise
+    else:
+        executor.shutdown(wait=True)
 
 
 def selection_cache_status(

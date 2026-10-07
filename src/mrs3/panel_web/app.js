@@ -2840,6 +2840,7 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
   const finalistRetestStart = document.querySelector('#performance-v2-finalist-retest-start-button');
   const finalistRetestCard = document.querySelector('#performance-v2-finalist-retest-card');
   const finalistRetestImport = document.querySelector('#performance-v2-finalist-retest-import-button');
+  const finalistRetestEquityFilter = document.querySelector('#performance-v2-finalist-retest-equity-filter-button');
   const finalistRetestReserve = document.querySelector('#performance-v2-finalist-retest-reserve');
   const finalistRetestClearReports = document.querySelector('#performance-v2-finalist-retest-clear-reports');
   const finalistRetestStartDate = document.querySelector('#performance-v2-finalist-retest-start');
@@ -2856,6 +2857,14 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
   let finalistRetestImportJobId = '';
   let finalistRetestHasSuccessfulExport = false;
   let finalistRetestTimer = 0;
+  const updateFinalistRetestEquityFilter = (job) => {
+    if (!finalistRetestEquityFilter) return;
+    const child = job?.equity_filter || {};
+    const active = child.state && !['IDLE', 'COMMITTED', 'FAILED', 'CANCELLED'].includes(child.state);
+    const committed = child.state === 'COMMITTED';
+    finalistRetestEquityFilter.disabled = child.eligible === false || active || committed || job?.state !== 'COMMITTED'
+      || job?.outcomes_finalized !== true || Number(job?.success_count || 0) <= 0;
+  };
   const updateFinalistRetestExport = () => {
     if (!finalistRetestExport) return;
     finalistRetestExport.hidden = false;
@@ -2878,8 +2887,11 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
     if (!finalistRetestJobId) return;
     try {
       const job = await requestJson(`/api/v2/strategies/performance-v2/finalist-retest/status?job_id=${encodeURIComponent(finalistRetestJobId)}`);
+      updateFinalistRetestEquityFilter(job);
       const importPending = job.import_pending === true;
-      const terminal = !importPending && (
+      const equityState = job.equity_filter?.state;
+      const equityActive = equityState && !['IDLE', 'COMMITTED', 'FAILED', 'CANCELLED'].includes(equityState);
+      const terminal = !equityActive && !importPending && (
         ['FAILED', 'CANCELLED'].includes(job.state)
         || (job.state === 'COMMITTED' && (!job.import_job_id || job.outcomes_finalized === true))
       );
@@ -2900,6 +2912,15 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
       const remainingFailures = Math.max(0, (Array.isArray(job.failures) ? job.failures.length : 0) - 8);
       const importTotals = `imported ${job.imported_count ?? job.success_count ?? 0}, skipped ${job.skipped_count ?? 0}, rejected ${job.rejected_count ?? job.failure_count ?? 0} of ${job.expected_count ?? job.cohort_count ?? 0}`;
       const memberSummary = failureDetails ? `; ${failureDetails}${remainingFailures ? `; and ${remainingFailures} more` : ''}` : '';
+      const equity = job.equity_filter || {};
+      const equityProgress = equity.progress || {};
+      const equityError = equity.error ? ` · equity filter error: ${equity.error.code || 'RETEST_EQUITY_FILTER_FAILED'}: ${equity.error.message || 'request failed'}` : '';
+      const equityResult = equity.result || {};
+      const equityCounts = equity.state === 'COMMITTED'
+        ? ` · pass ${equityResult.pass_count ?? 0}, drop ${equityResult.drop_count ?? 0}, reserved ${equityResult.reserved_count ?? 0}, not evaluated ${equityResult.not_evaluated_count ?? 0}`
+        : '';
+      const equityReason = !equity.eligible && equity.ineligible_reason ? ` · reason ${equity.ineligible_reason}` : '';
+      const equityStatus = ` · EQUITY FILTER ${equity.phase || equity.state || 'IDLE'} ${equityProgress.current || 0}/${equityProgress.total || 0}${equityReason}${equityCounts}${equityError}`;
       if (importPending) {
         if (finalistRetestStatus) finalistRetestStatus.textContent = 'IMPORT & REPLACE handoff is pending; do not click again.';
       } else if (finalistRetestImportJobId) {
@@ -2908,9 +2929,11 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
         const current = Number(p.current || 0);
         const total = Number(p.total || 0);
         const failed = Array.isArray(imported.evidence?.failed_names) ? imported.evidence.failed_names.length : Number(p.failed || 0);
-        if (finalistRetestStatus) finalistRetestStatus.textContent = `IMPORT & REPLACE: ${imported.phase || imported.state || 'IMPORTING'} · ${current}/${total} · batch ${p.batch_number || 0}/${p.batch_total || 0} · retries ${p.retries || 0} · failed ${failed}; ${importTotals}${memberSummary}${imported.error ? ` · ${formatErrorReason(imported.error)}` : ''}`;
+        if (finalistRetestStatus) finalistRetestStatus.textContent = `IMPORT & REPLACE: ${imported.phase || imported.state || 'IMPORTING'} · ${current}/${total} · batch ${p.batch_number || 0}/${p.batch_total || 0} · retries ${p.retries || 0} · failed ${failed}; ${importTotals}${memberSummary}${imported.error ? ` · ${formatErrorReason(imported.error)}` : ''}${equityStatus}`;
         if (finalistRetestImport) finalistRetestImport.disabled = !['FAILED', 'CANCELLED'].includes(imported.state);
-      } else if (finalistRetestStatus) finalistRetestStatus.textContent = `Global finalist retest: ${job.phase || job.state || 'RUNNING'} · ${current}/${total}${nativeStatus}${publicationWarning}${error}${cleanupError}`;
+      } else if (finalistRetestStatus) {
+        finalistRetestStatus.textContent = `Global finalist retest: ${job.phase || job.state || 'RUNNING'} · ${current}/${total}${nativeStatus}${publicationWarning}${error}${cleanupError}${equityStatus}`;
+      }
       if (finalistRetestImport && !finalistRetestImportJobId) finalistRetestImport.disabled = job.state !== 'COMMITTED' || importPending;
       if (job.success_count > 0) finalistRetestHasSuccessfulExport = true;
       updateFinalistRetestExport();
@@ -2938,13 +2961,27 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
   });
   finalistRetestCard?.addEventListener('toggle', () => { if (finalistRetestCard.open) loadFinalistRetestPreview(); });
   finalistRetestReserve?.addEventListener('change', () => { loadFinalistRetestPreview(); updateFinalistRetestExport(); });
+  finalistRetestEquityFilter?.addEventListener('click', async () => {
+    if (!finalistRetestJobId) return;
+    finalistRetestEquityFilter.disabled = true;
+    try {
+      const result = await remoteRequest('/api/v2/strategies/performance-v2/finalist-retest/equity-filter', { job_id: finalistRetestJobId });
+      if (finalistRetestStatus) finalistRetestStatus.textContent = `Equity filter queued: ${result.job_id || 'pending'}.`;
+      window.clearInterval(finalistRetestTimer);
+      finalistRetestTimer = window.setInterval(pollFinalistRetest, 1000);
+      await pollFinalistRetest();
+    } catch (error) {
+      if (finalistRetestStatus) finalistRetestStatus.textContent = `Equity filter failed: ${error?.code ? `${error.code}: ` : ''}${error?.message || 'request failed'}.`;
+      finalistRetestEquityFilter.disabled = false;
+    }
+  });
   updateFinalistRetestExport();
   const recoverFinalistRetestJob = async () => {
     try {
       const snapshot = await requestJson('/api/v2/jobs');
       const jobs = Array.isArray(snapshot.jobs) ? snapshot.jobs : [];
       const recovered = jobs
-        .filter((job) => job?.kind === 'strategies.performance.v2.finalist-retest' && job.state === 'COMMITTED' && typeof job.job_id === 'string')
+        .filter((job) => job?.kind === 'strategies.performance.v2.finalist-retest' && ['QUEUED', 'RUNNING', 'COMMITTED'].includes(job.state) && typeof job.job_id === 'string')
         .sort((left, right) => String(right.created_at_utc || '').localeCompare(String(left.created_at_utc || '')))[0];
       if (!recovered) return;
       finalistRetestJobId = recovered.job_id;

@@ -38,6 +38,21 @@ _INVALID_REASON_ORDER = (
     "EQUITY_OUTSIDE_REPORT_INTERVAL",
 )
 
+
+def equity_regime_policy_snapshot() -> dict[str, object]:
+    """Return the immutable classifier inputs used by a frozen retest action."""
+    return {
+        "algorithm_version": ALGORITHM_VERSION,
+        "epsilon": format(EPSILON, "f"),
+        "dd_limit": format(DD_LIMIT, "f"),
+        "grid_step_hours": int(GRID_STEP.total_seconds() // 3600),
+        "windows_days": [28, 14, 7],
+        "pre28_min_days": 14,
+        "slowdown_ratio": "0.8",
+        "strong_thresholds": {"v28": "10", "v14": "10", "v7": "10", "alternate_v28": "7"},
+        "ath": {"require_strict_stages": True, "require_held_w7_breakout": True},
+    }
+
 RegimeState = Literal["GROWING", "WEAKENING", "RESUMED", "STALLED", "DROP", "NOT_EVALUATED"]
 Decision = Literal["PASS", "DROP", "NOT_EVALUATED"]
 Rank = Literal["GROWING", "WEAKENING", "RESUMED", "RESERVED"]
@@ -538,6 +553,7 @@ def classify_equity_regime(
 
 __all__ = [
     "ALGORITHM_VERSION",
+    "equity_regime_policy_snapshot",
     "DD_LIMIT",
     "EPSILON",
     "EquityRegimeAssessment",

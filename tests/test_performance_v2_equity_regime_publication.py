@@ -335,6 +335,41 @@ def test_conflicting_assessment_for_same_strategy_aborts_combined_publication():
     assert connection.execute("select count(*) from strategy_rejection_sources").fetchone() == (0,)
 
 
+def test_failure_after_first_group_write_rolls_back_every_publication_table():
+    connection = _database()
+    request = _request()
+    result = _result(connection, _assessment(), filter_enabled=True)
+    first = new_run_metadata(connection, request)
+    second = new_run_metadata(connection, request)
+
+    class FailAfterFirstRun:
+        def __init__(self, wrapped):
+            self.wrapped = wrapped
+            self.run_inserts = 0
+
+        def execute(self, sql, *args, **kwargs):
+            if str(sql).lstrip().lower().startswith("insert into selection_runs"):
+                self.run_inserts += 1
+                if self.run_inserts == 2:
+                    raise duckdb.Error("injected publication failure")
+            return self.wrapped.execute(sql, *args, **kwargs)
+
+        def executemany(self, sql, *args, **kwargs):
+            return self.wrapped.executemany(sql, *args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(self.wrapped, name)
+
+    with pytest.raises(duckdb.Error, match="injected publication failure"):
+        persist_selection_snapshots(FailAfterFirstRun(connection), (
+            {"request": request, "config": SelectionConfig(), "result": result, "metadata": first},
+            {"request": request, "config": SelectionConfig(), "result": result, "metadata": second},
+        ), workbook_bytes=b"injected")
+
+    for table in ("selection_runs", "selection_results", "strategy_rejection_sources", "strategy_tags"):
+        assert connection.execute(f"select count(*) from {table}").fetchone()[0] == 0
+
+
 def test_manual_review_clearing_manual_tag_keeps_equity_rejection_effective(tmp_path):
     connection = _database()
     request = _request()
