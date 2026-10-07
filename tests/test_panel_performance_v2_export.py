@@ -212,17 +212,8 @@ def test_read_only_export_includes_only_fresh_cached_equity_facts_without_writes
 
     sheet = load_workbook(BytesIO(payload), data_only=True)["All candidates"]
     headers = [cell.value for cell in sheet[1]]
-    equity_start = headers.index("MA") + 1
-    assert headers[equity_start:equity_start + 4] == ["Equity state", "Equity basis", "Equity DD, %", "Equity smoothness"]
-    assert sheet.cell(2, headers.index("Equity state") + 1).value == facts.state
-    assert sheet.cell(2, headers.index("Equity basis") + 1).value == "7d / PROVISIONAL"
-    drawdown_cell = sheet.cell(2, headers.index("Equity DD, %") + 1)
-    smoothness_cell = sheet.cell(2, headers.index("Equity smoothness") + 1)
-    assert facts.drawdown is not None and facts.drawdown * 100 > 0
-    assert facts.drawdown * 100 != (facts.drawdown * 100).quantize(Decimal("0.01"))
-    assert facts.windows[-1].er != facts.windows[-1].er.quantize(Decimal("0.01"))
-    assert drawdown_cell.data_type == "n" and drawdown_cell.value == pytest.approx(float(facts.drawdown * 100))
-    assert smoothness_cell.data_type == "n" and smoothness_cell.value == pytest.approx(float(facts.windows[-1].er))
+    assert not {"Equity state", "Equity basis", "Equity DD, %", "Equity smoothness"}.intersection(headers)
+    assert not {"Regime state", "Regime decision", "Previous ATH W7", "ATH W28", "ATH W14", "ATH W7", "ATH End"}.intersection(headers)
     assert sheet.cell(2, headers.index("User Status") + 1).value == "REJECTED"
     assert sheet.cell(2, headers.index("RETEST") + 1).value == "RETEST"
     assert before_file == after_file

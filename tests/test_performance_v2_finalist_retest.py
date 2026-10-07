@@ -82,6 +82,29 @@ def _candidate_workbook(rows, request: SelectionRequest | None = None) -> bytes:
         return path.read_bytes()
 
 
+def test_bulk_control_candidate_workbook_uses_regime_column_contract() -> None:
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "filter_equity_regime", "enabled": True, "scope": "pair_side"},
+    ]})
+    workbook = load_workbook(BytesIO(_candidate_workbook([{"strategy_id": 1}], request)))
+    headers = [cell.value for cell in workbook["All candidates"][1]]
+    regime_block = [
+        "Regime rank", "Regime reasons",
+        "PRE28 direction", "PRE28 v", "PRE28 p", "W28 direction", "W28 v", "W28 p",
+        "W14 direction", "W14 v", "W14 p", "W7 direction", "W7 v", "W7 p",
+        "Regime DD14, %", "Regime DD7, %", "New ATH stages", "New ATH W7", "Held ATH W7",
+    ]
+    start = headers.index("Regime rank")
+    assert headers[start:start + len(regime_block)] == regime_block
+    assert not {"Regime state", "Regime decision", "Previous ATH W7", "ATH W28", "ATH W14", "ATH W7", "ATH End"}.intersection(headers)
+    assert not {"History days", "Completed cycles", "Profitable cycles", "Completed net PnL", "Top 5 PnL", "PnL after top 5"}.intersection(headers)
+    sheet = workbook["All candidates"]
+    for header in ("PRE28 p", "W28 p", "W14 p", "W7 p"):
+        column = headers.index(header) + 1
+        assert sheet.cell(1, column).border.right.style == "double"
+        assert sheet.cell(2, column).border.right.style == "double"
+
+
 def test_weighted_template_only_changes_name_and_mrs_priority() -> None:
     root = Path(__file__).resolve().parents[1]
     original_text = (root / "templates/strategies/retest-mrs3/base.json").read_text(encoding="utf-8")

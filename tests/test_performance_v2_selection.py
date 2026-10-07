@@ -4104,6 +4104,70 @@ def test_equity_workbook_appends_four_precise_columns_and_labels_method(tmp_path
     assert ("selection_method", "equity_quality_v1") in {tuple(row) for row in metadata_sheet.iter_rows(min_row=1, max_col=2, values_only=True)}
 
 
+def test_legacy_export_does_not_publish_stale_equity_quality_block(tmp_path: Path) -> None:
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
+    facts = _equity_rank_facts(101, 0, "1", "0.1", "0.2", 28, state="GROWING")
+    result = pd.DataFrame([{
+        "strategy_id": 1,
+        "result_id": 101,
+        "strategy_name": "legacy-with-old-cache",
+        "symbol": "BTCUSDT",
+        "side": "LONG",
+        "timeframe": "1h",
+        "order_count": 1,
+        "close_ma_len": 3,
+        "finalist": True,
+        "_equity_cache": {"status": "FRESH", **facts},
+    }])
+
+    headers = [cell.value for cell in load_workbook(
+        write_selection_workbook(result, tmp_path / "legacy-with-old-cache.xlsx", request), data_only=True,
+    )["All candidates"][1]]
+
+    assert "Equity state" not in headers
+    assert "Equity basis" not in headers
+    assert "Equity DD, %" not in headers
+    assert "Equity smoothness" not in headers
+
+
+def test_malformed_regime_snapshot_does_not_publish_regime_block(tmp_path: Path) -> None:
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
+    result = pd.DataFrame([{
+        "strategy_id": 1,
+        "result_id": 101,
+        "strategy_name": "malformed-regime",
+        "symbol": "BTCUSDT",
+        "side": "LONG",
+        "timeframe": "1h",
+        "order_count": 1,
+        "close_ma_len": 3,
+        "finalist": True,
+        "equity_regime_json": "not-json",
+    }])
+
+    headers = [cell.value for cell in load_workbook(
+        write_selection_workbook(result, tmp_path / "malformed-regime.xlsx", request), data_only=True,
+    )["All candidates"][1]]
+
+    assert "Regime state" not in headers
+    assert "Regime decision" not in headers
+
+
+def test_non_equity_rank_does_not_publish_legacy_quality_block(tmp_path: Path) -> None:
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "rank_robust_top_n", "enabled": True, "scope": "pair_side", "top_n": 1,
+         "method": "robust_v1"},
+    ]})
+    result = run_selection(pd.DataFrame([_selection_row("robust")]), request)
+    headers = [cell.value for cell in load_workbook(
+        write_selection_workbook(result, tmp_path / "robust-rank.xlsx", request), data_only=True,
+    )["All candidates"][1]]
+
+    assert not any(header in headers for header in (
+        "Equity state", "Equity basis", "Equity DD, %", "Equity smoothness",
+    ))
+
+
 def test_equity_regime_workbook_displays_rank_only_when_regime_is_enabled(tmp_path: Path) -> None:
     request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
         {"id": "filter_equity_regime", "enabled": True, "scope": "pair_side"},
@@ -4116,6 +4180,11 @@ def test_equity_regime_workbook_displays_rank_only_when_regime_is_enabled(tmp_pa
 
     assert "Regime rank" in headers
     assert sheet.cell(2, headers.index("Regime rank") + 1).value == "RESERVED"
+    assert not any(header in headers for header in (
+        "Equity state", "Equity basis", "Equity DD, %", "Equity smoothness",
+    ))
+    assert "Regime state" not in headers
+    assert "Regime decision" not in headers
 
     legacy_request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
     legacy_result = run_selection(pd.DataFrame([_selection_row("legacy")]), legacy_request)
@@ -4123,6 +4192,64 @@ def test_equity_regime_workbook_displays_rank_only_when_regime_is_enabled(tmp_pa
         write_selection_workbook(legacy_result, tmp_path / "legacy.xlsx", legacy_request), data_only=True,
     )["All candidates"]
     assert "Regime rank" not in [cell.value for cell in legacy_sheet[1]]
+
+
+def test_equity_blocks_keep_a_stable_order_for_all_request_permutations(tmp_path: Path) -> None:
+    def headers(name: str, result: pd.DataFrame, request) -> list[object]:
+        return [cell.value for cell in load_workbook(
+            write_selection_workbook(result, tmp_path / f"{name}.xlsx", request), data_only=True,
+        )["All candidates"][1]]
+
+    no_equity_request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
+    no_equity = run_selection(pd.DataFrame([_selection_row("plain")]), no_equity_request)
+    quality_request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "rank_robust_top_n", "enabled": True, "scope": "pair_side", "top_n": 1,
+         "method": "equity_quality_v1"},
+    ]})
+    quality = run_selection(pd.DataFrame([_selection_row("quality", _equity_state="GROWING")]), quality_request)
+    quality = quality.drop(columns=["equity_regime_json"])
+    regime_request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "filter_equity_regime", "enabled": True, "scope": "pair_side"},
+    ]})
+    regime = run_selection(pd.DataFrame([_selection_row("regime", _equity_state="STALLED")]), regime_request)
+    both_request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "filter_equity_regime", "enabled": True, "scope": "pair_side"},
+        {"id": "rank_robust_top_n", "enabled": True, "scope": "pair_side", "top_n": 1,
+         "method": "equity_quality_v1"},
+    ]})
+    both = run_selection(pd.DataFrame([_selection_row("both", _equity_state="GROWING")]), both_request)
+
+    no_headers = headers("no-equity", no_equity, no_equity_request)
+    quality_headers = headers("quality-only", quality, quality_request)
+    regime_headers = headers("regime-only", regime, regime_request)
+    both_headers = headers("quality-and-regime", both, both_request)
+    quality_block = ["Equity state", "Equity basis", "Equity DD, %", "Equity smoothness"]
+    regime_block = [
+        "Regime rank", "Regime reasons",
+        "PRE28 direction", "PRE28 v", "PRE28 p", "W28 direction", "W28 v", "W28 p",
+        "W14 direction", "W14 v", "W14 p", "W7 direction", "W7 v", "W7 p",
+        "Regime DD14, %", "Regime DD7, %", "New ATH stages", "New ATH W7", "Held ATH W7",
+    ]
+    removed_regime_columns = {"Regime state", "Regime decision", "Previous ATH W7", "ATH W28", "ATH W14", "ATH W7", "ATH End"}
+    for current in (no_headers, quality_headers, regime_headers, both_headers):
+        assert current[-1] == no_headers[-1]
+        assert current.index("Auto Status") < current.index(no_headers[-1])
+        assert not removed_regime_columns.intersection(current)
+    assert not any(column in no_headers for column in (*quality_block, *regime_block))
+    assert quality_headers[quality_headers.index("MA") + 1:quality_headers.index("MA") + 5] == quality_block
+    assert regime_headers[regime_headers.index("MA") + 1:regime_headers.index("MA") + 1 + len(regime_block)] == regime_block
+    assert both_headers[both_headers.index("MA") + 1:both_headers.index("MA") + 1 + len(quality_block)] == quality_block
+    regime_start = both_headers.index("Regime rank")
+    assert both_headers[regime_start:regime_start + len(regime_block)] == regime_block
+
+    regime_book = load_workbook(tmp_path / "regime-only.xlsx", data_only=True)
+    regime_sheet = regime_book["All candidates"]
+    regime_headers_row = [cell.value for cell in regime_sheet[1]]
+    for header in ("PRE28 p", "W28 p", "W14 p", "W7 p"):
+        column = regime_headers_row.index(header) + 1
+        assert regime_sheet.cell(1, column).border.right.style == "double"
+        assert regime_sheet.cell(2, column).border.right.style == "double"
+    assert regime_sheet.cell(1, regime_headers_row.index("PRE28 v") + 1).border.right.style != "double"
 
 
 def test_selection_workbook_does_not_copy_equity_evidence_into_row_formatting(
@@ -4222,7 +4349,10 @@ def test_equity_workbook_rejects_fresh_facts_missing_their_horizon_window() -> N
 
 
 def test_equity_workbook_maps_cached_facts_positionally_with_duplicate_dataframe_index(tmp_path: Path) -> None:
-    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "rank_robust_top_n", "enabled": True, "scope": "pair_side", "top_n": 1,
+         "method": "equity_quality_v1"},
+    ]})
     first = _equity_rank_facts(101, 0, "1", "0.1", "0.2", 28)
     second = _equity_rank_facts(102, 1, "2", "0.2", "0.3", 14, state="WEAKENING")
     result = pd.DataFrame([
@@ -4331,8 +4461,9 @@ def test_workbook_keeps_all_candidates_and_ab_30d_columns(tmp_path: Path) -> Non
     trades_30_column = headers.index("Trades/30") + 1
     assert book["All candidates"].cell(winner_row, trades_30_column).value == 3.75
     assert book["All candidates"].cell(winner_row, trades_30_column).data_type == "n"
-    for header in ("Completed net PnL", "Top 5 PnL", "Top 5 share, %", "PnL after top 5"):
-        assert header in headers
+    for header in ("History days", "Completed cycles", "Profitable cycles", "Completed net PnL", "Top 5 PnL", "PnL after top 5"):
+        assert header not in headers
+    assert "Top 5 share, %" in headers
     assert book["All candidates"].cell(3, headers.index("Причина") + 1).value == "PARETO_PLATEAU_POINTS_PER_ORDER"
     assert book["All candidates"].cell(3, headers.index("Причина") + 1).alignment.horizontal == "left"
     for header in ("PnL/30", "PnL DD5/30", "PF", "PnL A/30д, %", "PnL B/30д, %"):
@@ -4738,7 +4869,9 @@ def test_top_five_replaces_legacy_best_trade_rule_and_exports_evidence(tmp_path:
     assert "TOP5_SHARE" in result.loc[0, "elimination_reason"]
     path = write_selection_workbook(result, tmp_path / "top5.xlsx", request)
     headers = [cell.value for cell in load_workbook(path, data_only=True)["All candidates"][1]]
-    assert {"Top 5 share, %", "Completed net PnL", "PnL after top 5"}.issubset(headers)
+    assert "Top 5 share, %" in headers
+    assert "Completed net PnL" not in headers
+    assert "PnL after top 5" not in headers
 
 
 def test_loader_uses_closed_cycles_for_b_gate_and_ignores_zero_and_commission(tmp_path: Path) -> None:

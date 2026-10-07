@@ -12,6 +12,23 @@ The legacy v6-to-v7 migration fix and the narrowly scoped recovery for the known
 
 ## Performance v2 selection and equity regime
 
+Excel column consistency is implemented in the shared workbook renderer.
+Legacy R7.3 cache presence no longer changes a legacy workbook's headers. The
+four R7.3 fields appear only for an explicit `equity_quality_v1` ranking
+request; the new regime block appears for an enabled `filter_equity_regime` or
+a valid published regime snapshot. The contract is [Performance v2 XLSX
+column contract](docs/specs/2026-10-07-performance-v2-xlsx-column-contract.md).
+The same contract omits the verbose history/cycle and top-five PnL display
+columns, plus regime state/decision and ATH diagnostic columns, while retaining
+those facts in the calculation/database layer. Regime period columns are shown
+as PRE28, W28, W14, W7 with double visual separators; the shared contract is
+covered for the ordinary writer, PerformanceDB export, finalist control, and
+bulk-control candidate workbook paths.
+The focused selection/export modules pass (`228 passed`); the related
+regime/export/finalist-control run is `90 passed, 1 skipped` plus the same
+pre-existing `PARETO_PLATEAU_POINTS_PER_ORDER` alias expectation. No live
+database or panel was used.
+
 The researched selection stages and the equity-regime cache are implemented. Selection publication validates cached facts against the current source before publishing. Missing or invalid cache data blocks publication atomically. Focused backend and Panel selection/equity suites passed; independent Claude Opus review passed.
 
 Card 6 now restores User Status and User Rank from partial selection XLSX folders and shows per-file progress, applied/unchanged counts, and actual API errors in Panel. Blank statuses are skipped; only nonblank decisions are checked against the database and written through the existing review ledger. FINALIST ranks are optional and unique within a run; RESERVE and REJECTED ranks must be blank. Focused partial-import/API/UI checks passed (19 tests), the full selection-review module passed (102 tests), and blank FINALIST rank clearing passed separately. Independent Claude Opus review passed. No live PerformanceDB was accessed or modified.

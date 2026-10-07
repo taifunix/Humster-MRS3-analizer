@@ -845,9 +845,12 @@ G/Q/D/P, source revision, quality reasons и версии — только snaps
 JSON, не ещё 15 hidden columns. В existing hidden metadata — ссылка/ID и
 минимальный контракт; Excel не дублирует всю DB и не служит audit source.
 
-При полностью legacy request сохраняется прежний набор колонок. Для нового
-selection block включён; read-only Performance export добавляет его только
-при наличии свежих equity facts хотя бы у одной экспортируемой строки.
+Состав и порядок новых XLSX теперь определяются отдельным контрактом
+[Performance v2 XLSX column contract](2026-10-07-performance-v2-xlsx-column-contract.md).
+Наличие старого или нового cache само по себе не меняет шапку: старый R7.3
+block появляется только при явном выборе `equity_quality_v1`, а regime block —
+при включённом `filter_equity_regime` или при наличии проверенного
+опубликованного regime snapshot.
 Null -> blank, unassessed stage -> N/A, не PASS и не ноль. Не применять generic
 quantize(.01) к исследовательским полям. Excel numeric cells сохраняют допустимую
 числовую точность; formats 4–6 decimals служат только для показа. DB JSON хранит

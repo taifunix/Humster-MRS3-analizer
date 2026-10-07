@@ -2230,15 +2230,29 @@ def _equity_workbook_values(cached: object) -> dict[str, object]:
 
 
 _EQUITY_REGIME_WORKBOOK_COLUMNS = (
-    "equity_regime_state", "equity_regime_decision", "equity_regime_rank", "equity_regime_reasons",
+    "equity_regime_rank", "equity_regime_reasons",
+    "equity_regime_pre28_direction", "equity_regime_pre28_v", "equity_regime_pre28_p",
     "equity_regime_w28_direction", "equity_regime_w28_v", "equity_regime_w28_p",
     "equity_regime_w14_direction", "equity_regime_w14_v", "equity_regime_w14_p",
     "equity_regime_w7_direction", "equity_regime_w7_v", "equity_regime_w7_p",
-    "equity_regime_pre28_direction", "equity_regime_pre28_v", "equity_regime_pre28_p",
-    "equity_regime_dd14_pct", "equity_regime_dd7_pct", "equity_regime_previous_ath_w7",
-    "equity_regime_hwm_t28", "equity_regime_hwm_t14", "equity_regime_hwm_t7", "equity_regime_hwm_t",
+    "equity_regime_dd14_pct", "equity_regime_dd7_pct",
     "equity_regime_ath_stage_counts", "equity_regime_new_ath_w7", "equity_regime_held_w7_breakout",
 )
+
+
+def _has_valid_equity_regime_snapshot(payload: object) -> bool:
+    if not isinstance(payload, str):
+        return False
+    try:
+        assessment = json.loads(payload)
+    except (TypeError, ValueError):
+        return False
+    return (
+        isinstance(assessment, Mapping)
+        and isinstance(assessment.get("state"), str)
+        and isinstance(assessment.get("facts"), Mapping)
+        and isinstance(assessment["facts"].get("windows"), Mapping)
+    )
 
 
 def _equity_regime_workbook_values(payload: object) -> dict[str, object]:
@@ -2252,17 +2266,10 @@ def _equity_regime_workbook_values(payload: object) -> dict[str, object]:
     except (KeyError, TypeError, ValueError):
         return values
     values.update({
-        "equity_regime_state": assessment.get("state"),
-        "equity_regime_decision": assessment.get("decision"),
         "equity_regime_rank": assessment.get("rank"),
         "equity_regime_reasons": ";".join(assessment.get("reasons", ())),
         "equity_regime_dd14_pct": _decimal_or_none(facts.get("dd14")),
         "equity_regime_dd7_pct": _decimal_or_none(facts.get("dd7")),
-        "equity_regime_previous_ath_w7": _decimal_or_none(facts.get("previous_ath_w7")),
-        "equity_regime_hwm_t28": _decimal_or_none(facts.get("hwm_t28")),
-        "equity_regime_hwm_t14": _decimal_or_none(facts.get("hwm_t14")),
-        "equity_regime_hwm_t7": _decimal_or_none(facts.get("hwm_t7")),
-        "equity_regime_hwm_t": _decimal_or_none(facts.get("hwm_t")),
         "equity_regime_ath_stage_counts": "/".join(map(str, facts.get("ath_stage_counts", ()))),
         "equity_regime_new_ath_w7": facts.get("new_ath_w7"),
         "equity_regime_held_w7_breakout": facts.get("held_w7_breakout"),
@@ -3462,22 +3469,22 @@ def write_selection_workbook(
         if stage.id == "rank_robust_top_n" and stage.enabled and stage.method == "equity_quality_v1"
     ), None)
     selection_method = None if equity_rank is None else "equity_quality_v1"
-    equity_request_enabled = selection_method is not None or any(
+    equity_filter_enabled = any(
         stage.id == "filter_equity_regime" and stage.enabled for stage in request.stages
     )
     published_regime_present = "equity_regime_json" in result and any(
-        isinstance(value, str) and value.strip() not in {"", "null"}
+        _has_valid_equity_regime_snapshot(value)
         for value in result["equity_regime_json"]
     )
-    equity_regime_display_enabled = equity_request_enabled or published_regime_present
+    # The two equity surfaces are independent.  A stale R7.3 cache must not
+    # change a legacy export, and an old ranking request must not manufacture
+    # a blank regime block.  Published regime snapshots remain visible even
+    # when the export request itself has no stages.
+    equity_quality_display_enabled = selection_method == "equity_quality_v1"
+    equity_regime_display_enabled = equity_filter_enabled or published_regime_present
     equity_columns = ("equity_state", "equity_basis", "equity_dd_pct", "equity_smoothness")
     regime_columns = _EQUITY_REGIME_WORKBOOK_COLUMNS
-    cached_equity_values = result.get("_equity_cache")
-    fresh_equity_present = cached_equity_values is not None and any(
-        isinstance(value, Mapping) and value.get("status") == "FRESH"
-        for value in cached_equity_values
-    )
-    if "_equity_cache" in result and (equity_request_enabled or fresh_equity_present):
+    if "_equity_cache" in result and equity_quality_display_enabled:
         values = [_equity_workbook_values(value) for value in result["_equity_cache"]]
         missing_equity_columns = [column for column in equity_columns if column not in result]
         if missing_equity_columns:
@@ -3501,7 +3508,7 @@ def write_selection_workbook(
     ], errors="ignore").copy()
     # Display rows must not inherit equity evidence; result keeps it for snapshot publication.
     display.attrs.clear()
-    equity_block_enabled = equity_request_enabled or any(column in display for column in equity_columns)
+    equity_block_enabled = equity_quality_display_enabled
     if equity_block_enabled:
         for column in equity_columns:
             if column not in display:
@@ -3648,7 +3655,7 @@ def write_selection_workbook(
         "pnl_30d_pct", "dd5_proxy", "ab_pnl_change_30d_pct", "ab_return_a_30d_pct", "ab_calendar_days_a", "ab_return_b_30d_pct", "ab_calendar_days_b", "positive_quarter_count",
         "capital_efficiency", "profit_factor", "max_drawdown_pct", "win_rate_pct", "total_trades", "trades_30d", "capital_proxy",
         "holding_p95_minutes", "holding_median_minutes",
-        "history_days", "completed_cycle_count", "completed_profitable_cycle_count", "completed_cycle_net_pnl", "top5_pnl", "top5_share_pct", "pnl_after_top5", "ab_completed_cycle_count", "ab_win_rate_b_pct",
+        "top5_share_pct", "ab_completed_cycle_count", "ab_win_rate_b_pct",
         "robust_pnl_30d_pct", "worst_drawdown_pct", "worst_holding_p95_minutes", "ab_stability_ratio",
         "rank_quality_robust_pnl", "rank_quality_worst_drawdown", "rank_quality_ab_stability", "rank_quality_first_shift", "rank_quality_minimum_plateau_points", "rank_quality_close_ma",
         "rank_weight_coverage_pct", "rank_weight_robust_pnl", "rank_weight_worst_drawdown", "rank_weight_ab_stability", "rank_weight_first_shift", "rank_weight_minimum_plateau_points", "rank_weight_close_ma",
@@ -3671,7 +3678,7 @@ def write_selection_workbook(
         "max_drawdown_pct": "DD", "win_rate_pct": "W/R", "total_trades": "Trades", "capital_proxy": "Lot DD5",
         "holding_p95_minutes": "Hold p95", "holding_median_minutes": "Hold M",
         "elimination_reason": "Причина",
-        "history_days": "History days", "completed_cycle_count": "Completed cycles", "completed_profitable_cycle_count": "Profitable cycles", "completed_cycle_net_pnl": "Completed net PnL", "top5_pnl": "Top 5 PnL", "top5_share_pct": "Top 5 share, %", "pnl_after_top5": "PnL after top 5", "ab_completed_cycle_count": "B cycles", "ab_win_rate_b_pct": "B W/R",
+        "top5_share_pct": "Top 5 share, %", "ab_completed_cycle_count": "B cycles", "ab_win_rate_b_pct": "B W/R",
         "positive_quarter_count": "Positive windows", "trades_30d": "Trades/30",
         "robust_pnl_30d_pct": "Robust PnL/30", "worst_drawdown_pct": "Worst DD", "worst_holding_p95_minutes": "Worst Hold p95",
         "ab_stability_ratio": "A/B stability",
@@ -3692,19 +3699,15 @@ def write_selection_workbook(
         "user_analog_of_strategy_id": "Analog Of ID", "comment": "Comment",
         "equity_state": "Equity state", "equity_basis": "Equity basis",
         "equity_dd_pct": "Equity DD, %", "equity_smoothness": "Equity smoothness",
-        "equity_regime_state": "Regime state", "equity_regime_decision": "Regime decision",
         "equity_regime_rank": "Regime rank",
         "equity_regime_reasons": "Regime reasons",
-        "equity_regime_w28_direction": "W28 direction", "equity_regime_w28_v": "W28 v",
-        "equity_regime_w28_p": "W28 p", "equity_regime_w14_direction": "W14 direction",
-        "equity_regime_w14_v": "W14 v", "equity_regime_w14_p": "W14 p",
-        "equity_regime_w7_direction": "W7 direction", "equity_regime_w7_v": "W7 v",
-        "equity_regime_w7_p": "W7 p", "equity_regime_pre28_direction": "PRE28 direction",
-        "equity_regime_pre28_v": "PRE28 v", "equity_regime_pre28_p": "PRE28 p",
+        "equity_regime_pre28_direction": "PRE28 direction", "equity_regime_pre28_v": "PRE28 v",
+        "equity_regime_pre28_p": "PRE28 p", "equity_regime_w28_direction": "W28 direction",
+        "equity_regime_w28_v": "W28 v", "equity_regime_w28_p": "W28 p",
+        "equity_regime_w14_direction": "W14 direction", "equity_regime_w14_v": "W14 v",
+        "equity_regime_w14_p": "W14 p", "equity_regime_w7_direction": "W7 direction",
+        "equity_regime_w7_v": "W7 v", "equity_regime_w7_p": "W7 p",
         "equity_regime_dd14_pct": "Regime DD14, %", "equity_regime_dd7_pct": "Regime DD7, %",
-        "equity_regime_previous_ath_w7": "Previous ATH W7",
-        "equity_regime_hwm_t28": "ATH W28", "equity_regime_hwm_t14": "ATH W14",
-        "equity_regime_hwm_t7": "ATH W7", "equity_regime_hwm_t": "ATH End",
         "equity_regime_ath_stage_counts": "New ATH stages",
         "equity_regime_new_ath_w7": "New ATH W7", "equity_regime_held_w7_breakout": "Held ATH W7",
     })
@@ -3783,6 +3786,10 @@ def write_selection_workbook(
             "3 Shift": ("right",),
                 "Points": ("left", "right"),
             "MA": ("left", "right"),
+            "PRE28 p": ("right",),
+            "W28 p": ("right",),
+            "W14 p": ("right",),
+            "W7 p": ("right",),
             "Auto Rank": ("left", "right"),
             "Close": ("left", "right"),
         },
