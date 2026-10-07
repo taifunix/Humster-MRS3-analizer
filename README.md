@@ -60,6 +60,9 @@ import, publication and analysis, but does not change calculated results.
 .\.venv\Scripts\python.exe -m mrs3.cli tester-plan --help
 .\.venv\Scripts\python.exe -m mrs3.cli tester-run --help
 
+# Bybit base-lot values in the Actual sheet of the liquidity workbook
+.\scripts\calculate_bybit_base_lots.cmd
+
 ```
 
 В панели источники MRS2 разделены на CSV и DuckDB. На вкладке «Кандидаты
