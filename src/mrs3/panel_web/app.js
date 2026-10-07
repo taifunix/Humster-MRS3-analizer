@@ -3455,16 +3455,18 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
   };
   const fixedSelectionPrefix = new Set([
     'filter_equity_regime', 'filter_lot_variant_redundancy', 'filter_hard_cutoffs', 'ab_deterioration', 'filter_best_trade_dependency',
+    'filter_min_shift',
     'pair_side_pnl_upper_half', 'structural_stage_1', 'structural_stage_2', 'pair_side_stage_3',
   ]);
   const defaultSelectionStageOrder = [
     'filter_equity_regime', 'filter_lot_variant_redundancy', 'filter_hard_cutoffs', 'ab_deterioration', 'filter_best_trade_dependency',
-    'pair_side_pnl_upper_half', 'structural_stage_1', 'structural_stage_2', 'pair_side_stage_3',
-    'filter_holding_outlier', 'filter_low_trades', 'filter_min_shift', 'pareto_dd5_balanced', 'pareto_robust', 'pareto_shift_near_tie',
+    'filter_min_shift', 'pair_side_pnl_upper_half', 'structural_stage_1', 'structural_stage_2', 'pair_side_stage_3',
+    'filter_holding_outlier', 'filter_low_trades', 'pareto_dd5_balanced', 'pareto_robust', 'pareto_shift_near_tie',
     'pareto_close_ma_near_tie',
   ];
   const defaultEnabledSelectionStages = new Set([
     'filter_lot_variant_redundancy', 'filter_hard_cutoffs', 'ab_deterioration', 'filter_best_trade_dependency',
+    'filter_min_shift',
     'pair_side_pnl_upper_half', 'structural_stage_1', 'structural_stage_2', 'pair_side_stage_3',
   ]);
   if (selectionPreviewOrder) {
@@ -3523,7 +3525,7 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
     id: stage.dataset.selectionStage,
     enabled: !!stage.querySelector('input[type="checkbox"]')?.checked,
     scope: stage.querySelector('[data-selection-scope]')?.value || (
-      ['filter_equity_regime', 'pair_side_pnl_upper_half', 'pair_side_stage_3'].includes(stage.dataset.selectionStage)
+      ['filter_equity_regime', 'filter_min_shift', 'pair_side_pnl_upper_half', 'pair_side_stage_3'].includes(stage.dataset.selectionStage)
         ? 'pair_side' : 'pair_side_timeframe'),
     ...(stage.querySelector('[data-selection-min-shift]') ? { min_shift_pct: stage.querySelector('[data-selection-min-shift]').value } : {}),
     ...(stage.querySelector('[data-selection-pnl-tolerance]') ? { pnl_tolerance_pct: stage.querySelector('[data-selection-pnl-tolerance]').value } : {}),

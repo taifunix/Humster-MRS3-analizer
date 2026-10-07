@@ -986,11 +986,63 @@ def test_min_shift_filter_excludes_any_existing_order_below_threshold() -> None:
         _selection_row("kept", strategy_id=1, order_count=2, order_1_shift_bp=30, order_2_shift_bp=40),
         _selection_row("excluded", strategy_id=2, order_count=2, order_1_shift_bp=40, order_2_shift_bp=20),
         _selection_row("missing", strategy_id=3, order_count=2, order_1_shift_bp=40),
+        _selection_row("no-shift", strategy_id=4, order_count=2, order_1_shift_bp=None),
+        _selection_row("negative-shift", strategy_id=5, order_count=2, order_1_shift_bp=-1),
     ]), request).set_index("strategy_name")
 
     assert not result.loc["kept", "eliminated_by_filter_min_shift"]
     assert result.loc["excluded", "eliminated_by_filter_min_shift"]
     assert not result.loc["missing", "eliminated_by_filter_min_shift"]
+    assert not result.loc["no-shift", "eliminated_by_filter_min_shift"]
+    assert result.loc["negative-shift", "eliminated_by_filter_min_shift"]
+
+
+def test_min_shift_percent_is_converted_to_basis_points_at_the_boundary() -> None:
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "filter_min_shift", "enabled": True, "scope": "pair_side", "min_shift_pct": "0.3"},
+    ]})
+    result = run_selection(pd.DataFrame([
+        _selection_row("exact", strategy_id=1, order_1_shift_bp=Decimal("30")),
+        _selection_row("below", strategy_id=2, order_1_shift_bp=Decimal("29.9")),
+    ]), request).set_index("strategy_name")
+
+    assert not result.loc["exact", "eliminated_by_filter_min_shift"]
+    assert result.loc["below", "eliminated_by_filter_min_shift"]
+
+    one_percent = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "filter_min_shift", "enabled": True, "scope": "pair_side", "min_shift_pct": "1"},
+    ]})
+    scaled = run_selection(pd.DataFrame([
+        _selection_row("exact-1pct", strategy_id=3, order_1_shift_bp=Decimal("100")),
+        _selection_row("below-1pct", strategy_id=4, order_1_shift_bp=Decimal("99.9")),
+    ]), one_percent).set_index("strategy_name")
+    assert not scaled.loc["exact-1pct", "eliminated_by_filter_min_shift"]
+    assert scaled.loc["below-1pct", "eliminated_by_filter_min_shift"]
+
+    precise = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "filter_min_shift", "enabled": True, "scope": "pair_side", "min_shift_pct": "0.07"},
+    ]})
+    precise_result = run_selection(pd.DataFrame([
+        _selection_row("exact-precise", strategy_id=5, order_1_shift_bp=Decimal("7")),
+    ]), precise).set_index("strategy_name")
+    assert not precise_result.loc["exact-precise", "eliminated_by_filter_min_shift"]
+
+
+@pytest.mark.parametrize(
+    ("stage", "error"),
+    [
+        ({"id": "filter_min_shift", "enabled": True, "scope": "pair_side"}, "INVALID_STAGE"),
+        ({"id": "filter_min_shift", "enabled": True, "scope": "pair_side", "min_shift_pct": None}, "INVALID_CONFIG_min_shift_pct"),
+        ({"id": "filter_min_shift", "enabled": True, "scope": "pair_side", "min_shift_pct": "-1"}, "INVALID_CONFIG_min_shift_pct"),
+        ({"id": "filter_min_shift", "enabled": True, "scope": "pair_side", "min_shift_pct": "0"}, "INVALID_CONFIG_min_shift_pct"),
+        ({"id": "filter_min_shift", "enabled": True, "scope": "pair_side", "min_shift_pct": "nope"}, "INVALID_CONFIG_min_shift_pct"),
+        ({"id": "filter_min_shift", "enabled": True, "min_shift_pct": "0.3"}, "INVALID_STAGE"),
+        ({"id": "filter_min_shift", "enabled": True, "scope": "unknown", "min_shift_pct": "0.3"}, "INVALID_SCOPE"),
+    ],
+)
+def test_present_min_shift_stage_rejects_malformed_contract(stage: dict[str, object], error: str) -> None:
+    with pytest.raises(PerformanceV2SelectionError, match=error):
+        parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [stage]})
 
 
 def test_window_b_pareto_eliminates_only_candidate_dominated_on_all_b_metrics() -> None:
@@ -4729,6 +4781,84 @@ def test_performance_v2_fixed_prefix_and_new_config_defaults(tmp_path: Path) -> 
         "filter_equity_regime", "filter_lot_variant_redundancy", "filter_hard_cutoffs",
         "ab_deterioration", "filter_best_trade_dependency",
     ]
+
+
+def test_min_shift_is_fixed_before_pair_side_pnl_stage() -> None:
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "pair_side_pnl_upper_half", "enabled": True, "scope": "pair_side"},
+        {"id": "filter_min_shift", "enabled": True, "scope": "pair_side", "min_shift_pct": "0.3"},
+    ]})
+
+    order = [stage.id for stage in selection_module.effective_selection_stages(
+        request, SelectionConfig(lot_variant_redundancy_enabled=False),
+    )]
+
+    assert order.index("filter_min_shift") < order.index("pair_side_pnl_upper_half")
+
+    legacy_request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "pair_side_pnl_upper_half", "enabled": True, "scope": "pair_side"},
+    ]})
+    assert [stage.id for stage in selection_module.effective_selection_stages(
+        legacy_request, SelectionConfig(lot_variant_redundancy_enabled=False),
+    )] == ["pair_side_pnl_upper_half"]
+
+    with pytest.raises(PerformanceV2SelectionError, match="INVALID_STAGE"):
+        parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+            {"id": "filter_min_shift", "enabled": True, "scope": "pair_side"},
+        ]})
+
+    rows = pd.DataFrame([
+        _selection_row("legacy-a", strategy_id=10, order_1_shift_bp=20, dd5_proxy=Decimal("10")),
+        _selection_row("legacy-b", strategy_id=11, order_1_shift_bp=40, dd5_proxy=Decimal("5")),
+    ])
+    omitted = run_selection(rows, legacy_request)
+    disabled_request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "filter_min_shift", "enabled": False, "scope": "pair_side", "min_shift_pct": "0.3"},
+        {"id": "pair_side_pnl_upper_half", "enabled": True, "scope": "pair_side"},
+    ]})
+    disabled = run_selection(rows, disabled_request)
+    assert "eliminated_by_filter_min_shift" not in omitted
+    legacy = omitted.set_index("strategy_name")
+    assert bool(legacy.loc["legacy-a", "finalist"])
+    assert legacy.loc["legacy-a", "elimination_reason"] is None
+    assert disabled["finalist"].tolist() == omitted["finalist"].tolist()
+    assert disabled["elimination_reason"].tolist() == omitted["elimination_reason"].tolist()
+
+
+def test_min_shift_survivors_define_the_pnl_upper_half_population() -> None:
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "pair_side_pnl_upper_half", "enabled": True, "scope": "pair_side"},
+        {"id": "filter_min_shift", "enabled": True, "scope": "pair_side", "min_shift_pct": "0.3"},
+    ]})
+    result = run_selection(pd.DataFrame([
+        _selection_row("removed-by-shift", strategy_id=1, order_1_shift_bp=20,
+                       dd5_proxy=Decimal("100"), ab_return_b_30d_pct=Decimal("100")),
+        _selection_row("survivor-high", strategy_id=2, order_1_shift_bp=30,
+                       dd5_proxy=Decimal("10"), ab_return_b_30d_pct=Decimal("10")),
+        _selection_row("survivor-low", strategy_id=3, order_1_shift_bp=40,
+                       dd5_proxy=Decimal("6"), ab_return_b_30d_pct=Decimal("6")),
+    ]), request).set_index("strategy_name")
+
+    assert result.loc["removed-by-shift", "eliminated_by_filter_min_shift"]
+    assert not result.loc["survivor-high", "eliminated_by_pair_side_pnl_upper_half"]
+    assert not result.loc["survivor-low", "eliminated_by_pair_side_pnl_upper_half"]
+
+
+def test_fixed_prefix_preserves_remainder_order_and_rejects_duplicate_stage_ids() -> None:
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "pareto_robust", "enabled": True, "scope": "pair_side_timeframe"},
+        {"id": "pair_side_pnl_upper_half", "enabled": True, "scope": "pair_side"},
+        {"id": "filter_min_shift", "enabled": True, "scope": "pair_side", "min_shift_pct": "0.3"},
+    ]})
+    assert [stage.id for stage in selection_module.effective_selection_stages(
+        request, SelectionConfig(lot_variant_redundancy_enabled=False),
+    )] == ["filter_min_shift", "pair_side_pnl_upper_half", "pareto_robust"]
+
+    with pytest.raises(PerformanceV2SelectionError, match="DUPLICATE_STAGE"):
+        parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+            {"id": "filter_min_shift", "enabled": True, "scope": "pair_side", "min_shift_pct": "0.3"},
+            {"id": "filter_min_shift", "enabled": True, "scope": "pair_side", "min_shift_pct": "0.3"},
+        ]})
 
 
 def test_enabled_time_consistency_is_retired_but_disabled_legacy_entry_is_inert() -> None:

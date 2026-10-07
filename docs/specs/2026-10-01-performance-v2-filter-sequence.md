@@ -4,7 +4,7 @@ Status: implementation contract. Date: 2026-10-01.
 
 ## Goal and scope
 
-Make screen `4. Pareto and filters` apply the five agreed stages in a fixed
+Make screen `4. Pareto and filters` apply the agreed stages in a fixed
 prefix, preserve the historical selection ledger, and expose clear reasons in
 the Panel and exported workbook. This supersedes the corresponding rule and
 order sections of the earlier finalist-selection, lot-variant and A/B specs.
@@ -30,13 +30,28 @@ The server and Panel fix this prefix, independent of submitted order:
 2. `filter_lot_variant_redundancy` (new rule, default ON);
 3. `filter_hard_cutoffs` (new, default ON);
 4. `ab_deterioration` (new rule, default ON);
-5. `filter_best_trade_dependency` (now top-five, default ON).
+5. `filter_best_trade_dependency` (now top-five, default ON);
+6. `filter_min_shift` (default ON, threshold `0.3%`);
+7. `pair_side_pnl_upper_half` (default ON);
+8. `structural_stage_1` (default ON);
+9. `structural_stage_2` (default ON);
+10. `pair_side_stage_3` (default ON).
 
-Later existing stages retain their relative order and current defaults. An
+The minimum-Shift stage is fixed immediately before the PnL DD5/30 + PnL B/30
+stage. Later existing stages retain their relative order and current defaults. An
 enabled stage only evaluates survivors of its predecessors. Missing facts do
 not become zero or cause exclusion. Every request has one stage entry per ID;
-legacy requests without a stage retain existing default handling. Server
-order is authoritative, and snapshots preserve the effective order and config.
+the current Panel request includes `filter_min_shift` enabled with the values
+above. Legacy API requests without that stage retain their existing handling;
+the server does not inject a new stage into those historical requests. When
+the stage is present, server order is authoritative, and snapshots preserve
+the effective order and config.
+
+The Panel does not persist the stage order or enabled set in local storage or a
+server preset; each page load starts from this documented default. A request
+that includes `filter_min_shift` must provide its typed `min_shift_pct` and
+scope fields; malformed older or hand-built requests fail closed with the
+existing invalid-stage error instead of silently disabling the filter.
 
 For each enabled stage, `eliminated` counts incoming rows that do not continue
 to the next stage, including rows assigned `RESERVE`; `remaining` counts only
@@ -173,6 +188,18 @@ nonpositive/unknown net PnL are diagnostic only, not exclusions. Export share,
 completed net PnL and remainder after top five for review. The former
 one-best-trade exclusion is retired; historical data is not rewritten.
 
+## 6. Minimum Shift
+
+`filter_min_shift` is a pair-side filter enabled by default with a `0.3%`
+threshold. It excludes a strategy when any existing order has
+`shift_bp < 30`. Missing Shift facts do not exclude the strategy. The stage is
+evaluated before `pair_side_pnl_upper_half`, so the PnL DD5/30 + PnL B/30 stage
+only receives survivors of the minimum-Shift check. The threshold remains
+explicitly configurable in the typed request as any positive decimal; zero,
+negative and nonnumeric values are rejected. Shift is compared as a signed
+`shift_bp` value, so a negative existing Shift is below every positive
+threshold and is excluded.
+
 ## Time-window diagnostic and Panel help
 
 Continue calculating positive sequential windows and exporting `Positive
@@ -189,7 +216,8 @@ the effective configured thresholds; the A/B stage loses its `PLANNED` badge.
 ## Acceptance evidence
 
 - TDD checks for fixed order on server and Panel, enabled defaults and all
-  five stage reasons/booleans, including the Lot 10/10 and B boundaries.
+  fixed-stage reasons/booleans, including the Lot 10/10, B boundaries and
+  minimum-Shift placement before the PnL stage.
 - DD guard boundaries 23 and 3x, including missing full PnL/30d; A/B
   boundaries 4/15/55, 24/25 cycles, missing A/B facts and independent
   branches; top-five 45 days/25 profits/80%, nonpositive net and incomplete

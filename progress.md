@@ -12,6 +12,17 @@ The legacy v6-to-v7 migration fix and the narrowly scoped recovery for the known
 
 ## Performance v2 selection and equity regime
 
+The Panel's `Минимальный Shift` stage is now enabled by default at `0.3%` and
+fixed immediately before `PnL DD5/30 + PnL B/30`. The server applies the same
+fixed ordering even when a request submits the two stages in the opposite
+order; missing Shift facts retain the existing pass-through behavior, exact
+percent-to-basis-point boundaries are covered, and legacy requests that omit
+the stage remain unchanged. Focused selection and Panel static UI verification
+passed (`401 passed`). No live database or tester was used.
+The broader selection/panel/export consumer run passed `341` tests with `4`
+platform symlink skips. The one stale XLSX-header expectation was updated to
+the accepted column contract; no runtime export failure remains in this run.
+
 Excel column consistency is implemented in the shared workbook renderer.
 Legacy R7.3 cache presence no longer changes a legacy workbook's headers. The
 four R7.3 fields appear only for an explicit `equity_quality_v1` ranking

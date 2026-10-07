@@ -2292,6 +2292,7 @@ def _equity_regime_workbook_values(payload: object) -> dict[str, object]:
 _FIXED_PREFIX = (
     "filter_equity_regime", "filter_lot_variant_redundancy", "filter_hard_cutoffs",
     "ab_deterioration", "filter_best_trade_dependency",
+    "filter_min_shift",
     "pair_side_pnl_upper_half", "structural_stage_1", "structural_stage_2", "pair_side_stage_3",
 )
 

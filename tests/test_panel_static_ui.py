@@ -71,10 +71,10 @@ assert.equal(collectionStatus.textContent, 'Collection: 2 packs');
 def test_researched_filters_have_fixed_order_and_editable_settings() -> None:
     html, js = _read("index.html"), _read("app.js")
     stages = re.findall(r'data-selection-stage="([^"]+)"', html)
-    assert stages[:9] == [
+    assert stages[:10] == [
         "filter_equity_regime", "filter_lot_variant_redundancy", "filter_hard_cutoffs",
-        "ab_deterioration", "filter_best_trade_dependency", "pair_side_pnl_upper_half",
-        "structural_stage_1", "structural_stage_2", "pair_side_stage_3",
+        "ab_deterioration", "filter_best_trade_dependency", "filter_min_shift",
+        "pair_side_pnl_upper_half", "structural_stage_1", "structural_stage_2", "pair_side_stage_3",
     ]
     assert 'id="performance-v2-selection-settings"' in html
     assert '/api/v2/strategies/performance-v2/selection-settings' in js
@@ -223,8 +223,9 @@ def test_selection_browser_payload_keeps_legacy_scope_defaults_and_rank() -> Non
     script = "const scopes = " + json.dumps(scopes) + ";\n" + """
 const orderedSelectionStages = () => ['filter_equity_regime','filter_lot_variant_redundancy',
 'filter_hard_cutoffs','ab_deterioration','filter_best_trade_dependency',
-'pair_side_pnl_upper_half','structural_stage_1','structural_stage_2','pair_side_stage_3'].map(id => ({
+'filter_min_shift','pair_side_pnl_upper_half','structural_stage_1','structural_stage_2','pair_side_stage_3'].map(id => ({
   dataset: {selectionStage: id}, querySelector: selector => selector === 'input[type="checkbox"]' ? {checked: true}
+    : selector === '[data-selection-min-shift]' && id === 'filter_min_shift' ? {value: '0.3'}
     : selector === '[data-selection-scope]' && scopes[id] ? {value: scopes[id]} : null
 }));
 const selectionRankStage = {querySelector: selector => selector === 'input[type="checkbox"]' ? {checked: true} : null};
@@ -235,9 +236,12 @@ const selectionRankStage = {querySelector: selector => selector === 'input[type=
     assert [stage["scope"] for stage in payload[:5]] == [
         "pair_side", "pair_side_timeframe", "pair_side_timeframe", "pair_side", "pair_side_timeframe",
     ]
-    assert [stage["scope"] for stage in payload[5:9]] == [
-        "pair_side", "pair_side_timeframe", "pair_side_timeframe", "pair_side",
+    assert [stage["scope"] for stage in payload[5:10]] == [
+        "pair_side", "pair_side", "pair_side_timeframe", "pair_side_timeframe", "pair_side",
     ]
+    assert next(stage for stage in payload if stage["id"] == "filter_min_shift") == {
+        "id": "filter_min_shift", "enabled": True, "scope": "pair_side", "min_shift_pct": "0.3",
+    }
     parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": payload})
 
 
@@ -1003,13 +1007,13 @@ def test_performance_v2_selection_preview_exposes_ordered_finalist_stages_withou
         "filter_hard_cutoffs",
         "ab_deterioration",
         "filter_best_trade_dependency",
+        "filter_min_shift",
         "pair_side_pnl_upper_half",
         "structural_stage_1",
         "structural_stage_2",
         "pair_side_stage_3",
         "filter_holding_outlier",
         "filter_low_trades",
-        "filter_min_shift",
         "pareto_robust",
         "pareto_shift_near_tie",
         "pareto_window_b",
@@ -1036,6 +1040,7 @@ def test_performance_v2_selection_preview_exposes_ordered_finalist_stages_withou
         assert f'data-selection-stage="{stage_id}"' in strategies
     checked_stage_ids = {
         "filter_lot_variant_redundancy", "filter_hard_cutoffs", "ab_deterioration", "filter_best_trade_dependency",
+        "filter_min_shift",
         "pair_side_pnl_upper_half", "structural_stage_1", "structural_stage_2", "pair_side_stage_3",
     }
     for stage_id in checked_stage_ids:
@@ -1050,14 +1055,14 @@ def test_performance_v2_selection_preview_exposes_ordered_finalist_stages_withou
     assert default_order
     assert re.findall(r"'([^']+)'", default_order.group(1)) == [
         "filter_equity_regime", "filter_lot_variant_redundancy", "filter_hard_cutoffs", "ab_deterioration", "filter_best_trade_dependency",
-        "pair_side_pnl_upper_half", "structural_stage_1", "structural_stage_2", "pair_side_stage_3",
-        "filter_holding_outlier", "filter_low_trades", "filter_min_shift", "pareto_dd5_balanced", "pareto_robust",
+        "filter_min_shift", "pair_side_pnl_upper_half", "structural_stage_1", "structural_stage_2", "pair_side_stage_3",
+        "filter_holding_outlier", "filter_low_trades", "pareto_dd5_balanced", "pareto_robust",
         "pareto_shift_near_tie", "pareto_close_ma_near_tie",
     ]
     default_enabled = re.search(r"const defaultEnabledSelectionStages = new Set\(\[(.*?)\]\);", js, re.S)
     assert default_enabled
     assert "filter_low_trades" not in default_enabled.group(1)
-    assert "filter_min_shift" not in default_enabled.group(1)
+    assert "filter_min_shift" in default_enabled.group(1)
     assert "filter_equity_regime" not in default_enabled.group(1)
     assert "filter_hard_cutoffs" in default_enabled.group(1)
     assert "pair_side_pnl_upper_half" in default_enabled.group(1)
@@ -1067,16 +1072,18 @@ def test_performance_v2_selection_preview_exposes_ordered_finalist_stages_withou
     assert 'data-selection-top-n type="number" min="1" step="1" value="20"' in strategies
     assert "near_tie_rank" not in strategies
     assert "data-selection-group" not in strategies
-    min_shift_stage = re.search(r'<li class="selection-stage" data-selection-stage="filter_min_shift">(.*?)</li>', strategies, re.S)
+    min_shift_stage = re.search(r'<li class="selection-stage selection-stage-fixed" data-selection-stage="filter_min_shift">(.*?)</li>', strategies, re.S)
     assert min_shift_stage and 'data-selection-min-shift' in min_shift_stage.group(1)
     assert 'value="0.3"' in min_shift_stage.group(1)
+    assert 'data-selection-move' not in min_shift_stage.group(1)
+    assert strategies.count('data-selection-stage="filter_min_shift"') == 1
     lot_stage = re.search(r'<li class="selection-stage" data-selection-stage="filter_lot_variant_redundancy">(.*?)</li>', strategies, re.S)
     assert lot_stage and 'data-selection-scope="pair_side_timeframe"' in lot_stage.group(1)
     assert re.findall(r'data-selection-stage="(filter_equity_regime|filter_lot_variant_redundancy|filter_hard_cutoffs|ab_deterioration|filter_best_trade_dependency)"', strategies) == [
         "filter_equity_regime", "filter_lot_variant_redundancy", "filter_hard_cutoffs", "ab_deterioration", "filter_best_trade_dependency",
     ]
     for stage_id in ("filter_equity_regime", "filter_lot_variant_redundancy", "filter_hard_cutoffs", "ab_deterioration", "filter_best_trade_dependency"):
-        stage = re.search(rf'<li class="selection-stage" data-selection-stage="{stage_id}">(.*?)</li>', strategies, re.S)
+        stage = re.search(rf'<li class="selection-stage(?: selection-stage-fixed)?" data-selection-stage="{stage_id}">(.*?)</li>', strategies, re.S)
         assert stage and 'data-selection-move' not in stage.group(1)
         assert re.search(r'<small>[^<]+</small>', stage.group(1))
     assert 'data-selection-stage="filter_time_consistency"' not in strategies
@@ -1091,7 +1098,7 @@ def test_performance_v2_selection_preview_exposes_ordered_finalist_stages_withou
     assert "fixedSelectionPrefix" in js
     pair_side_stages = {"filter_holding_outlier", "filter_low_trades", "filter_min_shift", "ab_deterioration", "pareto_dd5_balanced"}
     for stage_id in pair_side_stages:
-        stage = re.search(rf'<li class="selection-stage" data-selection-stage="{stage_id}">(.*?)</li>', strategies, re.S)
+        stage = re.search(rf'<li class="selection-stage(?: selection-stage-fixed)?" data-selection-stage="{stage_id}">(.*?)</li>', strategies, re.S)
         assert stage and 'data-selection-scope="pair_side"' in stage.group(1)
     for stage_id in set(expected_stage_order) - pair_side_stages - {"filter_equity_regime", "filter_lot_variant_redundancy", "filter_hard_cutoffs", "filter_best_trade_dependency", "pair_side_pnl_upper_half", "structural_stage_1", "structural_stage_2", "pair_side_stage_3"}:
         stage = re.search(rf'<li class="selection-stage" data-selection-stage="{stage_id}">(.*?)</li>', strategies, re.S)
@@ -1170,14 +1177,23 @@ def test_fixed_five_stage_prefix_has_equity_off_and_no_scope_or_move_controls() 
     assert "main H horizon" in stage.group(1)
     assert 'id="performance-v2-equity-regime-help"' not in html
     assert 'aria-describedby="performance-v2-equity-regime-help"' not in stage.group(1)
-    assert "'filter_equity_regime', 'pair_side_pnl_upper_half', 'pair_side_stage_3'" in js
+    assert "'filter_equity_regime', 'filter_min_shift', 'pair_side_pnl_upper_half', 'pair_side_stage_3'" in js
     assert re.search(
-        r"const fixedSelectionPrefix = new Set\(\[\s*'filter_equity_regime',\s*'filter_lot_variant_redundancy',\s*'filter_hard_cutoffs',\s*'ab_deterioration',\s*'filter_best_trade_dependency',.*?'pair_side_stage_3',?\s*\]\);",
+        r"const fixedSelectionPrefix = new Set\(\[\s*'filter_equity_regime',\s*'filter_lot_variant_redundancy',\s*'filter_hard_cutoffs',\s*'ab_deterioration',\s*'filter_best_trade_dependency',\s*'filter_min_shift',.*?'pair_side_stage_3',?\s*\]\);",
         js,
         re.S,
     )
     assert "fixedSelectionPrefix.has(target.dataset.selectionStage)" in js
     assert "fixedSelectionPrefix.has(stage.previousElementSibling?.dataset.selectionStage)" in js
+
+    fixed = re.search(r"const fixedSelectionPrefix = new Set\(\[(.*?)\]\);", js, re.S)
+    default = re.search(r"const defaultSelectionStageOrder = \[(.*?)\];", js, re.S)
+    assert fixed and default
+    panel_fixed_order = re.findall(r"'([^']+)'", fixed.group(1))
+    panel_default_order = re.findall(r"'([^']+)'", default.group(1))
+    from mrs3.performance_v2_selection import _FIXED_PREFIX
+    assert panel_fixed_order == list(_FIXED_PREFIX)
+    assert panel_default_order[:len(_FIXED_PREFIX)] == list(_FIXED_PREFIX)
 
 
 def test_every_selection_stage_keeps_a_nonempty_logic_description() -> None:

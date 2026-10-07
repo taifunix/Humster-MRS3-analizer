@@ -4532,7 +4532,8 @@ def test_selection_workbook_handles_equity_stage_only_when_enabled_column_is_pre
     if enabled:
         assert result.loc[0, "equity_regime_decision"] == "PASS"
     assert "eliminated_by_filter_equity_regime" not in headers
-    assert ("Equity state" in headers) is enabled
+    assert ("Regime rank" in headers) is enabled
+    assert "Equity state" not in headers
 
 
 def test_performance_v2_catalog_rejects_existing_bare_database_without_initializing_it(tmp_path: Path) -> None:
