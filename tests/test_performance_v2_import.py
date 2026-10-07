@@ -4,10 +4,12 @@ from dataclasses import replace
 from hashlib import sha256
 import csv
 import json
+from http.client import HTTPConnection
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
+import threading
 
 import duckdb
 import pytest
@@ -20,6 +22,7 @@ from mrs3.performance_v2_import import (
     PerformanceV2LockedError,
     import_performance_v2,
 )
+from mrs3.panel import PanelController, create_panel_server
 from mrs3.performance_v2_html import parse_current_performance_v2_html
 from mrs3.performance_v2_input import PerformanceV2InputError, read_performance_v2_inbox
 from mrs3.performance_v2_store import (
@@ -1854,6 +1857,255 @@ def test_retest_replace_rejects_a_shorter_effective_period_without_mutation(tmp_
         ).fetchone() == (result_id,)
         assert connection.execute("select count(*) from strategy_actions where result_id = ?", [result_id]).fetchone() == (actions,)
         assert connection.execute("select count(*) from strategy_equity where result_id = ?", [result_id]).fetchone() == (equity,)
+
+
+def test_mapped_retest_replace_rejects_shorter_period_per_strategy_and_imports_siblings(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path, names=("alpha", "beta"))
+    assert import_performance_v2(request).imported_count == 2
+    strategy_ids, expected = _current_strategy_map(request)
+    before_balances = _current_final_balances(request)
+    target = performance_v2_database_path(request.config)
+    with duckdb.connect(str(target), read_only=True) as connection:
+        before_alpha = connection.execute(
+            "select r.imported_at_utc, r.effective_start_utc, r.effective_end_utc "
+            "from strategies s join strategy_results r on r.result_id=s.current_result_id "
+            "where s.strategy_name='alpha'"
+        ).fetchone()
+        alpha_result_id = expected["alpha"]
+        alpha_action_count = connection.execute(
+            "select count(*) from strategy_actions where result_id=?", [alpha_result_id]
+        ).fetchone()[0]
+        alpha_equity_count = connection.execute(
+            "select count(*) from strategy_equity where result_id=?", [alpha_result_id]
+        ).fetchone()[0]
+
+    manifest_path = request.inbox / "inbox_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    shorter = FIXTURE.read_bytes().replace(b"2026-01-01 - 2026-01-09", b"2026-01-01 - 2026-01-04")
+    changed_sibling = FIXTURE.read_bytes().replace(b"1009.9", b"1019.9")
+    for entry in manifest["entries"]:
+        content = shorter if entry["strategy_name"] == "alpha" else changed_sibling
+        Path(entry["report_path"]).write_bytes(content)
+        entry["source_report_sha256"] = sha256(content).hexdigest()
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    replacement = PerformanceV2ImportRequest(
+        request.inbox, request.report_root, request.config, mode="REPLACE",
+        replacement_strategy_ids=strategy_ids,
+        expected_current_result_ids=expected,
+        listing_dates_path=request.listing_dates_path,
+    )
+
+    result = import_performance_v2(replacement)
+
+    assert result.status == "COMMITTED"
+    assert (result.imported_count, result.skipped_count, result.rejected_count) == (1, 0, 1)
+    assert result.failures == ({
+        "strategy_id": strategy_ids["alpha"],
+        "strategy_name": "alpha",
+        "symbol": "ONUSDT",
+        "reason": "SHORTER_EFFECTIVE_PERIOD",
+        "error": "REPLACE target 'alpha' has a shorter effective period",
+    },)
+    assert result.successful_replacements == ({
+        "strategy_id": strategy_ids["beta"],
+        "old_result_id": expected["beta"],
+        "new_result_id": expected["beta"],
+    },)
+    assert result.failure_report_path is not None
+    assert "SHORTER_EFFECTIVE_PERIOD" in result.failure_report_path.read_text(encoding="utf-8")
+    with duckdb.connect(str(target), read_only=True) as connection:
+        assert connection.execute(
+            "select current_result_id from strategies where strategy_name='alpha'"
+        ).fetchone() == (alpha_result_id,)
+        assert connection.execute(
+            "select r.imported_at_utc, r.effective_start_utc, r.effective_end_utc "
+            "from strategies s join strategy_results r on r.result_id=s.current_result_id "
+            "where s.strategy_name='alpha'"
+        ).fetchone() == before_alpha
+        assert connection.execute(
+            "select count(*) from strategy_actions where result_id=?", [alpha_result_id]
+        ).fetchone() == (alpha_action_count,)
+        assert connection.execute(
+            "select count(*) from strategy_equity where result_id=?", [alpha_result_id]
+        ).fetchone() == (alpha_equity_count,)
+    assert _current_final_balances(replacement)["alpha"] == before_balances["alpha"]
+    assert _current_final_balances(replacement)["beta"] != before_balances["beta"]
+    with duckdb.connect(str(target), read_only=True) as connection:
+        run_id, expected_count, imported_count, skipped_count, rejected_count, run_status = connection.execute(
+            "select import_run_id, expected_report_count, imported_count, skipped_count, rejected_count, status "
+            "from import_runs order by import_run_id desc limit 1"
+        ).fetchone()
+        assert (expected_count, imported_count, skipped_count, rejected_count, run_status) == (2, 1, 0, 1, "COMMITTED")
+        file_statuses = dict(connection.execute(
+            "select source_filename, status from import_files where import_run_id = ?", [run_id]
+        ).fetchall())
+        assert file_statuses == {"alpha.html": "REJECTED:SHORTER_EFFECTIVE_PERIOD", "beta.html": "REPLACED"}
+
+
+def test_mapped_retest_replace_rejects_invalid_effective_period_per_strategy(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path, names=("alpha", "beta"))
+    assert import_performance_v2(request).imported_count == 2
+    strategy_ids, expected = _current_strategy_map(request)
+    before_balances = _current_final_balances(request)
+    target = performance_v2_database_path(request.config)
+    with duckdb.connect(str(target)) as connection:
+        connection.execute(
+            "update strategy_results set effective_start_utc='2026-01-05 00:00:00+00', "
+            "effective_end_utc='2026-01-04 00:00:00+00' where result_id=?",
+            [expected["alpha"]],
+        )
+        before_alpha = connection.execute(
+            "select imported_at_utc, effective_start_utc, effective_end_utc from strategy_results where result_id=?",
+            [expected["alpha"]],
+        ).fetchone()
+    manifest_path = request.inbox / "inbox_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    changed_sibling = FIXTURE.read_bytes().replace(b"1009.9", b"1019.9")
+    for entry in manifest["entries"]:
+        if entry["strategy_name"] == "beta":
+            Path(entry["report_path"]).write_bytes(changed_sibling)
+            entry["source_report_sha256"] = sha256(changed_sibling).hexdigest()
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    replacement = PerformanceV2ImportRequest(
+        request.inbox, request.report_root, request.config, mode="REPLACE",
+        replacement_strategy_ids=strategy_ids, expected_current_result_ids=expected,
+        listing_dates_path=request.listing_dates_path,
+    )
+
+    result = import_performance_v2(replacement)
+
+    assert result.status == "COMMITTED"
+    assert (result.imported_count, result.skipped_count, result.rejected_count) == (1, 0, 1)
+    assert result.failures == ({
+        "strategy_id": strategy_ids["alpha"], "strategy_name": "alpha", "symbol": "ONUSDT",
+        "reason": "INVALID_EFFECTIVE_PERIOD",
+        "error": "REPLACE target 'alpha' has an invalid effective period",
+    },)
+    with duckdb.connect(str(target), read_only=True) as connection:
+        assert connection.execute(
+            "select imported_at_utc, effective_start_utc, effective_end_utc from strategy_results where result_id=?",
+            [expected["alpha"]],
+        ).fetchone() == before_alpha
+        assert connection.execute(
+            "select current_result_id from strategies where strategy_name='alpha'"
+        ).fetchone() == (expected["alpha"],)
+    assert _current_final_balances(replacement)["beta"] != before_balances["beta"]
+
+
+def test_empty_expected_result_mapping_fails_closed_as_mapped_retest(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path)
+    assert import_performance_v2(request).imported_count == 1
+    strategy_ids, expected = _current_strategy_map(request)
+    replacement = PerformanceV2ImportRequest(
+        request.inbox, request.report_root, request.config, mode="REPLACE",
+        replacement_strategy_ids=strategy_ids, listing_dates_path=request.listing_dates_path,
+    )
+    object.__setattr__(replacement, "expected_current_result_ids", {})
+
+    result = import_performance_v2(replacement)
+
+    assert result.status == "FAILED"
+    assert result.imported_count == 0 and result.rejected_count == 1
+    assert result.failures[0]["reason"] == "MISSING_EXPECTED_RESULT"
+    with duckdb.connect(str(performance_v2_database_path(request.config)), read_only=True) as connection:
+        assert connection.execute(
+            "select current_result_id from strategies where strategy_name='alpha'"
+        ).fetchone() == (expected["alpha"],)
+
+
+def test_finalist_retest_http_status_reports_mixed_import_outcomes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    request, _ = _request(tmp_path, names=("alpha", "beta"))
+    assert import_performance_v2(request).imported_count == 2
+    strategy_ids, expected = _current_strategy_map(request)
+    manifest_path = request.inbox / "inbox_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    shorter = FIXTURE.read_bytes().replace(b"2026-01-01 - 2026-01-09", b"2026-01-01 - 2026-01-04")
+    changed_sibling = FIXTURE.read_bytes().replace(b"1009.9", b"1019.9")
+    for entry in manifest["entries"]:
+        content = shorter if entry["strategy_name"] == "alpha" else changed_sibling
+        Path(entry["report_path"]).write_bytes(content)
+        entry["source_report_sha256"] = sha256(content).hexdigest()
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    replacement = PerformanceV2ImportRequest(
+        request.inbox, request.report_root, request.config, mode="REPLACE",
+        replacement_strategy_ids=strategy_ids, expected_current_result_ids=expected,
+        listing_dates_path=request.listing_dates_path,
+    )
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
+    registry = controller._panel_jobs
+    parent_id = "mixed-period-parent"
+    registry.submit(
+        "strategies.performance.v2.finalist-retest", {}, parent_id,
+        ("strategies.tester", "performance-v2-finalist-retest"), job_id=parent_id,
+    )
+    registry.transition(parent_id, "RUNNING")
+    registry.sync(parent_id, {"state": "COMMITTED", "phase": "COMMITTED", "inbox_ready": True}, runtime={
+        "bulk_retest": True, "scope": "FINALIST", "test_start": "2026-01-01", "test_end": "2026-10-01",
+        "cohort_members": [
+            {"strategy_id": strategy_ids[name], "strategy_name": name, "result_id": expected[name]}
+            for name in ("alpha", "beta")
+        ],
+    })
+
+    def execute_import(_payload: dict[str, object], *, _internal: bool = False, job_id: str | None = None) -> dict[str, str]:
+        assert _internal and job_id is not None
+        imported = import_performance_v2(replacement)
+        registry.submit("strategies.performance.v2.import", {}, job_id, ("performance-v2-db",), job_id=job_id)
+        registry.transition(job_id, "RUNNING")
+        registry.sync(job_id, {
+            "state": "COMMITTED",
+            "result": {
+                "imported_count": imported.imported_count,
+                "skipped_count": imported.skipped_count,
+                "rejected_count": imported.rejected_count,
+            },
+        }, runtime={
+            "successful_replacements": [dict(item) for item in imported.successful_replacements],
+            "failures": [dict(item) for item in imported.failures],
+        })
+        return {"job_id": job_id}
+
+    monkeypatch.setattr(controller, "strategies_performance_v2_import", execute_import)
+    monkeypatch.setattr(
+        controller, "_single_mode_strategy_test",
+        lambda: SimpleNamespace(status=lambda _job_id: (_ for _ in ()).throw(KeyError())),
+    )
+    server = create_panel_server("127.0.0.1", 0, controller)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        connection = HTTPConnection("127.0.0.1", server.server_port, timeout=10)
+        connection.request(
+            "POST", "/api/v2/strategies/performance-v2/finalist-retest/import",
+            body=json.dumps({"tester_job_id": parent_id}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        response = connection.getresponse()
+        queued = json.loads(response.read())
+        assert response.status == 200
+        connection.request("GET", f"/api/v2/strategies/performance-v2/finalist-retest/status?job_id={parent_id}")
+        response = connection.getresponse()
+        status = json.loads(response.read())
+        assert response.status == 200
+        connection.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert status["import_job_id"] == queued["job_id"]
+    assert status["import_job_state"] == "COMMITTED"
+    assert (status["imported_count"], status["skipped_count"], status["rejected_count"], status["expected_count"]) == (1, 0, 1, 2)
+    assert status["successful_replacements"] == [{
+        "strategy_id": strategy_ids["beta"],
+        "old_result_id": expected["beta"],
+        "new_result_id": expected["beta"],
+    }]
+    assert status["failures"] == [{
+        "strategy_id": strategy_ids["alpha"], "strategy_name": "alpha", "symbol": "ONUSDT",
+        "reason": "SHORTER_EFFECTIVE_PERIOD",
+        "error": "REPLACE target 'alpha' has a shorter effective period",
+    }]
 
 
 def test_lock_conflict_does_not_read_inbox_or_create_staging(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

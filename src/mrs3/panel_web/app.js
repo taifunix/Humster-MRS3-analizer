@@ -2895,7 +2895,7 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
       const error = job.error ? ` · ${formatErrorReason(job.error)}` : '';
       const cleanupError = job.error?.cleanup_error ? ` · cleanup: ${formatErrorReason(job.error.cleanup_error)}` : '';
       const failureDetails = Array.isArray(job.failures)
-        ? job.failures.slice(0, 8).map((failure) => `#${failure.strategy_id ?? '?'} ${failure.strategy_name || 'strategy'}: ${failure.reason || 'IMPORT_FAILED'}`).join('; ')
+        ? job.failures.slice(0, 8).map((failure) => `#${failure.strategy_id ?? '?'} ${failure.strategy_name || 'strategy'}: ${failure.reason || 'IMPORT_FAILED'}${failure.error ? ` (${failure.error})` : ''}`).join('; ')
         : '';
       const remainingFailures = Math.max(0, (Array.isArray(job.failures) ? job.failures.length : 0) - 8);
       const importTotals = `imported ${job.imported_count ?? job.success_count ?? 0}, skipped ${job.skipped_count ?? 0}, rejected ${job.rejected_count ?? job.failure_count ?? 0} of ${job.expected_count ?? job.cohort_count ?? 0}`;

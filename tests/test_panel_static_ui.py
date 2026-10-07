@@ -915,8 +915,11 @@ def test_finalist_retest_recovery_shows_member_failures_and_only_click_posts_imp
     assert "job.failures.slice(0, 8)" in poll
     assert "failure.strategy_id" in poll
     assert "failure.reason" in poll
+    assert "failure.error" in poll
     assert "job.imported_count" in poll and "job.skipped_count" in poll
     assert "job.rejected_count" in poll and "job.expected_count" in poll
+    assert "finalistRetestStatus.textContent = `IMPORT & REPLACE:" in poll
+    assert "finalistRetestStatus.innerHTML" not in poll
     assert "['FAILED', 'CANCELLED'].includes(imported.state)" in poll
     assert "/api/v2/strategies/performance-v2/finalist-retest/import" not in poll
     assert "/api/v2/strategies/performance-v2/finalist-retest/import" not in recovery

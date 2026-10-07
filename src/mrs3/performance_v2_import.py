@@ -1402,6 +1402,7 @@ def _publish(
     import_id: str,
     *,
     failure_reasons: Mapping[str, str] | None = None,
+    failure_rows: list[dict[str, object]] | None = None,
     phase_times: _PhaseTimes | None = None,
 ) -> tuple[int, int, int]:
     # The writer lock is held by the caller.  Start the transaction before any
@@ -1409,6 +1410,8 @@ def _publish(
     # publication.
     if phase_times is not None:
         phase_times.begin("PUBLISH_ADMISSION")
+    publication_failure_reasons = dict(failure_reasons or {})
+    publication_failure_rows = failure_rows if failure_rows is not None else []
     connection.execute("begin")
     try:
         append_schema_cache: dict[str, tuple[str, ...]] = {}
@@ -1533,15 +1536,30 @@ def _publish(
                 incoming_interval = _comparison_interval(report)
                 current_interval = _comparison_interval(report, current)
                 if incoming_interval is None or current_interval is None:
-                    raise PerformanceV2ImportError(
-                        f"REPLACE target {entry.strategy_name!r} has an invalid effective period"
-                    )
-                incoming_duration = incoming_interval[1] - incoming_interval[0]
-                current_duration = current_interval[1] - current_interval[0]
-                if incoming_interval[1] < current_interval[1] or incoming_duration < current_duration:
-                    raise PerformanceV2ImportError(
-                        f"REPLACE target {entry.strategy_name!r} has a shorter effective period"
-                    )
+                    reason = "INVALID_EFFECTIVE_PERIOD"
+                    message = f"REPLACE target {entry.strategy_name!r} has an invalid effective period"
+                else:
+                    incoming_duration = incoming_interval[1] - incoming_interval[0]
+                    current_duration = current_interval[1] - current_interval[0]
+                    if incoming_interval[1] < current_interval[1] or incoming_duration < current_duration:
+                        reason = "SHORTER_EFFECTIVE_PERIOD"
+                        message = f"REPLACE target {entry.strategy_name!r} has a shorter effective period"
+                    else:
+                        reason = ""
+                        message = ""
+                if reason:
+                    if request.expected_current_result_ids is None:
+                        raise PerformanceV2ImportError(message)
+                    publication_failure_rows.append({
+                        "strategy_id": int(row[1]),
+                        "strategy_name": entry.strategy_name,
+                        "symbol": entry.identity.symbol,
+                        "reason": reason,
+                        "error": message,
+                    })
+                    publication_failure_reasons[entry.strategy_name] = reason
+                    resolved[key] = ("REJECTED", row)
+                    continue
                 if request.expected_strategy_identities and entry.strategy_name in request.expected_strategy_identities:
                     expected = request.expected_strategy_identities[entry.strategy_name]
                     if not _expected_identity_matches(entry, expected):
@@ -1570,7 +1588,14 @@ def _publish(
             key = _typed_key(entry)
             representative = representatives[key]
             action, old = resolved[key]
-            decisions.append((action if index == representative[0] else "SKIPPED", entry, report, old, representative[1]))
+            if action == "REJECTED":
+                if index == representative[0]:
+                    decisions.append((action, entry, None, old, representative[1]))
+                    rejected += 1
+                else:
+                    decisions.append(("SKIPPED", entry, report, old, representative[1]))
+            else:
+                decisions.append((action if index == representative[0] else "SKIPPED", entry, report, old, representative[1]))
 
         replacement_result_ids = sorted({
             int(old[10])
@@ -1642,7 +1667,7 @@ def _publish(
                 )
         for decision, entry, report, old, _representative in decisions:
             if report is None:
-                reason = (failure_reasons or {}).get(entry.strategy_name, "INVALID_REPORT")
+                reason = publication_failure_reasons.get(entry.strategy_name, "INVALID_REPORT")
                 record = (entry.report_path.name, report_hash(entry), entry.report_path.stat().st_size, 0, 0, f"REJECTED:{reason}")
                 result_files.setdefault(record[1], record)
                 continue
@@ -2048,6 +2073,7 @@ def import_performance_v2(
             parsed,
             import_id,
             failure_reasons=failure_reasons,
+            failure_rows=failure_rows,
             phase_times=phase_times,
         )
         status = "FAILED" if imported == 0 and rejected == len(prepared.entries) and rejected > 0 else "COMMITTED"
@@ -2096,7 +2122,7 @@ def import_performance_v2(
                 if current_result is not None:
                     successful_replacements.append({
                         "strategy_id": int(strategy_id),
-                        "old_result_id": int(request.expected_current_result_ids.get(strategy_name, current_result)) if request.expected_current_result_ids else int(current_result),
+                        "old_result_id": int(request.expected_current_result_ids.get(strategy_name, current_result)) if request.expected_current_result_ids is not None else int(current_result),
                         "new_result_id": int(current_result),
                     })
             phase_times.end("POST_COMMIT_REPLACEMENT_READBACK")
