@@ -1779,6 +1779,13 @@ class PortfolioPanelService:
         overall = 100 if state == "SUCCEEDED" else min(99, (completed * 100) // len(stage_names))
         if state in {"CANCELLED", "FAILED", "INTERRUPTED"}:
             overall = (completed * 100) // len(stage_names)
+        stage2_results = runtime.get("stage2_results") if stage2 and isinstance(runtime.get("stage2_results"), list) else []
+        stage2_binding = runtime.get("stage2") if stage2 and isinstance(runtime.get("stage2"), Mapping) else {}
+        batch_count = stage2_binding.get("candidate_count") if type(stage2_binding.get("candidate_count")) is int else 0
+        batch_index = runtime.get("current_index") if type(runtime.get("current_index")) is int else None
+        batch_completed = len(stage2_results)
+        if stage2:
+            overall = batch_completed * 100 // batch_count if batch_count else 0
         diagnostics = saved.get("diagnostics") if isinstance(saved.get("diagnostics"), list) else runtime.get("diagnostics", [])
         diagnostics = [
             {"severity": str(item.get("severity", "ERROR")), "code": str(item.get("code", "PORTFOLIO_JOB_FAILED")), "message": _redact_text(item.get("message", ""))}
@@ -1809,8 +1816,17 @@ class PortfolioPanelService:
         result = {"job_id": saved.get("job_id"), "campaign_id": campaign.get("campaign_id"), "kind": "FINALIST_PREPARATION" if preparation else ("TESTER_SUBMISSION" if stage2 else "STAGE1_CALCULATION"), "status": state, "stage": stage, "overall_percent": overall, "counters": _plain(runtime.get("counters", {})), "progress": _plain(progress) if progress is not None else None, "diagnostics": diagnostics, "journal": journal, "input_digest": campaign.get("input_digest"), "config_digest": frozen_digest, "settings_changed_since_freeze": bool(frozen_digest and current_digest != frozen_digest), "created_at": saved.get("created_at_utc"), "started_at": runtime.get("started_at"), "finished_at": runtime.get("finished_at")}
         if preparation:
             result["preparation"] = _plain(runtime.get("preparation", {}))
-        if stage2 and state == "SUCCEEDED" and isinstance(runtime.get("stage2_result"), Mapping):
-            result["result"] = _plain(runtime["stage2_result"])
+        if stage2:
+            result["results"] = _plain(stage2_results)
+            result["batch"] = {
+                "current_index": batch_index,
+                "total": batch_count,
+                "completed": batch_completed,
+            }
+            if state == "SUCCEEDED" and stage2_results and isinstance(stage2_results[-1], Mapping):
+                result["result"] = _plain(stage2_results[-1])
+        elif saved.get("kind") == "portfolio.stage1" and type(runtime.get("executables_count")) is int:
+            result["executables_count"] = runtime["executables_count"]
         return result
 
     def job(self, job_id: str) -> dict[str, Any]:
@@ -2544,8 +2560,8 @@ class PortfolioPanelService:
         except (ArithmeticError, OSError, UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
             raise PortfolioPanelError("PORTFOLIO_STAGE1_EXECUTABLES_UNAVAILABLE", "stage 1 executables are unavailable", status=409) from error
 
-    def _prepare_stage2_baseline(self, campaign_id: str) -> dict[str, Any]:
-        """Build one exact Stage 2 input package without running or mutating anything."""
+    def _prepare_stage2_batch(self, campaign_id: str) -> tuple[dict[str, Any], ...]:
+        """Build exact per-candidate Stage 2 packages in committed artifact order."""
         try:
             saved, runtime = self._campaign_by_id(campaign_id)
             campaign = self._hydrate_campaign(saved, runtime, allow_terminal=True, expected_campaign_id=campaign_id)
@@ -2562,23 +2578,25 @@ class PortfolioPanelService:
             ):
                 raise ValueError("stage 1 bindings are invalid")
             artifact = self._load_stage1_executables(campaign_id, input_digest, config_digest, artifact_digest)
-            candidate = artifact["candidates"][0]
-
-            material = _stage2_material(candidate)
-            return {
-                "campaign_id": campaign_id,
-                "input_digest": input_digest,
-                "config_digest": config_digest,
-                "artifact_digest": artifact_digest,
-                "candidate_id": material["candidate_id"],
-                "candidate_digest": candidate["candidate_digest"],
-                "portfolio_name": material["candidate_id"],
-                "expected_names": material["expected_names"],
-                "pretest_period": material["pretest_period"],
-                "tester_config_json": material["tester_config_json"],
-                "strategy_jsons": material["strategy_jsons"],
-                "receipt": material["receipt"],
-            }
+            prepared_candidates = []
+            for candidate_index, candidate in enumerate(artifact["candidates"]):
+                material = _stage2_material(candidate)
+                prepared_candidates.append({
+                    "campaign_id": campaign_id,
+                    "input_digest": input_digest,
+                    "config_digest": config_digest,
+                    "artifact_digest": artifact_digest,
+                    "candidate_index": candidate_index,
+                    "candidate_id": material["candidate_id"],
+                    "candidate_digest": candidate["candidate_digest"],
+                    "portfolio_name": material["candidate_id"],
+                    "expected_names": material["expected_names"],
+                    "pretest_period": material["pretest_period"],
+                    "tester_config_json": material["tester_config_json"],
+                    "strategy_jsons": material["strategy_jsons"],
+                    "receipt": material["receipt"],
+                })
+            return tuple(prepared_candidates)
         except PortfolioPanelError as error:
             raise PortfolioPanelError("PORTFOLIO_STAGE2_INPUT_INVALID", "stage 2 baseline input is invalid", status=409) from error
         except (ArithmeticError, OSError, UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
@@ -2595,9 +2613,16 @@ class PortfolioPanelService:
             )
             candidates = artifact.get("candidates")
             receipt = prepared.get("receipt")
-            if not isinstance(candidates, list) or not candidates or not isinstance(receipt, Mapping):
+            candidate_index = prepared.get("candidate_index")
+            if (
+                not isinstance(candidates, list)
+                or not candidates
+                or type(candidate_index) is not int
+                or not 0 <= candidate_index < len(candidates)
+                or not isinstance(receipt, Mapping)
+            ):
                 raise ValueError("stage 2 receipt is invalid")
-            candidate = candidates[0]
+            candidate = candidates[candidate_index]
             if not isinstance(candidate, Mapping):
                 raise ValueError("stage 2 candidate is invalid")
             payloads = candidate.get("strategy_payloads")
@@ -2674,16 +2699,16 @@ class PortfolioPanelService:
 
     def _stage2_cancel_finish(self, job_id: str) -> None:
         try:
-            saved = self.registry.get(job_id)
-            if saved["state"] in {"QUEUED", "RUNNING"}:
-                saved = self.registry.cancel(job_id)
-            runtime = self.registry.runtime(job_id)
-            runtime.pop("stage2_result", None)
-            runtime["finished_at"] = _now()
-            if saved["state"] in {"QUEUED", "RUNNING", "CANCELLING"}:
-                self.registry.sync(job_id, {"state": "CANCELLED", "phase": "CANCELLED"}, runtime=runtime)
-            else:
-                self.registry.sync(job_id, {"state": saved["state"], "phase": saved.get("phase")}, runtime=runtime)
+            with self.registry.lock:
+                saved = self.registry.get(job_id)
+                if saved["state"] in {"QUEUED", "RUNNING"}:
+                    saved = self.registry.cancel(job_id)
+                runtime = self.registry.runtime(job_id)
+                runtime["finished_at"] = _now()
+                if saved["state"] in {"QUEUED", "RUNNING", "CANCELLING"}:
+                    self.registry.sync(job_id, {"state": "CANCELLED", "phase": "CANCELLED"}, runtime=runtime)
+                else:
+                    self.registry.sync(job_id, {"state": saved["state"], "phase": saved.get("phase")}, runtime=runtime)
         except PanelJobError:
             pass
 
@@ -2694,28 +2719,21 @@ class PortfolioPanelService:
             message = str(error) if isinstance(error, PortfolioPanelError) else "portfolio tester submission failed"
             diagnostics = [{"severity": "ERROR", "code": code, "message": _redact_text(message)}]
             runtime = self.registry.runtime(job_id)
-            runtime.pop("stage2_result", None)
             runtime["diagnostics"] = diagnostics
             runtime["finished_at"] = _now()
             if saved["state"] in _TERMINAL:
                 state, phase = saved["state"], saved.get("phase")
             else:
                 state, phase = "FAILED", "FAILED"
-            self.registry.sync(job_id, {"state": state, "phase": phase, "error": {"code": code, "message": _redact_text(message)}, "result": {}}, runtime=runtime)
+            self.registry.sync(job_id, {"state": state, "phase": phase, "error": {"code": code, "message": _redact_text(message)}, "diagnostics": diagnostics}, runtime=runtime)
         except PanelJobError:
             pass
 
-    def _run_stage2(self, job_id: str, prepared: Mapping[str, Any]) -> None:
-        tester: Any = None
+    def _run_stage2_candidate(self, job_id: str, prepared: Mapping[str, Any], tester: Any) -> dict[str, Any]:
         filled = False
         failure: BaseException | None = None
         completed_result: dict[str, Any] | None = None
         try:
-            if self._cancelled(job_id):
-                raise asyncio.CancelledError
-            self.registry.transition(job_id, "RUNNING", phase=STAGE2_STAGES[0])
-            self._sync_runtime(job_id, started_at=_now(), stage_index=0, completed_stages=0)
-            tester = self._local_testing_service_provider()
             if self._cancelled(job_id):
                 raise asyncio.CancelledError
             self._verify_stage2_prepared(prepared)
@@ -2823,7 +2841,7 @@ class PortfolioPanelService:
                             "stable_polls": stable_report_polls,
                         },
                     )
-                    self._sync_runtime(job_id, stage_index=3, completed_stages=3, stage2_result=completed_result)
+                    self._sync_runtime(job_id, stage_index=3, completed_stages=3)
                     break
                 interval = float(getattr(tester.config, "poll_interval_seconds", 1.0))
                 event = self._cancel_events.get(job_id)
@@ -2831,8 +2849,6 @@ class PortfolioPanelService:
                     continue
             else:
                 raise PortfolioPanelError("PORTFOLIO_JOB_STAGE2_TIMEOUT", "tester result did not become fresh", status=500)
-            if self._cancelled(job_id):
-                raise asyncio.CancelledError
         except asyncio.CancelledError as error:
             failure = error
         except BaseException as error:
@@ -2844,15 +2860,65 @@ class PortfolioPanelService:
                 except BaseException as error:
                     if failure is None or isinstance(failure, asyncio.CancelledError):
                         failure = error
-            if failure is None and completed_result is not None:
+        if failure is not None:
+            raise failure
+        if completed_result is None:
+            raise PortfolioPanelError("PORTFOLIO_JOB_STAGE2_TIMEOUT", "tester result did not become fresh", status=500)
+        return completed_result
+
+    def _run_stage2(self, job_id: str, prepared_candidates: Sequence[Mapping[str, Any]]) -> None:
+        failure: BaseException | None = None
+        try:
+            if self._cancelled(job_id):
+                raise asyncio.CancelledError
+            self.registry.transition(job_id, "RUNNING", phase=STAGE2_STAGES[0])
+            self._sync_runtime(job_id, started_at=_now(), stage_index=0, completed_stages=0)
+            tester = self._local_testing_service_provider()
+            for prepared in prepared_candidates:
                 if self._cancelled(job_id):
-                    failure = asyncio.CancelledError()
-                else:
-                    try:
-                        runtime = self.registry.runtime(job_id)
-                        self.registry.sync(job_id, {"state": "COMMITTED", "phase": "COMMITTED", "result": completed_result}, runtime={**runtime, "finished_at": _now()})
-                    except BaseException as error:
-                        failure = asyncio.CancelledError() if self._cancelled(job_id) else error
+                    raise asyncio.CancelledError
+                candidate_index = prepared["candidate_index"]
+                self._sync_runtime(
+                    job_id,
+                    current_index=candidate_index,
+                    current_candidate_id=prepared["candidate_id"],
+                    stage_index=0,
+                    completed_stages=0,
+                    stage_completed=0,
+                    stage_percent=0,
+                )
+                completed_result = self._run_stage2_candidate(job_id, prepared, tester)
+                with self.registry.lock:
+                    runtime = self.registry.runtime(job_id)
+                    results = list(runtime.get("stage2_results", []))
+                    results.append(completed_result)
+                    runtime.update(
+                        stage2_results=results,
+                        completed_count=len(results),
+                        stage_index=3,
+                        completed_stages=3,
+                        stage_completed=1,
+                        stage_total=1,
+                        stage_percent=100,
+                    )
+                    state = self.registry.get(job_id)["state"]
+                    self.registry.sync(job_id, {"state": state}, runtime=runtime)
+                if self._cancelled(job_id):
+                    raise asyncio.CancelledError
+            if self._cancelled(job_id):
+                raise asyncio.CancelledError
+            runtime = self.registry.runtime(job_id)
+            try:
+                self.registry.sync(job_id, {"state": "COMMITTED", "phase": "COMMITTED"}, runtime={**runtime, "finished_at": _now()})
+            except BaseException as error:
+                if self._cancelled(job_id):
+                    raise asyncio.CancelledError from error
+                raise
+        except asyncio.CancelledError as error:
+            failure = error
+        except BaseException as error:
+            failure = error
+        finally:
             if isinstance(failure, asyncio.CancelledError):
                 self._stage2_cancel_finish(job_id)
             elif failure is not None:
@@ -3084,6 +3150,7 @@ class PortfolioPanelService:
                 "workbook_path": str(final),
                 "executables_path": str(final_executables),
                 "executables_digest": verified_executables["payload_digest"],
+                "executables_count": len(verified_executables["candidates"]),
                 "finished_at": _now(),
             }
             try:
@@ -3142,6 +3209,7 @@ class PortfolioPanelService:
                 failed_runtime.pop("workbook_path", None)
                 failed_runtime.pop("executables_path", None)
                 failed_runtime.pop("executables_digest", None)
+                failed_runtime.pop("executables_count", None)
                 entries = failed_runtime.get("journal") if isinstance(failed_runtime.get("journal"), list) else []
                 stage_index = failed_runtime.get("stage_index")
                 stage = STAGES[stage_index] if isinstance(stage_index, int) and 0 <= stage_index < len(STAGES) else "FAILED"
@@ -3711,6 +3779,9 @@ class PortfolioPanelService:
         return path
 
     def cancel(self, job_id: str) -> dict[str, Any]:
+        event = self._cancel_events.get(job_id)
+        if event is not None:
+            event.set()
         try:
             saved = self.registry.get(job_id)
         except PanelJobError as error:
@@ -3722,9 +3793,6 @@ class PortfolioPanelService:
             raise PortfolioPanelError("PORTFOLIO_JOB_NOT_FOUND", "job is not available", status=404)
         if saved["state"] in _TERMINAL:
             raise PortfolioPanelError("PORTFOLIO_JOB_TERMINAL", "job is terminal", status=409)
-        event = self._cancel_events.get(job_id)
-        if event is not None:
-            event.set()
         if saved["state"] == "QUEUED":
             try:
                 saved = self.registry.cancel(job_id)
@@ -3842,10 +3910,10 @@ class PortfolioPanelService:
             raise PortfolioPanelError("PORTFOLIO_JOB_WORKBOOK_UNAVAILABLE", "workbook is not available", status=409) from None
 
     def submit_tester_submission(self, campaign_id: str, payload: Mapping[str, Any]) -> dict[str, Any]:
-        if self._local_testing_service_provider is None:
-            raise PortfolioPanelError("PORTFOLIO_JOB_STAGE2_NOT_AUTHORIZED", "stage 2 is not authorized", status=409)
         if (
-            not isinstance(payload, Mapping)
+            not isinstance(campaign_id, str)
+            or not campaign_id
+            or not isinstance(payload, Mapping)
             or set(payload) != {"confirmed", "campaign_id"}
             or payload.get("confirmed") is not True
             or payload.get("campaign_id") != campaign_id
@@ -3865,24 +3933,32 @@ class PortfolioPanelService:
             saved_stage1, _runtime = self._campaign_by_id(campaign_id)
             if self._project_state(saved_stage1) != "SUCCEEDED":
                 raise PortfolioPanelError("PORTFOLIO_STAGE2_CAMPAIGN_NOT_READY", "stage 1 campaign is not ready", status=409)
-            prepared = self._prepare_stage2_baseline(campaign_id)
+            prepared_candidates = self._prepare_stage2_batch(campaign_id)
+            candidate_bindings = [
+                [prepared["candidate_id"], prepared["candidate_digest"]]
+                for prepared in prepared_candidates
+            ]
             binding = {
-                "campaign_id": prepared["campaign_id"],
-                "input_digest": prepared["input_digest"],
-                "config_digest": prepared["config_digest"],
-                "artifact_digest": prepared["artifact_digest"],
-                "candidate_id": prepared["candidate_id"],
-                "candidate_digest": prepared["candidate_digest"],
-                "expected_names": list(prepared["expected_names"]),
-                "pretest_period": _plain(prepared["pretest_period"]),
-                "receipt": _plain(prepared["receipt"]),
+                "campaign_id": campaign_id,
+                "input_digest": prepared_candidates[0]["input_digest"],
+                "config_digest": prepared_candidates[0]["config_digest"],
+                "artifact_digest": prepared_candidates[0]["artifact_digest"],
+                "candidate_count": len(prepared_candidates),
+                "candidate_bindings": candidate_bindings,
             }
             submission_key = f"portfolio-stage2:{campaign_id}"
             created_job_id: str | None = None
             try:
-                saved = self.registry.submit("portfolio.stage2", {"campaign_id": campaign_id, "candidate_id": prepared["candidate_id"]}, submission_key, ("portfolio_optimizer",))
+                saved = self.registry.submit("portfolio.stage2", {"campaign_id": campaign_id}, submission_key, ("portfolio_optimizer",))
                 created_job_id = saved["job_id"]
                 self.registry.reserve_runtime(saved["job_id"], "stage2", binding)
+                self._sync_runtime(
+                    saved["job_id"],
+                    stage2_results=[],
+                    current_index=None,
+                    current_candidate_id=None,
+                    completed_count=0,
+                )
             except PanelJobError as error:
                 if created_job_id is not None:
                     try:
@@ -3901,7 +3977,7 @@ class PortfolioPanelService:
             event = threading.Event()
             self._cancel_events[saved["job_id"]] = event
             try:
-                worker = threading.Thread(target=self._run_stage2, args=(saved["job_id"], prepared), name="mrs3-portfolio-stage2", daemon=True)
+                worker = threading.Thread(target=self._run_stage2, args=(saved["job_id"], prepared_candidates), name="mrs3-portfolio-stage2", daemon=True)
                 self._threads[saved["job_id"]] = worker
                 worker.start()
             except BaseException as error:

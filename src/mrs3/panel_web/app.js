@@ -4429,6 +4429,11 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
       const runButton = query('#portfolio-run');
       const newButton = query('#portfolio-new-calculation');
       const cancelButton = query('#portfolio-cancel');
+      const stage2Submit = query('#portfolio-stage2-submit');
+      const stage2State = query('#portfolio-stage2-state');
+      const stage2Reason = query('#portfolio-stage2-reason');
+      const stage2Progress = query('#portfolio-stage2-progress');
+      const stage2Results = query('#portfolio-stage2-results');
       const formStatus = query('#portfolio-form-status');
       const portfolioStatusLabels = Object.freeze({
         WAITING: 'ОЖИДАНИЕ', READY: 'ГОТОВО', BLOCKED: 'ЗАБЛОКИРОВАНО', EDITABLE: 'РЕДАКТИРУЕМО', FROZEN: 'ЗАФИКСИРОВАНО',
@@ -4450,6 +4455,14 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
       const text = (selector, value) => { const node = query(selector); if (node) node.textContent = value == null || value === '' ? '—' : String(value); };
       const terminal = (job) => ['SUCCEEDED', 'FAILED', 'CANCELLED', 'INTERRUPTED'].includes(String(job?.status || job?.state || '').toUpperCase());
       const statusOf = (job) => String(job?.status || job?.state || 'WAITING').toUpperCase();
+      const stage2Eligible = () => Boolean(
+        state.job?.kind === 'STAGE1_CALCULATION'
+        && statusOf(state.job) === 'SUCCEEDED'
+        && typeof state.job.campaign_id === 'string'
+        && state.job.campaign_id.length > 0
+        && Number.isSafeInteger(state.job?.executables_count)
+        && state.job.executables_count > 0
+      );
       const portfolioDecimal = (value) => {
         const raw = String(value ?? '').trim(); const match = /^(\d*)(?:\.(\d*))?(?:[eE]([+-]?\d+))?$/.exec(raw);
         if (!match || (!match[1] && !match[2])) return false;
@@ -4546,6 +4559,18 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
         if (prepareButton) { prepareButton.textContent = preparationState === 'READY' ? 'Готово' : (preparationState === 'ERROR' ? 'Повторить' : 'Подготовить данные финалистов'); prepareButton.disabled = state.locked || preparationState === 'READY' || preparationState === 'PREPARING'; }
         if (newButton) newButton.disabled = preparationState === 'PREPARING' || !state.locked || !jobTerminal;
         if (cancelButton) cancelButton.disabled = !state.activeJobId || jobTerminal || ['CANCEL_REQUESTED', 'CANCELLING'].includes(statusOf(state.job));
+        const stage2Ready = stage2Eligible();
+        if (stage2Submit) {
+          stage2Submit.disabled = !stage2Ready;
+          stage2Submit.setAttribute('aria-disabled', String(!stage2Ready));
+          if (stage2Ready) stage2Submit.removeAttribute('tabindex'); else stage2Submit.setAttribute('tabindex', '-1');
+        }
+        if (state.job?.kind !== 'TESTER_SUBMISSION') {
+          if (stage2State) setBadge('#portfolio-stage2-state', stage2Ready ? 'READY' : 'DISABLED', stage2Ready ? 'ready' : 'pending');
+          if (stage2Reason) stage2Reason.textContent = stage2Ready
+            ? `Готово к тестированию: ${state.job.executables_count} портфелей.`
+            : 'Доступно после успешного расчёта и подтверждения состава портфелей.';
+        }
       };
       const renderJournal = (job) => {
         const journal = query('#portfolio-journal'); if (!journal) return; journal.replaceChildren();
@@ -4703,6 +4728,39 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
           if (portfolioXlsx && result.workbook_available === true) { portfolioXlsx.href = `/api/v2/portfolio/campaigns/${encodeURIComponent(job.campaign_id)}/stage1.xlsx`; portfolioXlsx.hidden = false; }
         } catch (error) { if (summary) summary.textContent = `Результаты недоступны: ${portfolioErrorMessage(error)}`; }
       };
+      const renderStage2 = (job) => {
+        if (!stage2Progress || !stage2Results || !stage2State || !stage2Reason) return;
+        if (job?.kind !== 'TESTER_SUBMISSION') {
+          stage2Progress.textContent = '';
+          stage2Results.replaceChildren();
+          return;
+        }
+        const statusName = statusOf(job);
+        const batch = job.batch || {};
+        const total = Number.isSafeInteger(batch.total) ? batch.total : 0;
+        const current = Number.isInteger(batch.current_index) ? batch.current_index + 1 : 0;
+        const completed = Number.isSafeInteger(batch.completed) ? batch.completed : 0;
+        const overall = Number.isFinite(Number(job.overall_percent)) ? Math.max(0, Math.min(100, Number(job.overall_percent))) : 0;
+        const stageName = job.stage?.name || statusName;
+        stage2Progress.textContent = `${current} / ${total} · ${completed} завершено · ${portfolioStageLabel(stageName)} · ${Math.round(overall)}% · ${portfolioStatusLabel(statusName)}`;
+        setBadge('#portfolio-stage2-state', statusName, statusName === 'SUCCEEDED' ? 'ready' : (terminal(job) ? 'pending' : 'running'));
+        const diagnostic = Array.isArray(job.diagnostics) ? job.diagnostics.find((item) => item && typeof item === 'object') : null;
+        if (statusName === 'SUCCEEDED') stage2Reason.textContent = 'Тестирование портфелей завершено.';
+        else if (statusName === 'FAILED') stage2Reason.textContent = `Тестирование остановлено: ${diagnostic?.code || 'PORTFOLIO_JOB_STAGE2_FAILED'}`;
+        else if (statusName === 'CANCELLED') stage2Reason.textContent = 'Тестирование отменено; завершённые результаты сохранены.';
+        else if (statusName === 'INTERRUPTED') stage2Reason.textContent = 'Задание прервано после перезапуска; продолжение не выполняется.';
+        else stage2Reason.textContent = 'Портфели передаются тестеру поочерёдно.';
+        stage2Results.replaceChildren();
+        const results = Array.isArray(job.results) ? job.results : [];
+        results.forEach((result, index) => {
+          const row = document.createElement('li');
+          const reportFolder = typeof result?.report_folder === 'string' ? result.report_folder : String(result?.candidate_id || '');
+          const strategyCount = Array.isArray(result?.strategy_names) ? result.strategy_names.length : 0;
+          const candidate = document.createElement('code'); candidate.textContent = reportFolder;
+          row.append(document.createTextNode(`${index + 1}. Папка отчёта `), candidate, document.createTextNode(` · ${strategyCount} стратегий`));
+          stage2Results.append(row);
+        });
+      };
       const renderJob = (job) => {
         state.job = job || null;
         const statusName = statusOf(job); const stage = job?.stage || {}; const overallPercent = Number(job?.overall_percent); const stagePercent = Number(stage.percent); const overallKnown = Number.isFinite(overallPercent); const stageKnown = Number.isFinite(stagePercent) && stage.total !== undefined && Number.isFinite(Number(stage.total)); const stageIndeterminate = !!job && !stageKnown;
@@ -4739,7 +4797,7 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
         }
         setBadge('#portfolio-job-state', job ? statusName : 'NO JOB', statusName === 'SUCCEEDED' ? 'ready' : (job && !terminal(job) ? 'running' : 'pending'));
         setBadge('#portfolio-result-state', statusName === 'SUCCEEDED' ? 'SUCCEEDED' : (job ? statusName : 'WAITING'), statusName === 'SUCCEEDED' ? 'ready' : 'pending');
-        renderJournal(job); updateControls();
+        renderJournal(job); updateControls(); renderStage2(job);
         if (statusName === 'SUCCEEDED') renderResults(job); else { const xlsx = query('#portfolio-xlsx'); if (xlsx) { xlsx.hidden = true; xlsx.removeAttribute('href'); } }
       };
       const pollPortfolioJob = async () => {
@@ -4814,6 +4872,38 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
           }
           setLocked(false);
           if (formStatus) formStatus.textContent = portfolioErrorMessage(error);
+        }
+      });
+      stage2Submit?.addEventListener('click', async () => {
+        if (stage2Submit.disabled || !stage2Eligible()) return;
+        const campaignId = state.job.campaign_id;
+        const count = state.job.executables_count;
+        stage2Submit.disabled = true;
+        stage2Submit.setAttribute('aria-disabled', 'true');
+        const confirmed = window.confirm(`Передать тестеру ${count} портфелей кампании ${campaignId}?`);
+        if (!confirmed) { updateControls(); return; }
+        try {
+          const result = await requestJson(`/api/v2/portfolio/campaigns/${encodeURIComponent(campaignId)}/tester-submissions`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ confirmed: true, campaign_id: campaignId }),
+          });
+          if (!result.job_id) throw new Error('Не удалось создать задание передачи тестеру.');
+          state.activeJobId = result.job_id;
+          renderJob({
+            job_id: result.job_id,
+            campaign_id: campaignId,
+            kind: 'TESTER_SUBMISSION',
+            status: result.status || 'QUEUED',
+            overall_percent: 0,
+            stage: { name: 'PREPARE' },
+            results: [],
+            batch: { current_index: null, total: count, completed: 0 },
+          });
+          startPortfolioPolling();
+        } catch (error) {
+          updateControls();
+          if (stage2Reason) stage2Reason.textContent = portfolioErrorMessage(error);
         }
       });
       cancelButton?.addEventListener('click', async () => {

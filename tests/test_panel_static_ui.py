@@ -2916,7 +2916,7 @@ def test_portfolio_screen_and_settings_card_use_russian_user_labels() -> None:
         "Campaign frozen and queued on the server.", "New Campaign ready.", "Select ${row.pair}",
     ):
         assert text not in portfolio_js
-    assert "PORTFOLIO_JOB_STAGE2_NOT_AUTHORIZED" in portfolio_html
+    assert "PORTFOLIO_JOB_STAGE2_NOT_AUTHORIZED" not in portfolio_html
     assert "profile_id: profile.profile.toUpperCase()" in portfolio_js
 
 
@@ -2995,17 +2995,57 @@ def test_portfolio_recovery_and_polling_use_server_job_endpoints_only() -> None:
     assert "await requestJson('/api/v2/portfolio/readiness')" in js
 
 
-def test_portfolio_stage2_is_explicitly_disabled_without_tester_dispatch() -> None:
+def test_portfolio_stage2_is_disabled_until_server_projects_ready_stage1() -> None:
     html = _read("index.html")
     js = _read("app.js")
+    portfolio = js.split("function loadPortfolioScreen", 1)[1].split("function loadPortfolioSettings", 1)[0]
 
     assert 'id="portfolio-stage2-submit"' in html
     assert re.search(r'id="portfolio-stage2-submit"[^>]*disabled[^>]*aria-describedby="portfolio-stage2-reason"', html)
     assert 'id="portfolio-stage2-reason"' in html
-    assert "PORTFOLIO_JOB_STAGE2_NOT_AUTHORIZED" in html
-    assert "tester-submissions" not in js
-    portfolio = js.split("function loadPortfolioScreen", 1)[1].split("function loadPortfolioSettings", 1)[0]
+    assert 'id="portfolio-stage2-state"' in html
+    assert 'id="portfolio-stage2-progress"' in html
+    assert 'id="portfolio-stage2-results"' in html
+    assert "stage2Submit.disabled = !stage2Ready" in portfolio
+    assert "state.job?.kind === 'STAGE1_CALCULATION'" in portfolio
+    assert "statusOf(state.job) === 'SUCCEEDED'" in portfolio
+    assert "Number.isSafeInteger(state.job?.executables_count)" in portfolio
+    assert "state.job.executables_count > 0" in portfolio
+    assert "state.job.campaign_id" in portfolio
+    assert "window.confirm" in portfolio
+    assert "tester-submissions" in portfolio
+    assert "PORTFOLIO_JOB_STAGE2_NOT_AUTHORIZED" not in html
+    assert "state.readiness?.stage2?.enabled" not in portfolio
     assert "strategies.tester" not in portfolio
+    assert "Output/Portfolio" not in html + js
+
+
+def test_portfolio_stage2_confirmation_and_batch_progress_use_server_job() -> None:
+    js = _read("app.js")
+    portfolio = js.split("function loadPortfolioScreen", 1)[1].split("function loadPortfolioSettings", 1)[0]
+    stage2 = portfolio.split("const renderStage2 =", 1)[1].split("const renderJob =", 1)[0]
+    submit = portfolio.split("stage2Submit?.addEventListener('click'", 1)[1].split("cancelButton?.addEventListener", 1)[0]
+
+    assert "batch.current_index + 1" in stage2
+    assert "batch.completed" in stage2
+    assert "job.overall_percent" in stage2
+    assert "job.results" in stage2
+    assert "job.stage?.name" in stage2
+    assert "window.confirm" in submit
+    assert "state.job.campaign_id" in submit
+    assert "state.job.executables_count" in submit
+    assert "JSON.stringify({ confirmed: true, campaign_id: campaignId })" in submit
+    assert "tester-submissions" in submit
+    assert "if (!confirmed)" in submit
+    assert submit.index("stage2Submit.disabled = true") < submit.index("window.confirm")
+    assert submit.index("stage2Submit.disabled = true") < submit.index("requestJson")
+    assert "catch (error)" in submit
+    failure = submit.split("} catch (error) {", 1)[1]
+    assert failure.index("updateControls()") < failure.index("stage2Reason.textContent")
+    assert "stage2Reason.textContent = portfolioErrorMessage(error)" in failure
+    assert "setAttribute('aria-disabled', 'true')" in submit
+    assert "results.forEach" in stage2
+    assert "result?.report_folder" in stage2
 
 
 def test_portfolio_xlsx_is_rendered_only_after_succeeded_results() -> None:

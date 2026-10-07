@@ -24,6 +24,22 @@ A read-only replay classified 30,940 frozen rows twice with identical output SHA
 
 Panel PerformanceDB recalculation now serializes access through the controller lock. The focused Panel test module and independent review passed.
 
+Portfolio Stage 2 sequential batch is implemented against fixtures/fakes only:
+one job processes every committed Stage 1 candidate in order, exposes each
+completed result and batch progress, and requires explicit UI confirmation with
+the exact candidate count. Targeted backend tests passed (64 passed, 1
+platform-only symlink skip); tester lock/fill/stop tests passed (18); the full
+static UI module passed (161), and `node --check src/mrs3/panel_web/app.js`
+passed. A broader combined test run is not clean: the unmodified
+`tests/test_portfolio_input.py::_add_review` fixture inserts 11 values into
+the schema-v9 `selection_results` table after its `equity_regime_json` column
+was added. The live Panel was not restarted or used, and no real tester was
+run. A cancellation/result-sync race was reproduced before its fix; eleven
+selected backend/UI/fill/restore regression tests pass after the fix.
+Independent Claude Opus code review returned `CODE_REVIEW_PASS`. Any real local
+smoke remains a separate action requiring M5/M6 readiness and fresh user
+authorization.
+
 Performance v2 selection stages 6 through 9 and the stage 9 near-duplicate rule are documented in [the researched filter contract](docs/specs/2026-10-02-performance-v2-researched-filters.md). Focused selection and static UI checks passed; independent review passed.
 
 The Source v6 fresh compact multi-scope pipeline is marked complete in [PRD.md](PRD.md). This does not prove realized MRS3 performance.
@@ -37,7 +53,7 @@ The Source v6 fresh compact multi-scope pipeline is marked complete in [PRD.md](
 - Performance v2 equity-quality M5: evidence covers bounded real-data slices only. Full-corpus timing and user acceptance remain open in [the M5 evidence plan](docs/superpowers/plans/2026-09-26-performance-v2-equity-quality-m5-slice-evidence.md).
 - Heavy PerformanceDB follow-ups: residual import, analysis, cache, and materialization profiling is explicitly deferred and tracked in [the deferred follow-up plan](docs/superpowers/plans/2026-10-01-deferred-heavy-db-follow-ups.md). That plan does not authorize implementation.
 - Bybit collector: phases 1 through 8 are delivered; live integration and soak evidence in phase 9 remain open. See the [collector specification](docs/specs/2026-09-05-bybit-market-data-collector.md) and [implementation plan](docs/superpowers/plans/2026-09-05-bybit-market-data-collector.md).
-- Portfolio Optimizer: fixture/fake evidence does not authorize a real joint tester run, recommendation, trading admission, or live use. PnL floor, individual-DD ceiling, liquidity/freshness limits, and profile ranking remain open gates. Stage 2 remains blocked until its implementation gates and separate user authorization are satisfied. The Phase 13 limiter work remains off-only while the bot limiter is not operational. See the [optimizer specification](docs/specs/2026-09-05-portfolio-optimizer.md), [UI contract](docs/specs/2026-09-06-portfolio-optimizer-panel-ui.md), and [implementation plan](docs/superpowers/plans/2026-09-05-portfolio-optimizer.md).
+- Portfolio Optimizer: Stage 2 ordered-batch implementation has fixture/fake evidence and independent `CODE_REVIEW_PASS`; no real tester run occurred. This does not authorize a real joint tester run, recommendation, trading admission, or live use. M5/M6 readiness, PnL floor, individual-DD ceiling, liquidity/freshness limits, profile ranking, and fresh user authorization remain open gates. The Phase 13 limiter work remains off-only while the bot limiter is not operational. See the [optimizer specification](docs/specs/2026-09-05-portfolio-optimizer.md), [UI contract](docs/specs/2026-09-06-portfolio-optimizer-panel-ui.md), [batch decision](docs/decisions/0059-portfolio-stage2-sequential-batch.md), and [implementation plan](docs/superpowers/plans/2026-10-07-portfolio-stage2-sequential-batch.md).
 - Campaign combination preflight: the configured limit and server-side rejection of over-limit job creation are implemented. The form still does not calculate or display the exact finalist combination product before submission. See the [Portfolio Optimizer UI specification](docs/specs/2026-09-06-portfolio-optimizer-panel-ui.md).
 
 ## Next steps

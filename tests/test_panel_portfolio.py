@@ -160,6 +160,36 @@ def _stage2_service(tmp_path: Path, candidate: dict) -> tuple[PortfolioPanelServ
     return service, result
 
 
+def _stage2_batch_candidates(count: int = 3) -> tuple[dict, ...]:
+    candidates = []
+    for index, candidate_id in enumerate("abcdef"[:count]):
+        payloads = (
+            _stage2_payload("BTCUSDT", "LONG", name="PORTFOLIO_BTCUSDT_7_11"),
+            _stage2_payload("ETHUSDT", "SHORT", name="PORTFOLIO_ETHUSDT_8_12"),
+        )
+        digest = candidate_id * 64
+        candidates.append(_weighted_executable_candidate(payloads, candidate_id=digest, identity=digest))
+    return tuple(candidates)
+
+
+def _stage2_batch_service(tmp_path: Path, candidates: tuple[dict, ...]) -> tuple[PortfolioPanelService, dict]:
+    path = tmp_path / "portfolio_optimizer.local.json"
+    digest = _write_config(path)
+    service = PortfolioPanelService(
+        tmp_path,
+        path,
+        finalists_reader=lambda *_: [_finalist()],
+        variant_generator=lambda *_: candidates,
+    )
+    result = service.submit_campaign({
+        "pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}],
+        "profiles": [{"profile_id": "BALANCED", "bank_available_usdt": "10000", "max_candidates": len(candidates)}],
+        "expected_config_digest": digest,
+    })
+    assert _wait_stage1(service, result)["status"] == "SUCCEEDED"
+    return service, result
+
+
 def _wait_stage1(service: PortfolioPanelService, result: dict) -> dict:
     deadline = time.monotonic() + 3
     while time.monotonic() < deadline and service.job(result["job_id"])["status"] in {"QUEUED", "RUNNING"}:
@@ -2636,21 +2666,60 @@ def test_active_or_job_restores_latest_terminal_job(monkeypatch: pytest.MonkeyPa
     assert service.active_or_job() == {"job_id": "latest", "status": "FAILED"}
 
 
-def test_stage2_route_is_permanently_blocked(tmp_path: Path) -> None:
+def test_stage2_route_validates_confirmation_without_provider_gate(tmp_path: Path) -> None:
     path = tmp_path / "portfolio_optimizer.local.json"
     _write_config(path)
     service = PortfolioPanelService(tmp_path, path)
-    with pytest.raises(Exception) as error:
+    with pytest.raises(PortfolioPanelError) as error:
         service.submit_tester_submission("campaign", {"confirmed": True, "campaign_id": "campaign"})
-    assert getattr(error.value, "code", None) == "PORTFOLIO_JOB_STAGE2_NOT_AUTHORIZED"
+    assert error.value.code == "PORTFOLIO_CAMPAIGN_NOT_FOUND"
 
 
-@pytest.mark.parametrize("payload", ({}, {"confirmed": True, "campaign_id": "other"}))
-def test_stage2_route_blocks_before_confirmation_validation(tmp_path: Path, payload: dict) -> None:
+def test_stage2_route_rejects_non_string_campaign_id_before_lookup(tmp_path: Path) -> None:
+    service = PortfolioPanelService(tmp_path)
+
+    with pytest.raises(PortfolioPanelError) as error:
+        service.submit_tester_submission(7, {"confirmed": True, "campaign_id": 7})
+
+    assert error.value.code == "PORTFOLIO_CAMPAIGN_INVALID"
+
+
+def test_stage2_route_rejects_non_successful_campaign_before_job_submit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = PortfolioPanelService(tmp_path)
+    monkeypatch.setattr(
+        service,
+        "_campaign_by_id",
+        lambda _campaign_id: ({"kind": "portfolio.stage1", "state": "RUNNING"}, {}),
+    )
+    monkeypatch.setattr(
+        service.registry,
+        "submit",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("ineligible campaign was submitted")),
+    )
+
+    with pytest.raises(PortfolioPanelError) as error:
+        service.submit_tester_submission("campaign", {"confirmed": True, "campaign_id": "campaign"})
+
+    assert error.value.code == "PORTFOLIO_STAGE2_CAMPAIGN_NOT_READY"
+    assert error.value.status == 409
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        {},
+        {"confirmed": False, "campaign_id": "campaign"},
+        {"confirmed": True, "campaign_id": "other"},
+        {"confirmed": True, "campaign_id": "campaign", "extra": True},
+    ),
+)
+def test_stage2_route_rejects_invalid_confirmation_before_campaign_lookup(tmp_path: Path, payload: dict) -> None:
     service = PortfolioPanelService(tmp_path)
     with pytest.raises(PortfolioPanelError) as error:
         service.submit_tester_submission("campaign", payload)
-    assert error.value.code == "PORTFOLIO_JOB_STAGE2_NOT_AUTHORIZED"
+    assert error.value.code == "PORTFOLIO_CAMPAIGN_INVALID"
 
 
 @pytest.mark.parametrize("failure", (PanelJobError("RESOURCE_BUSY"), OSError("registry unavailable"), TypeError("registry unavailable"), ValueError("registry unavailable")))
@@ -3409,7 +3478,7 @@ def test_stage2_baseline_preparation_uses_first_persisted_candidate_and_exact_pa
     )
     service, result = _stage2_service(tmp_path, candidate)
 
-    prepared = service._prepare_stage2_baseline(result["campaign_id"])
+    prepared = service._prepare_stage2_batch(result["campaign_id"])[0]
     assert prepared["campaign_id"] == result["campaign_id"]
     assert prepared["input_digest"] == result["input_digest"]
     assert prepared["config_digest"] == result["config_digest"]
@@ -3446,6 +3515,101 @@ def test_stage2_baseline_preparation_uses_first_persisted_candidate_and_exact_pa
     ]
 
 
+def test_stage2_batch_preparation_preserves_all_candidates_and_indexes(tmp_path: Path) -> None:
+    candidates = _stage2_batch_candidates()
+    service, result = _stage2_batch_service(tmp_path, candidates)
+
+    prepared = service._prepare_stage2_batch(result["campaign_id"])
+
+    assert [item["candidate_id"] for item in prepared] == [candidate["candidate_id"] for candidate in candidates]
+    assert [item["candidate_index"] for item in prepared] == [0, 1, 2]
+    assert [item["candidate_digest"] for item in prepared] == [candidate["candidate_digest"] for candidate in service._load_stage1_executables(
+        result["campaign_id"], result["input_digest"], result["config_digest"],
+        service.registry.runtime(result["job_id"])["executables_digest"],
+    )["candidates"]]
+    for item in prepared:
+        service._verify_stage2_prepared(item)
+    invalid_index = {**prepared[1], "candidate_index": len(prepared)}
+    with pytest.raises(PortfolioPanelError) as error:
+        service._verify_stage2_prepared(invalid_index)
+    assert error.value.code == "PORTFOLIO_JOB_STAGE2_INPUT_CHANGED"
+
+
+def test_executables_count_is_persisted_and_public_for_stage1(tmp_path: Path) -> None:
+    candidates = _stage2_batch_candidates()
+    service, result = _stage2_batch_service(tmp_path, candidates)
+
+    runtime = service.registry.runtime(result["job_id"])
+
+    assert runtime["executables_count"] == len(candidates)
+    assert service.job(result["job_id"])["executables_count"] == len(candidates)
+
+
+def test_stage2_compact_binding_and_registry_request_contain_no_payloads(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    candidates = _stage2_batch_candidates()
+    service, stage1 = _stage2_batch_service(tmp_path, candidates)
+    fake = _FakeStage2Tester(tmp_path, ("unused",))
+    service._local_testing_service_provider = lambda: fake
+    requests: list[dict] = []
+    submit = service.registry.submit
+
+    def capture_submit(kind: str, request: dict, *args: object, **kwargs: object) -> dict:
+        requests.append(dict(request))
+        return submit(kind, request, *args, **kwargs)
+
+    monkeypatch.setattr(service.registry, "submit", capture_submit)
+    submitted = service.submit_tester_submission(
+        stage1["campaign_id"], {"confirmed": True, "campaign_id": stage1["campaign_id"]}
+    )
+    runtime = service.registry.runtime(submitted["job_id"])
+
+    assert requests == [{"campaign_id": stage1["campaign_id"]}]
+    assert runtime["stage2"] == {
+        "campaign_id": stage1["campaign_id"],
+        "input_digest": stage1["input_digest"],
+        "config_digest": stage1["config_digest"],
+        "artifact_digest": service.registry.runtime(stage1["job_id"])["executables_digest"],
+        "candidate_count": len(candidates),
+        "candidate_bindings": [[item["candidate_id"], item["candidate_digest"]] for item in service._load_stage1_executables(
+            stage1["campaign_id"], stage1["input_digest"], stage1["config_digest"],
+            service.registry.runtime(stage1["job_id"])["executables_digest"],
+        )["candidates"]],
+    }
+    assert "receipt" not in runtime["stage2"]
+    assert "strategy_jsons" not in runtime["stage2"]
+
+
+def test_stage2_batch_runs_all_candidates_in_artifact_order_and_retains_results(tmp_path: Path) -> None:
+    candidates = _stage2_batch_candidates()
+    service, stage1 = _stage2_batch_service(tmp_path, candidates)
+    payloads = tuple(_stage2_payload("BTCUSDT", "LONG", name="unused") for _ in range(2))
+    fake = _FakeStage2Tester(tmp_path, tuple(item["strategy"]["name"] for item in payloads))
+    service._local_testing_service_provider = lambda: fake
+
+    submitted = service.submit_tester_submission(
+        stage1["campaign_id"], {"confirmed": True, "campaign_id": stage1["campaign_id"]}
+    )
+    job = _wait_stage1(service, submitted)
+
+    expected_ids = [candidate["candidate_id"] for candidate in candidates]
+    assert job["status"] == "SUCCEEDED"
+    assert [call[0] for call in fake.calls] == ["fill_prebuilt", "start", "stop"] * len(candidates)
+    fill_calls = [call[1] for call in fake.calls if call[0] == "fill_prebuilt"]
+    expected_materials = [_stage2_material(candidate) for candidate in service._load_stage1_executables(
+        stage1["campaign_id"], stage1["input_digest"], stage1["config_digest"],
+        service.registry.runtime(stage1["job_id"])["executables_digest"],
+    )["candidates"]]
+    assert [call["tester_config_json"] for call in fill_calls] == [item["tester_config_json"] for item in expected_materials]
+    assert [call["strategy_jsons"] for call in fill_calls] == [item["strategy_jsons"] for item in expected_materials]
+    runtime = service.registry.runtime(submitted["job_id"])
+    assert [item["candidate_id"] for item in runtime["stage2_results"]] == expected_ids
+    assert runtime["completed_count"] == len(candidates)
+    assert job["results"] == runtime["stage2_results"]
+    assert job["batch"] == {"current_index": len(candidates) - 1, "total": len(candidates), "completed": len(candidates)}
+    assert job["overall_percent"] == 100
+    assert job["result"] == job["results"][-1]
+
+
 def test_stage2_baseline_preparation_uses_candidate_after_filtered_order_zero(tmp_path: Path) -> None:
     payloads = (
         _stage2_payload("BTCUSDT", "LONG", name="PORTFOLIO_BTCUSDT_7_11"),
@@ -3464,7 +3628,7 @@ def test_stage2_baseline_preparation_uses_candidate_after_filtered_order_zero(tm
     assert _wait_stage1(service, result)["status"] == "SUCCEEDED"
     artifact = json.loads((tmp_path / ".portfolio-results" / result["campaign_id"] / "stage1-executables.json").read_text(encoding="utf-8"))
     assert artifact["candidates"][0]["order"] == 1
-    assert service._prepare_stage2_baseline(result["campaign_id"])["candidate_id"] == "b" * 64
+    assert service._prepare_stage2_batch(result["campaign_id"])[0]["candidate_id"] == "b" * 64
 
 
 @pytest.mark.parametrize(
@@ -3483,7 +3647,7 @@ def test_stage2_baseline_preparation_rejects_unsafe_candidate_binding(tmp_path: 
     candidate.update(candidate_update)
     service, result = _stage2_service(tmp_path, candidate)
     with pytest.raises(PortfolioPanelError) as error:
-        service._prepare_stage2_baseline(result["campaign_id"])
+        service._prepare_stage2_batch(result["campaign_id"])
     assert error.value.code == "PORTFOLIO_STAGE2_INPUT_INVALID"
     assert error.value.status == 409
 
@@ -3529,7 +3693,7 @@ def test_stage2_maps_tampered_bank_mismatch_to_typed_error(tmp_path: Path, monke
     monkeypatch.setattr(service, "_load_stage1_executables", lambda *_args, **_kwargs: artifact)
 
     with pytest.raises(PortfolioPanelError) as error:
-        service._prepare_stage2_baseline(result["campaign_id"])
+        service._prepare_stage2_batch(result["campaign_id"])
 
     assert (error.value.code, error.value.status) == ("PORTFOLIO_STAGE2_INPUT_INVALID", 409)
 
@@ -3571,7 +3735,7 @@ def test_stage2_baseline_preparation_requires_complete_receipt_evidence(
     )
 
     with pytest.raises(PortfolioPanelError) as error:
-        service._prepare_stage2_baseline(result["campaign_id"])
+        service._prepare_stage2_batch(result["campaign_id"])
 
     assert error.value.code == "PORTFOLIO_STAGE2_INPUT_INVALID"
 
@@ -3587,7 +3751,7 @@ def test_stage2_receipt_rechecks_artifact_sizing_and_max_balance(
         tmp_path,
         _weighted_executable_candidate(payloads, candidate_id="3" * 64, identity="3" * 64),
     )
-    prepared = service._prepare_stage2_baseline(result["campaign_id"])
+    prepared = service._prepare_stage2_batch(result["campaign_id"])[0]
     changed = service._load_stage1_executables(
         prepared["campaign_id"], prepared["input_digest"], prepared["config_digest"], prepared["artifact_digest"]
     )
@@ -3609,7 +3773,7 @@ def test_stage2_rejects_receiptless_prepared_package(tmp_path: Path) -> None:
         tmp_path,
         _weighted_executable_candidate(payloads, candidate_id="4" * 64, identity="4" * 64),
     )
-    prepared = service._prepare_stage2_baseline(result["campaign_id"])
+    prepared = service._prepare_stage2_batch(result["campaign_id"])[0]
     prepared.pop("receipt")
 
     with pytest.raises(PortfolioPanelError) as error:
@@ -3625,7 +3789,7 @@ def test_stage2_baseline_preparation_rejects_unsafe_strategy_name(tmp_path: Path
     )
     service, result = _stage2_service(tmp_path, _weighted_executable_candidate(payloads, candidate_id="1" * 64, identity="1" * 64))
     with pytest.raises(PortfolioPanelError) as error:
-        service._prepare_stage2_baseline(result["campaign_id"])
+        service._prepare_stage2_batch(result["campaign_id"])
     assert error.value.code == "PORTFOLIO_STAGE2_INPUT_INVALID"
     assert error.value.status == 409
 
@@ -3641,12 +3805,37 @@ def test_stage2_baseline_preparation_loads_restart_without_stage1_recomputation(
         raise AssertionError("stage 1 inputs must not be recomputed")
 
     restarted = PortfolioPanelService(tmp_path, tmp_path / "portfolio_optimizer.local.json", finalists_reader=unexpected, optimizer_input_preparer=unexpected, variant_generator=unexpected)
-    prepared = restarted._prepare_stage2_baseline(result["campaign_id"])
+    prepared = restarted._prepare_stage2_batch(result["campaign_id"])[0]
     assert prepared["candidate_id"] == "f" * 64
 
 
 class _FakeStage2Tester:
-    def __init__(self, root: Path, expected_names: tuple[str, ...], *, write_result: bool = True, write_report: bool = True, delayed_report: bool = False, extra_report: bool = False, report_as_directory: bool = False, invalid_fill_readback: bool = False, after_fill: Any = None, after_start: Any = None, result_names: tuple[str, ...] | None = None, result_stats: dict[str, object] | None = None, fill_error: Exception | None = None, fill_enter: threading.Event | None = None, fill_release: threading.Event | None = None, stop_error: Exception | None = None, stop_enter: threading.Event | None = None, stop_release: threading.Event | None = None) -> None:
+    def __init__(
+        self,
+        root: Path,
+        expected_names: tuple[str, ...],
+        *,
+        write_result: bool = True,
+        write_report: bool = True,
+        delayed_report: bool = False,
+        extra_report: bool = False,
+        report_as_directory: bool = False,
+        invalid_fill_readback: bool = False,
+        after_fill: Any = None,
+        after_start: Any = None,
+        after_stop: Any = None,
+        result_names: tuple[str, ...] | None = None,
+        result_stats: dict[str, object] | None = None,
+        fill_error: Exception | None = None,
+        fill_enter: threading.Event | None = None,
+        fill_enter_at: int = 1,
+        fill_release: threading.Event | None = None,
+        stop_error: Exception | None = None,
+        stop_error_candidates: tuple[str, ...] = (),
+        missing_results: tuple[str, ...] = (),
+        stop_enter: threading.Event | None = None,
+        stop_release: threading.Event | None = None,
+    ) -> None:
         self.config = SimpleNamespace(
             wizard_result=root / "wizard-result.json",
             report_dir=root / "tester" / "report" / "my_test",
@@ -3656,7 +3845,9 @@ class _FakeStage2Tester:
             metric_tolerance=Decimal("0.01"),
         )
         self.expected_names = expected_names
-        self.result_names = result_names or expected_names
+        self.result_names = result_names
+        self.current_candidate_id = "a" * 64
+        self.current_names = expected_names
         self.result_stats = result_stats or {
             "InitialBalance": 10000,
             "FinalBalance": 10100,
@@ -3676,21 +3867,29 @@ class _FakeStage2Tester:
         self.invalid_fill_readback = invalid_fill_readback
         self.after_fill = after_fill
         self.after_start = after_start
+        self.after_stop = after_stop
         self.fill_error = fill_error
         self.fill_enter = fill_enter
+        self.fill_enter_at = fill_enter_at
         self.fill_release = fill_release
         self.stop_error = stop_error
+        self.stop_error_candidates = stop_error_candidates
+        self.missing_results = missing_results
         self.stop_enter = stop_enter
         self.stop_release = stop_release
         self.calls: list[tuple[str, object]] = []
+        self.fill_count = 0
+        self.stop_count = 0
         self.config.wizard_result.write_text("[]", encoding="utf-8")
 
     def fill_prebuilt(self, **kwargs: object) -> dict[str, object]:
         self.calls.append(("fill_prebuilt", kwargs))
-        if self.fill_enter is not None:
-            self.fill_enter.set()
-        if self.fill_release is not None:
-            self.fill_release.wait(timeout=2)
+        self.fill_count += 1
+        if self.fill_count == self.fill_enter_at:
+            if self.fill_enter is not None:
+                self.fill_enter.set()
+            if self.fill_release is not None:
+                self.fill_release.wait(timeout=2)
         if self.fill_error is not None:
             raise self.fill_error
         strategy_jsons = kwargs["strategy_jsons"]
@@ -3705,6 +3904,9 @@ class _FakeStage2Tester:
         ]
         config = kwargs["tester_config_json"]
         assert isinstance(config, str)
+        config_document = json.loads(config)
+        self.current_candidate_id = config_document["name_comment"]
+        self.current_names = tuple(strategy_jsons)
         readback = {
             "strategy_names": list(strategy_jsons),
             "strategy_file_manifest": manifest,
@@ -3718,9 +3920,9 @@ class _FakeStage2Tester:
 
     def start(self) -> dict[str, str]:
         self.calls.append(("start", None))
-        if self.write_result:
+        if self.write_result and self.current_candidate_id not in self.missing_results:
             if self.write_report:
-                report = self.config.report_dir.parent / ("a" * 64) / "portfolio.html"
+                report = self.config.report_dir.parent / self.current_candidate_id / "portfolio.html"
                 report.parent.mkdir(parents=True, exist_ok=True)
                 def write_report() -> None:
                     if self.report_as_directory:
@@ -3736,10 +3938,10 @@ class _FakeStage2Tester:
                 else:
                     write_report()
             self.config.wizard_result.write_text(json.dumps([{
-                "runId": "portfolio-run",
-                "strategies": list(self.result_names),
+                "runId": f"portfolio-run-{self.current_candidate_id[0]}",
+                "strategies": list(self.result_names if self.result_names is not None else self.current_names),
                 "stats": self.result_stats,
-                "chartUrl": f"/tester-report/{'a' * 64}/portfolio.html",
+                "chartUrl": f"/tester-report/{self.current_candidate_id}/portfolio.html",
                 "period": "2026-01-01..2026-01-14",
             }]), encoding="utf-8")
         if self.after_start is not None:
@@ -3748,11 +3950,16 @@ class _FakeStage2Tester:
 
     def stop(self) -> dict[str, str]:
         self.calls.append(("stop", None))
+        self.stop_count += 1
         if self.stop_enter is not None:
             self.stop_enter.set()
         if self.stop_release is not None:
             self.stop_release.wait(timeout=2)
-        if self.stop_error is not None:
+        if self.after_stop is not None:
+            self.after_stop()
+        if self.stop_error is not None and (
+            not self.stop_error_candidates or self.current_candidate_id in self.stop_error_candidates
+        ):
             raise self.stop_error
         return {"state": "STOPPED"}
 
@@ -3778,16 +3985,15 @@ def test_stage2_submission_runs_one_prepared_candidate_and_stops_service(tmp_pat
     assert job["status"] == "SUCCEEDED"
     assert [call[0] for call in fake.calls] == ["fill_prebuilt", "start", "stop"]
     runtime = service.registry.runtime(submitted["job_id"])
-    assert runtime["stage2"]["receipt"]["candidate_order"] == 0
-    assert runtime["stage2"]["receipt"]["member_identities"] == [
-        {"symbol": "BTCUSDT", "side": "LONG", "strategy_id": 1, "result_id": 101},
-        {"symbol": "ETHUSDT", "side": "SHORT", "strategy_id": 2, "result_id": 102},
-    ]
-    assert runtime["stage2_result"]["candidate_id"] == "a" * 64
-    assert runtime["stage2_result"]["report_folder"] == "a" * 64
-    assert runtime["stage2_result"]["strategy_names"] == [payload["strategy"]["name"] for payload in payloads]
-    assert runtime["stage2_result"]["pretest_period"] == {"start_utc": "2026-01-01T00:00:00Z", "end_utc": "2026-01-15T00:00:00Z"}
-    evidence = runtime["stage2_result"]["report_evidence"]
+    assert runtime["stage2"]["candidate_count"] == 1
+    assert runtime["stage2"]["candidate_bindings"] == [["a" * 64, runtime["stage2"]["candidate_bindings"][0][1]]]
+    assert "receipt" not in runtime["stage2"]
+    assert runtime["stage2_results"][0]["candidate_id"] == "a" * 64
+    assert runtime["stage2_results"][0]["report_folder"] == "a" * 64
+    assert runtime["stage2_results"][0]["strategy_names"] == [payload["strategy"]["name"] for payload in payloads]
+    assert runtime["stage2_results"][0]["pretest_period"] == {"start_utc": "2026-01-01T00:00:00Z", "end_utc": "2026-01-15T00:00:00Z"}
+    evidence = runtime["stage2_results"][0]["report_evidence"]
+    assert job["result"] == runtime["stage2_results"][0]
     assert evidence["fingerprint"]["size"] > 0
     assert evidence["fingerprint"]["sha256"]
     assert evidence["stable_polls"] >= 2
@@ -3827,6 +4033,295 @@ def _submit_stage2_with_fake(tmp_path: Path, *, fake_kwargs: dict[str, object] |
     service._local_testing_service_provider = lambda: fake
     submission = service.submit_tester_submission(stage1["campaign_id"], {"confirmed": True, "campaign_id": stage1["campaign_id"]})
     return service, stage1, fake, submission
+
+
+def _submit_stage2_batch_with_fake(
+    tmp_path: Path,
+    candidates: tuple[dict, ...],
+    *,
+    fake_kwargs: dict[str, object] | None = None,
+) -> tuple[PortfolioPanelService, dict, _FakeStage2Tester, dict]:
+    service, stage1 = _stage2_batch_service(tmp_path, candidates)
+    expected_names = tuple(payload["strategy"]["name"] for payload in candidates[0]["strategy_payloads"])
+    fake = _FakeStage2Tester(tmp_path, expected_names, **(fake_kwargs or {}))
+    service._local_testing_service_provider = lambda: fake
+    submission = service.submit_tester_submission(
+        stage1["campaign_id"], {"confirmed": True, "campaign_id": stage1["campaign_id"]}
+    )
+    return service, stage1, fake, submission
+
+
+def test_stage2_batch_artifact_mutation_keeps_completed_candidate_and_stops(tmp_path: Path) -> None:
+    candidates = _stage2_batch_candidates()
+    completed_stops = 0
+
+    def mutate_after_first_stop() -> None:
+        nonlocal completed_stops
+        completed_stops += 1
+        if completed_stops == 1:
+            _tamper_stage1_artifact(tmp_path)
+
+    service, _stage1, fake, submission = _submit_stage2_batch_with_fake(
+        tmp_path, candidates, fake_kwargs={"after_stop": mutate_after_first_stop}
+    )
+
+    job = _wait_stage1(service, submission)
+
+    assert job["status"] == "FAILED"
+    assert job["diagnostics"][0]["code"] == "PORTFOLIO_JOB_STAGE2_INPUT_CHANGED"
+    assert [item["candidate_id"] for item in job["results"]] == [candidates[0]["candidate_id"]]
+    assert job["batch"] == {"current_index": 1, "total": 3, "completed": 1}
+    assert job["overall_percent"] == 33
+    assert [call[0] for call in fake.calls] == ["fill_prebuilt", "start", "stop"]
+
+
+def test_stage2_batch_stale_second_report_keeps_first_result(tmp_path: Path) -> None:
+    candidates = _stage2_batch_candidates()
+    service, _stage1, fake, submission = _submit_stage2_batch_with_fake(
+        tmp_path, candidates, fake_kwargs={"missing_results": (candidates[1]["candidate_id"],)}
+    )
+
+    job = _wait_stage1(service, submission)
+
+    assert job["status"] == "FAILED"
+    assert job["diagnostics"][0]["code"] == "PORTFOLIO_JOB_STAGE2_TIMEOUT"
+    assert [item["candidate_id"] for item in job["results"]] == [candidates[0]["candidate_id"]]
+    assert job["overall_percent"] == 33
+    assert [call[0] for call in fake.calls] == ["fill_prebuilt", "start", "stop"] * 2
+
+
+def test_stage2_batch_restore_failure_on_second_candidate_keeps_first(tmp_path: Path) -> None:
+    candidates = _stage2_batch_candidates()
+    service, _stage1, fake, submission = _submit_stage2_batch_with_fake(
+        tmp_path,
+        candidates,
+        fake_kwargs={
+            "stop_error": RuntimeError("restore failed"),
+            "stop_error_candidates": (candidates[1]["candidate_id"],),
+        },
+    )
+
+    job = _wait_stage1(service, submission)
+
+    assert job["status"] == "FAILED"
+    assert [item["candidate_id"] for item in job["results"]] == [candidates[0]["candidate_id"]]
+    assert [call[0] for call in fake.calls] == ["fill_prebuilt", "start", "stop"] * 2
+
+
+def test_stage2_batch_cancel_on_second_candidate_stops_without_starting_third(tmp_path: Path) -> None:
+    candidates = _stage2_batch_candidates()
+    entered, release = threading.Event(), threading.Event()
+    service, _stage1, fake, submission = _submit_stage2_batch_with_fake(
+        tmp_path, candidates, fake_kwargs={"fill_enter": entered, "fill_enter_at": 2, "fill_release": release}
+    )
+    assert entered.wait(timeout=2)
+
+    assert service.cancel(submission["job_id"])["status"] == "CANCEL_REQUESTED"
+    release.set()
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline and service.job(submission["job_id"])["status"] == "CANCEL_REQUESTED":
+        time.sleep(0.01)
+    job = service.job(submission["job_id"])
+
+    assert job["status"] == "CANCELLED"
+    assert [item["candidate_id"] for item in job["results"]] == [candidates[0]["candidate_id"]]
+    assert job["batch"] == {"current_index": 1, "total": 3, "completed": 1}
+    assert job["overall_percent"] == 33
+    assert [call[0] for call in fake.calls] == ["fill_prebuilt", "start", "stop", "fill_prebuilt", "stop"]
+
+
+def test_stage2_batch_restore_failure_during_second_candidate_cancel_is_failed(tmp_path: Path) -> None:
+    candidates = _stage2_batch_candidates()
+    entered, release = threading.Event(), threading.Event()
+    service, _stage1, fake, submission = _submit_stage2_batch_with_fake(
+        tmp_path,
+        candidates,
+        fake_kwargs={
+            "fill_enter": entered,
+            "fill_enter_at": 2,
+            "fill_release": release,
+            "stop_error": RuntimeError("restore failed"),
+            "stop_error_candidates": (candidates[1]["candidate_id"],),
+        },
+    )
+    assert entered.wait(timeout=2)
+
+    service.cancel(submission["job_id"])
+    release.set()
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline and service.job(submission["job_id"])["status"] == "CANCEL_REQUESTED":
+        time.sleep(0.01)
+    job = service.job(submission["job_id"])
+
+    assert job["status"] == "FAILED"
+    assert [item["candidate_id"] for item in job["results"]] == [candidates[0]["candidate_id"]]
+    assert [call[0] for call in fake.calls] == ["fill_prebuilt", "start", "stop", "fill_prebuilt", "stop"]
+
+
+def test_stage2_cancel_first_observed_during_polling_persists_result_after_stop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from mrs3 import panel_portfolio
+
+    candidates = _stage2_batch_candidates()
+    service, _stage1, fake, submission = _submit_stage2_batch_with_fake(tmp_path, candidates)
+    read_stable = panel_portfolio.read_stable_file
+    changed_observations = 0
+
+    def cancel_on_second_read(path: Path, parser: Any, *, baseline: Any = None) -> Any:
+        nonlocal changed_observations
+        result = read_stable(path, parser, baseline=baseline)
+        if result is not None:
+            changed_observations += 1
+            if changed_observations == 2:
+                service.cancel(submission["job_id"])
+        return result
+
+    monkeypatch.setattr(panel_portfolio, "read_stable_file", cancel_on_second_read)
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline and service.job(submission["job_id"])["status"] in {"QUEUED", "RUNNING", "CANCEL_REQUESTED"}:
+        time.sleep(0.01)
+    job = service.job(submission["job_id"])
+
+    assert job["status"] == "CANCELLED"
+    assert [item["candidate_id"] for item in job["results"]] == [candidates[0]["candidate_id"]]
+    assert job["batch"] == {"current_index": 0, "total": 3, "completed": 1}
+    assert job["overall_percent"] == 33
+    assert [call[0] for call in fake.calls] == ["fill_prebuilt", "start", "stop"]
+
+
+def test_stage2_cancel_racing_result_sync_keeps_result_and_stops_batch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    candidates = _stage2_batch_candidates()
+    service, _stage1, fake, submission = _submit_stage2_batch_with_fake(tmp_path, candidates)
+    entered_sync, release_sync = threading.Event(), threading.Event()
+    original_sync = service.registry.sync
+
+    def pause_result_sync(job_id: str, status: dict, *, runtime: dict | None = None, **kwargs: Any) -> dict:
+        if runtime is not None and len(runtime.get("stage2_results", [])) == 1 and not entered_sync.is_set():
+            entered_sync.set()
+            assert release_sync.wait(timeout=2)
+        return original_sync(job_id, status, runtime=runtime, **kwargs)
+
+    monkeypatch.setattr(service.registry, "sync", pause_result_sync)
+    assert entered_sync.wait(timeout=2)
+
+    cancel_errors: list[str] = []
+
+    def request_cancel() -> None:
+        try:
+            service.cancel(submission["job_id"])
+        except PortfolioPanelError as error:
+            cancel_errors.append(error.code)
+
+    cancel_thread = threading.Thread(target=request_cancel, daemon=True)
+    cancel_thread.start()
+    assert service._cancel_events[submission["job_id"]].wait(timeout=2)
+    release_sync.set()
+    cancel_thread.join(timeout=2)
+
+    job = _wait_stage1(service, submission)
+
+    assert job["status"] == "CANCELLED", (
+        job,
+        service.registry.get(submission["job_id"]),
+        service.registry.runtime(submission["job_id"]),
+        cancel_errors,
+        [call[0] for call in fake.calls],
+    )
+    assert [item["candidate_id"] for item in job["results"]] == [candidates[0]["candidate_id"]]
+    assert job["batch"] == {"current_index": 0, "total": 3, "completed": 1}
+    assert [call[0] for call in fake.calls] == ["fill_prebuilt", "start", "stop"]
+
+
+@pytest.mark.parametrize(
+    ("saved_state", "error", "expected_status"),
+    (
+        ("QUEUED", None, "QUEUED"),
+        ("RUNNING", None, "RUNNING"),
+        ("COMMITTED", None, "SUCCEEDED"),
+        ("FAILED", {"code": "FAILED"}, "FAILED"),
+        ("CANCELLED", None, "CANCELLED"),
+        ("FAILED", {"code": "INTERRUPTED"}, "INTERRUPTED"),
+    ),
+)
+def test_stage2_submission_is_idempotent_in_every_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    saved_state: str,
+    error: dict | None,
+    expected_status: str,
+) -> None:
+    candidates = _stage2_batch_candidates(1)
+    service, stage1 = _stage2_batch_service(tmp_path, candidates)
+    saved = {
+        "job_id": "existing-stage2",
+        "kind": "portfolio.stage2",
+        "state": saved_state,
+        "error": error,
+    }
+    monkeypatch.setattr(service.registry, "list", lambda: [saved])
+    monkeypatch.setattr(service.registry, "runtime", lambda _job_id: {"stage2": {"campaign_id": stage1["campaign_id"]}})
+    monkeypatch.setattr(service.registry, "submit", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("duplicate job created")))
+    monkeypatch.setattr(service.registry, "reserve_runtime", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("duplicate job reserved")))
+
+    result = service.submit_tester_submission(
+        stage1["campaign_id"], {"confirmed": True, "campaign_id": stage1["campaign_id"]}
+    )
+
+    assert result == {"campaign_id": stage1["campaign_id"], "job_id": "existing-stage2", "status": expected_status}
+
+
+@pytest.mark.parametrize(
+    ("saved_state", "error", "expected_status"),
+    (
+        ("FAILED", {"code": "FAILED"}, "FAILED"),
+        ("CANCELLED", None, "CANCELLED"),
+        ("FAILED", {"code": "INTERRUPTED"}, "INTERRUPTED"),
+    ),
+)
+def test_stage2_public_non_success_keeps_results_batch_and_completed_percent(
+    tmp_path: Path,
+    saved_state: str,
+    error: dict | None,
+    expected_status: str,
+) -> None:
+    service = PortfolioPanelService(tmp_path)
+    completed = {"candidate_id": "a" * 64}
+    public = service._public_job(
+        {"job_id": "stage2-public", "kind": "portfolio.stage2", "state": saved_state, "error": error},
+        {
+            "stage2": {"campaign_id": "campaign", "candidate_count": 3},
+            "stage2_results": [completed],
+            "completed_count": 1,
+            "current_index": 1,
+            "current_candidate_id": "b" * 64,
+            "stage_index": 2,
+            "completed_stages": 2,
+        },
+    )
+
+    assert public["status"] == expected_status
+    assert public["results"] == [completed]
+    assert public["batch"] == {"current_index": 1, "total": 3, "completed": 1}
+    assert public["overall_percent"] == 33
+    assert "result" not in public
+
+
+def test_second_portfolio_job_is_blocked_by_existing_resource_key(tmp_path: Path) -> None:
+    candidates = _stage2_batch_candidates(1)
+    service, stage1 = _stage2_batch_service(tmp_path, candidates)
+    service._local_testing_service_provider = lambda: _FakeStage2Tester(tmp_path, ("unused",))
+    service.registry.submit("portfolio.stage1", {}, "active-portfolio", ("portfolio_optimizer",))
+
+    with pytest.raises(PortfolioPanelError) as error:
+        service.submit_tester_submission(
+            stage1["campaign_id"], {"confirmed": True, "campaign_id": stage1["campaign_id"]}
+        )
+
+    assert error.value.code == "PORTFOLIO_JOB_BUSY"
+    assert not any(saved["kind"] == "portfolio.stage2" for saved in service.registry.list())
 
 
 def test_stage2_submission_is_idempotent_for_campaign(tmp_path: Path) -> None:
@@ -4027,7 +4522,7 @@ def test_stage2_restore_failure_after_cancel_fails_job(tmp_path: Path) -> None:
     assert service.job(submission["job_id"])["status"] == "FAILED"
 
 
-def test_stage2_cancel_removes_result_staged_before_restore(tmp_path: Path) -> None:
+def test_stage2_cancel_during_stop_persists_result_after_successful_restore(tmp_path: Path) -> None:
     stop_enter, stop_release = threading.Event(), threading.Event()
     service, _stage1, fake, submission = _submit_stage2_with_fake(tmp_path, fake_kwargs={"stop_enter": stop_enter, "stop_release": stop_release})
     assert stop_enter.wait(timeout=2)
@@ -4037,7 +4532,8 @@ def test_stage2_cancel_removes_result_staged_before_restore(tmp_path: Path) -> N
     while time.monotonic() < deadline and service.job(submission["job_id"])["status"] == "CANCEL_REQUESTED":
         time.sleep(0.01)
     assert service.job(submission["job_id"])["status"] == "CANCELLED"
-    assert "stage2_result" not in service.registry.runtime(submission["job_id"])
+    assert len(service.registry.runtime(submission["job_id"])["stage2_results"]) == 1
+    assert len(service.job(submission["job_id"])["results"]) == 1
     assert [call[0] for call in fake.calls] == ["fill_prebuilt", "start", "stop"]
 
 
@@ -4087,10 +4583,25 @@ def test_stage2_cancel_race_during_commit_becomes_cancelled(tmp_path: Path, monk
 def test_stage2_restart_projects_nonterminal_job_as_interrupted(tmp_path: Path) -> None:
     registry = PanelJobRegistry(tmp_path / ".panel-jobs.json")
     saved = registry.submit("portfolio.stage2", {"campaign_id": "campaign"}, "stage2-restart", ("portfolio_optimizer",), job_id="stage2-restart")
-    registry.reserve_runtime("stage2-restart", "stage2", {"campaign_id": "campaign", "input_digest": "i", "config_digest": "c"})
+    registry.reserve_runtime("stage2-restart", "stage2", {
+        "campaign_id": "campaign", "input_digest": "i", "config_digest": "c",
+        "artifact_digest": "d", "candidate_count": 3, "candidate_bindings": [],
+    })
     registry.transition("stage2-restart", "RUNNING")
+    registry.sync("stage2-restart", {"state": "RUNNING"}, runtime={
+        **registry.runtime("stage2-restart"),
+        "stage2_results": [{"candidate_id": "a" * 64}],
+        "completed_count": 1,
+        "current_index": 1,
+        "current_candidate_id": "b" * 64,
+    })
     restarted = PortfolioPanelService(tmp_path, registry=PanelJobRegistry(tmp_path / ".panel-jobs.json"))
-    assert restarted.job(saved["job_id"])["status"] == "INTERRUPTED"
+    public = restarted.job(saved["job_id"])
+    assert public["status"] == "INTERRUPTED"
+    assert public["results"] == [{"candidate_id": "a" * 64}]
+    assert public["batch"] == {"current_index": 1, "total": 3, "completed": 1}
+    assert public["overall_percent"] == 33
+    assert "result" not in public
 
 
 def test_stage1_executable_loader_fails_closed_for_tampered_or_missing_artifact(tmp_path: Path) -> None:
