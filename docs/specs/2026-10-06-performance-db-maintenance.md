@@ -236,3 +236,27 @@ cohort instead of the complete PerformanceDB.
 The resolver must require a symbol whenever an ID scope is supplied, keep
 overlay activation symbol-scoped, and filter review/result/rejection payload
 rows by the selected IDs. An empty selected-ID set is a no-op.
+
+## Targeted preview preflight and bounded scans
+
+`catalog()` keeps the complete schema, ownership, and reachability audit for
+the standalone maintenance catalog check. `create_preview()` and its apply
+revalidation use only schema validation plus ownership checks scoped to the
+selected symbols; they do not run the database-wide orphan-count audit before
+building a selected-pair preview. This prevents an all-pairs request from
+rescanning every large fact table before its actual target calculation.
+
+Pair-scoped preview fingerprints must not use a global `ORDER BY ALL`. The
+preview scanner uses bounded DuckDB aggregates for row counts and an
+order-independent multiset fingerprint; only the small strategy-ID scan
+materializes keys needed to construct the delete target. Global journal
+fingerprints use the same bounded aggregate approach. Preview and apply use the
+same fingerprint contract, so a changed target still invalidates confirmation
+without holding the complete fact tables in memory.
+
+Full apply performs the complete reachability audit again after preview
+revalidation and before the first delete transaction. Thus a pre-existing
+orphan anywhere in the database fails closed without partially deleting the
+selected pair; rejected retirement keeps its existing single-batch behavior.
+Scoped action ownership checks include both the owning strategy symbol and the
+stored action symbol, so a mismatch is detected when either side is selected.

@@ -351,6 +351,70 @@ def test_schema_table_classifier_preserves_duplicate_entries() -> None:
     assert maintenance._SCHEMA_TABLE_CLASSES["pair-scoped"] == maintenance._PAIR_TABLES
 
 
+class _RecordingConnection:
+    def __init__(self, connection: duckdb.DuckDBPyConnection) -> None:
+        self.connection = connection
+        self.sql: list[str] = []
+
+    def execute(self, sql: str, parameters=None):
+        self.sql.append(sql)
+        if parameters is None:
+            return self.connection.execute(sql)
+        return self.connection.execute(sql, parameters)
+
+
+def test_scan_table_streams_and_fingerprints_rows_without_ordering() -> None:
+    connection = duckdb.connect()
+    try:
+        connection.execute("create table facts (symbol varchar, fact_id integer)")
+        connection.execute("insert into facts values ('BTCUSDT', 1), ('BTCUSDT', 2), ('ETHUSDT', 3)")
+        recorder = _RecordingConnection(connection)
+
+        ascending = maintenance._scan_table(
+            recorder,
+            "select symbol, fact_id from (select * from facts order by fact_id asc)",
+            [],
+        )
+        descending = maintenance._scan_table(
+            recorder,
+            "select symbol, fact_id from (select * from facts order by fact_id desc)",
+            [],
+        )
+
+        assert ascending[:3] == descending[:3]
+        assert ascending[0] == 3
+        assert ascending[1] == {"BTCUSDT": 2, "ETHUSDT": 1}
+        ascending_keys = maintenance._scan_table(
+            recorder,
+            "select symbol, fact_id from (select * from facts order by fact_id asc)",
+            [],
+            collect_keys=True,
+        )
+        descending_keys = maintenance._scan_table(
+            recorder,
+            "select symbol, fact_id from (select * from facts order by fact_id desc)",
+            [],
+            collect_keys=True,
+        )
+        assert ascending_keys[:3] == descending_keys[:3]
+        assert all("order by all" not in sql.casefold() for sql in recorder.sql)
+    finally:
+        connection.close()
+
+
+def test_preview_skips_global_reachability_audit(
+    maintenance_db: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_if_called(connection: duckdb.DuckDBPyConnection) -> None:
+        raise AssertionError("targeted preview must not audit every table in the database")
+
+    monkeypatch.setattr(maintenance, "_audit_reachability", fail_if_called)
+    with duckdb.connect(str(maintenance_db), read_only=True) as connection:
+        preview = create_preview(connection, ["BTCUSDT"], "rejected")
+
+    assert preview["symbols"] == ["BTCUSDT"]
+
+
 def test_schema_table_classifier_rejects_duplicate_declarations(
     maintenance_db: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -385,6 +449,7 @@ def test_catalog_preview_and_apply_reject_cross_symbol_selection_ownership(
         for operation in (
             lambda: catalog(connection),
             lambda: create_preview(connection, ["BTCUSDT"], "full"),
+            lambda: create_preview(connection, ["ETHUSDT"], "full"),
             lambda: apply_preview(connection, valid_preview),
         ):
             with pytest.raises(PerformanceV2MaintenanceError, match="selection_results.*owning pair"):
@@ -396,6 +461,30 @@ def test_catalog_preview_and_apply_reject_cross_symbol_selection_ownership(
         assert connection.execute(
             "select * from selection_results where selection_run_id = 'sel-btc' order by strategy_id"
         ).fetchall() == selection_before
+
+
+def test_targeted_pair_ownership_checks_action_symbol_scope(maintenance_db: Path) -> None:
+    with _writable_fixture(maintenance_db, maintenance_db.parent) as connection:
+        connection.execute("update strategy_actions set symbol = 'ETHUSDT' where result_id = 101")
+
+        with pytest.raises(PerformanceV2MaintenanceError, match="strategy_actions.symbol"):
+            create_preview(connection, ["ETHUSDT"], "full")
+
+
+def test_full_apply_rejects_preexisting_orphan_before_delete(maintenance_db: Path) -> None:
+    with _writable_fixture(maintenance_db, maintenance_db.parent) as connection:
+        now = datetime.now(timezone.utc)
+        connection.execute(
+            "insert into equity_quality_metrics values (999999, 'rev', 'v1', '{}', 'orphan-hash', ?)",
+            [now],
+        )
+        before = connection.execute("select count(*) from strategies where symbol = 'BTCUSDT'").fetchone()[0]
+        preview = create_preview(connection, ["BTCUSDT"], "full")
+
+        with pytest.raises(PerformanceV2MaintenanceError, match="equity_quality_metrics contains 1 orphan"):
+            apply_preview(connection, preview)
+
+        assert connection.execute("select count(*) from strategies where symbol = 'BTCUSDT'").fetchone()[0] == before
 
 
 def test_full_preview_counts_shared_plateau_once_and_global_journal_once(maintenance_db: Path) -> None:

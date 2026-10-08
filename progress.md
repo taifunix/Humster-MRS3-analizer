@@ -108,3 +108,26 @@ card string expectation, a Windows Node command-line length error, and the
 PARETO reason-alias expectation. The UI toggle was exercised with a Node event
 simulation; no live database or browser smoke was run. Reload the Panel before
 using the checkbox.
+
+Maintenance preview preflight fix (2026-10-08): removed the database-wide
+reachability audit from selected-pair preview and apply revalidation; catalog
+inspection retains that full audit. Replaced pair/global fingerprint sorting
+with bounded DuckDB multiset aggregates, leaving key collection only for the
+small strategy-ID target scan. This removes the `ORDER BY ALL` sort and the
+long post-sort Python walk over the large equity/actions tables. Maintenance
+and selection-review suites pass 165 tests; the new regressions verify the
+preview bypass and order-independent fingerprint. No live PerformanceDB was
+modified. The Opus re-review returned `CODE_REVIEW_PASS` after the orphan
+preflight and two-direction action ownership fixes.
+
+Follow-up review fixes (2026-10-08): full apply now repeats the complete
+reachability audit after fingerprint revalidation and before the first DELETE,
+so pre-existing orphan rows fail closed without deleting the selected pair.
+Scoped action ownership now checks both `strategies.symbol` and
+`strategy_actions.symbol`. Added regressions for an orphan preflight and an
+action-symbol-only mismatch; maintenance suite passes 58 tests. No live
+PerformanceDB was modified.
+
+Panel maintenance recovery checks also pass 14 tests. The remaining catalog
+endpoint full-audit cost is a separate performance follow-up; it does not
+run in targeted preview and is not part of this fix.

@@ -176,14 +176,27 @@ def _audit_full_delete_result(
             )
 
 
-def _audit_pair_ownership(connection: duckdb.DuckDBPyConnection) -> None:
+def _audit_pair_ownership(
+    connection: duckdb.DuckDBPyConnection,
+    symbols: Sequence[str] | None = None,
+) -> None:
+    scope = ""
+    params: list[object] = []
+    if symbols is not None:
+        scope = (
+            " and (strategies.symbol in (select unnest(?::varchar[])) "
+            "or actions.symbol in (select unnest(?::varchar[])))"
+        )
+        params.extend((list(symbols), list(symbols)))
     row = connection.execute(
         """select actions.result_id, actions.symbol, strategies.symbol
              from strategy_actions actions
              join strategy_results results using (result_id)
              join strategies using (strategy_id)
-            where actions.symbol is distinct from strategies.symbol
-            limit 1"""
+            where actions.symbol is distinct from strategies.symbol"""
+        + scope
+        + " limit 1",
+        params,
     ).fetchone()
     if row:
         raise PerformanceV2MaintenanceError(
@@ -192,17 +205,23 @@ def _audit_pair_ownership(connection: duckdb.DuckDBPyConnection) -> None:
         )
 
 
-def catalog(connection: duckdb.DuckDBPyConnection) -> list[str]:
+def _catalog_symbols(connection: duckdb.DuckDBPyConnection) -> list[str]:
     _require_schema_v9(connection)
-    _audit_pair_ownership(connection)
-    _check_selection_ownership(connection)
-    _audit_reachability(connection)
     rows = connection.execute(
         "select symbol from strategies union select symbol from selection_runs order by symbol"
     ).fetchall()
     if any(row[0] is None for row in rows):
         raise PerformanceV2MaintenanceError("catalog contains a NULL symbol")
     return [str(row[0]) for row in rows]
+
+
+def catalog(connection: duckdb.DuckDBPyConnection) -> list[str]:
+    """Return the catalog after the full integrity audit used by the UI."""
+    symbols = _catalog_symbols(connection)
+    _audit_pair_ownership(connection)
+    _check_selection_ownership(connection)
+    _audit_reachability(connection)
+    return symbols
 
 
 def _ids_by_symbol(
@@ -223,14 +242,27 @@ def _ids_by_symbol(
     return grouped
 
 
-def _check_selection_ownership(connection: duckdb.DuckDBPyConnection) -> None:
+def _check_selection_ownership(
+    connection: duckdb.DuckDBPyConnection,
+    symbols: Sequence[str] | None = None,
+) -> None:
+    scope = ""
+    params: list[object] = []
+    if symbols is not None:
+        scope = (
+            " and (runs.symbol in (select unnest(?::varchar[])) "
+            "or strategies.symbol in (select unnest(?::varchar[])))"
+        )
+        params.extend((list(symbols), list(symbols)))
     mismatch = connection.execute(
         """select runs.selection_run_id, rows.strategy_id, runs.symbol, strategies.symbol
              from selection_results rows
              join selection_runs runs using (selection_run_id)
              join strategies using (strategy_id)
-            where runs.symbol is distinct from strategies.symbol
-            limit 1"""
+            where runs.symbol is distinct from strategies.symbol"""
+        + scope
+        + " limit 1",
+        params,
     ).fetchone()
     if mismatch:
         raise PerformanceV2MaintenanceError(
@@ -244,8 +276,10 @@ def _check_selection_ownership(connection: duckdb.DuckDBPyConnection) -> None:
              join selection_review_imports imports using (review_import_id)
              join selection_runs runs using (selection_run_id)
              join strategies using (strategy_id)
-            where runs.symbol is distinct from strategies.symbol
-            limit 1"""
+            where runs.symbol is distinct from strategies.symbol"""
+        + scope
+        + " limit 1",
+        params,
     ).fetchone()
     if mismatch:
         raise PerformanceV2MaintenanceError(
@@ -280,35 +314,74 @@ def _scan_table(
     *,
     collect_keys: bool = False,
 ) -> tuple[int, dict[str, int], str, dict[str, list[tuple[object, ...]]]]:
-    """Hash and count ordered row identities in bounded batches."""
-    cursor = connection.execute(f"{sql.rstrip()} order by all", list(params))
-    digest = hashlib.sha256()
+    """Count and fingerprint rows without a global sort or full Python scan.
+
+    The ordinary path lets DuckDB aggregate a 64-bit row hash in bounded
+    memory. ``collect_keys`` is reserved for the small strategies table, where
+    the caller needs individual IDs for target construction.
+    """
     counts: Counter[str] = Counter()
     collected: dict[str, list[tuple[object, ...]]] = defaultdict(list)
+    source_sql = sql.rstrip().rstrip(";")
+    if not collect_keys:
+        probe = connection.execute(f"select * from ({source_sql}) as source limit 0", list(params))
+        columns = [str(description[0]) for description in (probe.description or ())]
+        if not columns:
+            raise PerformanceV2MaintenanceError("maintenance scan query returned no columns")
+        qualified = [f'source."{column.replace(chr(34), chr(34) * 2)}"' for column in columns]
+        aggregate = connection.execute(
+            "select "
+            f"{qualified[0]}, count(*), bit_xor(hash({', '.join(qualified)})), "
+            f"sum(hash({', '.join(qualified)})::HUGEINT) "
+            f"from ({source_sql}) as source group by {qualified[0]}",
+            list(params),
+        )
+        count = 0
+        digest_sum = 0
+        digest_xor = 0
+        for symbol, row_count, row_xor, row_sum in aggregate.fetchall():
+            normalized_symbol = str(symbol)
+            normalized_count = int(row_count)
+            counts[normalized_symbol] = normalized_count
+            count += normalized_count
+            digest_xor ^= int(row_xor or 0)
+            digest_sum += int(row_sum or 0)
+        digest = hashlib.sha256(
+            f"duckdb-multiset-v2:{count}:{digest_sum}:{digest_xor:016x}".encode("ascii")
+        ).hexdigest()
+        return count, dict(counts), digest, collected
+
+    cursor = connection.execute(source_sql, list(params))
     count = 0
+    digest_sum = 0
+    digest_xor = 0
     while rows := cursor.fetchmany(4096):
         for row in rows:
             symbol = str(row[0])
             key = tuple(row[1:])
-            digest.update(json.dumps([symbol, *key], default=str, separators=(",", ":")).encode("utf-8"))
-            digest.update(b"\n")
+            payload = json.dumps([symbol, *key], default=str, separators=(",", ":")).encode("utf-8")
+            row_digest = hashlib.sha256(payload).digest()
+            row_value = int.from_bytes(row_digest, "big")
+            digest_sum += row_value
+            digest_xor ^= row_value
             counts[symbol] += 1
             count += 1
-            if collect_keys:
-                collected[symbol].append(key)
-    return count, dict(counts), digest.hexdigest(), collected
+            collected[symbol].append(key)
+    digest = hashlib.sha256(
+        f"python-multiset-v2:{count}:{digest_sum}:{digest_xor:064x}".encode("ascii")
+    ).hexdigest()
+    return count, dict(counts), digest, collected
 
 
 def _scan_global_table(connection: duckdb.DuckDBPyConnection, table: str, key_column: str) -> tuple[int, str]:
-    cursor = connection.execute(f"select {key_column} from {table} order by {key_column}")
-    digest = hashlib.sha256()
-    count = 0
-    while rows := cursor.fetchmany(4096):
-        for row in rows:
-            digest.update(json.dumps(row, default=str, separators=(",", ":")).encode("utf-8"))
-            digest.update(b"\n")
-            count += 1
-    return count, digest.hexdigest()
+    count, row_xor, row_sum = connection.execute(
+        f"select count(*), bit_xor(hash({key_column})), sum(hash({key_column})::HUGEINT) from {table}"
+    ).fetchone()
+    normalized_count = int(count)
+    digest = hashlib.sha256(
+        f"duckdb-global-multiset-v2:{normalized_count}:{int(row_sum or 0)}:{int(row_xor or 0):016x}".encode("ascii")
+    ).hexdigest()
+    return normalized_count, digest
 
 
 def create_preview(
@@ -321,7 +394,11 @@ def create_preview(
     """Build exact target counts and identity fingerprint without database writes."""
     if operation not in _OPERATION_TABLES:
         raise PerformanceV2MaintenanceError("operation must be 'rejected' or 'full'")
-    available = catalog(connection)
+    # Preview only needs the schema and selected-pair ownership checks.  The
+    # standalone catalog endpoint keeps the full reachability audit, but
+    # running all orphan-count queries here would rescan the entire database
+    # before the selected-pair preview even starts.
+    available = _catalog_symbols(connection)
     recovery_symbols: tuple[str, ...] = ()
     recovery_targets: Mapping[str, object] | None = None
     if recovery_preview is not None:
@@ -345,6 +422,8 @@ def create_preview(
         recovery_symbols = tuple(raw_recovery_symbols)
         recovery_targets = raw_recovery_targets
     selected = _normalize_symbols(symbols, available, recovery_symbols=recovery_symbols)
+    _audit_pair_ownership(connection, selected)
+    _check_selection_ownership(connection, selected)
     # Full deletion sees both lifecycles. Rejected cleanup also scans both:
     # an interrupted earlier run may have archived a row before its detail
     # delete completed, and the next cleanup must remove those residual facts.
@@ -822,6 +901,13 @@ def apply_preview(
     )
     if current["_fingerprint"] != preview["_fingerprint"]:
         raise PerformanceV2MaintenanceError("preview is stale; request a new preview")
+    # A targeted preview deliberately skips the database-wide reachability
+    # audit so that its read path stays bounded. Full apply must restore that
+    # fail-closed admission check before any DELETE is committed; otherwise a
+    # pre-existing orphan elsewhere in the database would be discovered only
+    # after selected rows had already been removed.
+    if current["operation"] == "full":
+        _audit_reachability(connection)
 
     targets = current["_targets"]
     rows_deleted = 0
