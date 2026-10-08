@@ -23,7 +23,7 @@ def test_compact_refuses_existing_target(tmp_path: Path) -> None:
     assert target.read_bytes() == b"keep"
 
 
-def test_compact_copies_complete_small_v9_fixture(tmp_path: Path) -> None:
+def test_compact_copies_complete_small_v10_fixture(tmp_path: Path) -> None:
     from tests.test_performance_v2_selection import _candidate_db
 
     (tmp_path / "source").mkdir()
@@ -32,7 +32,7 @@ def test_compact_copies_complete_small_v9_fixture(tmp_path: Path) -> None:
     strategy_id, result_id = connection.execute(
         "select strategy_id, result_id from strategy_results"
     ).fetchone()
-    selection_run_id = "compact-v9-run"
+    selection_run_id = "compact-v10-run"
     instance_id = connection.execute(
         "select value from schema_info where key = 'database_instance_id'"
     ).fetchone()[0]
@@ -91,8 +91,8 @@ def test_compact_copies_complete_small_v9_fixture(tmp_path: Path) -> None:
     report = compact_performance_v2(source, target, workers=2)
 
     assert report["source_stat_unchanged"] is True
-    assert report["source_schema_version"] == 9
-    assert report["target"]["schema_version"] == 9
+    assert report["source_schema_version"] == 10
+    assert report["target"]["schema_version"] == 10
     assert report["memory_limit"] == "16GB"
     assert report["table_counts"] == {name: int(count) for name, count in before.items()}
     assert report["verified_table_counts"] == report["table_counts"]
@@ -167,7 +167,7 @@ def test_compact_preserves_semantically_invalid_legacy_payload(tmp_path: Path) -
     assert decode_prepared_storage(target_payload) == legacy_payload
 
 
-def test_compact_migrates_empty_v6_schema_to_v9(tmp_path: Path) -> None:
+def test_compact_migrates_empty_v6_schema_to_v10(tmp_path: Path) -> None:
     from tests.test_performance_v2_store import _initialize_v6_fixture
 
     source = tmp_path / "source.duckdb"
@@ -178,7 +178,7 @@ def test_compact_migrates_empty_v6_schema_to_v9(tmp_path: Path) -> None:
     report = compact_performance_v2(source, target, workers=1)
 
     assert report["source_schema_version"] == 6
-    assert report["target"]["schema_version"] == 9
+    assert report["target"]["schema_version"] == 10
 
 
 def test_compact_accepts_v5_commission_rate_not_nullability(tmp_path: Path) -> None:
@@ -195,11 +195,11 @@ def test_compact_accepts_v5_commission_rate_not_nullability(tmp_path: Path) -> N
             "where table_name = 'strategy_results' and column_name = 'commission_rate'"
         ).fetchone() == ("NO",)
 
-    target = tmp_path / "target-v9.duckdb"
+    target = tmp_path / "target-v10.duckdb"
     report = compact_performance_v2(source, target, workers=1)
 
     assert report["source_schema_version"] == 5
-    assert report["target"]["schema_version"] == 9
+    assert report["target"]["schema_version"] == 10
     with duckdb.connect(str(source), read_only=True) as connection:
         assert require_performance_v2_readable(connection) == 5
         assert connection.execute(
@@ -259,17 +259,17 @@ def test_compact_migrates_v8_selection_rows_without_backfill(tmp_path: Path) -> 
         metrics_before = connection.execute("select * from equity_quality_metrics").fetchall()
         assert len(selection_before) == 1
 
-    target = tmp_path / "target-v9.duckdb"
+    target = tmp_path / "target-v10.duckdb"
     report = compact_performance_v2(source, target, workers=1)
 
     assert report["source_schema_version"] == 8
-    assert report["target"]["schema_version"] == 9
+    assert report["target"]["schema_version"] == 10
     assert report["table_counts"]["selection_results"] == 1
     assert report["verified_table_counts"]["selection_results"] == 1
     assert report["table_counts"]["strategy_rejection_sources"] == 0
     assert report["verified_table_counts"]["strategy_rejection_sources"] == 0
     with duckdb.connect(str(target), read_only=True) as connection:
-        assert require_performance_v2_readable(connection) == 9
+        assert require_performance_v2_readable(connection) == 10
         assert connection.execute("select * from selection_results").fetchall() == [
             (*selection_before[0], None)
         ]

@@ -4614,7 +4614,7 @@ class PanelController:
                 if stat.st_size == 0:
                     self._initialize_missing_performance_v2_target(self._performance_v2_config())
                 version = None
-                v9_repair_required = False
+                schema_repair_required = False
                 with duckdb.connect(str(target), read_only=True) as connection:
                     has_schema_info = connection.execute(
                         "select count(*) from information_schema.tables "
@@ -4636,7 +4636,7 @@ class PanelController:
                                 "PERFORMANCE_V2_MIGRATION_REQUIRED", status=409,
                                 message="Existing Performance v2 database requires an explicit offline migration",
                             )
-                        if version == "9":
+                        if version in {"9", "10"}:
                             require_performance_v2_readable(connection)
                             repairable_columns = {
                                 ("window_metrics", "holding_seconds"),
@@ -4658,8 +4658,8 @@ class PanelController:
                                     where table_schema = 'main'
                                       and table_name in ('window_metrics', 'strategy_results')"""
                             ).fetchall())
-                            v9_repair_required = not repairable_columns.issubset(existing_columns)
-                if version != "9" or v9_repair_required:
+                            schema_repair_required = not repairable_columns.issubset(existing_columns)
+                if version != "10" or schema_repair_required:
                     with self._performance_v2_writer_guard(target):
                         with duckdb.connect(str(target)) as connection:
                             initialize_performance_v2(connection)

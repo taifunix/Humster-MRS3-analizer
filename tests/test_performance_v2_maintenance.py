@@ -244,7 +244,7 @@ def test_catalog_fails_closed_when_action_symbol_disagrees_with_strategy(mainten
             catalog(connection)
 
 
-def test_catalog_fails_closed_on_unclassified_schema_v9_table(maintenance_db: Path) -> None:
+def test_catalog_fails_closed_on_unclassified_schema_v10_table(maintenance_db: Path) -> None:
     with _writable_fixture(maintenance_db, maintenance_db.parent) as connection:
         connection.execute("create table unexpected_table (value varchar)")
     with duckdb.connect(str(maintenance_db), read_only=True) as connection:
@@ -287,7 +287,7 @@ def test_schema_classification_ignores_noncurrent_tables(
             connection.execute(f"attach '{attached_path.as_posix()}' as secondary")
 
         with pytest.raises(maintenance.PerformanceV2MaintenanceSchemaError, match="missing classified.*optimizer_prepared_inputs"):
-            maintenance._classify_schema_v9_tables(connection)
+            maintenance._classify_schema_v10_tables(connection)
 
 
 def test_maintenance_schema_ownership_columns_match_delete_model(maintenance_db: Path) -> None:
@@ -425,7 +425,7 @@ def test_schema_table_classifier_rejects_duplicate_declarations(
     )
     with duckdb.connect(str(maintenance_db), read_only=True) as connection:
         with pytest.raises(maintenance.PerformanceV2MaintenanceSchemaError, match="classified more than once: strategies"):
-            maintenance._classify_schema_v9_tables(connection)
+            maintenance._classify_schema_v10_tables(connection)
 
 
 def test_catalog_preview_and_apply_reject_cross_symbol_selection_ownership(
@@ -1082,7 +1082,7 @@ def test_full_delete_recovers_from_legacy_migrated_strategy_results_reference(ma
             "select count(*) from strategies where symbol = 'BTCUSDT'"
         ).fetchone() == (0,)
         assert result["table_counts"]["strategies"] == 1
-        assert connection.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("9",)
+        assert connection.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("10",)
         assert connection.execute(
             "select count(*) from information_schema.tables "
             "where table_schema = 'main' and table_name = '__performance_v2_v7_strategy_results'"
@@ -1101,7 +1101,7 @@ def test_legacy_recovery_rolls_back_compatibility_table_when_strategy_retry_fail
             "select count(*) from information_schema.tables "
             "where table_schema = 'main' and table_name = '__performance_v2_v7_strategy_results'"
         ).fetchone() == (0,)
-        assert connection.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("9",)
+        assert connection.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("10",)
 
 
 @pytest.mark.parametrize(

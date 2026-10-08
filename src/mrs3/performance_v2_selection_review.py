@@ -979,7 +979,7 @@ def _validate_selection_user_field_ranks(
     ]
     prior_reviews = latest_user_reviews_by_strategy(connection, run_strategy_ids)
     submitted = {
-        int(strategy_id): (str(status), rank)
+        int(strategy_id): (None if status is None else str(status), rank)
         for strategy_id, status, rank in decisions
     }
     rank_owners: dict[int, int] = {}
@@ -1004,19 +1004,15 @@ def _validate_selection_user_field_ranks(
 def import_selection_user_fields(
     connection: duckdb.DuckDBPyConnection, data: bytes,
 ) -> dict[str, object]:
-    """Append only nonblank operator status/rank cells from a selection workbook."""
+    """Append operator status/rank cells, treating blanks as explicit clears."""
     metadata, submitted_rows = _parse_selection_user_fields_workbook(data)
     run_id = metadata["selection_run_id"]
     decisions: list[list[object]] = []
     strategy_ids: set[int] = set()
     ranks: set[int] = set()
-    unchanged_count = 0
     for raw_id, raw_status, raw_rank in submitted_rows:
         status_text = "" if raw_status is None else str(raw_status).strip().upper()
-        if not status_text:
-            unchanged_count += 1
-            continue
-        if status_text not in {"FINALIST", "RESERVE", "REJECTED"}:
+        if status_text and status_text not in {"FINALIST", "RESERVE", "REJECTED"}:
             raise SelectionReviewError(
                 "SELECTION_REVIEW_INVALID_STATUS",
                 "User Status must be FINALIST, RESERVE, REJECTED, or blank",
@@ -1027,10 +1023,9 @@ def import_selection_user_fields(
         strategy_ids.add(strategy_id)
         rank = None
         if raw_rank not in (None, ""):
-            if status_text != "FINALIST":
+            if status_text not in {"", "FINALIST"}:
                 raise SelectionReviewError(
-                    "SELECTION_REVIEW_INVALID_RANK",
-                    "User Rank must be blank for RESERVE and REJECTED",
+                    "SELECTION_REVIEW_INVALID_RANK", "User Rank must be blank for RESERVE and REJECTED",
                 )
             try:
                 rank = _whole_number(raw_rank, "SELECTION_REVIEW_INVALID_RANK", optional=False)
@@ -1038,19 +1033,20 @@ def import_selection_user_fields(
                 raise SelectionReviewError(
                     "SELECTION_REVIEW_INVALID_RANK", "FINALIST User Rank must be a positive integer",
                 ) from None
-            if rank in ranks:
+            if status_text == "FINALIST" and rank in ranks:
                 raise SelectionReviewError(
                     "SELECTION_REVIEW_INVALID_RANK", "FINALIST User Rank values must be unique in the workbook",
                 )
-            ranks.add(rank)
-        decisions.append([strategy_id, status_text, rank])
+            if status_text == "FINALIST":
+                ranks.add(rank)
+        decisions.append([strategy_id, status_text or None, rank])
 
     if not decisions:
         return {
             "selection_run_id": run_id,
             "row_count": 0,
             "applied_count": 0,
-            "unchanged_count": unchanged_count,
+            "unchanged_count": 0,
             "finalist_count": 0,
         }
 
@@ -1122,7 +1118,7 @@ def import_selection_user_fields(
         "selection_run_id": run_id,
         "row_count": len(decisions),
         "applied_count": len(decisions),
-        "unchanged_count": unchanged_count,
+        "unchanged_count": 0,
         "finalist_count": sum(row[1] == "FINALIST" for row in decisions),
     }
 
@@ -1453,7 +1449,7 @@ def latest_user_reviews_by_strategy(
         params,
     ).fetchall():
         reviews.setdefault(int(strategy_id), {
-            "user_status": str(status),
+            "user_status": None if status is None else str(status),
             "user_rank": None if rank is None else int(rank),
             "user_analog_of_strategy_id": None if analog is None else int(analog),
             "comment": comment,
@@ -1466,7 +1462,7 @@ def effective_selection_decisions(
     *,
     symbol: str | None = None,
     strategy_ids: Sequence[int] | None = None,
-) -> dict[int, tuple[str, int | None, str | None]]:
+) -> dict[int, tuple[str | None, int | None, str | None]]:
     """Resolve ordinary selection snapshots and reviewed scoped overlays.
 
     A regular selection run is a complete replacement for its Pair+Side, while
@@ -1493,7 +1489,7 @@ def effective_selection_decisions(
                from selection_runs runs {run_scope}
               order by runs.created_at_utc asc, runs.selection_run_id asc""", scope_params
     ).fetchall()
-    states: dict[tuple[str, str], dict[int, tuple[str, int | None, str | None]]] = {}
+    states: dict[tuple[str, str], dict[int, tuple[str | None, int | None, str | None]]] = {}
     latest_reviews = latest_user_reviews_by_strategy(connection, strategy_ids)
     overlay_run_ids: set[str] = set()
     for run_id, _run_symbol, _run_side, raw_request in runs:

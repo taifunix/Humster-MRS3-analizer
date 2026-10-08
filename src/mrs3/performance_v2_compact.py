@@ -761,8 +761,8 @@ def verify_existing_candidate(
 
         with duckdb.connect(str(source), read_only=True) as source_connection:
             source_version = require_performance_v2_readable(source_connection)
-            if source_version not in {8, 9}:
-                raise ValueError("source schema version must be 8 or 9")
+            if source_version not in {8, 9, 10}:
+                raise ValueError("source schema version must be 8, 9 or 10")
             _unknown_catalog_objects(source_connection)
             source_markers = _markers(source_connection)
             source_tables = _table_names(source_connection)
@@ -771,8 +771,8 @@ def verify_existing_candidate(
         with duckdb.connect(str(candidate), read_only=True) as connection:
             _configure_connection(connection, workers, spill)
             target_version = require_performance_v2_readable(connection)
-            if target_version not in {8, 9} or target_version < source_version:
-                raise ValueError("candidate schema version must be 8 or 9 and no older than source")
+            if target_version not in {8, 9, 10} or target_version < source_version:
+                raise ValueError("candidate schema version must be 8, 9 or 10 and no older than source")
             _unknown_catalog_objects(connection)
             target_markers = _markers(connection)
             target_tables = _table_names(connection)
@@ -781,7 +781,7 @@ def verify_existing_candidate(
                 raise ValueError("source/candidate sequence state differs")
             if target_version == source_version and target_signature != source_signature:
                 raise ValueError("source/candidate catalog signatures differ")
-            if target_version == 9 and source_version == 8:
+            if target_version >= 9 and source_version == 8:
                 if target_tables != source_tables | {"strategy_rejection_sources"}:
                     raise ValueError("source/candidate catalog tables differ")
             elif target_tables != source_tables:
@@ -969,10 +969,10 @@ def compact_performance_v2(
         if _commission_nullable(target) != ("NO" if source_version in {5, 6} else "YES"):
             raise ValueError("native schema copy changed commission_rate nullability")
         initialize_performance_v2(target, create_if_missing=False)
-        if require_performance_v2_readable(target) != 9:
-            raise ValueError("target did not reach schema version 9")
+        if require_performance_v2_readable(target) != 10:
+            raise ValueError("target did not reach schema version 10")
         if _commission_nullable(target) != "YES":
-            raise ValueError("target commission_rate is not nullable in schema version 9")
+            raise ValueError("target commission_rate is not nullable in schema version 10")
         target_signature = _catalog_signature(target)
         if any(int(target.execute(f"select count(*) from main.{_ident(table)}").fetchone()[0]) for table in TABLES):
             raise ValueError("target was not empty before migration")
@@ -991,11 +991,11 @@ def compact_performance_v2(
 
         with duckdb.connect(str(stage), read_only=True) as check:
             _configure_connection(check, workers, spill)
-            if require_performance_v2_readable(check) != 9:
-                raise ValueError("candidate is not a readable v9 database")
+            if require_performance_v2_readable(check) != 10:
+                raise ValueError("candidate is not a readable v10 database")
             if _commission_nullable(check) != "YES":
-                raise ValueError("candidate commission_rate is not nullable in schema version 9")
-            if _markers(check) != {**source_markers, "schema_version": "9"}:
+                raise ValueError("candidate commission_rate is not nullable in schema version 10")
+            if _markers(check) != {**source_markers, "schema_version": "10"}:
                 raise ValueError("database markers were not preserved")
             if _catalog_signature(check) != target_signature:
                 raise ValueError("database catalog changed during compaction")
@@ -1048,7 +1048,7 @@ def compact_performance_v2(
             "source": {"path": str(source), **source_before, "sha256": source_hash_before, "wal": source_wal_before},
             "source_after": {**source_after, "sha256": source_hash_after, "wal": source_wal_after},
             "source_schema_version": source_version,
-            "target": {"path": str(output), **stage_stat, "sha256": target_hash, "schema_version": 9},
+            "target": {"path": str(output), **stage_stat, "sha256": target_hash, "schema_version": 10},
             "table_counts": counts,
             "verified_table_counts": verified_counts,
             "prepared": payload_stats,

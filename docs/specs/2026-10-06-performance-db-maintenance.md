@@ -1,8 +1,8 @@
 # PerformanceDB maintenance in Strategy and DD5
 
-**Status:** Implementation complete; independent Claude Opus 5 review passed. Schema v9 remains unchanged.
+**Status:** Implementation complete; independent Claude Opus 5 review passed. Maintenance behavior is unchanged; the current supported schema is v10.
 **Date:** 2026-10-06
-**Dependencies:** PerformanceDB schema v9; [typed-config deduplication](2026-09-04-performance-v2-config-dedup.md); [equity status map](2026-10-03-equity-regime-status-map.md); [ADR-0055](../decisions/0055-equity-filter-rejected-and-manual-fact-cleanup.md); [ADR-0056](../decisions/0056-equity-rejection-source-lifecycle.md).
+**Dependencies:** PerformanceDB schema v10 (migrated transactionally from v9); [typed-config deduplication](2026-09-04-performance-v2-config-dedup.md); [equity status map](2026-10-03-equity-regime-status-map.md); [ADR-0055](../decisions/0055-equity-filter-rejected-and-manual-fact-cleanup.md); [ADR-0056](../decisions/0056-equity-rejection-source-lifecycle.md).
 
 Once accepted, this feature contract supersedes only the prior manual-cleanup
 requirements for cleanup markers, deletion timestamps and verified backups.
@@ -176,8 +176,8 @@ measured limit rather than making writes concurrent.
 
 ## Non-goals
 
-- No schema v10, cleanup-state fields, deletion timestamps, persistent
-  maintenance log, backup, or staging database.
+- No maintenance-specific schema migration, cleanup-state fields, deletion
+  timestamps, persistent maintenance log, backup, or staging database.
 - No automatic cleanup, pruning by date, tester job, import, or market-data
   operation.
 - No changes to effective `User Status` or equity rejection lifecycle.

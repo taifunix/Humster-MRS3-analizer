@@ -793,7 +793,7 @@ def test_v2_panel_first_import_bootstrap_initializes_empty_and_preserves_foreign
         with duckdb.connect(str(target), read_only=True) as connection:
             assert connection.execute(
                 "select value from schema_info where key = 'schema_version'"
-            ).fetchone() == ("9",)
+            ).fetchone() == ("10",)
     else:
         assert target.read_bytes() == existing
 
@@ -3836,7 +3836,8 @@ def test_selection_finalist_reserved_mode_filters_pipeline_cache_and_xlsx(tmp_pa
     reviewed = BytesIO()
     workbook.save(reviewed)
     imported = controller.strategies_performance_v2_selection_user_fields_import(reviewed.getvalue())
-    assert imported["applied_count"] == 3
+    assert imported["applied_count"] == 4
+    assert imported["unchanged_count"] == 0
 
     all_request = {"symbol": "BTCUSDT", "side": "LONG", "stages": []}
     finalists_request = {**all_request, "finalists_only": True}
@@ -4386,10 +4387,26 @@ def test_panel_schema_preflight_initializes_an_empty_new_database(tmp_path: Path
     with duckdb.connect(str(database), read_only=True) as connection:
         assert connection.execute(
             "select value from schema_info where key = 'schema_version'"
-        ).fetchone() == ("9",)
+        ).fetchone() == ("10",)
         assert connection.execute(
             "select count(*) from information_schema.tables where table_name = 'strategy_rejection_sources'"
         ).fetchone() == (1,)
+
+
+def test_panel_schema_preflight_migrates_v9_to_v10(tmp_path: Path) -> None:
+    controller, database, _ = _controller_for_windows(tmp_path)
+    with duckdb.connect(str(database)) as connection:
+        connection.execute("alter table selection_review_rows alter column user_status set not null")
+        connection.execute("update schema_info set value = '9' where key = 'schema_version'")
+
+    controller._ensure_performance_v2_schema(database)
+
+    with duckdb.connect(str(database), read_only=True) as connection:
+        assert connection.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("10",)
+        assert connection.execute(
+            "select is_nullable from information_schema.columns "
+            "where table_name = 'selection_review_rows' and column_name = 'user_status'"
+        ).fetchone() == ("YES",)
 
 
 def test_panel_schema_preflight_maps_corrupt_database_to_schema_invalid(tmp_path: Path) -> None:
@@ -4943,20 +4960,20 @@ def test_selection_recalculate_passes_only_missing_strategy_ids(tmp_path: Path, 
     assert calls and calls[0][0][-1] == (17, 23) and calls[0][1] == {"include_equity_regime": True}
 
 
-def test_valid_v9_schema_check_does_not_open_writer_with_reader_present(tmp_path: Path) -> None:
+def test_valid_v10_schema_check_does_not_open_writer_with_reader_present(tmp_path: Path) -> None:
     controller, database, _ = _controller_for_windows(tmp_path)
 
     with duckdb.connect(str(database), read_only=True) as reader:
-        assert reader.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("9",)
+        assert reader.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("10",)
         controller._ensure_performance_v2_schema(database)
 
 
-def test_cached_v9_schema_check_skips_reopen_with_reader_present(tmp_path: Path, monkeypatch) -> None:
+def test_cached_v10_schema_check_skips_reopen_with_reader_present(tmp_path: Path, monkeypatch) -> None:
     controller, database, _ = _controller_for_windows(tmp_path)
     controller._ensure_performance_v2_schema(database)
 
     with duckdb.connect(str(database), read_only=True) as reader:
-        assert reader.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("9",)
+        assert reader.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("10",)
 
         def unexpected_reopen(*_args, **_kwargs):
             raise AssertionError("schema cache hit reopened the database")
@@ -4965,7 +4982,7 @@ def test_cached_v9_schema_check_skips_reopen_with_reader_present(tmp_path: Path,
         controller._ensure_performance_v2_schema(database)
 
 
-def test_v9_schema_check_rejects_malformed_catalog(tmp_path: Path) -> None:
+def test_v10_schema_check_rejects_malformed_catalog(tmp_path: Path) -> None:
     controller, database, _ = _controller_for_windows(tmp_path)
     with duckdb.connect(str(database)) as connection:
         connection.execute("drop table strategy_rejection_sources")
@@ -4977,7 +4994,7 @@ def test_v9_schema_check_rejects_malformed_catalog(tmp_path: Path) -> None:
     assert raised.value.status == 500
 
 
-def test_v9_schema_check_repairs_missing_window_column(tmp_path: Path) -> None:
+def test_v10_schema_check_repairs_missing_window_column(tmp_path: Path) -> None:
     controller, database, _ = _controller_for_windows(tmp_path)
     with duckdb.connect(str(database)) as connection:
         connection.execute("alter table window_metrics drop column holding_seconds")

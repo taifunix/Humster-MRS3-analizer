@@ -1,10 +1,11 @@
 # Performance v2 finalist snapshots, analogs and XLSX review import
 
-**Status:** Implemented — acceptance pending
+**Status:** Implemented and independently reviewed; live v9 migration pending
 **Date:** 2026-09-02
 **Depends on:**
 [Performance v2 robust finalist ranking](2026-09-01-performance-v2-robust-finalist-ranking.md),
-[ADR-0021](../decisions/0021-performance-v2-persisted-selection-snapshots.md)
+[ADR-0021](../decisions/0021-performance-v2-persisted-selection-snapshots.md),
+[ADR-0062](../decisions/0062-performance-v2-selection-review-clear-fields.md)
 
 ## Purpose
 
@@ -421,44 +422,51 @@ decisions. It has a dedicated API endpoint and does not relax the strict
 `selection-review-import` or RETEST tag import contracts.
 
 The partial importer accepts only `performance-v2-selection-review-v1`
-workbooks with `_MRS_SELECTION_META`. For files with decisions, it requires the
-workbook database instance to match the open PerformanceDB and its selection
-run ID to exist in that same database. It does not require the selection run to
-be latest and does not require a complete candidate row set. In the `All candidates` worksheet it
-finds exact `ID`, `User Status`, and `User Rank` headers, regardless of their
-column positions or the other columns present. Only rows with a nonblank
-`User Status` are submitted. Duplicate or malformed IDs, unknown strategies,
-and IDs outside the run snapshot reject the whole file when they belong to
-submitted rows.
+workbooks with `_MRS_SELECTION_META`. It requires the workbook database
+instance to match the open PerformanceDB and its selection run ID to exist in
+that same database. It does not require the selection run to be latest and
+does not require a complete candidate row set. In the `All candidates`
+worksheet it requires the exact `ID`, `User Status`, and `User Rank` headers,
+regardless of their column positions or the other columns present; a missing
+required header is a schema error, not an implicit blank field. Every non-empty
+data row is submitted, including rows where both user fields are blank. Duplicate
+or malformed IDs, unknown strategies, and IDs outside the run snapshot reject
+the whole file.
 
-Rows with blank `User Status` are not written to the review ledger and do not
-change that strategy's previous user decision; they are counted as unchanged
-without database membership lookups. A workbook with no nonblank statuses
-completes as a no-op without database identity/run checks or database writes;
-its returned run ID is informational and the Panel does not use it. Nonblank
-statuses are limited to `FINALIST`, `RESERVE`, and `REJECTED`. A nonblank
-`User Rank` is accepted only for `FINALIST`; it must be a positive integer and
+Each field is replaced independently. A blank `User Status` clears the prior
+user status; a blank `User Rank` clears the prior user rank. A cleared status is
+stored as SQL `NULL`, remains visible as a blank in exported workbooks, and
+removes the strategy from the effective user-status cohort. Clearing a
+`REJECTED` status also removes its current `REJECTED` tag. A blank-only file is
+therefore a real import when it contains candidate rows: it validates database
+identity, run and strategy membership, then appends clear decisions atomically.
+Nonblank statuses are limited to `FINALIST`, `RESERVE`, and `REJECTED`. A
+nonblank `User Rank` is accepted only for `FINALIST` or a blank status; therefore
+a rank may be stored while status is blank, and it does not participate in
+FINALIST uniqueness until that row is later promoted to `FINALIST`. The rank
+must be a positive integer, and ranks on submitted `FINALIST` rows must be
 unique among effective FINALIST reviews within the selection run after applying
-the submitted rows. Missing FINALIST ranks are allowed; an applied FINALIST
-with a blank rank clears its previous user rank. A rank on RESERVE or REJECTED
-is rejected with `SELECTION_REVIEW_INVALID_RANK`; the importer does not silently
-normalize submitted values.
+the submitted rows. Missing FINALIST ranks are allowed and do not participate
+in uniqueness comparison. A FINALIST with a blank rank clears its previous user rank.
+A rank on `RESERVE` or `REJECTED` is rejected with
+`SELECTION_REVIEW_INVALID_RANK`; the importer does not silently normalize
+submitted values.
 
 Each accepted file is one transaction in the existing
-`selection_review_imports` and `selection_review_rows` ledger. It appends only
-the nonblank status rows, stores rank only for FINALIST, and synchronizes the
-REJECTED tag for only those submitted strategy IDs: clear the prior REJECTED
-tag, then add it back only where the new status is REJECTED. It preserves prior
-comments and does not modify RETEST, automatic fields, selection results, or
-strategy/result facts. Since this import accepts no ANALOG status, it clears a
-prior analog target on each row whose status it replaces. Workbook SHA-256
+`selection_review_imports` and `selection_review_rows` ledger. It appends all
+submitted rows, including clear decisions, stores rank only where supplied for
+FINALIST or blank status, and synchronizes the REJECTED tag for only those
+submitted strategy IDs: clear the prior REJECTED tag, then add it back only
+where the new status is REJECTED. It preserves prior comments and does not
+modify RETEST, automatic fields, selection results, or strategy/result facts.
+Since this import accepts no ANALOG status, it clears a prior analog target on
+each row whose status it replaces. Workbook SHA-256
 duplicate detection is shared with the existing review ledger; a repeated
 workbook returns the typed `SELECTION_REVIEW_ALREADY_IMPORTED` error with no
 writes. Any validation or write error rolls back the entire file.
-For nonempty imports, `row_count` and `finalist_count` describe only rows
-applied from that file; `unchanged_count` is the number of blank-status rows.
-A blank-only file reports zero applied/finalist rows and its blank rows as
-unchanged.
+For imports with candidate rows, `row_count` and `applied_count` include rows
+whose fields are cleared; `finalist_count` describes submitted FINALIST rows.
+`unchanged_count` is zero because blank fields are explicit clear instructions.
 
 The card processes selected `.xlsx` files sequentially and displays each
 filename, current file number, applied and unchanged counts, or the full
@@ -466,15 +474,18 @@ backend message and stable error code. It then reports imported, unchanged, and
 failed file totals, refreshes the Performance v2 catalogue and current
 FINALIST RETEST preview, and clears the folder input. Its controls use IDs
 separate from card 7's RETEST folder import. Files are ordered by last-modified
-time oldest to newest, then by name; if a strategy has nonblank decisions in
-multiple files, the later accepted file supplies its current decision.
+time oldest to newest, then by name; the later accepted file supplies the
+current values for each strategy and clears fields left blank in that file.
 
-Acceptance evidence for this partial path covers flexible exact-header parsing,
-blank-only no-op and prior-decision preservation, comment/analog handling,
-FINALIST rank optionality/clearing and same-run uniqueness, rankless
-RESERVE/REJECTED rows, atomic rollback and hash duplicates, run/database
-identity and strategy membership validation, the dedicated HTTP route, and
-card 6 folder/log wiring. No schema migration or new table is introduced.
+This nullable review status is introduced by PerformanceDB schema v10. The
+v9-to-v10 migration drops only the `NOT NULL` constraint on
+`selection_review_rows.user_status` in one transaction; existing review history
+is preserved. Acceptance evidence for this partial path covers flexible
+exact-header parsing, blank-field clearing, comment/analog handling, FINALIST
+rank optionality/clearing and same-run uniqueness, rankless RESERVE/REJECTED
+rows, atomic rollback and hash duplicates, run/database identity and strategy
+membership validation, Panel v9-to-v10 schema preflight, the dedicated HTTP
+route, and card 6 folder/log wiring.
 
 ## Errors
 

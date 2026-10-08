@@ -14,7 +14,8 @@ import duckdb
 from .config import PanelPathSettings, load_duckdb_import_settings, load_panel_path_settings
 
 
-_SCHEMA_VERSION = "9"
+_SCHEMA_VERSION = "10"
+_V9_SCHEMA_VERSION = "9"
 _V8_SCHEMA_VERSION = "8"
 _V7_SCHEMA_VERSION = "7"
 _V6_SCHEMA_VERSION = "6"
@@ -483,6 +484,10 @@ _SELECTION_SCHEMA_V3 = _SELECTION_SCHEMA.replace(
     _V4_TAG_SCHEMA,
     _V3_TAG_SCHEMA,
 )
+_SELECTION_SCHEMA_V10 = _SELECTION_SCHEMA.replace(
+    "user_status VARCHAR NOT NULL CHECK (user_status IN ('FINALIST', 'RESERVE', 'ANALOG', 'FILTERED', 'REJECTED'))",
+    "user_status VARCHAR CHECK (user_status IN ('FINALIST', 'RESERVE', 'ANALOG', 'FILTERED', 'REJECTED'))",
+)
 
 _V2_TABLE_NAMES = {
     "schema_info",
@@ -734,10 +739,12 @@ def _require_v8_catalog(connection: duckdb.DuckDBPyConnection) -> None:
     _require_equity_catalog(connection, schema_version=_V8_SCHEMA_VERSION, commission_nullable="YES")
 
 
-def _require_v9_catalog(connection: duckdb.DuckDBPyConnection) -> None:
+def _require_v9_catalog(
+    connection: duckdb.DuckDBPyConnection, *, schema_version: str = _V9_SCHEMA_VERSION,
+) -> None:
     _require_equity_catalog(
         connection,
-        schema_version=_SCHEMA_VERSION,
+        schema_version=schema_version,
         commission_nullable="YES",
         expected_tables=_V9_EXPECTED_TABLES,
     )
@@ -763,6 +770,12 @@ def _require_v9_catalog(connection: duckdb.DuckDBPyConnection) -> None:
         ("stage_trace_json", "VARCHAR", "NO"),
         ("equity_regime_json", "VARCHAR", "YES"),
     ):
+        raise PerformanceV2StoreError("Performance database has an unexpected catalog")
+    status_nullable = connection.execute(
+        "select is_nullable from information_schema.columns "
+        "where table_schema = 'main' and table_name = 'selection_review_rows' and column_name = 'user_status'"
+    ).fetchone()
+    if schema_version == _V9_SCHEMA_VERSION and status_nullable != ("NO",):
         raise PerformanceV2StoreError("Performance database has an unexpected catalog")
     source_columns = tuple(
         connection.execute(
@@ -807,15 +820,25 @@ def _require_v9_catalog(connection: duckdb.DuckDBPyConnection) -> None:
         raise PerformanceV2StoreError("Performance database has an unexpected catalog")
 
 
+def _require_v10_catalog(connection: duckdb.DuckDBPyConnection) -> None:
+    _require_v9_catalog(connection, schema_version=_SCHEMA_VERSION)
+    status_column = connection.execute(
+        "select data_type, is_nullable from information_schema.columns "
+        "where table_schema = 'main' and table_name = 'selection_review_rows' and column_name = 'user_status'"
+    ).fetchone()
+    if status_column != ("VARCHAR", "YES"):
+        raise PerformanceV2StoreError("Performance database has an unexpected catalog")
+
+
 def require_performance_v2(connection: duckdb.DuckDBPyConnection) -> None:
     """Fail closed unless the connection already contains the v2 schema."""
     if _schema_version(connection) != _SCHEMA_VERSION:
-        raise PerformanceV2StoreError("Performance database does not have schema version 9")
-    _require_v9_catalog(connection)
+        raise PerformanceV2StoreError("Performance database does not have schema version 10")
+    _require_v10_catalog(connection)
 
 
 def require_performance_v2_readable(connection: duckdb.DuckDBPyConnection) -> int:
-    """Accept exact read-only v5/v6/v7/v8/v9 catalogs without migrating or repairing."""
+    """Accept exact read-only v5/v6/v7/v8/v9/v10 catalogs without migrating or repairing."""
     version = _schema_version(connection)
     if version == _V5_SCHEMA_VERSION:
         _require_v5_catalog(connection)
@@ -829,9 +852,12 @@ def require_performance_v2_readable(connection: duckdb.DuckDBPyConnection) -> in
     if version == _V8_SCHEMA_VERSION:
         _require_v8_catalog(connection)
         return 8
-    if version == _SCHEMA_VERSION:
+    if version == _V9_SCHEMA_VERSION:
         _require_v9_catalog(connection)
         return 9
+    if version == _SCHEMA_VERSION:
+        _require_v10_catalog(connection)
+        return 10
     raise PerformanceV2StoreError("Performance database schema version requires upgrade")
 
 
@@ -1136,6 +1162,23 @@ def _migrate_schema_v8_to_v9(connection: duckdb.DuckDBPyConnection) -> None:
     _require_v9_catalog(connection)
 
 
+def _migrate_schema_v9_to_v10(connection: duckdb.DuckDBPyConnection) -> None:
+    _require_v9_catalog(connection)
+    try:
+        connection.execute("begin transaction")
+        connection.execute("alter table selection_review_rows alter column user_status drop not null")
+        connection.execute("update schema_info set value = '10' where key = 'schema_version'")
+        _require_v10_catalog(connection)
+        connection.execute("commit")
+    except Exception as error:
+        _rollback_quietly(connection)
+        raise PerformanceV2StoreError(
+            f"Performance database schema migration failed (v9->v10 selection review clears; "
+            f"requires DuckDB >=1.5): {error}"
+        ) from error
+    _require_v10_catalog(connection)
+
+
 def _alter_v6_commission_with_children(connection: duckdb.DuckDBPyConnection) -> None:
     snapshots = {
         table_name: f"__performance_v2_v7_{table_name}"
@@ -1256,11 +1299,11 @@ def initialize_performance_v2(
     *,
     create_if_missing: bool = True,
 ) -> None:
-    """Initialize or migrate the isolated Performance v2 schema to v9."""
+    """Initialize or migrate the isolated Performance v2 schema to v10."""
     version = _schema_version(connection)
     if version is not None and version not in {
         "2", "3", "4", _V5_SCHEMA_VERSION, _V6_SCHEMA_VERSION, _V7_SCHEMA_VERSION,
-        _V8_SCHEMA_VERSION, _SCHEMA_VERSION,
+        _V8_SCHEMA_VERSION, _V9_SCHEMA_VERSION, _SCHEMA_VERSION,
     }:
         raise PerformanceV2StoreError("Performance database has an unsupported schema version")
     if version == "2":
@@ -1283,25 +1326,32 @@ def initialize_performance_v2(
         _migrate_schema_v6_to_v7(connection)
         _migrate_schema_v7_to_v8(connection)
         _migrate_schema_v8_to_v9(connection)
+        _migrate_schema_v9_to_v10(connection)
         require_performance_v2(connection)
         return
     if version == _V6_SCHEMA_VERSION:
         _migrate_schema_v6_to_v7(connection)
         _migrate_schema_v7_to_v8(connection)
         _migrate_schema_v8_to_v9(connection)
+        _migrate_schema_v9_to_v10(connection)
         require_performance_v2(connection)
         return
     if version == _V7_SCHEMA_VERSION:
         _migrate_schema_v7_to_v8(connection)
         _migrate_schema_v8_to_v9(connection)
+        _migrate_schema_v9_to_v10(connection)
         require_performance_v2(connection)
         return
     if version == _V8_SCHEMA_VERSION:
         _migrate_schema_v8_to_v9(connection)
+        _migrate_schema_v9_to_v10(connection)
         require_performance_v2(connection)
         return
+    if version == _V9_SCHEMA_VERSION:
+        _migrate_schema_v9_to_v10(connection)
+        version = _SCHEMA_VERSION
     if version == _SCHEMA_VERSION:
-        _require_v9_catalog(connection)
+        _require_v10_catalog(connection)
         try:
             connection.execute("begin transaction")
             _add_window_columns(connection)
@@ -1319,6 +1369,7 @@ def initialize_performance_v2(
         _migrate_schema_v6_to_v7(connection)
         _migrate_schema_v7_to_v8(connection)
         _migrate_schema_v8_to_v9(connection)
+        _migrate_schema_v9_to_v10(connection)
         require_performance_v2(connection)
         return
     if version == "4":
@@ -1327,6 +1378,7 @@ def initialize_performance_v2(
         _migrate_schema_v6_to_v7(connection)
         _migrate_schema_v7_to_v8(connection)
         _migrate_schema_v8_to_v9(connection)
+        _migrate_schema_v9_to_v10(connection)
         require_performance_v2(connection)
         return
     if version == _V5_SCHEMA_VERSION:
@@ -1334,6 +1386,7 @@ def initialize_performance_v2(
         _migrate_schema_v6_to_v7(connection)
         _migrate_schema_v7_to_v8(connection)
         _migrate_schema_v8_to_v9(connection)
+        _migrate_schema_v9_to_v10(connection)
         require_performance_v2(connection)
         return
     if not create_if_missing:
@@ -1344,7 +1397,7 @@ def initialize_performance_v2(
         connection.execute("begin transaction")
         connection.execute("create table schema_info (key varchar primary key, value varchar not null)")
         connection.execute(_SCHEMA)
-        connection.execute(_SELECTION_SCHEMA)
+        connection.execute(_SELECTION_SCHEMA_V10)
         connection.execute(_EQUITY_QUALITY_SCHEMA)
         _add_schema_v9(connection)
         connection.executemany(

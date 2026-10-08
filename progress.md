@@ -10,7 +10,7 @@ do not treat this file as a replacement for a feature specification.
 
 ## PerformanceDB maintenance
 
-The maintenance card is implemented in the Strategy and DD5 tab. It supports pair selection, strategy-count previews, Rejected retirement, full pair deletion, progress reporting, elapsed time, and actionable database errors. `Удалить Rejected` now physically removes per-strategy facts, window/equity caches, tags, rejection sources, and selection rows, compacts the retained result to interval/provenance identity, then atomically marks the typed identity as `DISCARDED`; only strategy settings/orders and that compact tombstone remain for deduplication. The code targets schema v9 and adds no cleanup markers, deletion timestamps, backups, or maintenance tables. Contract: [PerformanceDB maintenance](docs/specs/2026-10-06-performance-db-maintenance.md); retirement decision: [ADR-0061](docs/decisions/0061-performance-db-rejected-retirement.md).
+The maintenance card is implemented in the Strategy and DD5 tab. It supports pair selection, strategy-count previews, Rejected retirement, full pair deletion, progress reporting, elapsed time, and actionable database errors. `Удалить Rejected` now physically removes per-strategy facts, window/equity caches, tags, rejection sources, and selection rows, compacts the retained result to interval/provenance identity, then atomically marks the typed identity as `DISCARDED`; only strategy settings/orders and that compact tombstone remain for deduplication. The code targets schema v10 and adds no cleanup markers, deletion timestamps, backups, or maintenance tables. Contract: [PerformanceDB maintenance](docs/specs/2026-10-06-performance-db-maintenance.md); retirement decision: [ADR-0061](docs/decisions/0061-performance-db-rejected-retirement.md).
 
 Retirement verification after the expansion: maintenance 52 passed, selection 239 passed, importer 120 passed, XLSX export 11 passed, and the Panel discarded-catalog check passed; `node --check src/mrs3/panel_web/app.js`, `py_compile`, and `git diff --check` passed. All database tests used isolated temporary DuckDB fixtures; no live PerformanceDB or Panel process was used.
 
@@ -28,9 +28,17 @@ implemented locally; its live migration remains open. Evidence and exact
 status rules are linked from the [equity status map](docs/specs/2026-10-03-equity-regime-status-map.md).
 
 Card 6 partial selection review import and the global finalist retest control
-are implemented and reviewed. The current live retest/import state is tracked
-under [Blockers and open tracks](#blockers-and-open-tracks) below; no live
-database mutation is implied by local test evidence.
+are implemented. Blank `User Status` and `User Rank` cells now clear saved
+values. Final focused verification with
+`.venv\Scripts\python.exe -m pytest -p no:cacheprovider tests/test_performance_v2_selection_review.py tests/test_performance_v2_store.py tests/test_performance_v2_compact.py tests/test_performance_v2_maintenance.py tests/test_panel_performance_v2.py`
+passed 477 tests with 4 platform skips. This covers transactional v9-to-v10
+migration, rollback/retry, and Panel schema preflight. A separate clean-HEAD
+control reproduced 15 existing failures across the static-shell and legacy
+v6-v8 benchmark suites (18 tests passed); these failures predate this change.
+The live v9 database migration is still pending: after deploying this version,
+the Panel schema preflight must run before the Card 6 import. No live database
+mutation or Panel restart was performed. Independent code review returned
+`CODE_REVIEW_PASS`.
 ## Other verified Panel changes
 
 Panel PerformanceDB recalculation now serializes access through the controller

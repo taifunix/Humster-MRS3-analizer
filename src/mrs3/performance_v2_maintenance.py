@@ -1,4 +1,4 @@
-"""Read-only planning and serialized deletes for schema-v9 PerformanceDB."""
+"""Read-only planning and serialized deletes for schema-v10 PerformanceDB."""
 
 from __future__ import annotations
 
@@ -65,7 +65,7 @@ class PerformanceV2MaintenanceError(ValueError):
 
 
 class PerformanceV2MaintenanceSchemaError(PerformanceV2MaintenanceError):
-    """The database does not match the classified schema-v9 contract."""
+    """The database does not match the classified schema-v10 contract."""
 
 
 def set_query_workers(connection: duckdb.DuckDBPyConnection, workers: int) -> int:
@@ -77,12 +77,12 @@ def set_query_workers(connection: duckdb.DuckDBPyConnection, workers: int) -> in
     return capped
 
 
-def _classify_schema_v9_tables(connection: duckdb.DuckDBPyConnection) -> None:
+def _classify_schema_v10_tables(connection: duckdb.DuckDBPyConnection) -> None:
     classified: dict[str, str] = {}
     for category, tables in _SCHEMA_TABLE_CLASSES.items():
         for table in tables:
             if table in classified:
-                raise PerformanceV2MaintenanceSchemaError(f"schema v9 table is classified more than once: {table}")
+                raise PerformanceV2MaintenanceSchemaError(f"schema v10 table is classified more than once: {table}")
             classified[table] = category
     actual = {
         str(row[0])
@@ -96,24 +96,24 @@ def _classify_schema_v9_tables(connection: duckdb.DuckDBPyConnection) -> None:
     unclassified = sorted(actual - set(classified))
     if unclassified:
         raise PerformanceV2MaintenanceSchemaError(
-            "unclassified schema v9 table(s): " + ", ".join(unclassified)
+            "unclassified schema v10 table(s): " + ", ".join(unclassified)
         )
     missing = sorted(set(classified) - actual)
     if missing:
         raise PerformanceV2MaintenanceSchemaError(
-            "missing classified schema v9 table(s): " + ", ".join(missing)
+            "missing classified schema v10 table(s): " + ", ".join(missing)
         )
 
 
-def _require_schema_v9(connection: duckdb.DuckDBPyConnection) -> None:
+def _require_schema_v10(connection: duckdb.DuckDBPyConnection) -> None:
     try:
         row = connection.execute("select value from schema_info where key = 'schema_version'").fetchone()
     except Exception as error:
         raise PerformanceV2MaintenanceSchemaError(str(error)) from error
     version = None if row is None else row[0]
-    if str(version) != "9":
-        raise PerformanceV2MaintenanceSchemaError(f"maintenance requires PerformanceDB schema v9; found {version}")
-    _classify_schema_v9_tables(connection)
+    if str(version) != "10":
+        raise PerformanceV2MaintenanceSchemaError(f"maintenance requires PerformanceDB schema v10; found {version}")
+    _classify_schema_v10_tables(connection)
     try:
         require_performance_v2(connection)
     except Exception as error:
@@ -206,7 +206,7 @@ def _audit_pair_ownership(
 
 
 def _catalog_symbols(connection: duckdb.DuckDBPyConnection) -> list[str]:
-    _require_schema_v9(connection)
+    _require_schema_v10(connection)
     rows = connection.execute(
         "select symbol from strategies union select symbol from selection_runs order by symbol"
     ).fetchall()
@@ -443,7 +443,7 @@ def create_preview(
     discarded_ids: set[int] = set()
     rejected_strategy_counts: Counter[str] = Counter()
     if operation == "rejected":
-        decisions: dict[int, tuple[str, int | None, str | None]] = {}
+        decisions: dict[int, tuple[str | None, int | None, str | None]] = {}
         for symbol in selected:
             symbol_strategy_ids = strategy_ids_by_symbol.get(symbol, ())
             if not symbol_strategy_ids:
