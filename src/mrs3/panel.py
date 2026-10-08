@@ -250,7 +250,7 @@ from .performance_v2_maintenance import (
     PerformanceV2MaintenanceError,
     PerformanceV2MaintenanceSchemaError,
     apply_preview as apply_performance_v2_maintenance_preview,
-    catalog as performance_v2_maintenance_catalog,
+    catalog_symbols as performance_v2_maintenance_catalog,
     create_preview as create_performance_v2_maintenance_preview,
     public_preview as public_performance_v2_maintenance_preview,
     set_query_workers as set_performance_v2_maintenance_workers,

@@ -260,3 +260,9 @@ orphan anywhere in the database fails closed without partially deleting the
 selected pair; rejected retirement keeps its existing single-batch behavior.
 Scoped action ownership checks include both the owning strategy symbol and the
 stored action symbol, so a mismatch is detected when either side is selected.
+
+The Panel pair-picker endpoint uses `catalog_symbols()`, which performs only
+schema validation and the symbol lookup. The audited `catalog()` helper remains
+available for integrity checks and tests, but it is not called while loading
+the UI picker. Loading the maintenance screen must therefore not scan the
+large fact tables before the user requests a preview.

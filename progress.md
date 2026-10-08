@@ -136,9 +136,15 @@ Scoped action ownership now checks both `strategies.symbol` and
 action-symbol-only mismatch; maintenance suite passes 58 tests. No live
 PerformanceDB was modified.
 
-Panel maintenance recovery checks also pass 14 tests. The remaining catalog
-endpoint full-audit cost is a separate performance follow-up; it does not
-run in targeted preview and is not part of this fix.
+Panel maintenance recovery checks also pass 14 tests. The catalog endpoint
+optimization is recorded separately below.
+
+Catalog picker follow-up (2026-10-08): the Panel maintenance catalog endpoint
+now calls `catalog_symbols()` instead of the audited `catalog()` helper. The
+pair picker performs schema validation and symbol lookup only; full reachability
+validation remains in full apply before DELETE. Maintenance and Panel
+maintenance checks pass 73 tests in the focused run. No live PerformanceDB was
+modified.
 
 Interrupted finalist RETEST recovery (2026-10-08): recovered the existing
 2360 indexed reports plus the already-tested manual finalist report into the

@@ -17,7 +17,13 @@ import pytest
 
 from mrs3.performance_v2_store import initialize_performance_v2
 import mrs3.performance_v2_maintenance as maintenance
-from mrs3.performance_v2_maintenance import PerformanceV2MaintenanceError, apply_preview, catalog, create_preview
+from mrs3.performance_v2_maintenance import (
+    PerformanceV2MaintenanceError,
+    apply_preview,
+    catalog,
+    catalog_symbols,
+    create_preview,
+)
 from mrs3.performance_v2_maintenance import set_query_workers
 
 
@@ -205,6 +211,19 @@ def _seed_fixture(connection: duckdb.DuckDBPyConnection) -> None:
 def test_catalog_includes_strategy_and_selection_only_symbols(maintenance_db: Path) -> None:
     with duckdb.connect(str(maintenance_db), read_only=True) as connection:
         assert catalog(connection) == ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
+
+
+def test_catalog_symbols_skips_global_reachability_audit(
+    maintenance_db: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_if_called(connection: duckdb.DuckDBPyConnection) -> None:
+        raise AssertionError("symbol picker must not audit every fact table")
+
+    with duckdb.connect(str(maintenance_db), read_only=True) as connection:
+        expected = catalog(connection)
+    monkeypatch.setattr(maintenance, "_audit_reachability", fail_if_called)
+    with duckdb.connect(str(maintenance_db), read_only=True) as connection:
+        assert catalog_symbols(connection) == expected == ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
 
 
 def test_rejected_retirement_covers_every_strategy_or_result_table(maintenance_db: Path) -> None:

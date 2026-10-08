@@ -216,12 +216,17 @@ def _catalog_symbols(connection: duckdb.DuckDBPyConnection) -> list[str]:
 
 
 def catalog(connection: duckdb.DuckDBPyConnection) -> list[str]:
-    """Return the catalog after the full integrity audit used by the UI."""
+    """Return the catalog after the full integrity audit."""
     symbols = _catalog_symbols(connection)
     _audit_pair_ownership(connection)
     _check_selection_ownership(connection)
     _audit_reachability(connection)
     return symbols
+
+
+def catalog_symbols(connection: duckdb.DuckDBPyConnection) -> list[str]:
+    """Return symbols for the UI picker without scanning large fact tables."""
+    return _catalog_symbols(connection)
 
 
 def _ids_by_symbol(
