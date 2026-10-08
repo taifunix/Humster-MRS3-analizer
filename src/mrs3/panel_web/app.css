@@ -276,9 +276,9 @@ tbody th { font-weight: 750; }
 .selection-stage-fixed { margin-top: 7px; }
 .selection-stage-fixed .selection-rank-main { grid-column: 2 / 4; display: grid; gap: 8px; min-width: 0; }
 .selection-stage-fixed .selection-rank-main .check { grid-column: 1; }
-.selection-stage-fixed .selection-stage-threshold { grid-column: 1; grid-template-columns: 70px minmax(0, 1fr); margin-left: 32px; align-items: center; }
-.selection-stage-fixed .selection-stage-threshold input[data-selection-top-n] { max-width: 78px; }
-.selection-stage-fixed .selection-stage-threshold select { min-width: 0; width: 100%; min-height: 30px; padding: 4px 6px; font: inherit; font-size: .7rem; color: var(--text); }
+.selection-stage-fixed[data-selection-rank] .selection-stage-threshold { grid-column: 1; grid-template-columns: 70px minmax(0, 1fr); margin-left: 32px; align-items: center; }
+.selection-stage-fixed[data-selection-rank] .selection-stage-threshold input[data-selection-top-n] { max-width: 78px; }
+.selection-stage-fixed[data-selection-rank] .selection-stage-threshold select { min-width: 0; width: 100%; min-height: 30px; padding: 4px 6px; font: inherit; font-size: .7rem; color: var(--text); }
 .selection-stage-fixed .selection-stage-scope { grid-column: 6; }
 .selection-stage-fixed .selection-stage-scope > span:last-child { margin-top: 0; color: var(--text); min-height: 30px; display: flex; align-items: center; padding: 4px 6px; border: 1px solid #cbd7e4; border-radius: 7px; background: #fff; font-size: .7rem; }
 .selection-objectives { display: grid; gap: 10px; margin-top: 16px; }

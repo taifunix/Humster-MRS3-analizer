@@ -22,6 +22,9 @@ passed (`401 passed`). No live database or tester was used.
 The broader selection/panel/export consumer run passed `341` tests with `4`
 platform symlink skips. The one stale XLSX-header expectation was updated to
 the accepted column contract; no runtime export failure remains in this run.
+The Minimum Shift threshold input now uses the dedicated threshold column in
+the Panel; the Top N-only fixed-stage layout no longer captures it. Static UI
+verification after the CSS fix passed (`163 passed`).
 
 Excel column consistency is implemented in the shared workbook renderer.
 Legacy R7.3 cache presence no longer changes a legacy workbook's headers. The

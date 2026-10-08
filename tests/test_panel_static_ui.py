@@ -69,7 +69,7 @@ assert.equal(collectionStatus.textContent, 'Collection: 2 packs');
 
 
 def test_researched_filters_have_fixed_order_and_editable_settings() -> None:
-    html, js = _read("index.html"), _read("app.js")
+    html, js, css = _read("index.html"), _read("app.js"), _read("app.css")
     stages = re.findall(r'data-selection-stage="([^"]+)"', html)
     assert stages[:10] == [
         "filter_equity_regime", "filter_lot_variant_redundancy", "filter_hard_cutoffs",
@@ -91,6 +91,33 @@ def test_researched_filters_have_fixed_order_and_editable_settings() -> None:
         body = html.split(f'data-selection-stage="{stage_id}"', 1)[1].split("</li>", 1)[0]
         assert re.search(r"<small>[^<]+</small>", body), stage_id
         assert "data-selection-move" not in body, stage_id
+    min_shift = re.search(r'<li class="selection-stage[^>]*" data-selection-stage="filter_min_shift">.*?</li>', html, re.S)
+    assert min_shift and "data-selection-rank" not in min_shift.group(0)
+    rank_tag = re.search(r'<div class="selection-stage selection-stage-fixed" data-selection-rank>', html)
+    assert rank_tag
+    order_markup = html.split('<ol id="performance-v2-selection-order"', 1)[1].split("</ol>", 1)[0]
+    assert order_markup.count('<li class="selection-stage') == len(stages)
+    assert '<div class="selection-stage' not in order_markup
+    assert re.search(
+        r"\.selection-stage-fixed\[data-selection-rank\] \.selection-stage-threshold\s*\{[^}]*grid-column:\s*1",
+        css,
+    )
+    assert not re.search(r"\.selection-stage-fixed\s+\.selection-stage-threshold\s*\{[^}]*grid-column", css)
+    assert not re.search(r"\.selection-stage-fixed\s+\.selection-stage-threshold", css)
+    assert ".selection-stage-fixed[data-selection-rank] .selection-stage-threshold input[data-selection-top-n]" in css
+    assert ".selection-stage-fixed[data-selection-rank] .selection-stage-threshold select" in css
+    assert re.search(r"\.selection-stage-threshold\s*\{[^}]*grid-column:\s*5", css)
+    assert "  .selection-stage-threshold { grid-column: 2; }" in css
+    desktop_grid = re.search(r"\.selection-stage \{[^}]*grid-template-columns:\s*([^;]+);", css)
+    assert desktop_grid
+    desktop_tracks = re.findall(r"minmax\([^)]*\)|\S+", desktop_grid.group(1))
+    assert len(desktop_tracks) >= 8
+    assert "grid-template-columns: 28px 24px minmax(0, 1fr) 112px 78px 175px" in css
+    assert min_shift.group(0).index("selection-stage-kind") < min_shift.group(0).index("selection-stage-threshold") < min_shift.group(0).index("selection-stage-scope")
+    assert ".selection-stage-kind { grid-column: 4;" in css
+    assert ".selection-stage-scope { display: grid; grid-column: 6;" in css
+    assert ".selection-stage-summary { display: grid; grid-column: 7;" in css
+    assert ".selection-stage-controls { grid-column: 8;" in css
 
 
 def test_selection_catalog_defaults_to_a_valid_scope_and_refreshes_counts() -> None:
@@ -1136,7 +1163,7 @@ def test_performance_v2_selection_preview_exposes_ordered_finalist_stages_withou
     assert ".selection-stage-fixed .selection-stage-scope > span:last-child {" in css
     assert ".selection-stage-fixed .selection-rank-main { grid-column: 2 / 4;" in css
     assert ".selection-stage-fixed .selection-stage-scope { grid-column: 6; }" in css
-    assert ".selection-stage-fixed .selection-stage-threshold select { min-width: 0; width: 100%;" in css
+    assert ".selection-stage-fixed[data-selection-rank] .selection-stage-threshold select { min-width: 0; width: 100%;" in css
     assert ".selection-stage-summary { display: grid; grid-column: 7;" in css
     assert "@media (max-width: 1279px)" in css
     mobile = css.split("@media (max-width: 1279px)", 1)[1]
