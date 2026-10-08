@@ -177,6 +177,33 @@ def publish_run_snapshots(
         artifact_digest = shortlist_provenance.get("artifact_sha256")
         selected_ids = shortlist_provenance.get("selected_candidate_ids")
         options = shortlist_provenance.get("applied_options")
+        option_valid = False
+        if isinstance(options, Mapping):
+            try:
+                legacy_keys = {"pretest_ab_enabled", "ladder_enabled", "pareto_enabled"}
+                enabled_keys = legacy_keys | {"min_shift_enabled", "min_shift_pct"}
+                if set(options) == legacy_keys and all(type(options[name]) is bool for name in legacy_keys):
+                    from .fresh_shortlist import LEGACY_FILTER_ENGINE_VERSION, serialize_applied_options
+                    option_valid = serialize_applied_options(
+                        (options["pretest_ab_enabled"], options["ladder_enabled"], options["pareto_enabled"]),
+                    ) == dict(options) and shortlist_provenance.get("filter_engine_version") == LEGACY_FILTER_ENGINE_VERSION
+                elif set(options) == enabled_keys and (
+                    all(type(options[name]) is bool for name in legacy_keys)
+                    and type(options["min_shift_enabled"]) is bool
+                ):
+                    from .fresh_shortlist import FILTER_ENGINE_VERSION, serialize_applied_options
+                    serialized = serialize_applied_options(
+                        (options["pretest_ab_enabled"], options["ladder_enabled"], options["pareto_enabled"]),
+                        min_shift_enabled=options["min_shift_enabled"],
+                        min_shift_pct=options["min_shift_pct"],
+                    )
+                    option_valid = (
+                        options["min_shift_enabled"] is True
+                        and shortlist_provenance.get("filter_engine_version") == FILTER_ENGINE_VERSION
+                        and serialized == dict(options)
+                    )
+            except (TypeError, ValueError):
+                option_valid = False
         if (
             shortlist_provenance.get("filter_version") != "shortlist-v2"
             or not isinstance(shortlist_provenance.get("filter_engine_version"), str)
@@ -187,9 +214,7 @@ def publish_run_snapshots(
             or not isinstance(selected_ids, list) or not selected_ids
             or not all(isinstance(item, str) and item for item in selected_ids)
             or selected_ids != sorted(set(selected_ids))
-            or not isinstance(options, Mapping)
-            or set(options) != {"pretest_ab_enabled", "ladder_enabled", "pareto_enabled"}
-            or any(type(value) is not bool for value in options.values())
+            or not option_valid
         ):
             raise ValueError("shortlist provenance is invalid")
     root = Path(bot_root).resolve()

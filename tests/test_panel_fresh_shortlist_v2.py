@@ -58,6 +58,26 @@ def test_fresh_shortlist_returns_applied_snapshot_identity(tmp_path: Path) -> No
     assert result["groups"][0]["candidate_ids"] == ["STR-READY"]
 
 
+def test_fresh_shortlist_min_shift_is_canonicalized_and_persisted_in_snapshot(tmp_path: Path) -> None:
+    controller, _analysis_path, analysis_id = _controller(tmp_path)
+
+    result = controller.strategies_fresh_shortlist(_selection_request(
+        analysis_id, min_shift_enabled=True, min_shift_pct="0.3",
+    ))
+
+    assert result["filter_engine_version"] == "shortlist-v2-engine-2"
+    assert result["applied_options"]["min_shift_enabled"] is True
+    assert result["applied_options"]["min_shift_pct"] == "0.300"
+    assert result["groups"][0]["candidate_ids"] == ["STR-READY"]
+
+    disabled = controller.strategies_fresh_shortlist(_selection_request(
+        analysis_id, min_shift_enabled=False, min_shift_pct="100.000",
+    ))
+    assert set(disabled["applied_options"]) == {
+        "pretest_ab_enabled", "ladder_enabled", "pareto_enabled",
+    }
+
+
 @pytest.mark.parametrize("token", [None, "0" * 64], ids=["missing", "stale"])
 @pytest.mark.parametrize(
     ("consumer", "extra"),
@@ -95,7 +115,8 @@ def test_json_generation_uses_server_ready_ids_not_browser_candidate_ids(
     tmp_path: Path, monkeypatch,
 ) -> None:
     controller, _analysis_path, analysis_id = _controller(tmp_path)
-    snapshot = controller.strategies_fresh_shortlist(_selection_request(analysis_id))
+    enabled_request = _selection_request(analysis_id, min_shift_enabled=True, min_shift_pct="0.3")
+    snapshot = controller.strategies_fresh_shortlist(enabled_request)
     captured: dict[str, object] = {}
     template = tmp_path / "template.json"
     template.write_text("{}", encoding="utf-8")
@@ -109,6 +130,7 @@ def test_json_generation_uses_server_ready_ids_not_browser_candidate_ids(
     monkeypatch.setattr("mrs3.panel.generate_fresh_analysis_strategies", generate)
     result = controller._generate_fresh_strategies(_selection_request(
         analysis_id,
+        min_shift_enabled=True, min_shift_pct="0.3",
         candidate_ids=["BROWSER-FORGED-ID"],
         selected_scopes=[["BTCUSDT", "LONG", "1h"]],
         selection_token=snapshot["selection_token"],
@@ -116,6 +138,8 @@ def test_json_generation_uses_server_ready_ids_not_browser_candidate_ids(
 
     assert captured["candidate_ids"] == ("STR-READY",)
     assert captured["selection"].selection_token == snapshot["selection_token"]
+    assert captured["selection"].min_shift_enabled is True
+    assert captured["selection"].min_shift_pct == "0.300"
     assert result["phase"] == "COMMITTED"
     assert (tmp_path / "Output" / "fresh-shortlist-v2" / analysis_id).is_dir()
 
@@ -350,6 +374,30 @@ def test_audit_publishes_tokenized_workbook_with_missing_output_parent(
         summary = dict(workbook["Summary"].iter_rows(min_row=2, values_only=True))
         assert summary["selection_token"] == snapshot["selection_token"]
         assert workbook["READY"].max_row == 2
+    finally:
+        workbook.close()
+
+
+def test_enabled_min_shift_audit_contains_threshold_and_first_order_shift(
+    tmp_path: Path,
+) -> None:
+    from openpyxl import load_workbook
+
+    controller, _analysis_path, analysis_id = _controller(tmp_path)
+    snapshot = controller.strategies_fresh_shortlist(_selection_request(
+        analysis_id, min_shift_enabled=True, min_shift_pct="0.3",
+    ))
+    result = controller.strategies_fresh_filter_audit(_selection_request(
+        analysis_id, min_shift_enabled=True, min_shift_pct="0.3",
+        selection_token=snapshot["selection_token"],
+    ))
+    workbook = load_workbook(tmp_path / "Output" / result["filename"], read_only=True, data_only=True)
+    try:
+        summary = dict(workbook["Summary"].iter_rows(min_row=2, values_only=True))
+        headers = [cell.value for cell in next(workbook["READY"].iter_rows(max_row=1))]
+        assert summary["min_shift_pct"] == "0.300"
+        assert summary["min_shift_threshold_bp"] == "30.000"
+        assert "order1_shift_bp" in headers
     finally:
         workbook.close()
 

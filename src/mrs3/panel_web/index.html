@@ -201,6 +201,8 @@
               <div class="shortlist-filter-controls">
                 <label class="check"><input id="shortlist-filter-pretest-ab" type="checkbox"><span>Source PRETEST A/B gate (optional, 14-day tail)</span></label>
                 <label class="check"><input id="shortlist-filter-ladder" type="checkbox"><span>Opening MA proximity</span></label>
+                <label class="check"><input id="shortlist-filter-min-shift" type="checkbox"><span>Minimum Shift (%)</span></label>
+                <label class="field-inline" for="shortlist-filter-min-shift-pct"><span class="sr-only">Minimum Shift percentage</span><input id="shortlist-filter-min-shift-pct" type="number" value="0.3" min="0.001" max="100" step="0.001" inputmode="decimal"></label>
                 <label class="check"><input id="shortlist-filter-pareto" type="checkbox"><span>Joint Pareto</span></label>
                 <p id="shortlist-filter-status" class="card-status" role="status" aria-live="polite">Откройте анализ, чтобы применить фильтры.</p>
                 <button id="shortlist-filter-recalculate" type="button" class="button button-primary" disabled>Пересчитать фильтры</button>

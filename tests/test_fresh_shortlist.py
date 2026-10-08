@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from decimal import Decimal
 from hashlib import sha256
 from pathlib import Path
 import threading
@@ -140,6 +141,186 @@ def test_ladder_uses_first_order_and_filters_before_pareto(tmp_path: Path) -> No
     assert rejected.reason == "OPEN_MA_OUTSIDE_FIRST_ORDER_PLUS_MINUS_1"
     assert rejected.dominator_candidate_id is None
     assert result.ready_candidate_ids == ("STR-READY",)
+
+
+@pytest.mark.parametrize("value", [True, False, None, "nope", "0", "-1", "100.001", "0.0001", float("inf")])
+def test_min_shift_parser_rejects_invalid_thresholds(value: object) -> None:
+    from mrs3.fresh_shortlist import normalize_min_shift
+
+    with pytest.raises(ValueError, match="min_shift_pct"):
+        normalize_min_shift(True, value)
+
+
+def test_min_shift_parser_canonicalizes_enabled_and_discards_valid_disabled_threshold() -> None:
+    from mrs3.fresh_shortlist import normalize_min_shift, parse_fresh_shortlist_request
+
+    assert normalize_min_shift(True, "0.3") == (True, "0.300")
+    assert normalize_min_shift(True, "0.300") == (True, "0.300")
+    assert normalize_min_shift(False, "100.000") == (False, None)
+    assert normalize_min_shift(False, None) == (False, None)
+    assert normalize_min_shift(False, "0.0001") == (False, None)
+    assert normalize_min_shift(False, "not-a-number") == (False, None)
+    assert parse_fresh_shortlist_request({"filter_version": "shortlist-v2", "min_shift_enabled": True, "min_shift_pct": "0.3"}) == ((False, False, False), True, "0.300")
+
+
+def test_min_shift_threshold_is_exactly_percent_to_basis_points() -> None:
+    from mrs3.fresh_shortlist import min_shift_threshold_bp
+
+    assert {
+        value: min_shift_threshold_bp(value)
+        for value in ("0.001", "0.100", "0.250", "0.300", "1.000", "2.500", "100.000")
+    } == {
+        "0.001": Decimal("0.100"), "0.100": Decimal("10.000"),
+        "0.250": Decimal("25.000"), "0.300": Decimal("30.000"),
+        "1.000": Decimal("100.000"), "2.500": Decimal("250.000"),
+        "100.000": Decimal("10000.000"),
+    }
+
+
+def test_min_shift_requires_v2_filter_version() -> None:
+    from mrs3.fresh_shortlist import parse_fresh_shortlist_request
+
+    with pytest.raises(ValueError, match="filter_version"):
+        parse_fresh_shortlist_request({"min_shift_enabled": True, "min_shift_pct": "0.3"})
+    with pytest.raises(ValueError, match="min_shift_enabled"):
+        parse_fresh_shortlist_request({"filter_version": "shortlist-v2", "min_shift_pct": "0.3"})
+
+
+def test_min_shift_filters_below_threshold_before_pareto(tmp_path: Path) -> None:
+    from mrs3.fresh_shortlist import evaluate_fresh_shortlist, prepare_fresh_shortlist
+
+    database = tmp_path / "analysis.analysis-v6.duckdb"
+    analysis_id, _surface = _make_analysis(database)
+    base = _read_structure(database)
+    weak = json.loads(json.dumps(base))
+    weak["candidate_id"] = weak["structure_id"] = "SHIFT-WEAK"
+    weak["orders"][0]["shift_bp"] = 99
+    weak["orders"][1]["shift_bp"] = 300
+    # Keep source point facts aligned with the persisted order shift.
+    import duckdb
+    connection = duckdb.connect(str(database))
+    try:
+        point = json.loads(connection.execute("select payload_json from points where payload_json like '%event-a%'").fetchone()[0])
+        point["point_id"] = "BTCUSDT|LONG|1h|99|3|9"
+        point["shift_bp"] = 99
+        connection.execute("insert into points values (?, ?)", ["BTCUSDT|LONG|1h", json.dumps(point, sort_keys=True, separators=(",", ":"))])
+    finally:
+        connection.close()
+    weak["orders"][0]["point_id"] = "BTCUSDT|LONG|1h|99|3|9"
+    _append_structure(database, weak)
+
+    result = evaluate_fresh_shortlist(
+        prepare_fresh_shortlist(database, analysis_id),
+        (False, True, True), workers=1, min_shift_enabled=True, min_shift_pct="1.000",
+    )
+
+    deferred = next(item for item in result.candidates if item.candidate_id == "SHIFT-WEAK")
+    assert deferred.filter_status == "DEFERRED_MIN_SHIFT"
+    assert deferred.reason == "ORDER_SHIFT_BELOW_MINIMUM"
+    assert deferred.dominator_candidate_id is None
+    assert result.ready_candidate_ids == ("STR-READY",)
+    assert result.min_shift_enabled is True
+    assert result.min_shift_pct == "1.000"
+    assert result.groups[0].ready == 1
+    assert result.groups[0].deferred == 1
+    assert result.groups[0].all_count == 2
+
+
+def test_min_shift_canonical_tokens_match_and_missing_shift_defers() -> None:
+    from mrs3.fresh_shortlist import (
+        FreshCandidateMetrics, FreshOrderMetrics, FreshScopeFacts, PreparedFreshAnalysis,
+        evaluate_fresh_shortlist,
+    )
+
+    order = FreshOrderMetrics(3, None, "P", 1, 1, 1, 1)  # type: ignore[arg-type]
+    candidate = FreshCandidateMetrics("C", "S", "BTCUSDT", "LONG", "1h", 9, 1, "READY_MRS3_STRUCTURE", (order,), None)
+    prepared = PreparedFreshAnalysis("a" * 64, "b" * 64, (FreshScopeFacts("BTCUSDT|LONG|1h", "BTCUSDT", "LONG", "1h", 1, None),), (candidate,))
+
+    first = evaluate_fresh_shortlist(prepared, (False, False, False), workers=1, min_shift_enabled=True, min_shift_pct="0.3")
+    second = evaluate_fresh_shortlist(prepared, (False, False, False), workers=1, min_shift_enabled=True, min_shift_pct="0.300")
+    assert first.selection_token == second.selection_token
+    assert first.ready_candidate_ids == ()
+    assert first.candidates[0].filter_status == "DEFERRED_MIN_SHIFT"
+    assert first.candidates[0].reason == "ORDER_SHIFT_UNKNOWN"
+    assert first.filter_engine_version == "shortlist-v2-engine-2"
+
+    legacy = evaluate_fresh_shortlist(prepared, (False, False, False), workers=1)
+    assert legacy.filter_engine_version == "shortlist-v2-engine-1"
+    assert legacy.selection_token != first.selection_token
+
+
+@pytest.mark.parametrize("bad_shift", [True, False, "abc", "", float("nan"), float("inf")])
+def test_min_shift_rejects_malformed_present_first_shift_and_disabled_ignores_it(bad_shift: object) -> None:
+    from mrs3.fresh_shortlist import (
+        FreshCandidateMetrics, FreshOrderMetrics, FreshScopeFacts, PreparedFreshAnalysis,
+        evaluate_fresh_shortlist,
+    )
+
+    candidate = FreshCandidateMetrics(
+        "BAD-SHIFT", "BAD-SHIFT", "BTCUSDT", "LONG", "1h", 9, 1,
+        "READY_MRS3_STRUCTURE",
+        (FreshOrderMetrics(3, bad_shift, "P", Decimal("1"), Decimal("1"), 1, 1),),  # type: ignore[arg-type]
+        None,
+    )
+    prepared = PreparedFreshAnalysis(
+        "1" * 64, "2" * 64,
+        (FreshScopeFacts("BTCUSDT|LONG|1h", "BTCUSDT", "LONG", "1h", 1, None),),
+        (candidate,),
+    )
+    with pytest.raises(ValueError, match="fresh shortlist order Shift is invalid"):
+        evaluate_fresh_shortlist(
+            prepared, (False, False, False), workers=1,
+            min_shift_enabled=True, min_shift_pct="0.300",
+        )
+    disabled = evaluate_fresh_shortlist(prepared, (False, False, False), workers=1)
+    assert disabled.ready_candidate_ids == ("BAD-SHIFT",)
+
+
+def test_min_shift_only_limits_the_first_order() -> None:
+    from mrs3.fresh_shortlist import (
+        FreshCandidateMetrics, FreshOrderMetrics, FreshScopeFacts, PreparedFreshAnalysis,
+        evaluate_fresh_shortlist,
+    )
+
+    orders = (
+        FreshOrderMetrics(3, 30, "P1", Decimal("1"), Decimal("1"), 1, 1),
+        FreshOrderMetrics(4, 40, "P2", Decimal("1"), Decimal("1"), 1, 1),
+    )
+    candidate = FreshCandidateMetrics("C2", "S2", "BTCUSDT", "LONG", "1h", 9, 2, "READY_MRS3_STRUCTURE", orders, None)
+    prepared = PreparedFreshAnalysis("c" * 64, "d" * 64, (FreshScopeFacts("BTCUSDT|LONG|1h", "BTCUSDT", "LONG", "1h", 1, None),), (candidate,))
+
+    result = evaluate_fresh_shortlist(prepared, (False, False, False), workers=1, min_shift_enabled=True, min_shift_pct="0.300")
+
+    assert result.ready_candidate_ids == ("C2",)
+
+
+def test_min_shift_enabled_below_any_present_shift_preserves_disabled_membership() -> None:
+    from mrs3.fresh_shortlist import (
+        FreshCandidateMetrics, FreshOrderMetrics, FreshScopeFacts, PreparedFreshAnalysis,
+        evaluate_fresh_shortlist,
+    )
+
+    candidate = FreshCandidateMetrics(
+        "C3", "S3", "BTCUSDT", "LONG", "1h", 9, 2, "READY_MRS3_STRUCTURE",
+        (FreshOrderMetrics(3, 30, "P1", Decimal("1"), Decimal("1"), 1, 1),
+         FreshOrderMetrics(4, None, "P2", Decimal("1"), Decimal("1"), 1, 1)), None,
+    )
+    prepared = PreparedFreshAnalysis(
+        "e" * 64, "f" * 64,
+        (FreshScopeFacts("BTCUSDT|LONG|1h", "BTCUSDT", "LONG", "1h", 1, None),),
+        (candidate,),
+    )
+    disabled = evaluate_fresh_shortlist(prepared, (False, False, False), workers=1)
+    enabled = evaluate_fresh_shortlist(
+        prepared, (False, False, False), workers=1,
+        min_shift_enabled=True, min_shift_pct="0.001",
+    )
+    assert enabled.ready_candidate_ids == disabled.ready_candidate_ids == ("C3",)
+    assert [(item.filter_status, item.reason, item.dominator_candidate_id) for item in enabled.candidates] == [
+        (item.filter_status, item.reason, item.dominator_candidate_id) for item in disabled.candidates
+    ]
+    assert enabled.groups == disabled.groups
+    assert enabled.filter_engine_version != disabled.filter_engine_version
 
 
 def test_pareto_keeps_full_equality_and_uses_economic_strictness(tmp_path: Path) -> None:
@@ -663,7 +844,7 @@ def test_executor_releases_singleflight_slot_after_failure(tmp_path: Path, monke
 
 
 def test_executor_rejects_incomplete_cached_or_singleflight_state(tmp_path: Path) -> None:
-    from mrs3.fresh_shortlist import FILTER_ENGINE_VERSION, FreshShortlistExecutor
+    from mrs3.fresh_shortlist import FreshShortlistExecutor
 
     database = tmp_path / "analysis.analysis-v6.duckdb"
     analysis_id, _surface = _make_analysis(database)
@@ -671,7 +852,7 @@ def test_executor_rejects_incomplete_cached_or_singleflight_state(tmp_path: Path
     prepared, result = FreshShortlistExecutor().evaluate_with_prepared(
         database, analysis_id, options, workers=1,
     )
-    prepared_key = (analysis_id, prepared.artifact_sha256, FILTER_ENGINE_VERSION)
+    prepared_key = (analysis_id, prepared.artifact_sha256, "prepared-v1")
     action_key = (prepared_key, options)
 
     broken_cache = FreshShortlistExecutor()

@@ -89,7 +89,7 @@ def test_shortlist_digest_failure_leaves_existing_run_publication_untouched(tmp_
         "orders": ({"point_id": "P", "plateau_id": "PLAT", "open_ma": 5, "shift_bp": 100, "close_support": 1.0, "source_pnl_pct": 10},),
     }
     shortlist = {
-        "filter_version": "shortlist-v2", "filter_engine_version": "engine-1",
+        "filter_version": "shortlist-v2", "filter_engine_version": "shortlist-v2-engine-1",
         "selection_token": "a" * 64, "artifact_sha256": "b" * 64,
         "applied_options": {"pretest_ab_enabled": False, "ladder_enabled": False, "pareto_enabled": False},
         "selected_candidate_ids": ["CANDIDATE"],
@@ -114,6 +114,57 @@ def test_shortlist_digest_failure_leaves_existing_run_publication_untouched(tmp_
         path.name: path.read_bytes() for path in (*runs.iterdir(), tester_config, tester / "runs_manifest.json")
     }
     assert after == before
+
+
+@pytest.mark.parametrize(
+    ("applied_options", "engine_version", "valid"),
+    [
+        ({"pretest_ab_enabled": False, "ladder_enabled": False, "pareto_enabled": False}, "shortlist-v2-engine-1", True),
+        ({"pretest_ab_enabled": False, "ladder_enabled": False, "pareto_enabled": False,
+          "min_shift_enabled": True, "min_shift_pct": "0.300"}, "shortlist-v2-engine-2", True),
+        ({"pretest_ab_enabled": False, "ladder_enabled": False, "pareto_enabled": False,
+          "min_shift_enabled": True, "min_shift_pct": "0.3"}, "shortlist-v2-engine-2", False),
+        ({"pretest_ab_enabled": 0, "ladder_enabled": False, "pareto_enabled": False}, "shortlist-v2-engine-1", False),
+        ({"pretest_ab_enabled": False, "ladder_enabled": False, "pareto_enabled": False,
+          "min_shift_enabled": False, "min_shift_pct": "0.300"}, "shortlist-v2-engine-2", False),
+        ({"pretest_ab_enabled": False, "ladder_enabled": False, "pareto_enabled": False,
+          "min_shift_enabled": True, "min_shift_pct": "0.300"}, "shortlist-v2-engine-1", False),
+    ],
+)
+def test_publish_run_snapshots_validates_min_shift_provenance_types(
+    tmp_path: Path, applied_options: dict[str, object], engine_version: str, valid: bool,
+) -> None:
+    template = tmp_path / "run_snapshot.json"
+    template.write_text(json.dumps({
+        "settings": [{
+            "basic": {"strategy": "mrs3", "symbol": "OLD", "time_frame": "5m", "use_long": True, "use_short": False},
+            "mrs3": {
+                "ma_long": [{"id": 1, "len": 1, "multiplier": 1.0, "lot_x": 0.0}],
+                "ma_short": [], "ma_close_long": {"len": 1, "multiplier": 1.0},
+                "ma_close_short": {"len": 1, "multiplier": 1.0},
+            },
+        }],
+        "tester_config": {},
+    }), encoding="utf-8")
+    bot_root = tmp_path / "bot"
+    tester_config = bot_root / "tester" / "config_tester.json"
+    tester_config.parent.mkdir(parents=True)
+    tester_config.write_text("{}", encoding="utf-8")
+    structure = {"candidate_id": "C", "structure_id": "S", "symbol": "BTCUSDT", "side": "LONG", "timeframe": "1h", "order_count": 1, "common_close_ma": 7, "orders": ({"point_id": "P", "plateau_id": "PLAT", "open_ma": 5, "shift_bp": 100, "close_support": 1.0, "source_pnl_pct": 10},)}
+    provenance = {
+        "filter_version": "shortlist-v2", "filter_engine_version": engine_version,
+        "selection_token": "a" * 64, "artifact_sha256": "b" * 64,
+        "applied_options": applied_options, "selected_candidate_ids": ["C"],
+    }
+    call = lambda: publish_run_snapshots(
+        template, bot_root, tester_config, [structure], "2026-08-01", "2026-08-18", 1,
+        AlgorithmConfig.defaults(), analysis_run_id="a" * 64, shortlist_provenance=provenance,
+    )
+    if valid:
+        assert call()["run_count"] == 1
+    else:
+        with pytest.raises(ValueError, match="shortlist provenance is invalid"):
+            call()
 
 
 def test_publish_run_snapshots_rejects_unowned_existing_file(tmp_path: Path) -> None:

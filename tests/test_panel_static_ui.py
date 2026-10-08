@@ -1737,7 +1737,15 @@ assert.notEqual(start, -1, 'production shortlist state helper missing');
 assert.notEqual(end, -1, 'production shortlist state helper boundary missing');
 const context = {{}};
 vm.runInNewContext(source.slice(start, end), context, {{ filename: 'app.js' }});
-const {{ create, readyGroups, sumPlateauCounts, pruneReadyScopes }} = context.freshShortlistStateHelpers;
+const {{ create, readyGroups, sumPlateauCounts, pruneReadyScopes, canonicalPctForComparison, validatePctForRequest }} = context.freshShortlistStateHelpers;
+assert.equal(canonicalPctForComparison('0.3'), '0.300');
+assert.equal(canonicalPctForComparison(' .300 '), '0.300');
+assert.equal(canonicalPctForComparison('.3'), '0.300');
+assert.equal(canonicalPctForComparison('3e-1'), '0.300');
+assert.equal(canonicalPctForComparison('0.0001'), '0.0001');
+assert.equal(validatePctForRequest('0.0001'), 'Minimum Shift may use at most three decimal places.');
+assert.equal(validatePctForRequest('1e-3'), '');
+assert.match(validatePctForRequest('101'), /at most 100%/);
 class FakeCheckbox {{
   constructor(checked) {{ this.checked = checked; this.listeners = {{}}; }}
   addEventListener(name, handler) {{ (this.listeners[name] ||= []).push(handler); }}
@@ -1911,6 +1919,65 @@ pruneReadyScopes(selectedScopes, [
 assert.deepEqual([...selectedScopes], ['keep'], 'successful replacement prunes absent and non-READY scopes');
  }})().catch((error) => {{ console.error(error); process.exitCode = 1; }});
 """
+    completed = subprocess.run(("node", "-e", script), capture_output=True, text=True)
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_shortlist_min_shift_enabled_payload_reaches_applied_actions() -> None:
+    script = r"""
+const fs = require('node:fs');
+const vm = require('node:vm');
+const assert = require('node:assert/strict');
+const source = fs.readFileSync(__APP_JS__, 'utf8');
+const start = source.indexOf('const freshShortlistStateHelpers = (() => {');
+const end = source.indexOf('\nconst ORDER_BUCKETS', start);
+const context = {};
+vm.runInNewContext(source.slice(start, end), context, { filename: 'app.js' });
+class Control {
+  constructor({ checked = false, value = '' } = {}) { this.checked = checked; this.value = value; this.listeners = {}; }
+  addEventListener(name, handler) { (this.listeners[name] ||= []).push(handler); }
+}
+const controls = {
+  pretest_ab_enabled: new Control(), ladder_enabled: new Control(), pareto_enabled: new Control(),
+  min_shift_enabled: new Control(), min_shift_pct: new Control({ value: '0.3' }),
+};
+const calls = [];
+const request = (_endpoint, body) => new Promise((resolve, reject) => calls.push({ body, resolve, reject }));
+const response = (options, token) => ({
+  filter_version: 'shortlist-v2', filter_engine_version: options.min_shift_enabled ? 'shortlist-v2-engine-2' : 'shortlist-v2-engine-1',
+  analysis_run_id: 'run-1', applied_options: options, selection_token: token,
+  groups: [{ scope_key: 'BTCUSDT|LONG|1h', ready_after_filters: 1, candidate_ids: ['C'] }], items: [{ candidate_id: 'C' }],
+});
+const state = context.freshShortlistStateHelpers.create({ controls, request });
+const revision = state.beginAnalysis();
+state.setAnalysis('run-1', revision);
+const initial = state.load(revision);
+assert.deepEqual(JSON.parse(JSON.stringify(calls[0].body)), {
+  analysis_run_id: 'run-1', filter_version: 'shortlist-v2',
+  pretest_ab_enabled: false, ladder_enabled: false, pareto_enabled: false,
+});
+calls[0].resolve(response({ pretest_ab_enabled: false, ladder_enabled: false, pareto_enabled: false }, 'off-token'));
+(async () => {
+  assert.equal(await initial, true);
+  controls.min_shift_enabled.checked = true;
+  const apply = state.applyDraft();
+  assert.deepEqual(JSON.parse(JSON.stringify(calls[1].body)), {
+    analysis_run_id: 'run-1', filter_version: 'shortlist-v2',
+    pretest_ab_enabled: false, ladder_enabled: false, pareto_enabled: false,
+    min_shift_enabled: true, min_shift_pct: '0.300',
+  });
+  calls[1].resolve(response({
+    pretest_ab_enabled: false, ladder_enabled: false, pareto_enabled: false,
+    min_shift_enabled: true, min_shift_pct: '0.300',
+  }, 'enabled-token'));
+  assert.equal(await apply, true);
+  assert.deepEqual(JSON.parse(JSON.stringify(state.actionPayload({ audit: true }))), {
+    analysis_run_id: 'run-1', filter_version: 'shortlist-v2',
+    pretest_ab_enabled: false, ladder_enabled: false, pareto_enabled: false,
+    min_shift_enabled: true, min_shift_pct: '0.300', selection_token: 'enabled-token', audit: true,
+  });
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+""".replace('__APP_JS__', json.dumps(str(PANEL_WEB / 'app.js')))
     completed = subprocess.run(("node", "-e", script), capture_output=True, text=True)
     assert completed.returncode == 0, completed.stderr
 

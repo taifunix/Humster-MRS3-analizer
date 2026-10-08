@@ -324,6 +324,8 @@ def export_fresh_filter_audit(result: object, output_path: Path | str) -> Path:
 
 def export_fresh_shortlist_audit(prepared: object, evaluation: object, output_path: Path | str) -> Path:
     """Write the same v2 evaluation used by the fresh shortlist and generators."""
+    from .fresh_shortlist import min_shift_threshold_bp, serialize_applied_options
+
     option_names = ("pretest_ab_enabled", "ladder_enabled", "pareto_enabled")
     candidates = {item.candidate_id: item for item in prepared.candidates}
     headers = [
@@ -332,8 +334,10 @@ def export_fresh_shortlist_audit(prepared: object, evaluation: object, output_pa
         "pretest_ab_decline_pct", "pretest_ab_evidence_json",
     ]
     for order in range(1, 5):
+        headers.extend((f"order{order}_point_id", f"order{order}_open_ma", f"order{order}_open_ma_diff"))
+        if evaluation.min_shift_enabled:
+            headers.append(f"order{order}_shift_bp")
         headers.extend((
-            f"order{order}_point_id", f"order{order}_open_ma", f"order{order}_open_ma_diff",
             f"order{order}_source_pnl_pct", f"order{order}_source_dd_pct",
             f"order{order}_plateau_point_count", f"order{order}_point_event_count",
         ))
@@ -365,19 +369,30 @@ def export_fresh_shortlist_audit(prepared: object, evaluation: object, output_pa
                 f"order{index}_plateau_point_count": order.plateau_point_count,
                 f"order{index}_point_event_count": order.point_event_count,
             })
+            if evaluation.min_shift_enabled:
+                row[f"order{index}_shift_bp"] = None if order.shift_bp is None else str(order.shift_bp)
         rows["READY" if result.filter_status == "READY_AFTER_FILTERS" else "DEFERRED"].append(row)
-    options = dict(zip(option_names, evaluation.options, strict=True))
+    options = serialize_applied_options(
+        evaluation.options,
+        **({"min_shift_enabled": True, "min_shift_pct": evaluation.min_shift_pct}
+           if evaluation.min_shift_enabled else {}),
+    )
+    summary_metrics = [
+        "analysis_run_id", "artifact_sha256", "filter_version", "filter_engine_version",
+        "selection_token", *option_names, "candidate_count", "ready_count", "deferred_count",
+    ]
+    summary_values: list[object] = [
+        evaluation.analysis_id, evaluation.artifact_sha256, evaluation.filter_version,
+        evaluation.filter_engine_version, evaluation.selection_token,
+        *(options[name] for name in option_names), len(evaluation.candidates),
+        len(rows["READY"]), len(rows["DEFERRED"]),
+    ]
+    if evaluation.min_shift_enabled:
+        summary_metrics.extend(("min_shift_enabled", "min_shift_pct", "min_shift_threshold_bp"))
+        summary_values.extend((True, evaluation.min_shift_pct, str(min_shift_threshold_bp(evaluation.min_shift_pct))))
     summary = pd.DataFrame({
-        "metric": (
-            "analysis_run_id", "artifact_sha256", "filter_version", "filter_engine_version",
-            "selection_token", *option_names, "candidate_count", "ready_count", "deferred_count",
-        ),
-        "value": (
-            evaluation.analysis_id, evaluation.artifact_sha256, evaluation.filter_version,
-            evaluation.filter_engine_version, evaluation.selection_token,
-            *(options[name] for name in option_names), len(evaluation.candidates),
-            len(rows["READY"]), len(rows["DEFERRED"]),
-        ),
+        "metric": summary_metrics,
+        "value": summary_values,
     })
     tables = {
         "Summary": summary,

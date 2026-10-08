@@ -217,7 +217,7 @@ from .fresh_analysis_strategies import (
     load_fresh_ready_candidates,
     read_fresh_analysis_identity,
 )
-from .fresh_shortlist import ShortlistBusyError
+from .fresh_shortlist import ShortlistBusyError, parse_fresh_shortlist_request, serialize_applied_options
 from .tester_run_files import publish_run_snapshots
 from .panel_strategy_batch import LocalStrategyBatchService, StrategyBatchValidationError, validate_strategy_manifest
 from .panel_tester_runs import LocalRunsBatchService
@@ -3107,7 +3107,7 @@ class PanelController:
             raise ValueError("output_dir is server-controlled")
         if any(not isinstance(key, str) or key.startswith("_") for key in payload):
             raise ValueError("private fields are not allowed")
-        options = self._fresh_shortlist_options(payload)
+        options, min_shift_enabled, min_shift_pct = self._fresh_shortlist_settings(payload)
         candidates = payload.get("candidate_ids")
         scopes = payload.get("selected_scopes")
         if candidates is not None and (not isinstance(candidates, list) or not all(isinstance(item, str) for item in candidates)):
@@ -3118,7 +3118,10 @@ class PanelController:
         path = self._fresh_analysis_paths.get(analysis_id)
         if path is None:
             raise ValueError("fresh analysis is not available in this panel session")
-        prepared, evaluation = self._verified_fresh_shortlist(path, analysis_id, options, payload)
+        prepared, evaluation = self._verified_fresh_shortlist(
+            path, analysis_id, options, payload,
+            min_shift_enabled=min_shift_enabled, min_shift_pct=min_shift_pct,
+        )
         scopes, selected_ids = self._selected_fresh_ready(
             prepared, evaluation, scopes, require_one_side=True,
         )
@@ -3136,6 +3139,8 @@ class PanelController:
             "pretest_ab_enabled": options[0],
             "ladder_enabled": options[1],
             "pareto_enabled": options[2],
+            **({"min_shift_enabled": True, "min_shift_pct": min_shift_pct}
+               if min_shift_enabled else {}),
             "filter_version": "shortlist-v2",
             "selection_token": evaluation.selection_token,
             "_shortlist_prepared": prepared,
@@ -3158,8 +3163,8 @@ class PanelController:
 
     def strategies_fresh_generate_runs(self, payload: Mapping[str, object]) -> dict[str, object]:
         """Publish the selected filtered candidates as tester run snapshots."""
-        options = self._fresh_shortlist_options(payload)
-        if set(payload).difference({"analysis_run_id", "filter_version", "filters", "pretest_ab_enabled", "ladder_enabled", "pareto_enabled", "selection_token", "selected_scopes", "start_date", "end_date"}):
+        options, min_shift_enabled, min_shift_pct = self._fresh_shortlist_settings(payload)
+        if set(payload).difference({"analysis_run_id", "filter_version", "filters", "pretest_ab_enabled", "ladder_enabled", "pareto_enabled", "min_shift_enabled", "min_shift_pct", "selection_token", "selected_scopes", "start_date", "end_date"}):
             raise ValueError("tester run request contains unsupported fields")
         scopes = payload.get("selected_scopes")
         if not isinstance(scopes, list) or not all(
@@ -3174,7 +3179,10 @@ class PanelController:
         analysis_path = self._fresh_analysis_paths.get(analysis_id)
         if analysis_path is None:
             raise ValueError("fresh analysis is not available in this panel session")
-        prepared, evaluation = self._verified_fresh_shortlist(analysis_path, analysis_id, options, payload)
+        prepared, evaluation = self._verified_fresh_shortlist(
+            analysis_path, analysis_id, options, payload,
+            min_shift_enabled=min_shift_enabled, min_shift_pct=min_shift_pct,
+        )
         scopes, selected_ids = self._selected_fresh_ready(
             prepared, evaluation, scopes, require_one_side=False,
         )
@@ -3215,7 +3223,7 @@ class PanelController:
             return dict(self._fresh_generation_job)
 
     def _generate_fresh_strategies(self, payload: Mapping[str, object]) -> dict[str, object]:
-        options = self._fresh_shortlist_options(payload)
+        options, min_shift_enabled, min_shift_pct = self._fresh_shortlist_settings(payload)
         scopes = payload["selected_scopes"]
         assert isinstance(scopes, list)
         analysis_id = self._required(payload, "analysis_run_id")
@@ -3225,7 +3233,10 @@ class PanelController:
         prepared = payload.get("_shortlist_prepared")
         evaluation = payload.get("_shortlist_evaluation")
         if prepared is None or evaluation is None:
-            prepared, evaluation = self._verified_fresh_shortlist(analysis_path, analysis_id, options, payload)
+            prepared, evaluation = self._verified_fresh_shortlist(
+                analysis_path, analysis_id, options, payload,
+                min_shift_enabled=min_shift_enabled, min_shift_pct=min_shift_pct,
+            )
         if payload.get("selection_token") != evaluation.selection_token:
             raise ValueError("STALE_SHORTLIST_SELECTION")
         scopes, selected_ids = self._selected_fresh_ready(
@@ -3248,6 +3259,8 @@ class PanelController:
                 config,
                 surface_path=self._fresh_analysis_surfaces.get(analysis_id),
                 pretest_ab_enabled=options[0],
+                **({"min_shift_enabled": True, "min_shift_pct": min_shift_pct}
+                   if min_shift_enabled else {}),
                 selection=evaluation,
             )
             self._assert_fresh_analysis_digest(analysis_path, evaluation.artifact_sha256)
@@ -3380,12 +3393,15 @@ class PanelController:
         }
 
     def strategies_fresh_shortlist(self, payload: Mapping[str, object]) -> dict[str, object]:
-        options = self._fresh_shortlist_options(payload)
+        options, min_shift_enabled, min_shift_pct = self._fresh_shortlist_settings(payload)
         analysis_id = self._required(payload, "analysis_run_id")
         path = self._fresh_analysis_paths.get(analysis_id)
         if path is None:
             raise ValueError("fresh analysis is not available in this panel session")
-        prepared, evaluation = self._evaluate_fresh_shortlist_snapshot(path, analysis_id, options)
+        prepared, evaluation = self._evaluate_fresh_shortlist_snapshot(
+            path, analysis_id, options,
+            min_shift_enabled=min_shift_enabled, min_shift_pct=min_shift_pct,
+        )
         if payload.get("audit") is True:
             self._require_fresh_selection_token(payload, evaluation)
             output = self.root / "Output" / f"{analysis_id}.shortlist-v2.{evaluation.selection_token}.xlsx"
@@ -3401,12 +3417,15 @@ class PanelController:
         return fresh_shortlist_response(prepared, evaluation)
 
     def strategies_fresh_filter_audit(self, payload: Mapping[str, object]) -> dict[str, object]:
-        options = self._fresh_shortlist_options(payload)
+        options, min_shift_enabled, min_shift_pct = self._fresh_shortlist_settings(payload)
         analysis_id = self._required(payload, "analysis_run_id")
         path = self._fresh_analysis_paths.get(analysis_id)
         if path is None:
             raise ValueError("fresh analysis is not available in this panel session")
-        prepared, evaluation = self._verified_fresh_shortlist(path, analysis_id, options, payload)
+        prepared, evaluation = self._verified_fresh_shortlist(
+            path, analysis_id, options, payload,
+            min_shift_enabled=min_shift_enabled, min_shift_pct=min_shift_pct,
+        )
         output = self.root / "Output" / f"{analysis_id}.shortlist-v2.{evaluation.selection_token}.xlsx"
         output.parent.mkdir(parents=True, exist_ok=True)
         staged = output.with_name(f".{output.stem}.{uuid.uuid4().hex}.pending.xlsx")
@@ -3420,50 +3439,36 @@ class PanelController:
 
     @staticmethod
     def _fresh_shortlist_options(payload: Mapping[str, object]) -> tuple[bool, bool, bool]:
-        """Normalize the fresh-only filter API and reject ambiguous old controls."""
-        legacy_names = ("source_pnl", "efficiency", "close_support", "point_event_count")
-        legacy_values: list[object] = []
-        if "filters" in payload:
-            filters = payload["filters"]
-            if not isinstance(filters, Mapping) or set(filters).difference(legacy_names):
-                raise ValueError("filters must contain only recognized legacy booleans")
-            legacy_values.extend(filters.values())
-        legacy_values.extend(payload[name] for name in legacy_names if name in payload)
-        if any(type(value) is not bool for value in legacy_values):
-            raise ValueError("Phase 2 filters must be booleans")
+        """Backward-compatible view of the centralized fresh request parser."""
+        if "min_shift_enabled" in payload or "min_shift_pct" in payload:
+            raise ValueError("Minimum Shift settings require _fresh_shortlist_settings")
+        return parse_fresh_shortlist_request(payload)[0]
 
-        flag_names = ("pretest_ab_enabled", "ladder_enabled", "pareto_enabled")
-        flags = []
-        for name in flag_names:
-            value = payload.get(name, False)
-            if type(value) is not bool:
-                raise ValueError(f"{name} must be a boolean")
-            flags.append(value)
-
-        version_present = "filter_version" in payload
-        if version_present and payload["filter_version"] != "shortlist-v2":
-            raise ValueError("unsupported filter_version; expected shortlist-v2")
-        if any(legacy_values):
-            raise ValueError("stale shortlist client; send filter_version=shortlist-v2 and use the v2 flags")
-        if not version_present and any(name in payload for name in flag_names[1:]):
-            raise ValueError("stale shortlist client; send filter_version=shortlist-v2")
-        return flags[0], flags[1], flags[2]
+    @staticmethod
+    def _fresh_shortlist_settings(
+        payload: Mapping[str, object],
+    ) -> tuple[tuple[bool, bool, bool], bool, str | None]:
+        return parse_fresh_shortlist_request(payload)
 
     def _evaluate_fresh_shortlist_snapshot(
         self, path: Path, analysis_id: str, options: tuple[bool, bool, bool],
+        *, min_shift_enabled: bool = False, min_shift_pct: str | None = None,
     ) -> tuple[object, object]:
         """Prepare and evaluate through the single content-bound executor."""
         return self._fresh_shortlist_executor.evaluate_with_prepared(
-            path,
-            analysis_id,
-            options,
-            workers=self._import_settings().workers,
+            path, analysis_id, options, workers=self._import_settings().workers,
+            **({"min_shift_enabled": True, "min_shift_pct": min_shift_pct}
+               if min_shift_enabled else {"min_shift_enabled": False}),
         )
 
     def _verified_fresh_shortlist(
         self, path: Path, analysis_id: str, options: tuple[bool, bool, bool], payload: Mapping[str, object],
+        *, min_shift_enabled: bool = False, min_shift_pct: str | None = None,
     ) -> tuple[object, object]:
-        prepared, evaluation = self._evaluate_fresh_shortlist_snapshot(path, analysis_id, options)
+        prepared, evaluation = self._evaluate_fresh_shortlist_snapshot(
+            path, analysis_id, options,
+            min_shift_enabled=min_shift_enabled, min_shift_pct=min_shift_pct,
+        )
         self._require_fresh_selection_token(payload, evaluation)
         return prepared, evaluation
 
@@ -3517,11 +3522,11 @@ class PanelController:
             "filter_engine_version": evaluation.filter_engine_version,
             "selection_token": evaluation.selection_token,
             "artifact_sha256": evaluation.artifact_sha256,
-            "applied_options": dict(zip(
-                ("pretest_ab_enabled", "ladder_enabled", "pareto_enabled"),
+            "applied_options": serialize_applied_options(
                 evaluation.options,
-                strict=True,
-            )),
+                **({"min_shift_enabled": True, "min_shift_pct": evaluation.min_shift_pct}
+                   if evaluation.min_shift_enabled else {}),
+            ),
             "selected_candidate_ids": list(selected_ids),
         }
 

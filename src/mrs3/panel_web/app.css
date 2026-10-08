@@ -239,6 +239,8 @@ tbody th { font-weight: 750; }
 .shortlist-table th:nth-child(12), .shortlist-table td:nth-child(12) { width: 100px; }
 
 .shortlist-filter-controls { display: flex; flex-direction: column; align-items: flex-start; gap: 10px; margin: 12px 0; }
+.shortlist-filter-controls .field-inline { display: flex; align-items: center; gap: 8px; }
+.shortlist-filter-controls .field-inline input { width: 7rem; }
 #shortlist-summary { display: none; }
 
 .performance-v2-strategy-details { margin: -2px 0 14px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; background: #fbfcfe; color: var(--muted); font-size: .78rem; }

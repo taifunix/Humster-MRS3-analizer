@@ -32,6 +32,12 @@ def test_fresh_shortlist_options_requires_version_for_new_flags() -> None:
 
     with pytest.raises(ValueError, match="filter_version=shortlist-v2"):
         parse({"ladder_enabled": False})
+    with pytest.raises(ValueError, match="_fresh_shortlist_settings"):
+        parse({
+            "filter_version": "shortlist-v2",
+            "min_shift_enabled": True,
+            "min_shift_pct": "0.300",
+        })
 
 
 @pytest.mark.parametrize("payload", [
@@ -194,6 +200,7 @@ def test_generation_thread_start_failure_does_not_poison_the_next_request(tmp_pa
     snapshot = controller.strategies_fresh_shortlist({
         "analysis_run_id": analysis_id, "filter_version": "shortlist-v2",
         "pretest_ab_enabled": False, "ladder_enabled": False, "pareto_enabled": False,
+        "min_shift_enabled": True, "min_shift_pct": "0.3",
     })
 
     class FailingThread:
@@ -210,6 +217,7 @@ def test_generation_thread_start_failure_does_not_poison_the_next_request(tmp_pa
             "analysis_run_id": analysis_id,
             "filter_version": "shortlist-v2",
             "pretest_ab_enabled": False, "ladder_enabled": False, "pareto_enabled": False,
+            "min_shift_enabled": True, "min_shift_pct": "0.3",
             "selection_token": snapshot["selection_token"],
             "candidate_ids": ["browser-id"],
             "selected_scopes": [["BTCUSDT", "LONG", "1h"]],
@@ -445,11 +453,13 @@ def test_run_files_uses_filtered_ready_candidates(tmp_path: Path, monkeypatch) -
     snapshot = controller.strategies_fresh_shortlist({
         "analysis_run_id": analysis_id, "filter_version": "shortlist-v2",
         "pretest_ab_enabled": False, "ladder_enabled": False, "pareto_enabled": False,
+        "min_shift_enabled": True, "min_shift_pct": "0.3",
     })
 
     result = controller.strategies_fresh_generate_runs({
         "analysis_run_id": analysis_id, "filter_version": "shortlist-v2",
         "pretest_ab_enabled": False, "ladder_enabled": False, "pareto_enabled": False,
+        "min_shift_enabled": True, "min_shift_pct": "0.3",
         "selection_token": snapshot["selection_token"],
         "selected_scopes": [["BTCUSDT", "LONG", "1h"]],
         "start_date": "2026-08-01", "end_date": "2026-08-18",
@@ -463,6 +473,10 @@ def test_run_files_uses_filtered_ready_candidates(tmp_path: Path, monkeypatch) -
     runs_manifest = json.loads((tmp_path / "bot" / "tester" / "runs_manifest.json").read_text(encoding="utf-8"))
     assert runs_manifest["shortlist_v2"]["selection_token"] == snapshot["selection_token"]
     assert runs_manifest["shortlist_v2"]["selected_candidate_ids"] == ["STR-READY"]
+    assert runs_manifest["shortlist_v2"]["applied_options"] == {
+        "pretest_ab_enabled": False, "ladder_enabled": False, "pareto_enabled": False,
+        "min_shift_enabled": True, "min_shift_pct": "0.300",
+    }
 
 
 def test_fresh_generation_uses_config_workflow_defaults_not_browser_paths(tmp_path: Path, monkeypatch) -> None:

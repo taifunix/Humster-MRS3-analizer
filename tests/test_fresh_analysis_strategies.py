@@ -294,6 +294,34 @@ def test_fresh_json_generator_requires_verified_shortlist_selection(tmp_path: Pa
     assert not (tmp_path / "out").exists()
 
 
+def test_fresh_json_generator_binds_min_shift_settings_to_selection(tmp_path: Path) -> None:
+    from mrs3.fresh_analysis_strategies import generate_fresh_analysis_strategies
+    from mrs3.fresh_shortlist import FreshShortlistExecutor
+
+    database = tmp_path / "run.analysis-v6.duckdb"
+    analysis_id, _surface = _make_analysis(database)
+    selection = FreshShortlistExecutor().evaluate(
+        database, analysis_id, (False, False, False), workers=1,
+        min_shift_enabled=True, min_shift_pct="0.3",
+    )
+    template = tmp_path / "template.json"
+    template.write_text(json.dumps(_template()), encoding="utf-8")
+    common = (database, analysis_id, selection.ready_candidate_ids, [("BTCUSDT", "LONG", "1h")], template, tmp_path / "out", AlgorithmConfig.defaults())
+    with pytest.raises(ValueError, match="settings are required"):
+        generate_fresh_analysis_strategies(*common, selection=selection)
+    with pytest.raises(ValueError, match="supplied together"):
+        generate_fresh_analysis_strategies(*common, min_shift_enabled=True, selection=selection)
+    with pytest.raises(ValueError, match="options disagree"):
+        generate_fresh_analysis_strategies(
+            *common, min_shift_enabled=True, min_shift_pct="1.000", selection=selection,
+        )
+    result = generate_fresh_analysis_strategies(
+        *common, min_shift_enabled=True, min_shift_pct="0.3", selection=selection,
+    )
+    manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    assert manifest["shortlist_v2"]["applied_options"]["min_shift_pct"] == "0.300"
+
+
 def test_legacy_analysis_works_without_pretest_and_requires_rebuild_with_it(tmp_path: Path) -> None:
     from mrs3.fresh_analysis_strategies import generate_fresh_analysis_strategies
 

@@ -56,6 +56,7 @@ _PRETEST_AB_FIELDS = {
     "a_days", "b_days", "a_pnl", "b_pnl", "a_round_trips", "b_round_trips",
 }
 _LEGACY_SURFACE_FINGERPRINT = "surface-v6-fresh-compact-v2"
+_MISSING_GENERATOR_OPTION = object()
 
 
 def _supports_pretest_ab(manifest: Mapping[str, object]) -> bool:
@@ -394,7 +395,7 @@ def _canonical_id_sql_filter(expression: str, selected_ids: Sequence[str]) -> tu
 
 def fresh_shortlist_response(prepared: object, evaluation: object) -> dict[str, object]:
     """Render the cached v2 selection without rereading candidate payloads."""
-    from .fresh_shortlist import FILTER_VERSION
+    from .fresh_shortlist import FILTER_VERSION, serialize_applied_options
 
     results = {item.candidate_id: item for item in evaluation.candidates}
     scope_facts = {
@@ -425,11 +426,11 @@ def fresh_shortlist_response(prepared: object, evaluation: object) -> dict[str, 
         "filter_engine_version": evaluation.filter_engine_version,
         "artifact_sha256": evaluation.artifact_sha256,
         "selection_token": evaluation.selection_token,
-        "applied_options": dict(zip(
-            ("pretest_ab_enabled", "ladder_enabled", "pareto_enabled"),
+        "applied_options": serialize_applied_options(
             evaluation.options,
-            strict=True,
-        )),
+            **({"min_shift_enabled": True, "min_shift_pct": evaluation.min_shift_pct}
+               if evaluation.min_shift_enabled else {}),
+        ),
         "items": items,
         "groups": _shortlist_groups(items, scope_facts, filtered=True),
         "active_criteria": [],
@@ -630,6 +631,8 @@ def generate_fresh_analysis_strategies(
     surface_path: Path | str | None = None,
     filters: Mapping[str, object] | Sequence[str] | None = None,
     pretest_ab_enabled: bool = False,
+    min_shift_enabled: object = _MISSING_GENERATOR_OPTION,
+    min_shift_pct: object = _MISSING_GENERATOR_OPTION,
     selection: object,
 ) -> FreshAnalysisStrategies:
     """Generate EQUAL/INCOME JSON for exact READY candidates in one fresh run."""
@@ -648,6 +651,18 @@ def generate_fresh_analysis_strategies(
             raise ValueError("filters must contain only recognized legacy booleans")
     if selection is None:
         raise ValueError("a verified shortlist selection is required")
+    from .fresh_shortlist import normalize_min_shift
+    if (min_shift_enabled is _MISSING_GENERATOR_OPTION) != (min_shift_pct is _MISSING_GENERATOR_OPTION):
+        raise ValueError("min_shift_enabled and min_shift_pct must be supplied together")
+    selection_shift_enabled = bool(getattr(selection, "min_shift_enabled", False))
+    selection_shift_pct = getattr(selection, "min_shift_pct", None)
+    if min_shift_enabled is _MISSING_GENERATOR_OPTION:
+        if selection_shift_enabled:
+            raise ValueError("enabled shortlist Minimum Shift settings are required")
+    else:
+        requested_shift = normalize_min_shift(min_shift_enabled, min_shift_pct)
+        if requested_shift != (selection_shift_enabled, selection_shift_pct):
+            raise ValueError("shortlist options disagree with generator request")
     analysis_file = Path(analysis_path).resolve()
     expected_digest = getattr(selection, "artifact_sha256", None)
     manifest, analysis_id, analysis_artifact_sha256 = _read_analysis(analysis_file)
@@ -728,16 +743,18 @@ def generate_fresh_analysis_strategies(
         "generator_schema_version": GENERATOR_SCHEMA,
     }
     if selection is not None:
+        from .fresh_shortlist import serialize_applied_options
+
         common["shortlist_v2"] = {
             "filter_version": selection.filter_version,
             "filter_engine_version": selection.filter_engine_version,
             "selection_token": selection.selection_token,
             "artifact_sha256": selection.artifact_sha256,
-            "applied_options": dict(zip(
-                ("pretest_ab_enabled", "ladder_enabled", "pareto_enabled"),
+            "applied_options": serialize_applied_options(
                 selection.options,
-                strict=True,
-            )),
+                **({"min_shift_enabled": True, "min_shift_pct": selection.min_shift_pct}
+                   if selection.min_shift_enabled else {}),
+            ),
             "selected_candidate_ids": list(selected),
         }
     if "analysis_input_digest" in manifest:

@@ -243,8 +243,42 @@ const freshShortlistStateHelpers = (() => {
   const version = 'shortlist-v2';
   const off = Object.freeze({ pretest_ab_enabled: false, ladder_enabled: false, pareto_enabled: false });
   const optionKeys = Object.keys(off);
-  const optionsOf = (options = off) => Object.fromEntries(optionKeys.map((key) => [key, options[key] === true]));
-  const sameOptions = (left, right) => optionKeys.every((key) => left[key] === right[key]);
+  const parsePctForComparison = (value) => {
+    const text = String(value ?? '').trim();
+    const regular = text.match(/^\+?(\d+)(?:\.(\d*))?(?:e([+-]?\d+))?$/i);
+    const leading = text.match(/^\+?\.(\d+)(?:e([+-]?\d+))?$/i);
+    if (!regular && !leading) return null;
+    const fractional = regular ? (regular[2] || '') : leading[1];
+    const exponent = Number(regular ? (regular[3] || 0) : (leading[2] || 0));
+    return { text, decimalPlaces: Math.max(0, fractional.length - exponent), numeric: Number(text) };
+  };
+  const canonicalPctForComparison = (value) => {
+    const parsed = parsePctForComparison(value);
+    if (!parsed || parsed.decimalPlaces > 3 || !Number.isFinite(parsed.numeric)) return parsed?.text ?? String(value ?? '').trim();
+    return parsed.numeric.toFixed(3);
+  };
+  const validatePctForRequest = (value) => {
+    const parsed = parsePctForComparison(value);
+    if (!parsed || !Number.isFinite(parsed.numeric) || parsed.numeric <= 0 || parsed.numeric > 100) {
+      return 'Minimum Shift must be a finite number greater than 0 and at most 100%.';
+    }
+    if (parsed.decimalPlaces > 3) return 'Minimum Shift may use at most three decimal places.';
+    return '';
+  };
+  const optionsOf = (options = off) => {
+    const result = Object.fromEntries(optionKeys.map((key) => [key, options[key] === true]));
+    if (options.min_shift_enabled === true) {
+      result.min_shift_enabled = true;
+      result.min_shift_pct = canonicalPctForComparison(options.min_shift_pct ?? '');
+    }
+    return result;
+  };
+  const sameOptions = (left, right) => {
+    const a = optionsOf(left); const b = optionsOf(right);
+    return Object.keys(a).length === Object.keys(b).length && Object.keys(a).every((key) => (
+      key === 'min_shift_pct' ? canonicalPctForComparison(a[key]) === canonicalPctForComparison(b[key]) : a[key] === b[key]
+    ));
+  };
   const isReady = (group) => Number(group?.ready_after_filters ?? group?.ready ?? 0) > 0;
   const readyGroups = (groups) => groups.filter(isReady);
   const pruneReadyScopes = (selected, groups) => {
@@ -268,20 +302,38 @@ const freshShortlistStateHelpers = (() => {
     let generateBusy = false;
     let generationRevision = 0;
     let error = '';
-    const readDraft = () => Object.fromEntries(optionKeys.map((key) => [key, !!controls[key]?.checked]));
-    const writeDraft = (options) => { for (const key of optionKeys) if (controls[key]) controls[key].checked = options[key] === true; };
+    const readDraft = () => {
+      const result = Object.fromEntries(optionKeys.map((key) => [key, !!controls[key]?.checked]));
+      if (controls.min_shift_enabled || controls.min_shift_pct) {
+        result.min_shift_enabled = controls.min_shift_enabled?.checked === true;
+        result.min_shift_pct = String(controls.min_shift_pct?.value ?? '0.3');
+      }
+      return result;
+    };
+    const writeDraft = (options) => {
+      for (const key of optionKeys) if (controls[key]) controls[key].checked = options[key] === true;
+      if (controls.min_shift_enabled) controls.min_shift_enabled.checked = options.min_shift_enabled === true;
+      if (controls.min_shift_pct && options.min_shift_enabled === true) {
+        controls.min_shift_pct.value = String(options.min_shift_pct);
+      } else if (controls.min_shift_pct && !controls.min_shift_pct.value) {
+        controls.min_shift_pct.value = '0.3';
+      }
+    };
     const notify = () => onChange({
       analysisRunId, snapshot, busy, generateBusy,
       pending: !!snapshot && !sameOptions(readDraft(), snapshot.applied_options),
       error,
     });
     for (const key of optionKeys) controls[key]?.addEventListener('change', () => { error = ''; notify(); });
+    controls.min_shift_enabled?.addEventListener('change', () => { error = ''; notify(); });
+    controls.min_shift_pct?.addEventListener('input', () => { error = ''; notify(); });
+    controls.min_shift_pct?.addEventListener('change', () => { error = ''; notify(); });
     writeDraft(off);
     const isCurrent = (expectedRevision, expectedAnalysisId = analysisRunId) => revision === expectedRevision && analysisRunId === expectedAnalysisId;
     const bodyFor = (analysisId, options) => ({ analysis_run_id: analysisId, filter_version: version, ...optionsOf(options) });
     const snapshotFrom = (payload, analysisId) => {
       const applied = payload?.applied_options;
-      if (payload?.filter_version !== version || payload?.analysis_run_id !== analysisId || typeof payload?.selection_token !== 'string' || !payload.selection_token.trim() || !applied || optionKeys.some((key) => typeof applied[key] !== 'boolean')) {
+      if (payload?.filter_version !== version || payload?.analysis_run_id !== analysisId || typeof payload?.selection_token !== 'string' || !payload.selection_token.trim() || !applied || optionKeys.some((key) => typeof applied[key] !== 'boolean') || (applied.min_shift_enabled === true && typeof applied.min_shift_pct !== 'string')) {
         throw new Error('Invalid shortlist snapshot');
       }
       return {
@@ -334,7 +386,14 @@ const freshShortlistStateHelpers = (() => {
         return false;
       }
     };
-    const applyDraft = () => replaceSnapshot(readDraft());
+    const applyDraft = () => {
+      const draft = readDraft();
+      if (draft.min_shift_enabled === true) {
+        const validationError = validatePctForRequest(draft.min_shift_pct);
+        if (validationError) { error = validationError; notify(); return Promise.resolve(false); }
+      }
+      return replaceSnapshot(draft);
+    };
     const refresh = () => snapshot ? replaceSnapshot(snapshot.applied_options) : false;
     const actionPayload = (extra = {}) => snapshot && !busy && snapshot.analysis_run_id === analysisRunId
       ? { ...extra, analysis_run_id: analysisRunId, filter_version: snapshot.filter_version, ...snapshot.applied_options, selection_token: snapshot.selection_token }
@@ -356,7 +415,7 @@ const freshShortlistStateHelpers = (() => {
       sumPlateauCounts,
     };
   };
-  return { create, isReady, readyGroups, pruneReadyScopes, sumPlateauCounts };
+  return { create, isReady, readyGroups, pruneReadyScopes, sumPlateauCounts, canonicalPctForComparison, validatePctForRequest };
 })();
 if (typeof globalThis !== 'undefined') globalThis.freshShortlistStateHelpers = freshShortlistStateHelpers;
 
@@ -1923,6 +1982,8 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
     controls: {
       pretest_ab_enabled: document.querySelector('#shortlist-filter-pretest-ab'),
       ladder_enabled: document.querySelector('#shortlist-filter-ladder'),
+      min_shift_enabled: document.querySelector('#shortlist-filter-min-shift'),
+      min_shift_pct: document.querySelector('#shortlist-filter-min-shift-pct'),
       pareto_enabled: document.querySelector('#shortlist-filter-pareto'),
     },
     request: remoteRequest,

@@ -22,7 +22,9 @@ import numpy as np
 
 
 FILTER_VERSION = "shortlist-v2"
-FILTER_ENGINE_VERSION = "shortlist-v2-engine-1"
+LEGACY_FILTER_ENGINE_VERSION = "shortlist-v2-engine-1"
+FILTER_ENGINE_VERSION = "shortlist-v2-engine-2"
+_MISSING = object()
 _READY_STATUS = "READY_MRS3_STRUCTURE"
 _TABLES = ("points", "structures", "plateaus")
 _DEFAULT_CACHE_LIMIT = 256 * 1024 * 1024
@@ -117,6 +119,8 @@ class FreshShortlistEvaluation:
     ready_candidate_ids: tuple[str, ...]
     candidates: tuple[FreshCandidateResult, ...]
     groups: tuple[FreshScopeResult, ...]
+    min_shift_enabled: bool = False
+    min_shift_pct: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -443,6 +447,101 @@ def _validate_options(options: object) -> tuple[bool, bool, bool]:
     return bool(options[0]), bool(options[1]), bool(options[2])
 
 
+def normalize_min_shift(enabled: object, pct: object = _MISSING) -> tuple[bool, str | None]:
+    """Validate and canonicalize the fresh shortlist Minimum Shift settings."""
+    if type(enabled) is not bool:
+        raise ValueError("min_shift_enabled must be a boolean")
+    if not enabled:
+        return False, None
+    if pct is _MISSING:
+        raise ValueError("min_shift_pct is required when min_shift_enabled is true")
+    if isinstance(pct, bool) or pct is None:
+        raise ValueError("min_shift_pct must be a finite numeric percentage")
+    try:
+        value = Decimal(str(pct))
+    except (InvalidOperation, TypeError, ValueError) as error:
+        raise ValueError("min_shift_pct must be a finite numeric percentage") from error
+    if not value.is_finite() or value <= 0 or value > 100 or value.as_tuple().exponent < -3:
+        raise ValueError("min_shift_pct must be greater than 0, at most 100, and use at most 3 decimals")
+    canonical = format(value.quantize(Decimal("0.001")), "f")
+    return enabled, canonical if enabled else None
+
+
+def parse_fresh_shortlist_request(
+    payload: Mapping[str, object],
+) -> tuple[tuple[bool, bool, bool], bool, str | None]:
+    """Parse all fresh shortlist options, including the optional Shift gate."""
+    legacy_names = ("source_pnl", "efficiency", "close_support", "point_event_count")
+    legacy_values: list[object] = []
+    if "filters" in payload:
+        filters = payload["filters"]
+        if not isinstance(filters, Mapping) or set(filters).difference(legacy_names):
+            raise ValueError("filters must contain only recognized legacy booleans")
+        legacy_values.extend(filters.values())
+    legacy_values.extend(payload[name] for name in legacy_names if name in payload)
+    if any(type(value) is not bool for value in legacy_values):
+        raise ValueError("Phase 2 filters must be booleans")
+
+    flag_names = ("pretest_ab_enabled", "ladder_enabled", "pareto_enabled")
+    flags: list[bool] = []
+    for name in flag_names:
+        value = payload.get(name, False)
+        if type(value) is not bool:
+            raise ValueError(f"{name} must be a boolean")
+        flags.append(value)
+
+    if "filter_version" in payload and payload["filter_version"] != FILTER_VERSION:
+        raise ValueError(f"unsupported filter_version; expected {FILTER_VERSION}")
+    if any(legacy_values):
+        raise ValueError("stale shortlist client; send filter_version=shortlist-v2 and use the v2 flags")
+    if "filter_version" not in payload and any(
+        name in payload for name in (*flag_names[1:], "min_shift_enabled", "min_shift_pct")
+    ):
+        raise ValueError("stale shortlist client; send filter_version=shortlist-v2")
+
+    enabled = payload.get("min_shift_enabled", False)
+    if "min_shift_pct" in payload and "min_shift_enabled" not in payload:
+        raise ValueError("min_shift_enabled is required when min_shift_pct is supplied")
+    pct = payload["min_shift_pct"] if "min_shift_pct" in payload else _MISSING
+    normalized_enabled, normalized_pct = normalize_min_shift(enabled, pct)
+    return (flags[0], flags[1], flags[2]), normalized_enabled, normalized_pct
+
+
+def min_shift_threshold_bp(canonical_pct: str) -> Decimal:
+    """Convert the canonical percentage token to the comparison basis."""
+    return Decimal(canonical_pct) * 100
+
+
+def serialize_applied_options(
+    options: tuple[bool, bool, bool], *, min_shift_enabled: bool = False,
+    min_shift_pct: object = _MISSING,
+) -> dict[str, object]:
+    """Serialize applied options while retaining the disabled legacy shape."""
+    flags = _validate_options(options)
+    enabled, canonical = normalize_min_shift(min_shift_enabled, min_shift_pct)
+    result: dict[str, object] = dict(zip(
+        ("pretest_ab_enabled", "ladder_enabled", "pareto_enabled"), flags, strict=True,
+    ))
+    if enabled:
+        result.update(min_shift_enabled=True, min_shift_pct=canonical)
+    return result
+
+
+def _coerce_order_shift(value: object = _MISSING) -> Decimal | None:
+    """Parse a present persisted Shift without leaking Decimal exceptions."""
+    if value is _MISSING or value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValueError("fresh shortlist order Shift is invalid")
+    try:
+        result = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError) as error:
+        raise ValueError("fresh shortlist order Shift is invalid") from error
+    if not result.is_finite():
+        raise ValueError("fresh shortlist order Shift is invalid")
+    return result
+
+
 def _dominates(first: FreshCandidateMetrics, second: FreshCandidateMetrics) -> bool:
     if len(first.orders) != len(second.orders):
         return False
@@ -464,16 +563,20 @@ def _comparison_key(candidate: FreshCandidateMetrics) -> tuple[str, str, str, in
     return (candidate.pair, candidate.side, candidate.timeframe, candidate.common_close_ma, candidate.order_count)
 
 
-def _token(prepared: PreparedFreshAnalysis, options: tuple[bool, bool, bool], ready_ids: tuple[str, ...]) -> str:
+def _token(
+    prepared: PreparedFreshAnalysis, options: tuple[bool, bool, bool], ready_ids: tuple[str, ...],
+    *, min_shift_enabled: bool = False, min_shift_pct: str | None = None,
+    engine_version: str = LEGACY_FILTER_ENGINE_VERSION,
+) -> str:
     payload = {
         "analysis_id": prepared.analysis_id,
         "artifact_sha256": prepared.artifact_sha256,
-        "engine_version": FILTER_ENGINE_VERSION,
-        "options": {
-            "pretest_ab_enabled": options[0],
-            "ladder_enabled": options[1],
-            "pareto_enabled": options[2],
-        },
+        "engine_version": engine_version,
+        "options": serialize_applied_options(
+            options,
+            **({"min_shift_enabled": True, "min_shift_pct": min_shift_pct}
+               if min_shift_enabled else {}),
+        ),
         "ready_candidate_ids": list(ready_ids),
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
@@ -613,11 +716,16 @@ def evaluate_fresh_shortlist(
     *,
     workers: int,
     temporary_array_budget_bytes: int = _DEFAULT_TEMP_ARRAY_LIMIT,
+    min_shift_enabled: object = False,
+    min_shift_pct: object = _MISSING,
 ) -> FreshShortlistEvaluation:
     """Apply READY -> PRETEST A/B -> first-order MA ladder -> one joint Pareto."""
     from .fresh_analysis_strategies import _pretest_ab_outcome
 
     flags = _validate_options(options)
+    shift_enabled, shift_pct = normalize_min_shift(min_shift_enabled, min_shift_pct)
+    engine_version = FILTER_ENGINE_VERSION if shift_enabled else LEGACY_FILTER_ENGINE_VERSION
+    threshold_bp = min_shift_threshold_bp(shift_pct) if shift_enabled and shift_pct is not None else None
     if isinstance(workers, bool) or not isinstance(workers, int) or workers < 1:
         raise ValueError("fresh shortlist workers must be a positive integer")
     if isinstance(temporary_array_budget_bytes, bool) or not isinstance(temporary_array_budget_bytes, int) or temporary_array_budget_bytes < 1:
@@ -649,6 +757,21 @@ def evaluate_fresh_shortlist(
                 ab_status, ab_reason, decline,
             )
             continue
+        if shift_enabled:
+            # Minimum Shift limits the opening (first) order only. For 1ORD it
+            # is the sole order; for 2ORD/3ORD later orders keep the existing
+            # strictly increasing-Shift construction rule.
+            first_order = candidate.orders[0] if candidate.orders else None
+            first_shift = _coerce_order_shift(
+                getattr(first_order, "shift_bp", _MISSING) if first_order is not None else _MISSING,
+            )
+            if first_shift is None or first_shift < threshold_bp:
+                provisional[candidate.candidate_id] = (
+                    candidate, "DEFERRED_MIN_SHIFT",
+                    "ORDER_SHIFT_UNKNOWN" if first_shift is None else "ORDER_SHIFT_BELOW_MINIMUM",
+                    ab_status, ab_reason, decline,
+                )
+                continue
         provisional[candidate.candidate_id] = (
             candidate, "READY_AFTER_FILTERS", "", ab_status, ab_reason, decline,
         )
@@ -703,8 +826,12 @@ def evaluate_fresh_shortlist(
             counts, len(ready_rows), len(rows) - len(ready_rows), len(rows), ids,
         ))
     return FreshShortlistEvaluation(
-        prepared.analysis_id, prepared.artifact_sha256, FILTER_VERSION, FILTER_ENGINE_VERSION,
-        flags, _token(prepared, flags, ready_ids), ready_ids, tuple(results), tuple(scope_groups),
+        prepared.analysis_id, prepared.artifact_sha256, FILTER_VERSION, engine_version,
+        flags, _token(
+            prepared, flags, ready_ids, min_shift_enabled=shift_enabled,
+            min_shift_pct=shift_pct, engine_version=engine_version,
+        ),
+        ready_ids, tuple(results), tuple(scope_groups), shift_enabled, shift_pct,
     )
 
 
@@ -772,11 +899,10 @@ class FreshShortlistExecutor:
     def _get_cached(
         self,
         prepared_key: tuple[str, str, str],
-        options: tuple[bool, bool, bool],
+        cache_key: tuple[object, ...],
     ) -> tuple[PreparedFreshAnalysis | None, FreshShortlistEvaluation | None]:
         with self._condition:
             prepared = self._prepared if self._prepared_key == prepared_key else None
-            cache_key = (prepared_key, options)
             cached = self._evaluations.get(cache_key)
             if cached is not None:
                 self._evaluations.move_to_end(cache_key)
@@ -787,7 +913,7 @@ class FreshShortlistExecutor:
         self,
         prepared_key: tuple[str, str, str],
         prepared: PreparedFreshAnalysis,
-        options: tuple[bool, bool, bool],
+        cache_key: tuple[object, ...],
         result: FreshShortlistEvaluation,
     ) -> None:
         prepared_size = _object_graph_size(prepared)
@@ -806,7 +932,6 @@ class FreshShortlistExecutor:
                     self._prepared_bytes = 0
             if self._prepared_key != prepared_key or self._prepared is not prepared:
                 return
-            cache_key = (prepared_key, options)
             prior = self._evaluations.pop(cache_key, None)
             if prior is not None:
                 self._evaluation_bytes -= prior[1]
@@ -832,9 +957,12 @@ class FreshShortlistExecutor:
         options: tuple[bool, bool, bool] | Sequence[bool],
         *,
         workers: int,
+        min_shift_enabled: object = False,
+        min_shift_pct: object = _MISSING,
     ) -> FreshShortlistEvaluation:
         return self.evaluate_with_prepared(
             analysis_path, analysis_id, options, workers=workers,
+            min_shift_enabled=min_shift_enabled, min_shift_pct=min_shift_pct,
         )[1]
 
     def evaluate_with_prepared(
@@ -844,16 +972,26 @@ class FreshShortlistExecutor:
         options: tuple[bool, bool, bool] | Sequence[bool],
         *,
         workers: int,
+        min_shift_enabled: object = False,
+        min_shift_pct: object = _MISSING,
     ) -> tuple[PreparedFreshAnalysis, FreshShortlistEvaluation]:
         from .fresh_analysis_strategies import _file_digest
 
         flags = _validate_options(options)
+        shift_enabled, shift_pct = normalize_min_shift(min_shift_enabled, min_shift_pct)
         path = Path(analysis_path).resolve()
         # Hash at the action's consistency point even for a warm cache hit.
         digest = _file_digest(path)
-        prepared_key = (str(analysis_id), digest, FILTER_ENGINE_VERSION)
-        action_key = (prepared_key, flags)
-        cached_prepared, cached_result = self._get_cached(prepared_key, flags)
+        # Preparation reads the analysis artifact only; the engine version is
+        # an evaluation concern and must not force the same artifact to be
+        # reparsed when the checkbox is toggled.
+        prepared_key = (str(analysis_id), digest, "prepared-v1")
+        cache_key: tuple[object, ...] = (
+            (prepared_key, flags)
+            if not shift_enabled else (prepared_key, flags, "min_shift-v1", shift_pct)
+        )
+        action_key = cache_key
+        cached_prepared, cached_result = self._get_cached(prepared_key, cache_key)
         if cached_result is not None:
             if cached_prepared is None:
                 raise RuntimeError("fresh shortlist evaluation cache has no prepared analysis")
@@ -903,8 +1041,10 @@ class FreshShortlistExecutor:
                 flags,
                 workers=workers,
                 temporary_array_budget_bytes=self.temporary_array_budget_bytes,
+                min_shift_enabled=shift_enabled,
+                **({"min_shift_pct": shift_pct} if shift_enabled else {}),
             )
-            self._remember(prepared_key, prepared, flags, result)
+            self._remember(prepared_key, prepared, cache_key, result)
         except BaseException as error:
             with self._condition:
                 self._active_done = True
