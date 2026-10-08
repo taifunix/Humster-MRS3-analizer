@@ -1,80 +1,77 @@
 # MRS3 Current Status
 
-Last updated: 2026-10-07
+Last updated: 2026-10-08
 
 This file is a current-status snapshot, not a session log. Earlier progress notes remain in Git history; feature contracts and detailed evidence belong in the linked specs, reports, and plans.
 
+Use [PRD.md](PRD.md) for the feature registry and [docs/README.md](docs/README.md)
+for the documentation map. Read the linked contract only for the active task;
+do not treat this file as a replacement for a feature specification.
+
 ## PerformanceDB maintenance
 
-The maintenance card is implemented in the Strategy and DD5 tab. It supports pair selection, strategy-count previews, Rejected detail cleanup, full pair deletion, progress reporting, elapsed time, and actionable database errors. The code targets schema v9 and adds no cleanup markers, deletion timestamps, backups, or maintenance tables.
+The maintenance card is implemented in the Strategy and DD5 tab. It supports pair selection, strategy-count previews, Rejected retirement, full pair deletion, progress reporting, elapsed time, and actionable database errors. `Удалить Rejected` now physically removes per-strategy facts, window/equity caches, tags, rejection sources, and selection rows, compacts the retained result to interval/provenance identity, then atomically marks the typed identity as `DISCARDED`; only strategy settings/orders and that compact tombstone remain for deduplication. The code targets schema v9 and adds no cleanup markers, deletion timestamps, backups, or maintenance tables. Contract: [PerformanceDB maintenance](docs/specs/2026-10-06-performance-db-maintenance.md); retirement decision: [ADR-0061](docs/decisions/0061-performance-db-rejected-retirement.md).
+
+Retirement verification after the expansion: maintenance 52 passed, selection 239 passed, importer 120 passed, XLSX export 11 passed, and the Panel discarded-catalog check passed; `node --check src/mrs3/panel_web/app.js`, `py_compile`, and `git diff --check` passed. All database tests used isolated temporary DuckDB fixtures; no live PerformanceDB or Panel process was used.
 
 The legacy v6-to-v7 migration fix and the narrowly scoped recovery for the known v9 catalog error are included. The feature contract is [PerformanceDB maintenance](docs/specs/2026-10-06-performance-db-maintenance.md). Independent Claude Opus review passed. Focused migration, maintenance, static UI, and Panel HTTP checks passed. No live PerformanceDB was accessed or modified during verification.
-
 ## Performance v2 selection and equity regime
 
-The Panel's `Минимальный Shift` stage is now enabled by default at `0.3%` and
-fixed immediately before `PnL DD5/30 + PnL B/30`. The server applies the same
-fixed ordering even when a request submits the two stages in the opposite
-order; missing Shift facts retain the existing pass-through behavior, exact
-percent-to-basis-point boundaries are covered, and legacy requests that omit
-the stage remain unchanged. Focused selection and Panel static UI verification
-passed (`401 passed`). No live database or tester was used.
-The broader selection/panel/export consumer run passed `341` tests with `4`
-platform symlink skips. The one stale XLSX-header expectation was updated to
-the accepted column contract; no runtime export failure remains in this run.
-The Minimum Shift threshold input now uses the dedicated threshold column in
-the Panel; the Top N-only fixed-stage layout no longer captures it. Static UI
-verification after the CSS fix passed (`163 passed`).
+The Performance v2 fixed-filter sequence is implemented and independently
+reviewed. Its fixed Minimum Shift gate is enabled at `0.3%` immediately before
+`PnL DD5/30 + PnL B/30`; the contract is [the filter-sequence specification](docs/specs/2026-10-01-performance-v2-filter-sequence.md).
 
-Excel column consistency is implemented in the shared workbook renderer.
-Legacy R7.3 cache presence no longer changes a legacy workbook's headers. The
-four R7.3 fields appear only for an explicit `equity_quality_v1` ranking
-request; the new regime block appears for an enabled `filter_equity_regime` or
-a valid published regime snapshot. The contract is [Performance v2 XLSX
-column contract](docs/specs/2026-10-07-performance-v2-xlsx-column-contract.md).
-The same contract omits the verbose history/cycle and top-five PnL display
-columns, plus regime state/decision and ATH diagnostic columns, while retaining
-those facts in the calculation/database layer. Regime period columns are shown
-as PRE28, W28, W14, W7 with double visual separators; the shared contract is
-covered for the ordinary writer, PerformanceDB export, finalist control, and
-bulk-control candidate workbook paths.
-The focused selection/export modules pass (`228 passed`); the related
-regime/export/finalist-control run is `90 passed, 1 skipped` plus the same
-pre-existing `PARETO_PLATEAU_POINTS_PER_ORDER` alias expectation. No live
-database or panel was used.
+The shared [XLSX column contract](docs/specs/2026-10-07-performance-v2-xlsx-column-contract.md)
+now gives stable columns and separates the PRE28/W28/W14/W7 regime blocks.
+The equity-regime classifier, cache, selection and Panel integration are
+implemented locally; its live migration remains open. Evidence and exact
+status rules are linked from the [equity status map](docs/specs/2026-10-03-equity-regime-status-map.md).
 
-The researched selection stages and the equity-regime cache are implemented. Selection publication validates cached facts against the current source before publishing. Missing or invalid cache data blocks publication atomically. Focused backend and Panel selection/equity suites passed; independent Claude Opus review passed.
-
-Card 6 now restores User Status and User Rank from partial selection XLSX folders and shows per-file progress, applied/unchanged counts, and actual API errors in Panel. Blank statuses are skipped; only nonblank decisions are checked against the database and written through the existing review ledger. FINALIST ranks are optional and unique within a run; RESERVE and REJECTED ranks must be blank. Focused partial-import/API/UI checks passed (19 tests), the full selection-review module passed (102 tests), and blank FINALIST rank clearing passed separately. Independent Claude Opus review passed. No live PerformanceDB was accessed or modified.
-
-The 250-member global finalist retest completed and `IMPORT & REPLACE` captured and validated its metadata inbox. The first import attempt failed before publication because 26 incoming reports have shorter effective periods than their current results; a read-only period audit confirmed 224 pass the existing guard. The earliest current effective start in this cohort is 2026-06-01 UTC. A read-only database check confirmed all 250 current Result IDs still match the frozen cohort, no cohort results were updated during the failed attempt, and no import-run rows were created. The importer now rejects a short or invalid period per strategy while eligible siblings continue, and the UI displays the concrete reason. Related importer, Panel, and UI modules pass 464 tests (4 platform-dependent real-symlink cases skipped); Claude Opus review passed and Panel was restarted. Start a fresh retest from 2026-06-01 through 2026-10-05 before importing again.
-
-A read-only replay classified 30,940 frozen rows twice with identical output SHA-256 `870C88D293067C2CB1E8A58B4A297E2C4234E7AC87DA509E225EA374F6CCE0AF`. This verifies frozen summary facts; it does not re-extract all raw equity points. Evidence is in [the production replay report](docs/reports/2026-10-04-equity-regime-production-replay.md) and [the M3 research report](docs/reports/2026-10-04-equity-regime-m3-research.md). Current status rules and cleanup policy are in the [status-map specification](docs/specs/2026-10-03-equity-regime-status-map.md), [ADR-0055](docs/decisions/0055-equity-filter-rejected-and-manual-fact-cleanup.md), [ADR-0056](docs/decisions/0056-equity-rejection-source-lifecycle.md), and [ADR-0057](docs/decisions/0057-performance-db-manual-maintenance.md); later decisions supersede the initial cleanup-marker proposal.
-
+Card 6 partial selection review import and the global finalist retest control
+are implemented and reviewed. The current live retest/import state is tracked
+under [Blockers and open tracks](#blockers-and-open-tracks) below; no live
+database mutation is implied by local test evidence.
 ## Other verified Panel changes
 
-Panel PerformanceDB recalculation now serializes access through the controller lock. The focused Panel test module and independent review passed.
+Panel PerformanceDB recalculation now serializes access through the controller
+lock; live PURR confirmation remains open below. Performance v2 researched
+stages 6–9 and the near-duplicate rule are governed by the
+[researched-filter contract](docs/specs/2026-10-02-performance-v2-researched-filters.md).
 
-Portfolio Stage 2 sequential batch is implemented against fixtures/fakes only:
-one job processes every committed Stage 1 candidate in order, exposes each
-completed result and batch progress, and requires explicit UI confirmation with
-the exact candidate count. Targeted backend tests passed (64 passed, 1
-platform-only symlink skip); tester lock/fill/stop tests passed (18); the full
-static UI module passed (161), and `node --check src/mrs3/panel_web/app.js`
-passed. A broader combined test run is not clean: the unmodified
-`tests/test_portfolio_input.py::_add_review` fixture inserts 11 values into
-the schema-v9 `selection_results` table after its `equity_regime_json` column
-was added. The live Panel was not restarted or used, and no real tester was
-run. A cancellation/result-sync race was reproduced before its fix; eleven
-selected backend/UI/fill/restore regression tests pass after the fix.
-Independent Claude Opus code review returned `CODE_REVIEW_PASS`. Any real local
-smoke remains a separate action requiring M5/M6 readiness and fresh user
-authorization.
+Portfolio Stage 2 ordered-batch is fixture/fake-only and does not authorize a
+real tester run. The Source v6 fresh compact multi-scope pipeline is complete;
+this does not establish realized MRS3 performance.
+## Bulk finalist equity-filter application (2026-10-07)
 
-Performance v2 selection stages 6 through 9 and the stage 9 near-duplicate rule are documented in [the researched filter contract](docs/specs/2026-10-02-performance-v2-researched-filters.md). Focused selection and static UI checks passed; independent review passed.
+Card 6 has an explicit asynchronous `Применить эквити фильтр` action for the
+frozen successful FINALIST or FINALIST+RESERVE cohort. It warms only missing
+equity cache rows, runs only `filter_equity_regime`, publishes group snapshots
+atomically, and reports phase/progress/result counts/typed errors. Import and
+recovery do not invoke it automatically. Contract: [Performance v2 finalist
+retest control](docs/specs/2026-09-09-performance-v2-finalist-retest-control.md).
 
-The Source v6 fresh compact multi-scope pipeline is marked complete in [PRD.md](PRD.md). This does not prove realized MRS3 performance.
+Local backend, UI, equity and publication checks passed; the pre-existing
+`PARETO_PLATEAU_POINTS_PER_ORDER` alias expectation is unchanged. No live
+database, tester or Panel process was used.
+## Bybit base-lot XLSX export (2026-10-07)
 
+The one-command [Bybit base-lot export](docs/specs/2026-10-07-bybit-base-lot-export.md)
+reuses the validated seven-day minute-liquidity window, writes the base lot to
+`Actual!C`, and writes the UTC date or an explicit cell error to `Actual!D`.
+Focused tests and independent review passed; no live workbook or network run
+was performed.
+## Fresh shortlist Minimum Shift gate (2026-10-08)
+
+The fresh **Shortlist and READY JSON** flow has an optional
+[Minimum Shift contract](docs/specs/2026-10-08-fresh-shortlist-minimum-shift.md)
+with [ADR-0060](docs/decisions/0060-fresh-shortlist-minimum-shift.md) and an
+[implementation plan](docs/superpowers/plans/2026-10-08-fresh-shortlist-minimum-shift.md).
+It checks only the first order Shift, preserves strictly increasing later
+orders, and canonicalizes `0.3%` as `30 bp` across shortlist, audit, READY and
+RUNS provenance. Focused tests and independent review passed.
+
+No live database, tester, migration, or Panel restart was performed; reload is
+the first operational step below.
 ## Blockers and open tracks
 
 - Live PerformanceDB: a read-only check on 2026-10-07 validated the schema v9 catalog and required tables. Finalist job `a21a55e57fc749ce9a132453594284d3` is `COMMITTED` at 250/250 and its metadata inbox is ready. Import child `5ee6a404025f4e15b63a4fe2a2b9c075` failed on a shorter effective period; rollback checks confirm current results were not changed. The per-strategy rejection fix passed independent review and Panel was restarted; no retry was started. Use a fresh retest dated 2026-06-01 through 2026-10-05.
@@ -84,33 +81,14 @@ The Source v6 fresh compact multi-scope pipeline is marked complete in [PRD.md](
 - Performance v2 equity-quality M5: evidence covers bounded real-data slices only. Full-corpus timing and user acceptance remain open in [the M5 evidence plan](docs/superpowers/plans/2026-09-26-performance-v2-equity-quality-m5-slice-evidence.md).
 - Heavy PerformanceDB follow-ups: residual import, analysis, cache, and materialization profiling is explicitly deferred and tracked in [the deferred follow-up plan](docs/superpowers/plans/2026-10-01-deferred-heavy-db-follow-ups.md). That plan does not authorize implementation.
 - Bybit collector: phases 1 through 8 are delivered; live integration and soak evidence in phase 9 remain open. See the [collector specification](docs/specs/2026-09-05-bybit-market-data-collector.md) and [implementation plan](docs/superpowers/plans/2026-09-05-bybit-market-data-collector.md).
-- Portfolio Optimizer: Stage 2 ordered-batch implementation has fixture/fake evidence and independent `CODE_REVIEW_PASS`; no real tester run occurred. This does not authorize a real joint tester run, recommendation, trading admission, or live use. M5/M6 readiness, PnL floor, individual-DD ceiling, liquidity/freshness limits, profile ranking, and fresh user authorization remain open gates. The Phase 13 limiter work remains off-only while the bot limiter is not operational. See the [optimizer specification](docs/specs/2026-09-05-portfolio-optimizer.md), [UI contract](docs/specs/2026-09-06-portfolio-optimizer-panel-ui.md), [batch decision](docs/decisions/0059-portfolio-stage2-sequential-batch.md), and [implementation plan](docs/superpowers/plans/2026-10-07-portfolio-stage2-sequential-batch.md).
+- Canonical Phase 1: Tasks 0–12B are recorded complete; Task 12C fresh real-source smoke/performance remains open. Follow the [active specification](docs/specs/2026-08-16-mrs3-v07-canonical-phase1.md) and [implementation plan](docs/superpowers/plans/2026-08-16-mrs3-v07-canonical-phase1.md).
+- Portfolio Optimizer: Stage 2 ordered-batch implementation has fixture/fake evidence and independent `CODE_REVIEW_PASS`; no real tester run occurred. M6–M8 evidence ledgers are unadopted until the governing phased specification is reconciled. This does not authorize a real joint tester run, recommendation, trading admission, or live use. M5/M6 readiness, PnL floor, individual-DD ceiling, liquidity/freshness limits, profile ranking, and fresh user authorization remain open gates. The Phase 13 limiter work remains off-only while the bot limiter is not operational. See the [optimizer specification](docs/specs/2026-09-05-portfolio-optimizer.md), [UI contract](docs/specs/2026-09-06-portfolio-optimizer-panel-ui.md), [batch decision](docs/decisions/0059-portfolio-stage2-sequential-batch.md), and [implementation plan](docs/superpowers/plans/2026-10-07-portfolio-stage2-sequential-batch.md).
 - Campaign combination preflight: the configured limit and server-side rejection of over-limit job creation are implemented. The form still does not calculate or display the exact finalist combination product before submission. See the [Portfolio Optimizer UI specification](docs/specs/2026-09-06-portfolio-optimizer-panel-ui.md).
-
 ## Next steps
 
-1. Run a fresh finalist retest from 2026-06-01 through 2026-10-05; then review the per-strategy import outcome before confirming it.
-2. Confirm the live PURR recalculation after the Panel lock change.
-3. Verify the READY JSON job state and identify the supported recovery procedure; do not edit the journal.
-4. Keep the remaining Performance v2, database profiling, collector, and Portfolio Optimizer gates within their linked plans and specifications.
-5. Do not make final MRS3 performance claims until real tick-test results and DD5 retesting are available.
-
-## Bulk finalist equity-filter application (2026-10-07)
-
-Card 6 now has an explicit `Применить эквити фильтр` action. It is asynchronous, uses only finalized successful replacements from the frozen FINALIST or FINALIST+RESERVE cohort, warms only missing equity cache rows, runs only the `filter_equity_regime` pair-side stage, and publishes all group snapshots atomically. The parent status includes an always-present `equity_filter` object with eligibility, application identity, attempt, phase, numeric progress, result counts, and typed errors. Import completion and recovery never start this action automatically. The Panel was not restarted.
-
-Verification so far: `tests/test_panel_performance_v2.py` 200 passed, 4 skipped; `tests/test_panel_static_ui.py` 163 passed; equity-regime and publication suites 43 passed; selection suite 224 passed; targeted equity-filter tests 16 passed; `node --check src/mrs3/panel_web/app.js` and `git diff --check` passed. The current finalist-retest module has 18 passed and one pre-existing reason-alias expectation failure in `PARETO_PLATEAU_POINTS_PER_ORDER`; an exact clean-HEAD baseline checkout reproduced the same 18/1 result. No live database, tester, or Panel process was used. The retry allocation is bounded at eight attempts, the UI treats unknown child states as active, the cache worker limit is capped at 16, and worker cleanup runs from `finally`.
-
-## Bybit base-lot XLSX export (2026-10-07)
-
-Added `scripts/calculate_bybit_base_lots.cmd` and its Python implementation. It reuses the optimizer's validated seven-day Bybit minute-liquidity window and writes the base `K*V25*A15` lot to `Actual!C`, with the UTC calculation date in `Actual!D`. A failed symbol clears its lot, records an explicit error in column D with a light-red fill, continues other symbols, and makes the command return nonzero. No live workbook or network run was performed.
-
-Verification: `tests/test_calculate_bybit_base_lots.py` plus `tests/test_portfolio_minute_capacity.py` — 40 passed; `py_compile`, wrapper help, and scoped `git diff --check` passed; independent Claude Opus review returned `CODE_REVIEW_PASS` after the implementation corrected the CLI argument wiring issue and added package guards. A read-only copy smoke of the real workbook with a fake invalid archive produced 0 unrelated cell changes and preserved the single comment; no live workbook was changed.
-
-## Fresh shortlist Minimum Shift gate (2026-10-08)
-
-The fresh **Shortlist and READY JSON** flow now has an optional Minimum Shift checkbox and percentage input. The gate checks only the first order Shift: the sole order for 1ORD and opening order for 2ORD/3ORD. The existing strictly increasing Shift construction rule remains unchanged. `0.3%` is compared exactly as `30 bp`; equality passes, and a lower first Shift is deferred before Pareto. Missing first Shift is reported as `ORDER_SHIFT_UNKNOWN`; malformed present values fail closed.
-
-Disabled requests preserve shortlist-v2 engine-1 behavior and the legacy three-key applied options. Enabled settings use engine-2 and the same canonical percentage in shortlist response, audit XLSX, READY JSON, and RUNS provenance. Browser validation blocks invalid enabled input before a request; failed recalculation keeps the prior applied snapshot. Contract: [fresh shortlist Minimum Shift](docs/specs/2026-10-08-fresh-shortlist-minimum-shift.md) and [ADR-0060](docs/decisions/0060-fresh-shortlist-minimum-shift.md).
-
-Verification: focused fresh shortlist, Panel, generator, audit, tester provenance, and UI tests passed; independent Claude Opus review returned `CODE_REVIEW_PASS`; `node --check src/mrs3/panel_web/app.js` and `git diff --check` passed. No live database, tester, migration, or Panel restart was performed. The unrelated full-static-suite Windows `WinError 206` remains in the existing portfolio settings helper test.
+1. Restart or reload the Panel before using the newly implemented Minimum Shift and finalist equity-filter controls; no live restart was performed during verification.
+2. Run a fresh finalist retest from 2026-06-01 through 2026-10-05; then review the per-strategy import outcome before confirming it.
+3. Confirm the live PURR recalculation after the Panel lock change.
+4. Verify the READY JSON job state and identify the supported recovery procedure; do not edit the journal.
+5. Keep the remaining Performance v2, database profiling, collector, and Portfolio Optimizer gates within their linked plans and specifications.
+6. Do not make final MRS3 performance claims until real tick-test results and DD5 retesting are available.

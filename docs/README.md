@@ -2,25 +2,16 @@
 
 ## Читать в таком порядке
 
-Новая рабочая сессия читает [AGENTS.md](../AGENTS.md) → [PRD.md](../PRD.md) → [progress.md](../progress.md) → активную спецификацию. Этого достаточно для большинства задач; архив открывается только по ссылке из active-doc.
+Новая рабочая сессия читает [AGENTS.md](../AGENTS.md) → текущие разделы [PRD.md](../PRD.md) → [progress.md](../progress.md) → активную спецификацию. Исторические приложения PRD и `docs/archive/` открываются только по прямой ссылке из активной спецификации или ADR.
 
 ## Актуальные документы
 
 | Раздел | Документ | Когда читать |
 | --- | --- | --- |
-| Current governing contract | [Performance DB v2 CHECK & RETEST](specs/2026-09-03-performance-v2-retest-workflow.md) | listing-date warm-up, raw DD, PnL/30d and Trades/30d, atomic import and safe recovery |
-| Контекст | [PRD](../PRD.md) | всегда после AGENTS |
-| Оперативный статус | [Progress](../progress.md) | всегда после PRD |
-| Текущая поставка | [DuckDB analysis storage and importer](specs/2026-08-11-v07-duckdb-analysis-storage-and-importer.md) | для source DuckDB, импорта из панели, analysis DuckDB и plateau lineage |
-| Active — implementation pending | [MRS3 v0.7 Canonical Phase 1](specs/2026-08-16-mrs3-v07-canonical-phase1.md) | Task 0 passed; свежие canonical surfaces и selection |
-| Текущая поставка | [v0.7 legacy selection](specs/2026-08-10-v07-legacy-selection.md) | для работы над v0.7 |
-| Event rules | [Event filter and shortlist](specs/v07-event-filter-and-shortlist.md) | при selector/event-filter изменениях |
-| Source verification | [Event source packs](specs/2026-08-10-v07-event-source-packs.md) | при CSV/DuckDB package, materializer или selector изменениях |
-| Необязательная фича — Deferred | [CSV-DuckDB overlay](specs/2026-08-11-v07-optional-csv-duckdb-overlay.md) | только если отдельно решено объединять CSV coarse-grid и DuckDB fine-grid |
-| Superseded / historical | [Source-potential calibration](specs/v07-posttest-calibration-source-potential.md) | legacy posttest calibration retained for provenance |
-| Portfolio Optimizer — Draft D5 / M0 accepted | [Phased specification](specs/2026-09-05-portfolio-optimizer.md), [implementation plan](superpowers/plans/2026-09-05-portfolio-optimizer.md), [M0 evidence](superpowers/plans/2026-09-06-portfolio-optimizer-m0-evidence.md), [ADR-0025 Proposed](decisions/0025-portfolio-optimizer-evidence-and-phases.md) | M0 accepted after CODE_REVIEW_PASS; M1 next, policies/capabilities and runtime gates remain open |
-| Portfolio Analyzer v0.4 — predecessor | [v0.4](specs/2026-08-09-portfolio-analyzer-v04.md) | происхождение прежнего queued-контракта до принятия замены |
-| Решения | [ADR-0001](decisions/0001-repository-and-documentation-model.md), [ADR-0002](decisions/0002-source-summary-and-window-metrics-verification.md), [ADR-0003](decisions/0003-source-integrity-action-metrics.md), [ADR-0009](decisions/0009-canonical-phase1-surface-selection-contract.md) | при вопросах структуры/workflow, source verification и Canonical Phase 1 governance |
+| Контекст | [PRD](../PRD.md) | после `AGENTS.md`; выбрать единственный маршрут в [навигации PRD](../PRD.md#навигация-для-агента) |
+| Оперативный статус | [Progress](../progress.md) | после PRD; проверить live/fixture/pending/blocker статус выбранного маршрута |
+| Контракт | [Specs](specs/) и [decisions](decisions/) | только по ссылкам из выбранной строки PRD или активной спецификации |
+| План/evidence | [Plans](superpowers/plans/) и [reports](reports/) | только если они указаны выбранным контрактом |
 
 ## Правила обновления
 
@@ -32,7 +23,6 @@
 
 ## Архив
 
-[archive/](archive/README.md) хранит v0.6 baseline, handoff и source-материалы.
-Он не определяет текущие требования; новый draft Portfolio Optimizer находится
-в `docs/specs/`, план — в `docs/superpowers/plans/`. Его Draft-статус не означает
-принятую замену existing runtime.
+[archive/](archive/README.md) хранит исторические baseline, handoff и
+source-материалы. Он не определяет текущие требования и открывается только по
+прямой ссылке из активной спецификации или ADR.

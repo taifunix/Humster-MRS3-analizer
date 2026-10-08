@@ -5305,6 +5305,29 @@ def test_v2_catalog_ignores_active_strategy_without_current_result(tmp_path: Pat
     assert [strategy["strategy_name"] for strategy in catalog["strategies"]] == ["alpha"]
 
 
+def test_v2_catalog_ignores_discarded_strategy_with_tombstone_result(tmp_path: Path) -> None:
+    connection, _ = _db(tmp_path)
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    discarded_id = connection.execute(
+        """insert into strategies (strategy_name, symbol, side, timeframe, close_ma_len,
+           order_count, analysis_run_id, candidate_identity, lifecycle_status,
+           created_at_utc, updated_at_utc) values ('discarded', 'BTCUSDT', 'LONG', '1h',
+           3, 1, 'run-discarded', 'discarded', 'DISCARDED', ?, ?) returning strategy_id""",
+        [now, now],
+    ).fetchone()[0]
+    result_id = connection.execute(
+        """insert into strategy_results (strategy_id, report_start_utc, report_end_utc,
+           exchange, initial_balance, final_balance, imported_at_utc)
+           values (?, ?, ?, 'DISCARDED_TOMBSTONE', 0, 0, ?) returning result_id""",
+        [discarded_id, now, datetime(2026, 1, 5, tzinfo=UTC), now],
+    ).fetchone()[0]
+    connection.execute("update strategies set current_result_id = ? where strategy_id = ?", [result_id, discarded_id])
+
+    catalog = performance_v2_catalog(connection)
+
+    assert [strategy["strategy_name"] for strategy in catalog["strategies"]] == ["alpha"]
+
+
 def test_v2_catalog_returns_empty_orders_for_current_strategy(tmp_path: Path) -> None:
     connection, _ = _db(tmp_path)
     now = datetime(2026, 1, 1, tzinfo=UTC)

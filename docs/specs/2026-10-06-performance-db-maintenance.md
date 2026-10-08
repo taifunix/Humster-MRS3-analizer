@@ -73,25 +73,46 @@ sources. Do not use `Auto Status`, a historical rejection alone, or a
 client-supplied strategy ID as the selector. A sticky rejection source remains
 effective under ADR-0056; an old selection row is not by itself sufficient.
 
-## Delete Rejected retention contract
+## Delete Rejected retirement contract
 
-For matching strategies, keep the strategy identity and complete typed
+For matching strategies, keep only the strategy identity and complete typed
 settings required by import deduplication: symbol, side, timeframe, close MA,
-order count, and every order's open MA, shift and lot. Keep the compact
-`strategy_results` summary, compact `window_metrics` and
-`equity_quality_metrics`, the effective rejection evidence, and selection/review
-history. Remove only detailed `strategy_actions`, detailed `strategy_equity`,
-and the large derived `optimizer_prepared_inputs` rows for those results.
+order count, and every order's open MA, shift and lot. Keep the compact current
+`strategy_results` tombstone with only `result_id`, `strategy_id`, report,
+reported and effective periods, listing fields, `warmup_hours`, and
+`imported_at_utc`. Retain its exchange provenance, set the required balances
+to zero, and clear PnL, DD, fee, trade-count, exclusion,
+optimizer-source and sizing payloads. Remove all other per-strategy operational
+data: `strategy_actions`, `strategy_equity`, `window_metrics`,
+`optimizer_prepared_inputs`, `equity_quality_metrics`, `strategy_tags`,
+`strategy_rejection_sources`, `selection_results`, and
+`selection_review_rows`. Pair-level `selection_runs` and shared review-import
+rows remain when they may belong to other strategies.
+
+The detail target includes every exact effective rejected strategy in the
+selected pairs, regardless of its current lifecycle. This lets a retry clean
+facts left by an interrupted earlier run. After those operational rows are removed,
+set `strategies.lifecycle_status` to
+`DISCARDED` in the same transaction. Every normal operational reader already
+uses `lifecycle_status='ACTIVE'`; therefore discarded strategies disappear from
+cache work, selection, current catalog counts and XLSX output. The retained
+typed configuration and compact current result form a permanent deduplication
+tombstone. They are not a hidden working strategy and are not eligible for
+normal reactivation.
+
+An incoming report with the same typed key is skipped whether its interval is
+equal, narrower, or wider. A duplicate discarded typed key is a fail-closed
+database error. Explicit `REPLACE` still requires an `ACTIVE` target. To
+intentionally reintroduce the configuration, first use full pair deletion and
+then import it as a new strategy. A skip caused by a unique discarded tombstone
+is journaled as `SKIPPED:DISCARDED_TOMBSTONE`; ordinary interval dedup remains
+`SKIPPED`. The rejected preview must explain this behavior before confirmation.
 
 This operation adds no `cleanup_state`, `deleted_at_utc`, cleanup log, backup,
 or schema change. A repeat preview derives remaining removable rows from the
-database and reports zero after the detailed facts are gone. Because the
-strategy, result summary and typed settings remain, an equal or narrower import
-does not restore removed details: an identical report is skipped by import
-deduplication, and a narrower period is skipped by the importer's interval
-rule. Only a valid wider report may replace the result and rebuild its detailed
-facts under the existing import contract. The rejected preview must show this
-consequence before confirmation.
+database and reports zero after the operational rows are gone. Full pair deletion
+removes the retained discarded strategy and its compact history as part of the
+existing full-delete contract.
 
 ## Delete fully contract
 
@@ -182,9 +203,12 @@ measured limit rather than making writes concurrent.
   only a generic message.
 - `Удалить Rejected` changes only exact effective-`REJECTED` strategies,
   preserves the listed identity, settings, compact metrics and rejection/review
-  evidence, and removes only the detailed facts listed above. Non-rejected and
-  unselected rows remain byte/row equivalent. Repeated preview reports zero
-  remaining detail rows for cleaned strategies.
+  evidence, removes the detailed facts listed above, and marks those strategy
+  rows `DISCARDED` atomically with the cleanup. Non-rejected and unselected rows
+  remain byte/row equivalent. Active selection/cache/catalog/XLSX readers omit
+  discarded rows; repeated preview reports zero remaining detail rows for
+  cleaned strategies; equal, narrower, and wider typed-key imports remain
+  skipped until full pair deletion.
 - `Удалить полностью` removes all enumerated strategy and pair-selection
   records for selected symbols, including manual review rows, while preserving
   shared plateau facts still referenced by another strategy. Every unselected

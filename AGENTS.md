@@ -2,50 +2,23 @@
 
 ## Назначение проекта
 
-Репозиторий развивает MRS3 Analyzer до v0.7: из проверенных MRS2-точек строятся воспроизводимые кандидаты MRS3, генерируются JSON для тестера, а результаты проходят audit и post-test сравнение. Текущая задача не включает портфельную симуляцию и не допускает выдавать source-метрики за результат готовой MRS3-стратегии.
+Репозиторий поддерживает локальный MRS3 Analyzer: PerformanceDB, фильтры
+Performance v2 и equity regime, свежий shortlist/READY JSON, XLSX и передачу
+результатов в tester. Текущее состояние и открытые ограничения находятся в
+`PRD.md` и `progress.md`, а детальные правила конкретной функции — только в
+связанных спецификациях и решениях. Диагностические и source-метрики нельзя
+выдавать за подтверждённый результат готовой MRS3-стратегии без реального
+tick-test и DD5 retest.
 
 ## Минимальный контекст новой сессии
 
 1. Прочитать этот файл.
-2. Прочитать `PRD.md`: цель этапа, scope и реестр активных фич.
+2. В `PRD.md` прочитать продукт, текущий статус, раздел `Навигация для агента` и только одну строку маршрута, соответствующую текущей задаче. Не загружать весь реестр, соседние модули или исторические приложения.
 3. Прочитать `progress.md`: последнюю проверку, следующий шаг и блокеры.
-4. Прочитать активную спецификацию, на которую ссылается `progress.md`, и только её явные зависимости.
-5. Открыть упомянутые в спецификации код, тесты и ADR.
+4. По выбранной строке PRD прочитать активную спецификацию и только её явные ADR, план и evidence-зависимости. Если маршрут не определён, остановиться на PRD/progress и уточнить scope.
+5. Открыть упомянутые в спецификации код и тесты; не читать документацию соседнего модуля без прямой зависимости.
 
 Не читать `docs/archive/` по умолчанию. Архив открывается только по прямой ссылке из active-spec/ADR: он сохраняет происхождение правил, но не является текущим контрактом.
-
-## Hooks по имени модуля
-
-Если пользователь пишет **«Оптимизатор портфеля»** или `Portfolio Optimizer`,
-после шагов 1–3 читать `docs/specs/2026-09-05-portfolio-optimizer.md`, затем
-`docs/decisions/0025-portfolio-optimizer-evidence-and-phases.md` и
-`docs/decisions/0029-portfolio-optimizer-research-risk-profile-v1.md`,
-`docs/decisions/0030-portfolio-optimizer-m2-admission-and-sizing-contract.md` и
-`docs/superpowers/plans/2026-09-05-portfolio-optimizer.md`. M0–M2 accepted;
-D6 `PLAN_APPROVED` уточняет strict `FINALIST` universe, seven-day liquidity distribution,
-maximum current symbol-level leverage и individual-DD ceiling from current
-portfolio equity. PnL, `each_strategy_max_dd_pct`, liquidity/freshness и ranking
-policies не закрыты; пакет не разрешает runtime или запуск tester. Исходная
-рабочая подборка не требуется для продолжения.
-Прохождение research thresholds не разрешает implementation, tester run,
-`RECOMMENDATION_READY`, trading admission или live use; все remaining gates
-(PnL floor, liquidity/freshness limits, profile ranking) остаются open blockers.
-Для работы над Panel/UI, настройками, Campaign jobs, XLSX или передачей тестеру
-дополнительно читать `docs/specs/2026-09-06-portfolio-optimizer-panel-ui.md` и
-`docs/decisions/0031-portfolio-optimizer-panel-ui-and-campaign-boundary.md`.
-D7 UI-контракт не делает M3 зависимым от Panel и не разрешает tester/runtime;
-U1 требует отдельного назначения, а Stage 2 — M5/M6 и явного разрешения.
-При конфликте основная optimizer spec и ADR-0030 выше UI spec/ADR-0031 для
-`FINALIST`, liquidity, leverage, sizing и DD; D7 сохраняет эти правила D6.
-Для M5 implementation-сессии дополнительно читать M3/M4 evidence
-`docs/superpowers/plans/2026-09-06-portfolio-optimizer-m3-evidence.md` и
-`docs/superpowers/plans/2026-09-06-portfolio-optimizer-m4-evidence.md`; M0–M2
-остаются историческими evidence, не текущей инструкцией. M3 и M4 accepted after
-independent `CODE_REVIEW_PASS`; M5 выполняется только на fixtures/fakes до
-отдельного разрешения real tester и принятого M6.
-
-Если пользователь пишет **«работаем над Анализатором Портфеля»** (или `Portfolio Analyzer`), это означает: после шагов 1–3 минимального контекста обязательно прочитать `docs/specs/2026-08-09-portfolio-analyzer-v04.md`, затем `docs/decisions/0001-repository-and-documentation-model.md`, затем только разделы 9–10 `docs/archive/sources/MRS3_v07_MASTER_HANDOFF_LEGACY_DUCKDB_2026-08-10.md`.
-
 
 ## Карта источников истины
 
@@ -63,19 +36,25 @@ independent `CODE_REVIEW_PASS`; M5 выполняется только на fixt
 ## Правила разработки
 
 - Перед изменением поведения создать или обновить спецификацию. Указать цель, non-goals, входы/выходы, инварианты, acceptance evidence и ссылки на нужный исторический контекст.
-- Развивать v0.7 из корня (`src/mrs3`, `tests`, `scripts`). Код v0.6 используется как перенесённая база и исторический источник, а не как отдельная актуальная версия.
 - Использовать TDD для новой логики и исправлений: сначала узкий failing test, затем минимальная реализация, затем focused и relevant broader tests.
-- Не начинать materializer без v4 import evidence; не удалять HTML без `schema_version=4`, manifest, нулевого quarantine и `safe_to_delete=YES`.
-- В legacy-run разрешён только единый `event_mode=legacy_trades_proxy`: `point_event_count=TotalTrades` для каждой строки. Нельзя смешивать его с real independent events.
-- Не считать сумму MRS2 Source PnL фактическим PnL MRS3. Финальные выводы требуют реального tick-test и DD5 retest.
-- Hook `Анализатор Портфеля`: прежде чем менять portfolio module, читать `PRD.md` и `docs/specs/2026-08-09-portfolio-analyzer-v04.md`; реализовывать Layer A можно отдельно, но simulation требует trade timestamps, limiter contract, L2 и margin data.
-- Для ресурсоемких процессов, таких как парсинг большого количества отчетов, валидация, дедуп, импорт, экспорт, упаковка, распаковка при возможности применять обработку в многопоточном режиме, стандартный вариант по умолчанию 16 потоков.
+- Для ресурсоёмких процессов использовать общий лимит `duckdb_import.workers` из
+  конфигурации. Не задавать отдельный фиксированный default для числа потоков в
+  правилах агента; конкретные ограничения брать из активной спецификации и
+  конфигурации проекта.
 
 ## Документация по ходу работы
 
-- Изменилось текущее состояние, команда проверки или блокер — обновить `progress.md` в том же коммите.
-- Изменились цель, границы, статус фичи или зависимости — обновить PRD.
-- Изменился публичный способ установки/запуска — обновить README после проверки команды.
+- После внедрения сначала обновить контракт затронутой функции (`docs/specs/`),
+  а архитектурное или safety-решение оформить новым ADR. Затем в том же
+  scoped-изменении обновить `progress.md` проверенными командами, evidence,
+  следующим шагом и блокерами.
+- Если изменились цель, границы, зависимости или статус функции, обновить
+  соответствующую строку/ссылку в `PRD.md`. Если изменился публичный запуск,
+  экспорт или UI, обновить `README.md` после проверки команды.
+- Не переписывать исторические документы ради текущего состояния; добавлять
+  новую спецификацию/ADR и менять только навигационные ссылки. После правки
+  проверить ссылки из `PRD.md` и `docs/README.md`, затем выполнить
+  `git diff --check`.
 - Принято решение, меняющее архитектуру, data contract или safety rule — создать новый ADR; не переписывать старый ADR задним числом.
 - Закрытая фича получает финальный статус в PRD и ссылку на её evidence; архивировать её спецификацию не нужно.
 
@@ -84,7 +63,7 @@ independent `CODE_REVIEW_PASS`; M5 выполняется только на fixt
 Все тесты проекта запускать только из локального окружения `.venv`:
 `.venv\\Scripts\\python.exe -m pytest ...` (не использовать системный
 `python`/`pytest`).
-Все тесты запускать во временной папке TEMP на диске Сжб после завершения тестов удалять временные файлы.
+Все тесты запускать во временной папке TEMP на диске С после завершения тестов удалять временные файлы.
 
 Каждый коммит проходит один и тот же порядок:
 
@@ -105,9 +84,8 @@ independent `CODE_REVIEW_PASS`; M5 выполняется только на fixt
 ## Статус активного плана
 
 - Для актуализации чекбоксов и строк статуса активного плана закреплён отдельный
-  read-only maintainer `plan_status_maintainer` на модели `GPT-5.6 Luna light`.
-  Он сверяет только подтверждённые root evidence и reviewer disposition с
-  `docs/superpowers/plans/2026-08-19-source-v6-analysis-handoff.md`, после чего
+  read-only maintainer `plan_status_maintainer` на модели `GPT-6 Luna light`.
+  Он сверяет только подтверждённые root evidence и reviewer disposition планом над которым идет работа, после чего
   обновляет в этом плане чекбоксы/статус без изменения кода, тестов,
   спецификаций, PRD или `progress.md`. Он не закрывает задачу по одному лишь
   сообщению исполнителя и не помечает review как PASS без фактического
@@ -115,5 +93,3 @@ independent `CODE_REVIEW_PASS`; M5 выполняется только на fixt
 - Root передаёт maintainer самодостаточный packet после каждой принятой задачи;
   до этого maintainer не изменяет план. Root сохраняет ответственность за
   acceptance, интеграцию, verification и решение по замечаниям review.
-
-Импортёры v3/v4 лежат в `programs/Обработчик HTML-DuckDB/`; v4 требует соседний v3 codec. Не переносить или не переписывать этот runtime-контур без отдельной спецификации и проверки на реальном пути отчётов.

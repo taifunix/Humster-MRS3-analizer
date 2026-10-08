@@ -2,13 +2,13 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Status:** Approved execution plan — Tasks 0–10 complete; Task 11 not started.
+**Status:** Approved execution plan — Tasks 0–12B complete; Task 12C fresh real-source smoke/performance pending.
 
-**Current execution status (2026-08-17):** Tasks 0–11 complete; Task 12 in progress (12A/12B complete, 12C smoke/performance pending).
+**Current execution status (2026-08-17):** Tasks 0–12B complete; Task 12C fresh real-source smoke/performance pending.
 
 **Goal:** Implement the approved canonical Phase 1 surface, readiness, parallel materialization, frozen selection, and independent 1ORD contracts without expanding into Phase 2.
 
-**Audit status (2026-08-17):** Tasks 0–11 are complete and reviewed. Task 12A/12B and the Task 12C synthetic smoke/performance evidence are complete and reviewed; full fresh real-source smoke remains intentionally open.
+**Audit status (2026-08-17):** Tasks 0–12B are complete and reviewed. The Task 12C synthetic smoke/performance evidence is complete and reviewed; full fresh real-source smoke remains intentionally open.
 
 **Architecture:** The normative contract lives only in `docs/specs/2026-08-16-mrs3-v07-canonical-phase1.md`, backed by ADR-0009. This plan decomposes that contract into small reviewed tasks. It must not introduce a competing contract; where wording conflicts, the approved specification wins.
 

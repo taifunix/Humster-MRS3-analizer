@@ -4158,7 +4158,7 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
     const scopeNote = document.querySelector('#performance-v2-maintenance-preview-scope-note');
     if (scopeNote) scopeNote.textContent = result.operation === 'full'
       ? 'Полное удаление также очищает записи выбора и больше не используемые analysis_plateaus; они не входят в число стратегий.'
-      : 'Показаны стратегии с подробными данными для очистки. Сами стратегии и их настройки сохраняются.';
+      : 'Показаны стратегии для очистки. Подробные факты, кеши и per-strategy результаты удаляются, а настройки и компактный результат сохраняются только для дедупликации.';
     const warning = document.querySelector('#performance-v2-maintenance-global-warning');
     if (warning) warning.hidden = result.operation !== 'full';
     if (maintenanceRejectedWarning) maintenanceRejectedWarning.hidden = result.operation !== 'rejected';
@@ -4224,7 +4224,7 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
     const strategyProgress = job.operation === 'full'
       ? `Удалено стратегий ${maintenanceCount(deletedStrategies)} из ${maintenanceCount(strategyTotal)}`
       : job.status === 'COMMITTED'
-        ? `Обработано стратегий ${maintenanceCount(strategyTotal)} из ${maintenanceCount(strategyTotal)}`
+        ? `Архивировано стратегий ${maintenanceCount(strategyTotal)} из ${maintenanceCount(strategyTotal)}`
         : `К очистке стратегий ${maintenanceCount(strategyTotal)}`;
     if (counts) counts.textContent = `${strategyProgress}; удалено ${maintenanceCount(deleted)} из ${maintenanceCount(total)} строк выбранных пар`;
     const global = document.querySelector('#performance-v2-maintenance-global-counts');
@@ -4241,7 +4241,7 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
       else if (job.status === 'COMMITTED') {
         const strategyOutcome = job.operation === 'full'
           ? `Удалено стратегий: ${maintenanceCount(strategyTotal)}.`
-          : `Обработано стратегий: ${maintenanceCount(strategyTotal)}.`;
+          : `Архивировано стратегий: ${maintenanceCount(strategyTotal)}.`;
         maintenanceSetStatus(`Обслуживание завершено. ${strategyOutcome} Показаны подтверждённые количества строк.`, false);
       }
       else maintenanceSetStatus(`Ошибка на этапе ${job.current_table || job.phase || 'неизвестно'}: ${job.error || 'операция завершилась с ошибкой'}. Показаны уже подтверждённые изменения.${job.recovery_warning ? ` ${job.recovery_warning}` : ''}`, true);

@@ -183,6 +183,38 @@ def test_read_only_export_accepts_v5_and_v8_without_schema_or_review_changes(
     assert before_catalog == after_catalog
 
 
+def test_read_only_export_omits_discarded_strategy_rows(tmp_path: Path) -> None:
+    database, strategy_id = _export_database(tmp_path / "strategy_performance.duckdb")
+    with duckdb.connect(str(database)) as connection:
+        discarded_id = connection.execute(
+            """insert into strategies (
+                   strategy_name, symbol, side, timeframe, close_ma_len,
+                   order_count, analysis_run_id, candidate_identity,
+                   lifecycle_status, created_at_utc, updated_at_utc
+               ) values ('discarded', 'BTCUSDT', 'LONG', '1h', 3, 1,
+                         'run-discarded', 'candidate-discarded', 'DISCARDED', ?, ?)
+               returning strategy_id""",
+            [datetime(2026, 1, 1, tzinfo=UTC)] * 2,
+        ).fetchone()[0]
+        discarded_result = connection.execute(
+            """insert into strategy_results (
+                   strategy_id, report_start_utc, report_end_utc, exchange,
+                   commission_rate, initial_balance, final_balance,
+                   total_pnl, total_pnl_pct, max_drawdown, max_drawdown_pct,
+                   total_fees, total_trades, imported_at_utc
+               ) values (?, ?, ?, 'Bybit', .0004, 100, 101, 1, 1, 0, 0, 0, 1, ?)
+               returning result_id""",
+            [discarded_id, datetime(2026, 1, 1, tzinfo=UTC), datetime(2026, 1, 9, tzinfo=UTC), datetime(2026, 1, 1, tzinfo=UTC)],
+        ).fetchone()[0]
+        connection.execute("update strategies set current_result_id = ? where strategy_id = ?", [discarded_result, discarded_id])
+
+    _, payload = export_performance_v2(database, PerformanceV2ExportSelection(all_active=True))
+    sheet = load_workbook(BytesIO(payload), data_only=True)["All candidates"]
+    headers = [cell.value for cell in sheet[1]]
+    ids = [sheet.cell(row, headers.index("ID") + 1).value for row in range(2, sheet.max_row + 1)]
+    assert ids == [strategy_id]
+
+
 def test_read_only_export_includes_only_fresh_cached_equity_facts_without_writes(tmp_path: Path, monkeypatch) -> None:
     database, strategy_id = _export_database(tmp_path / "strategy_performance.duckdb")
     with duckdb.connect(str(database)) as connection:

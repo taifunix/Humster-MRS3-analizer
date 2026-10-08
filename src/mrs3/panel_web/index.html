@@ -256,7 +256,7 @@
                 <div class="table-wrap"><table class="performance-v2-maintenance-table"><thead><tr><th scope="col">Пара</th><th id="performance-v2-maintenance-strategy-count-heading" scope="col">Стратегий</th></tr></thead><tbody id="performance-v2-maintenance-preview-pairs"></tbody></table></div>
                 <p id="performance-v2-maintenance-preview-scope-note" class="helper"></p>
                 <p id="performance-v2-maintenance-global-warning" class="helper" hidden>Полное удаление также очистит import_files и import_runs для всей базы, включая невыбранные пары.</p>
-                <p id="performance-v2-maintenance-rejected-warning" class="helper" hidden>Тот же отчёт будет пропущен дедупликацией, а отчёт с более узким периодом — правилом импорта, которое принимает только расширение периода. Для восстановления подробных строк нужен корректный отчёт с более широким периодом.</p>
+                <p id="performance-v2-maintenance-rejected-warning" class="helper" hidden>После очистки подробные факты, кеши и per-strategy результаты удаляются, а компактная запись остаётся только для дедупликации. Равный, более узкий и более широкий отчёт с тем же типизированным ключом будет пропущен. Для намеренного возврата сначала удалите пару полностью.</p>
                 <div class="button-row">
                   <button id="performance-v2-maintenance-cancel" type="button" class="button button-secondary">Отмена</button>
                   <button id="performance-v2-maintenance-confirm" type="button" class="button button-primary">Подтвердить удаление</button>

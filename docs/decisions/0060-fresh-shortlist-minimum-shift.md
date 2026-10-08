@@ -2,7 +2,8 @@
 
 Date: 2026-10-08
 
-Status: Accepted for implementation after independent Advisor `PLAN_APPROVED`.
+Status: Accepted and implemented; deployment remains pending the required
+Panel server and browser reload.
 
 ## Decision
 

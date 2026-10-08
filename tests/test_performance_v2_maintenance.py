@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from decimal import Decimal
 import hashlib
 import json
 import multiprocessing
@@ -204,6 +205,35 @@ def _seed_fixture(connection: duckdb.DuckDBPyConnection) -> None:
 def test_catalog_includes_strategy_and_selection_only_symbols(maintenance_db: Path) -> None:
     with duckdb.connect(str(maintenance_db), read_only=True) as connection:
         assert catalog(connection) == ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
+
+
+def test_rejected_retirement_covers_every_strategy_or_result_table(maintenance_db: Path) -> None:
+    with duckdb.connect(str(maintenance_db), read_only=True) as connection:
+        actual = {
+            str(row[0])
+            for row in connection.execute(
+                """select distinct table_name
+                     from information_schema.columns
+                    where table_schema = 'main'
+                      and column_name in ('strategy_id', 'result_id')"""
+            ).fetchall()
+        }
+    assert actual == set(maintenance._REJECTED_TABLES) | set(maintenance._REJECTED_RETAINED_TABLES)
+
+    with duckdb.connect(str(maintenance_db), read_only=True) as connection:
+        all_tables = {
+            str(row[0])
+            for row in connection.execute(
+                """select table_name from information_schema.tables
+                    where table_schema = 'main' and table_type = 'BASE TABLE'"""
+            ).fetchall()
+        }
+    expected_tables = {
+        *maintenance._PAIR_TABLES,
+        *maintenance._GLOBAL_JOURNAL_TABLES,
+        *maintenance._PRESERVED_METADATA_TABLES,
+    }
+    assert all_tables == expected_tables
 
 
 def test_catalog_fails_closed_when_action_symbol_disagrees_with_strategy(maintenance_db: Path) -> None:
@@ -557,22 +587,21 @@ def test_rejected_preview_uses_effective_review_and_sticky_equity_source(mainten
         preview = create_preview(connection, ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"], "rejected")
     by_symbol = {row["symbol"]: row for row in preview["pairs"]}
     assert {symbol: row["rows"] for symbol, row in by_symbol.items()} == {
-        "BTCUSDT": 3, "ETHUSDT": 3, "SOLUSDT": 0, "XRPUSDT": 0,
+        "BTCUSDT": 8, "ETHUSDT": 7, "SOLUSDT": 0, "XRPUSDT": 0,
     }
     assert {symbol: row["strategy_count"] for symbol, row in by_symbol.items()} == {
         "BTCUSDT": 1, "ETHUSDT": 1, "SOLUSDT": 0, "XRPUSDT": 0,
     }
-    assert preview["pair_scoped_total"] == 6
+    assert preview["pair_scoped_total"] == 15
     assert preview["global_counts"] == {}
 
 
-def test_rejected_apply_retains_identity_metrics_rejection_and_history(maintenance_db: Path) -> None:
+def test_rejected_apply_retains_dedup_identity_and_removes_operational_facts(maintenance_db: Path) -> None:
     with _writable_fixture(maintenance_db, maintenance_db.parent) as connection:
         preview = create_preview(connection, ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"], "rejected")
         retained_tables = (
-            "strategies", "strategy_orders", "strategy_results", "window_metrics",
-            "equity_quality_metrics", "strategy_tags", "strategy_rejection_sources",
-            "selection_runs", "selection_results", "selection_review_imports", "selection_review_rows",
+            "strategies", "strategy_orders", "strategy_results",
+            "selection_runs", "selection_review_imports",
         )
         retained_before = {
             table: connection.execute(f"select * from {table} order by all").fetchall()
@@ -583,13 +612,41 @@ def test_rejected_apply_retains_identity_metrics_rejection_and_history(maintenan
             table: connection.execute(f"select * from {table} order by all").fetchall()
             for table in retained_tables
         }
-        assert retained_after == retained_before
-        assert deleted["pair_scoped_deleted"] == 6
+        for table in retained_tables:
+            if table == "strategies":
+                before_without_status = [row[:9] + row[10:] for row in retained_before[table]]
+                after_without_status = [row[:9] + row[10:] for row in retained_after[table]]
+                assert after_without_status == before_without_status
+            elif table == "strategy_results":
+                before = retained_before[table]
+                after = retained_after[table]
+                assert [row[:4] + row[14:23] for row in after] == [row[:4] + row[14:23] for row in before]
+                before_by_id = {row[1]: row for row in before}
+                assert all(
+                    row[4] == before_by_id[row[1]][4]
+                    and row[5:14] == (None, Decimal("0"), Decimal("0"), None, None, None, None, None, None)
+                    and row[23:] == (None,) * 9
+                    for row in after
+                    if row[1] in {1, 2}
+                )
+            else:
+                assert retained_after[table] == retained_before[table]
+        assert deleted["pair_scoped_deleted"] == 15
+        assert connection.execute(
+            "select strategy_id, lifecycle_status from strategies order by strategy_id"
+        ).fetchall() == [(1, "DISCARDED"), (2, "DISCARDED"), (3, "ACTIVE")]
         assert connection.execute("select result_id from strategy_actions order by result_id").fetchall() == [(303,)]
         assert connection.execute("select result_id from strategy_equity order by result_id").fetchall() == [(303,)]
         assert connection.execute("select result_id from optimizer_prepared_inputs order by result_id").fetchall() == [(303,)]
+        assert connection.execute("select result_id from window_metrics order by result_id").fetchall() == [(303,)]
+        assert connection.execute("select result_id from equity_quality_metrics order by result_id").fetchall() == [(303,)]
+        assert connection.execute("select strategy_id from strategy_tags order by strategy_id").fetchall() == [(3,)]
+        assert connection.execute("select strategy_id from strategy_rejection_sources order by strategy_id").fetchall() == []
+        assert connection.execute("select strategy_id from selection_results order by strategy_id").fetchall() == [(3,), (3,)]
+        assert connection.execute("select strategy_id from selection_review_rows order by strategy_id").fetchall() == []
         repeat = create_preview(connection, ["BTCUSDT", "ETHUSDT"], "rejected")
         assert repeat["pair_scoped_total"] == 0
+        assert [pair["strategy_count"] for pair in repeat["pairs"]] == [0, 0]
 
 
 def test_apply_rejects_same_count_preview_when_target_identity_changes(maintenance_db: Path) -> None:
@@ -625,8 +682,8 @@ def test_rejected_apply_rejects_changed_effective_strategy_set_with_empty_facts(
 
         preview = create_preview(connection, ["BTCUSDT", "ETHUSDT"], "rejected")
         assert preview["_targets"]["rejected_strategy_ids"] == [1]
-        assert preview["pairs"][0]["strategy_count"] == 0
-        assert preview["pair_scoped_total"] == 0
+        assert preview["pairs"][0]["strategy_count"] == 1
+        assert preview["pair_scoped_total"] == 5
 
         connection.execute(
             "update selection_review_rows set user_status = 'FINALIST' where review_import_id = 'review-btc'"
@@ -639,6 +696,109 @@ def test_rejected_apply_rejects_changed_effective_strategy_set_with_empty_facts(
 
         with pytest.raises(PerformanceV2MaintenanceError, match="preview is stale"):
             apply_preview(connection, preview)
+
+
+def test_rejected_retry_removes_residual_details_from_discarded_strategy(maintenance_db: Path) -> None:
+    with _writable_fixture(maintenance_db, maintenance_db.parent) as connection:
+        first = create_preview(connection, ["BTCUSDT"], "rejected")
+        apply_preview(connection, first)
+        connection.execute(
+            """insert into strategy_actions (
+                   result_id, action_index, timestamp_utc, symbol, action, size,
+                   post_size, post_side, pnl, fee, balance
+               ) values (101, 99, now(), 'BTCUSDT', 'opened', 1, 1, 'LONG', 0, 0, 1000)"""
+        )
+        retry = create_preview(connection, ["BTCUSDT"], "rejected")
+        assert retry["pair_scoped_total"] == 1
+        assert retry["pairs"][0]["strategy_count"] == 1
+        apply_preview(connection, retry)
+        assert connection.execute("select count(*) from strategy_actions where result_id = 101").fetchone() == (0,)
+        assert connection.execute("select lifecycle_status from strategies where strategy_id = 1").fetchone() == ("DISCARDED",)
+
+
+def test_rejected_cleanup_removes_result_facts_when_current_result_pointer_is_missing(maintenance_db: Path) -> None:
+    with _writable_fixture(maintenance_db, maintenance_db.parent) as connection:
+        connection.execute("update strategies set current_result_id = null where strategy_id = 1")
+        preview = create_preview(connection, ["BTCUSDT"], "rejected")
+        assert preview["pair_scoped_total"] > 0
+        apply_preview(connection, preview)
+        assert connection.execute("select count(*) from strategy_actions where result_id = 101").fetchone() == (0,)
+        assert connection.execute("select count(*) from strategy_equity where result_id = 101").fetchone() == (0,)
+        assert connection.execute("select lifecycle_status from strategies where strategy_id = 1").fetchone() == ("DISCARDED",)
+
+
+def test_rejected_apply_rolls_back_all_deletes_when_one_table_fails(maintenance_db: Path) -> None:
+    with _writable_fixture(maintenance_db, maintenance_db.parent) as connection:
+        preview = create_preview(connection, ["BTCUSDT", "ETHUSDT"], "rejected")
+        before = {
+            table: connection.execute(f"select count(*) from {table}").fetchone()[0]
+            for table in maintenance._REJECTED_TABLES
+        }
+        before_status = connection.execute(
+            "select strategy_id, lifecycle_status from strategies order by strategy_id"
+        ).fetchall()
+
+        with pytest.raises(duckdb.IOException, match="injected failure at strategy_equity"):
+            apply_preview(_FailOnceOnDelete(connection, "strategy_equity"), preview)
+
+        assert {
+            table: connection.execute(f"select count(*) from {table}").fetchone()[0]
+            for table in maintenance._REJECTED_TABLES
+        } == before
+        assert connection.execute(
+            "select strategy_id, lifecycle_status from strategies order by strategy_id"
+        ).fetchall() == before_status
+
+
+class _FailAfterSqlFragment:
+    def __init__(self, connection: duckdb.DuckDBPyConnection, fragment: str) -> None:
+        self.connection = connection
+        self.fragment = fragment.casefold()
+        self.failed = False
+
+    def execute(self, sql: str, parameters=None):
+        if not self.failed and self.fragment in sql.casefold():
+            self.failed = True
+            if parameters is None:
+                result = self.connection.execute(sql)
+            else:
+                result = self.connection.execute(sql, parameters)
+            raise duckdb.IOException(f"injected failure after {self.fragment}")
+        if parameters is None:
+            return self.connection.execute(sql)
+        return self.connection.execute(sql, parameters)
+
+
+@pytest.mark.parametrize("failure_fragment", ["update strategy_results", "update strategies set lifecycle_status"])
+def test_rejected_apply_rolls_back_result_compaction_and_lifecycle_update(
+    maintenance_db: Path, failure_fragment: str,
+) -> None:
+    with _writable_fixture(maintenance_db, maintenance_db.parent) as connection:
+        preview = create_preview(connection, ["BTCUSDT", "ETHUSDT"], "rejected")
+        before_counts = {
+            table: connection.execute(f"select count(*) from {table}").fetchone()[0]
+            for table in maintenance._REJECTED_TABLES
+        }
+        before_results = connection.execute(
+            "select * from strategy_results where strategy_id in (1, 2) order by strategy_id"
+        ).fetchall()
+        before_status = connection.execute(
+            "select strategy_id, lifecycle_status from strategies order by strategy_id"
+        ).fetchall()
+
+        with pytest.raises(duckdb.IOException, match="injected failure after"):
+            apply_preview(_FailAfterSqlFragment(connection, failure_fragment), preview)
+
+        assert {
+            table: connection.execute(f"select count(*) from {table}").fetchone()[0]
+            for table in maintenance._REJECTED_TABLES
+        } == before_counts
+        assert connection.execute(
+            "select * from strategy_results where strategy_id in (1, 2) order by strategy_id"
+        ).fetchall() == before_results
+        assert connection.execute(
+            "select strategy_id, lifecycle_status from strategies order by strategy_id"
+        ).fetchall() == before_status
 
 
 def test_full_apply_removes_selected_pair_reachability_and_only_global_journal(maintenance_db: Path) -> None:

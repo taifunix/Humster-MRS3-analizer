@@ -20,7 +20,32 @@ _PAIR_TABLES = (
     "selection_runs", "selection_results", "selection_review_imports",
     "selection_review_rows", "analysis_plateaus",
 )
-_REJECTED_TABLES = ("strategy_actions", "strategy_equity", "optimizer_prepared_inputs")
+# Rejected retirement keeps only strategies, typed orders, and a compact
+# current strategy_results tombstone. The tombstone retains only temporal
+# identity/provenance fields used by interval deduplication; metric payloads
+# are stripped in the same transaction.
+# Every per-strategy fact/cache/review row is removed to take it out of active
+# cache, filter, and export work rather than merely hiding it at read time.
+_REJECTED_RETAINED_TABLES = frozenset({"strategies", "strategy_orders", "strategy_results"})
+_REJECTED_TABLES = (
+    "selection_review_rows", "selection_results",
+    "strategy_actions", "strategy_equity", "window_metrics",
+    "optimizer_prepared_inputs", "equity_quality_metrics",
+    "strategy_tags", "strategy_rejection_sources",
+)
+_REJECTED_RESIDUAL_EXISTS = {
+    "selection_review_rows": "exists (select 1 from selection_review_rows where strategy_id = strategies.strategy_id)",
+    "selection_results": "exists (select 1 from selection_results where strategy_id = strategies.strategy_id)",
+    "strategy_actions": "exists (select 1 from strategy_actions facts where facts.result_id in (select result_id from strategy_results where strategy_id = strategies.strategy_id union all select strategies.current_result_id))",
+    "strategy_equity": "exists (select 1 from strategy_equity facts where facts.result_id in (select result_id from strategy_results where strategy_id = strategies.strategy_id union all select strategies.current_result_id))",
+    "window_metrics": "exists (select 1 from window_metrics facts where facts.result_id in (select result_id from strategy_results where strategy_id = strategies.strategy_id union all select strategies.current_result_id))",
+    "optimizer_prepared_inputs": "exists (select 1 from optimizer_prepared_inputs facts where facts.result_id in (select result_id from strategy_results where strategy_id = strategies.strategy_id union all select strategies.current_result_id))",
+    "equity_quality_metrics": "exists (select 1 from equity_quality_metrics facts where facts.result_id in (select result_id from strategy_results where strategy_id = strategies.strategy_id union all select strategies.current_result_id))",
+    "strategy_tags": "exists (select 1 from strategy_tags where strategy_id = strategies.strategy_id)",
+    "strategy_rejection_sources": "exists (select 1 from strategy_rejection_sources where strategy_id = strategies.strategy_id)",
+}
+if set(_REJECTED_RESIDUAL_EXISTS) != set(_REJECTED_TABLES):
+    raise RuntimeError("rejected retirement residual map must cover every deleted table")
 _GLOBAL_JOURNAL_TABLES = frozenset({"import_files", "import_runs"})
 _PRESERVED_METADATA_TABLES = frozenset({"schema_info"})
 _LEGACY_V7_RESULTS_TABLE = "__performance_v2_v7_strategy_results"
@@ -180,10 +205,18 @@ def catalog(connection: duckdb.DuckDBPyConnection) -> list[str]:
     return [str(row[0]) for row in rows]
 
 
-def _ids_by_symbol(connection: duckdb.DuckDBPyConnection, symbols: Sequence[str]) -> dict[str, list[int]]:
+def _ids_by_symbol(
+    connection: duckdb.DuckDBPyConnection,
+    symbols: Sequence[str],
+    *,
+    active_only: bool = False,
+) -> dict[str, list[int]]:
     grouped: dict[str, list[int]] = {symbol: [] for symbol in symbols}
     for symbol, identifier in connection.execute(
-        "select symbol, strategy_id from strategies where symbol in (select unnest(?::varchar[])) order by symbol, strategy_id",
+        "select symbol, strategy_id from strategies "
+        "where symbol in (select unnest(?::varchar[])) "
+        + ("and lifecycle_status = 'ACTIVE' " if active_only else "")
+        + "order by symbol, strategy_id",
         [list(symbols)],
     ).fetchall():
         grouped[str(symbol)].append(int(identifier))
@@ -312,9 +345,13 @@ def create_preview(
         recovery_symbols = tuple(raw_recovery_symbols)
         recovery_targets = raw_recovery_targets
     selected = _normalize_symbols(symbols, available, recovery_symbols=recovery_symbols)
+    # Full deletion sees both lifecycles. Rejected cleanup also scans both:
+    # an interrupted earlier run may have archived a row before its detail
+    # delete completed, and the next cleanup must remove those residual facts.
     strategy_ids_by_symbol = _ids_by_symbol(connection, selected)
     strategy_ids = [identifier for identifiers in strategy_ids_by_symbol.values() for identifier in identifiers]
     rejected_ids: set[int] = set()
+    discarded_ids: set[int] = set()
     rejected_strategy_counts: Counter[str] = Counter()
     if operation == "rejected":
         decisions = effective_selection_decisions(connection)
@@ -322,19 +359,35 @@ def create_preview(
             identifier for identifier in strategy_ids
             if decisions.get(identifier, (None, None, None))[0] == "REJECTED"
         }
+        # A prior run removes the rejection source itself. If that run was
+        # interrupted after archiving, a DISCARDED tombstone with residual
+        # operational rows is still valid cleanup work even though it no
+        # longer resolves through the active User Status union.
+        residual_sql = " or ".join(_REJECTED_RESIDUAL_EXISTS[table] for table in _REJECTED_TABLES)
+        residual_discarded_ids = {
+            int(row[0]) for row in connection.execute(
+                f"""select distinct strategies.strategy_id
+                     from strategies
+                    where strategies.strategy_id in (select unnest(?::bigint[]))
+                      and strategies.lifecycle_status = 'DISCARDED'
+                      and ({residual_sql})""",
+                [strategy_ids],
+            ).fetchall()
+        }
+        rejected_ids.update(residual_discarded_ids)
+        # Retirement applies to every matching rejected strategy, including a
+        # row whose large detail facts were already removed by an earlier run.
+        # The detail-table scan below remains limited to physical rows that
+        # still exist, while this complete set drives the lifecycle update.
+        discarded_ids = set(rejected_ids)
         for symbol, count in connection.execute(
-            """select strategies.symbol, count(distinct strategies.strategy_id)
+            f"""select strategies.symbol, count(distinct strategies.strategy_id)
                  from strategies
-                where strategies.strategy_id in (select unnest(?::bigint[]))
-                  and exists (
-                      select 1 from strategy_results results
-                       where results.strategy_id = strategies.strategy_id
-                         and (
-                             exists (select 1 from strategy_actions where result_id = results.result_id)
-                             or exists (select 1 from strategy_equity where result_id = results.result_id)
-                             or exists (select 1 from optimizer_prepared_inputs where result_id = results.result_id)
-                         )
-                  )
+                 where strategies.strategy_id in (select unnest(?::bigint[]))
+                   and (
+                       strategies.lifecycle_status = 'ACTIVE'
+                        or ({residual_sql})
+                   )
                 group by strategies.symbol""",
             [sorted(rejected_ids)],
         ).fetchall():
@@ -343,6 +396,7 @@ def create_preview(
         "operation": operation,
         "symbols": list(selected),
         "rejected_strategy_ids": sorted(rejected_ids),
+        "discarded_strategy_ids": sorted(discarded_ids),
         "plateau_keys": [],
         "plateau_owners": {},
     }
@@ -355,6 +409,12 @@ def create_preview(
 
     if operation == "rejected":
         for table, sql in (
+            ("selection_review_rows", """select strategies.symbol, rows.review_import_id, rows.strategy_id
+                 from selection_review_rows rows join strategies using (strategy_id)
+                where rows.strategy_id in (select unnest(?::bigint[]))"""),
+            ("selection_results", """select strategies.symbol, rows.selection_run_id, rows.strategy_id
+                 from selection_results rows join strategies using (strategy_id)
+                where rows.strategy_id in (select unnest(?::bigint[]))"""),
             ("strategy_actions", """select strategies.symbol, actions.result_id, actions.action_index
                  from strategy_actions actions join strategy_results results using (result_id)
                  join strategies using (strategy_id)
@@ -367,6 +427,22 @@ def create_preview(
                  from optimizer_prepared_inputs facts join strategy_results results using (result_id)
                  join strategies using (strategy_id)
                 where results.strategy_id in (select unnest(?::bigint[]))"""),
+            ("window_metrics", """select strategies.symbol, facts.result_id, facts.requested_start_utc,
+                         facts.requested_end_utc, facts.metrics_version
+                  from window_metrics facts join strategy_results results using (result_id)
+                  join strategies using (strategy_id)
+                 where results.strategy_id in (select unnest(?::bigint[]))"""),
+            ("equity_quality_metrics", """select strategies.symbol, facts.result_id, facts.algo_version
+                  from equity_quality_metrics facts join strategy_results results using (result_id)
+                  join strategies using (strategy_id)
+                 where results.strategy_id in (select unnest(?::bigint[]))"""),
+            ("strategy_tags", """select strategies.symbol, tags.strategy_id, tags.tag
+                  from strategy_tags tags join strategies using (strategy_id)
+                 where tags.strategy_id in (select unnest(?::bigint[]))"""),
+            ("strategy_rejection_sources", """select strategies.symbol, sources.strategy_id,
+                         sources.source_kind, sources.reason_code
+                  from strategy_rejection_sources sources join strategies using (strategy_id)
+                 where sources.strategy_id in (select unnest(?::bigint[]))"""),
         ):
             count, grouped, digest, _ = _scan_table(connection, sql, [targets["rejected_strategy_ids"]])
             table_counts[table] = count
@@ -552,9 +628,12 @@ def _target_predicate(table: str, targets: Mapping[str, object]) -> tuple[str, l
         return f"strategy_id in ({strategy_source})", strategy_params
     if table in {"strategy_actions", "strategy_equity", "window_metrics", "optimizer_prepared_inputs", "equity_quality_metrics"}:
         return (
-            f"result_id in (select result_id from strategy_results where strategy_id in ({strategy_source}))",
-            strategy_params,
+            f"result_id in (select result_id from strategy_results where strategy_id in ({strategy_source}) "
+            f"union all select current_result_id from strategies where strategy_id in ({strategy_source}))",
+            strategy_params + strategy_params,
         )
+    if table in {"selection_results", "selection_review_rows"} and targets.get("operation") == "rejected":
+        return f"strategy_id in ({strategy_source})", strategy_params
     if table == "selection_review_rows":
         return (
             "review_import_id in (select review_import_id from selection_review_imports "
@@ -670,12 +749,18 @@ def _count_by_symbol(connection: duckdb.DuckDBPyConnection, table: str, targets:
     elif table == "selection_runs":
         source, alias, symbol = "selection_runs", "selection_runs", "symbol"
     elif table == "selection_results":
-        source, alias, symbol = "selection_results child join selection_runs using (selection_run_id)", "selection_runs", "symbol"
+        if targets.get("operation") == "rejected":
+            source, alias, symbol = "selection_results child join strategies using (strategy_id)", "strategies", "symbol"
+        else:
+            source, alias, symbol = "selection_results child join selection_runs using (selection_run_id)", "selection_runs", "symbol"
     elif table == "selection_review_imports":
         source, alias, symbol = "selection_review_imports child join selection_runs using (selection_run_id)", "selection_runs", "symbol"
     elif table == "selection_review_rows":
-        source = "selection_review_rows child join selection_review_imports using (review_import_id) join selection_runs using (selection_run_id)"
-        alias, symbol = "selection_runs", "symbol"
+        if targets.get("operation") == "rejected":
+            source, alias, symbol = "selection_review_rows child join strategies using (strategy_id)", "strategies", "symbol"
+        else:
+            source = "selection_review_rows child join selection_review_imports using (review_import_id) join selection_runs using (selection_run_id)"
+            alias, symbol = "selection_runs", "symbol"
     else:
         raise AssertionError(f"unsupported maintenance table {table}")
     source = source.replace(" child", "")
@@ -773,7 +858,7 @@ def apply_preview(
                 "before_shared": before_shared,
             })
 
-        if not any(int(state["expected"]) for state in states):
+        if not any(int(state["expected"]) for state in states) and current["operation"] != "rejected":
             return
         if on_phase:
             for state in states:
@@ -784,6 +869,42 @@ def apply_preview(
             for state in states:
                 table = str(state["table"])
                 connection.execute(f"delete from {table} where {state['where']}", state["params"])
+            if current["operation"] == "rejected":
+                archive_ids = list(targets.get("discarded_strategy_ids", ()))
+                if archive_ids:
+                    # Keep only the temporal identity needed to compare an
+                    # equal/narrower/wider future report.  The result row is
+                    # otherwise reduced to a tiny dedup tombstone.  Exchange
+                    # remains the original provenance value; lifecycle_status
+                    # is the tombstone marker and avoids a fake domain value.
+                    connection.execute(
+                        """update strategy_results
+                              set commission_rate = null,
+                                  initial_balance = 0,
+                                  final_balance = 0,
+                                  total_pnl = null,
+                                  total_pnl_pct = null,
+                                  max_drawdown = null,
+                                  max_drawdown_pct = null,
+                                  total_fees = null,
+                                  total_trades = null,
+                                  excluded_trade_count = null,
+                                  exclusion_reason = null,
+                                  optimizer_source_metadata_json = null,
+                                  sizing_use_upnl = null,
+                                  sizing_use_frozen_balance = null,
+                                  sizing_use_fix = null,
+                                  sizing_balance_percentage_long = null,
+                                  sizing_risk_long = null,
+                                  sizing_max_balance = null
+                            where strategy_id in (select unnest(?::BIGINT[]))""",
+                        [archive_ids],
+                    )
+                    connection.execute(
+                        "update strategies set lifecycle_status = 'DISCARDED' "
+                        "where strategy_id in (select unnest(?::BIGINT[]))",
+                        [archive_ids],
+                    )
             connection.execute("commit")
         except BaseException as error:
             try:
@@ -846,8 +967,11 @@ def apply_preview(
                 )
 
     delete_specs = _delete_specs(current)
-    for table in delete_specs:
-        delete_batch((table,))
+    if current["operation"] == "rejected":
+        delete_batch(delete_specs)
+    else:
+        for table in delete_specs:
+            delete_batch((table,))
 
     if current["operation"] == "full":
         _audit_full_delete_result(

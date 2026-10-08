@@ -3418,7 +3418,25 @@ def test_missing_cache_strategy_ids_only_returns_current_results_without_facts(t
         ).fetchone()[0]
         check.execute("update strategies set current_result_id = ? where strategy_id = ?", [result_id, strategy_id])
 
+        discarded_id = check.execute(
+            """insert into strategies (strategy_name, symbol, side, timeframe, close_ma_len,
+               order_count, analysis_run_id, candidate_identity, lifecycle_status,
+               created_at_utc, updated_at_utc) values ('discarded', 'BTCUSDT', 'LONG', '1h',
+               3, 1, 'run', 'candidate-discarded', 'DISCARDED', ?, ?) returning strategy_id""",
+            [start, start],
+        ).fetchone()[0]
+        discarded_result = check.execute(
+            """insert into strategy_results (strategy_id, report_start_utc, report_end_utc, exchange,
+               commission_rate, initial_balance, final_balance, total_pnl, total_pnl_pct,
+               max_drawdown, max_drawdown_pct, total_fees, total_trades, imported_at_utc)
+               values (?, ?, ?, 'Bybit', .0004, 100, 110, 10, 10, 5, 5, 2, 2, ?) returning result_id""",
+            [discarded_id, start, datetime(2026, 1, 31, tzinfo=UTC), start],
+        ).fetchone()[0]
+        check.execute("update strategies set current_result_id = ? where strategy_id = ?", [discarded_result, discarded_id])
+
         assert selection_cache_missing_strategy_ids(check, request, config) == (strategy_id,)
+        candidates = load_selection_candidates(check, request, config, cache_only=True)
+        assert discarded_id not in {int(value) for value in candidates["strategy_id"].tolist()}
 
 
 def test_legacy_full_ab_only_cache_is_not_ready(tmp_path: Path) -> None:

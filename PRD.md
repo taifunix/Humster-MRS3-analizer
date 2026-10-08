@@ -2,29 +2,65 @@
 
 ## Продукт
 
-Humster MRS3 Analyzer — локальный, детерминированный pipeline для перехода от результатов MRS2 к проверяемым кандидатам MRS3. Он нормализует входные точки, применяет правила устойчивости/пригодности, строит 1ORD и 2–4ORD структуры, выпускает валидированные strategy JSON, запускает batch в Hamster Bot Tester и сравнивает реальные результаты после tick-test.
+Humster MRS3 Analyzer — локальный детерминированный pipeline для PerformanceDB,
+импорта и замены результатов тестера, расчёта PnL/DD/equity-фактов,
+последовательного применения фильтров Performance v2, подготовки shortlist и
+READY JSON, XLSX-выгрузок и передачи кандидатов в tester. Каждая операция
+сохраняет происхождение и проверяемые причины решений.
 
-**Текущий статус:** код v0.6 перенесён в корневой пакет как baseline; продуктовая работа начинается с v0.7. Реальная эффективность MRS3 пока не доказана: до завершения materialization и tick-tests любые source-метрики — только диагностика.
+**Текущий статус (2026-10-08):** основные локальные контуры Performance v2,
+equity regime, finalist RETEST, XLSX-контракта, Minimum Shift, ручного
+обслуживания PerformanceDB и расчёта базового лота реализованы и прошли
+независимую проверку. Открытые live-проверки, миграции и tester smoke указаны в
+`progress.md` и не считаются выполненными по одному локальному evidence.
+Диагностические/source-метрики не являются доказанным результатом готовой
+MRS3-стратегии без реального tick-test и DD5 retest.
 
-BASE 1ORD selection (`docs/specs/2026-08-24-base-1ord-selection.md`) implemented and verified on the fresh CXMT corpus under `0.7-canonical-phase1-base-1ord-v3`; it publishes reproducible 1ORD BASE structures. This does not establish realized MRS3 PnL or replace tick-tests.
+## Навигация для агента
+
+Сначала всегда читать `AGENTS.md`, этот раздел и `progress.md`. Затем читать
+только строку, соответствующую текущей задаче; не загружать весь реестр,
+исторические приложения или соседние модули. Для выбранной строки читать
+спецификацию, затем только явно указанные в ней ADR/план/evidence.
+
+| Если задача касается | Обязательный контекст | Не читать без прямой ссылки |
+| --- | --- | --- |
+| PerformanceDB import/replace, RETEST, dedup | [v2 CHECK & RETEST](docs/specs/2026-09-03-performance-v2-retest-workflow.md), [typed-config dedup](docs/specs/2026-09-04-performance-v2-config-dedup.md), [SINGLE_MODE collection](docs/specs/2026-09-28-single-mode-report-collection.md) | legacy import/DD5 specs |
+| Performance v2 filters, selection, ranking | [fixed filter sequence](docs/specs/2026-10-01-performance-v2-filter-sequence.md), [researched filters](docs/specs/2026-10-02-performance-v2-researched-filters.md), [robust ranking](docs/specs/2026-09-01-performance-v2-robust-finalist-ranking.md) | predecessor Panel Phase 2 and old Pareto contracts |
+| Equity regime or equity-filter facts | [equity status map](docs/specs/2026-10-03-equity-regime-status-map.md), [production plan](docs/superpowers/plans/2026-10-04-equity-regime-production.md), [M3 research](docs/reports/2026-10-04-equity-regime-m3-research.md) | old equity-quality drafts unless linked by the status map |
+| Finalist RETEST and «Применить эквити фильтр» | [finalist RETEST control](docs/specs/2026-09-09-performance-v2-finalist-retest-control.md) and its linked ADR/plan | general tester recovery notes |
+| Shortlist, READY JSON, order structures, Minimum Shift | [Shortlist filters v2](docs/specs/2026-09-27-shortlist-filters-v2.md), [Minimum Shift](docs/specs/2026-10-08-fresh-shortlist-minimum-shift.md), linked ADRs/plans | historical event-filter and v0.6 generation specs |
+| XLSX export or column order | [XLSX column contract](docs/specs/2026-10-07-performance-v2-xlsx-column-contract.md), [PerformanceDB export](docs/specs/2026-09-24-performance-db-xlsx-export.md) | old DD5/XLSX contracts |
+| PerformanceDB maintenance or physical cleanup | [maintenance contract](docs/specs/2026-10-06-performance-db-maintenance.md), linked ADR/plan | old migration/cleanup rules |
+| Bybit base lot or market-data collector | [base-lot export](docs/specs/2026-10-07-bybit-base-lot-export.md); read the [collector spec](docs/specs/2026-09-05-bybit-market-data-collector.md) only when collector behavior is changed | historical collector appendices |
+| Canonical source/analysis materialization | [Canonical Phase 1](docs/specs/2026-08-16-mrs3-v07-canonical-phase1.md), [implementation plan](docs/superpowers/plans/2026-08-16-mrs3-v07-canonical-phase1.md) | v4 import, legacy selection and old readiness contracts |
+| Portfolio Optimizer | [phased optimizer spec](docs/specs/2026-09-05-portfolio-optimizer.md), [Panel UI contract](docs/specs/2026-09-06-portfolio-optimizer-panel-ui.md), [liquidity model](docs/specs/2026-09-27-liquidity-lot-model.md), [Stage 2 decision](docs/decisions/0059-portfolio-stage2-sequential-batch.md) | Portfolio Analyzer v0.4 and unadopted M6–M8 evidence unless the task explicitly needs provenance |
+
+`progress.md` is the status gate: it tells whether a linked item is live,
+fixture-only, pending reload, or still blocked. `docs/decisions/` records
+accepted invariants, `docs/superpowers/plans/` the implementation sequence,
+and `docs/reports/` measured evidence. Sections after `## Исторические
+приложения` retain provenance only and never add current instructions.
 
 ## Пользовательский результат
 
-Для одного сравнимого периода и одной стороны рынка пользователь получает:
+Для выбранной пары/стороны и сравнимого периода пользователь получает:
 
-1. audit происхождения каждой MRS2-точки и причины каждого исключения;
-2. воспроизводимые READY структуры 1ORD/2ORD/3ORD/4ORD с EQUAL и INCOME lot variants;
-3. JSON, технически валидные для тестера;
-4. результаты реального tick-test, расчётная DD5-нормализация и individual ranking;
-5. только после накопления результатов — калиброванный безопасный pre-test potential filter.
+1. факты PerformanceDB с происхождением и причиной каждого решения фильтра;
+2. воспроизводимые shortlist/READY структуры и JSON, валидные для тестера;
+3. XLSX с единым составом колонок, equity-метриками и статусами;
+4. результаты реального tick-test, DD5-нормализацию и individual ranking;
+5. отдельные live/retest evidence только после фактического запуска и проверки.
 
-## Текущий этап: v0.7 Source v6 fresh compact multi-scope — complete
+## Текущий этап: v0.7 — PerformanceDB/Performance v2 hardening; Canonical Phase 1 Task 12C pending
 
+Source v6 fresh compact multi-scope is complete. The active MRS3 delivery track
+is [Canonical Phase 1 Task 12C](docs/specs/2026-08-16-mrs3-v07-canonical-phase1.md)
+with its [implementation plan](docs/superpowers/plans/2026-08-16-mrs3-v07-canonical-phase1.md).
 The Performance v2 fixed filter sequence is implemented and independently
-reviewed in local `main` (commit `eae54c0`): Equity, Lot variant, hard cutoffs,
-A/B deterioration and top-five concentration. The contract and evidence are
-listed in the implemented-feature table below. Researched pair-side PnL and
-structural stages 6–9 are implemented in the Panel under
+reviewed: Equity, Lot variant, hard cutoffs, A/B deterioration and top-five
+concentration. The contract and evidence are listed in the registry below.
+Researched pair-side PnL and structural stages 6–9 are implemented in the Panel under
 [their active contract](docs/specs/2026-10-02-performance-v2-researched-filters.md).
 The Panel export uses its existing sheets, reason and analog columns.
 
@@ -35,18 +71,11 @@ Lossless prepared compression and fresh-file compaction have independent
 plan approval and are being implemented; the actual database remains unchanged. This does not alter financial
 facts, strategy admission or portfolio simulation scope.
 
-Предыдущий DuckDB analysis-storage/importer этап реализован и проверен:
-source schema v5, управляемый импорт, immutable analysis surfaces, повторный
-plateau-анализ, lineage, библиотека результатов и детерминированные экспорты
-уже доступны. Это инфраструктурная база нового Phase 1, но она не доказывает
-доходность готовых MRS3-стратегий.
-
-Базовый [DuckDB surface coverage review](docs/specs/2026-08-14-duckdb-surface-coverage-review.md)
-и его Priority-1 patch также реализованы и проверены как **исторический текущий
-runtime**: double-zero isolation, stale-token clearing, диагностируемые direct
-jobs, ordinal и coverage-artifact links при старом one-MA-pair readiness.
-Readiness-поведение этого historical runtime заменено canonical six-CloseMA
-core в Task 2; panel/storage selected-preflight integration остаётся Task 3.
+Source DuckDB и Analysis DuckDB образуют реализованный слой хранения фактов,
+immutable surfaces, analysis runs и lineage. Его текущий operational contract
+определяет [Canonical Phase 1 specification](docs/specs/2026-08-16-mrs3-v07-canonical-phase1.md).
+Открытым остаётся только Task 12C — fresh real-source smoke/performance — по
+[активному плану](docs/superpowers/plans/2026-08-16-mrs3-v07-canonical-phase1.md).
 
 Новая [Canonical Phase 1 specification](docs/specs/2026-08-16-mrs3-v07-canonical-phase1.md)
 утверждена как активный контракт, а [ADR-0009](docs/decisions/0009-canonical-phase1-surface-selection-contract.md)
@@ -56,15 +85,16 @@ surfaces и MRS3 selection:
 - exact canonical Shift grid `30..550`;
 - один общий UTC-интервал и шесть readiness witnesses CloseMA `2..7`;
 - exact preview/audit/preflight replay;
-- bounded 15-process direct materialization;
+- bounded materialization using the shared `duckdb_import.workers` setting;
 - frozen CMARepresentative / CloseMA continuity / BASE facts;
 - 2/3/4ORD только из frozen representatives;
 - независимый exact-scope 1ORD;
 - hard rejection старых/non-canonical surfaces из нового operational flow.
 
 Governance Task 0, canonical-config Task 1 и six-CloseMA readiness Task 2
-завершены; следующий шаг — Task 3 из отдельного плана. Task 2 проверен
-focused `79 passed`, `git diff --check` и независимым Luna `PASS`.
+завершены; Tasks 3–12B закрыты в implementation plan. Открыт только Task
+12C. Task 2 проверен focused `79 passed`, `git diff --check` и независимым
+Luna `PASS`.
 Принятые ADR-0007 и ADR-0008 не переписываются; их конфликтующие части
 superseded ADR-0009 только для новых canonical surfaces. Старый
 [Common Close-MA Readiness plan](docs/superpowers/plans/2026-08-15-common-close-ma-readiness.md)
@@ -75,266 +105,86 @@ Analysis DuckDB — append-only хранилищем immutable materialized surf
 analysis runs и lineage согласно уже реализованной
 [спецификации DuckDB analysis storage and importer](docs/specs/2026-08-11-v07-duckdb-analysis-storage-and-importer.md).
 
-Соединение CSV с DuckDB остаётся Optional / Deferred по
-[CSV-DuckDB overlay](docs/specs/2026-08-11-v07-optional-csv-duckdb-overlay.md).
-
-### Этапы поставки
-
-| № | Результат | Входной критерий | Выходной критерий |
-| --- | --- | --- | --- |
-| Current governing contract | [Performance DB v2 CHECK & RETEST](docs/specs/2026-09-03-performance-v2-retest-workflow.md) + [typed-config dedup](docs/specs/2026-09-04-performance-v2-config-dedup.md) | listing-date warm-up, raw DD, PnL/30d and Trades/30d comparison, atomic import/replacement and typed-config deduplication | schema v4 validation, 149-ID audit seed and read-only duplicate audit baseline verified |
-
-> The older 2026-08-14 Performance import/DD5 rows below are retained as
-> historical provenance; the 2026-09-03 Performance DB v2 contract governs the
-> current runtime and selection behavior.
-| 0 | Репозиторий v0.7 | перенесён baseline | root package, tests, docs и Git готовы |
-| 1 | Проверенный v4 import | база и audit доступны | schema v4, manifest, quarantine/checklist проверены |
-| 2 | Source packages | CSV и raw payloads v4 | один declared event mode, window и audit на пакет |
-| 3 | DuckDB materializer | raw payloads v4 | closed cycles, exclusions и `point_period_metrics` |
-| 4 | Selector v0.7 | ровно один source package | event gate, full rebuild, audit и JSON |
-| 5 | Реальные MRS3 results | READY JSON | raw tick-test + расчётное DD5 ranking и individual ranking |
-| 6 | Source-potential calibration | достаточная пачка results | LOPO-validated optional cap |
-
 ## Границы и safety rules
 
-- Не удалять raw HTML до подтверждённого v4 audit и `safe_to_delete=YES`.
-- Не использовать `len(raw actions)` как `TotalTrades` без reconciliation.
-- Не смешивать `legacy_trades_proxy` и `real_independent_events` в одном run.
-- Не фильтровать готовые v0.6 structures задним числом: после event-filter пересобирать весь universe.
-- Не объявлять `SourcePnLSum` потолком или прогнозом фактического MRS3 PnL без калибровки.
-- Не выдавать individual ranking за portfolio simulation: для портфеля нужны time series equity/drawdown/occupancy/margin.
+- Не выдавать диагностические/source-метрики за реализованный результат MRS3
+  без реального tick-test и DD5 retest.
+- Разделять read-only экспорт/расчёт фактов и операции, изменяющие базу;
+  mutation выполняется только по активному контракту конкретной функции.
+- Использовать общий лимит `duckdb_import.workers`; отдельные фиксированные
+  значения потоков в PRD и локальных инструкциях не задавать.
+- Не объявлять individual ranking результатом портфельной симуляции; для
+  портфельных выводов нужны отдельные временные ряды equity/drawdown и
+  ограничения, описанные в контракте оптимизатора.
 
 ## Не входит в текущий scope
 
-- портфельная симуляция и смешивание независимых событий с legacy proxy;
-- реализация портфельного модуля до появления его обязательных входных данных;
+- live trading, торговый admission и публикация рекомендаций без закрытых
+  соответствующих gates;
 - ML, regression score или per-pair/per-TF production thresholds;
 - GitHub push, PR или публикация результатов без отдельного разрешения.
 
-## Hook: Анализатор Портфеля
-
-Новый Portfolio Optimizer — **Draft D7 / M0–M8 fixture scope accepted**. Канонические
-[спецификация по фазам](docs/specs/2026-09-05-portfolio-optimizer.md),
-[план внедрения](docs/superpowers/plans/2026-09-05-portfolio-optimizer.md) и
-[ADR-0025 (Proposed)](docs/decisions/0025-portfolio-optimizer-evidence-and-phases.md),
-[ADR-0030 (Accepted)](docs/decisions/0030-portfolio-optimizer-m2-admission-and-sizing-contract.md),
-[UI spec](docs/specs/2026-09-06-portfolio-optimizer-panel-ui.md) и
-[ADR-0031 (Accepted)](docs/decisions/0031-portfolio-optimizer-panel-ui-and-campaign-boundary.md)
-фиксируют дизайн и границы принятой fixture-only реализации M0–M5; они не
-доказывают portfolio results и не разрешают runtime/tester/live use.
-[Portfolio Analyzer v0.4](docs/specs/2026-08-09-portfolio-analyzer-v04.md)
-сохраняется как предшествующий queued-контракт до принятия замены.
-
-Новый поиск описан в
-[техническом плане weighted search](docs/superpowers/plans/2026-09-12-portfolio-optimizer-weighted-search-discussion.md),
-который 2026-09-14 заменил накопительный черновик. План готовит root по прямому
-назначению пользователя; независимый Advisor — Opus. Пользователь передал
-итоговый PLAN_APPROVED для R3. Затем по его поручению подготовлена R4,
-возвращающая возможность увеличивать размеры с лимитером: полные IM/MM
-проверяются до реакции, профильный свободный резерв — после неё.
-Пользователь передал новый PLAN_APPROVED от Opus для R4. R4.1 добавляет
-однозначный порядок пересчёта приоритетов после изменения размеров и чек-лист;
-математика одобренной политики не меняется.
-После узкого PLAN_REVISE подготовлены WS1.1 / R4.2: маржа равна коэффициенту × x,
-неподтверждённое освобождение IM сохраняет I_held=I_all; типы результатов
-явно относятся к candidate_search. Пользователь передал Opus PLAN_APPROVED
-для этой редакции 2026-09-14; оговорка CONFIRMED/UNKNOWN добавлена в §9 плана.
-Приняты [спецификация WS1.1](docs/specs/2026-09-14-portfolio-optimizer-weighted-search.md)
-и [ADR-0036](docs/decisions/0036-portfolio-optimizer-weighted-search-contract.md)
-как контракт нового режима. Phase 5 implementation, verification, and the
-directed benchmark are recorded in
-[Phase 5 evidence](docs/superpowers/plans/2026-09-14-portfolio-optimizer-weighted-search-phase-5-evidence.md);
-independent Opus implementation review returned `CODE_REVIEW_PASS`, so Phase 5
-is accepted.
-Phase 8 is also accepted: Performance v2 schema v5 persists nullable typed
-action Price/Cost, six nullable WS1.1 sizing facts, and one private, versioned,
-digest-bound, per-result prepared optimizer input;
-see the [Phase 8 specification](docs/specs/2026-09-17-performance-v2-optimizer-prepared-inputs.md)
-and [acceptance evidence](docs/superpowers/plans/2026-09-17-performance-v2-optimizer-prepared-inputs-evidence.md).
-Phase 9 is accepted as WS1.2: each enabled canonical `(symbol, side)` slot
-contributes one finalist from its configured top-N pool, all fixed-slot
-compositions are ranked on equal terms, and same-symbol LONG+SHORT share one
-liquidity cap while retaining additive margin and distinct limiter slots.
-See [ADR-0039](docs/decisions/0039-portfolio-optimizer-ws12-directional-shared-cap.md)
-and [Phase 9 evidence](docs/superpowers/plans/2026-09-18-portfolio-optimizer-weighted-search-phase-9-evidence.md).
-WS1.3 is implemented and independently reviewed under the user-approved
-[unified liquidity model](docs/specs/2026-09-27-liquidity-lot-model.md) and
-[ADR-0046](docs/decisions/0046-portfolio-unified-liquidity-and-one-way-model.md).
-It replaces the shared mean-turnover cap with one geometry-dependent cap per
-directional strategy, default 10-USDT flooring, and K/bonus settings. Both
-directions remain selectable; effective historical cycles obey one active
-direction per symbol under the explicit dedicated-close-first assumption.
-The frozen cycle schedule is an approximation, not a joint tick-test or a
-conservative profitability bound. Additive margin and risk thresholds remain
-unchanged. Eight affected suites passed (1224 tests, one environment skip),
-and independent Opus 5/high returned `CODE_REVIEW_PASS`. This is not empirical
-calibration or permission to run a tester or use live trading.
-Current production weighted Stage 1 follows `LIMITER_DISABLED_OFF_ONLY` because
-the bot's `open_positions_limiter` is not operational. The adapter passes `L=0`
-and priority 1 for every member; the executable strategy keeps
-`mrs.position_priority=1`, while the frozen internal payload wrapper records
-`account.open_positions_limiter=0` (not tester readback). Lower-level limiter
-math, APIs and tests remain intact for Phase 13. Phase 7 is now an off-only
-joint baseline and all its execution items remain open. The revised pre-run
-package P7-R4 received independent Opus high `PLAN_APPROVED` on 2026-09-22.
-Separate explicit user authorization on 2026-09-21 permits only a bounded
-local-only off-only tester baseline. The fake-only boundary passed focused and
-affected suites plus independent Opus high implementation review; no run or
-result is complete, and execution remains stopped for a fresh
-before-execution confirmation. Exchange actions, trading, and production
-PerformanceDB writes are not authorized. See
-[ADR-0040](docs/decisions/0040-portfolio-optimizer-phase7-off-only-local-stage2.md).
-История и
-[ответ на замечания](docs/superpowers/plans/2026-09-14-portfolio-optimizer-weighted-search-review-response.md)
-сохраняют основания решения и изменение области резерва (§8.1 плана).
-При полной нагрузке до реакции резерв может быть ниже профильного порога;
-оба значения должны быть видны в отчёте; это входит в одобренную R4.
-Параллельные вычисления используют единственное поле панели duckdb_import.workers;
-бюджет учитывает доступные CPU/RAM и подтверждается замером. WS1.2 выбирает по
-одному FINALIST из настроенного top-N для каждой включённой стороны символа;
-разные составы участвуют в общем ранжировании. Подбор полных размеров и
-требуемого капитала формирует ограниченный
-список совместных тестов. Существующий путь adapter/candidate_search и
-инфраструктура Campaign/экспорта переиспользуются. MaxDD 20/10/5% от пика equity,
-резерв 20/40/60% и MM 50/35/20% сохраняются. Настройки остаются в том же JSON
-с понятными полями панели; предусмотрена защита от повторного API-бана.
-Фаза 5 принята только как fixture/local evidence implementation, а не как
-runtime или trading release. Нормализация исходных динамических
-лотов требует контрольной проверки; обычный повторный импорт не восстанавливает
-отсутствующий плановый sizing. Обновление active-spec перед изменением поведения,
-фазы реализации и критерии приёмки перечислены в плане. Действующие runtime-
-контракты и production-данные этой редакцией не изменены.
-
-Цель нового MVP: несколько независимых Unified Cross портфелей из проверенных
-immutable MRS3-кандидатов, liquidity/margin guards, общий tick-test и
-рекомендации AGGRESSIVE/BALANCED/CONSERVATIVE. Фиксированного продуктового числа
-пар нет; депозиты задаёт пользователь. Грубая общая liquidity-проверка
-повторяющихся symbols и базовая validation входят в MVP. Распределение общего
-капитала, live monitor, sessions, advanced risk и rotation — последующие фазы.
-
-M0 read-only inventory accepted after independent `CODE_REVIEW_PASS`. Fixture-only
-M1 config/storage/snapshot implementation is accepted after independent Opus
-`CODE_REVIEW_PASS`. Fixture-only M2 liquidity/reference implementation is accepted
-after independent Opus `CODE_REVIEW_PASS`. Fixture-only M3–M4 are accepted after
-independent Opus `CODE_REVIEW_PASS`; fixture/fake-only M5 is accepted after
-independent Opus `CODE_REVIEW_PASS`. Fixture/fake-only M6 is accepted after a
-fresh full Opus `CODE_REVIEW_PASS`. M7 is accepted after a fresh full Opus
-`CODE_REVIEW_PASS`; M8 fixture export and replay are accepted after final Opus
-`CODE_REVIEW_PASS`, while real E2E remains pending separate authorization.
-Q01-Q12 unknowns are isolated or
-fail-closed where unresolved.
-The versioned matrix is in
-[M0 evidence](docs/superpowers/plans/2026-09-06-portfolio-optimizer-m0-evidence.md).
-M1 evidence is recorded in
-[the implementation ledger](docs/superpowers/plans/2026-09-06-portfolio-optimizer-m1-evidence.md).
-M2 evidence is recorded in
-[the M2 ledger](docs/superpowers/plans/2026-09-06-portfolio-optimizer-m2-evidence.md).
-M3 evidence is recorded in
-[the M3 ledger](docs/superpowers/plans/2026-09-06-portfolio-optimizer-m3-evidence.md).
-M4 evidence is recorded in
-[the M4 ledger](docs/superpowers/plans/2026-09-06-portfolio-optimizer-m4-evidence.md).
-M5 evidence is recorded in
-[the M5 ledger](docs/superpowers/plans/2026-09-06-portfolio-optimizer-m5-evidence.md).
-Accepted M6 evidence is recorded in
-[the M6 ledger](docs/superpowers/plans/2026-09-07-portfolio-optimizer-m6-evidence.md).
-Accepted M7 evidence is recorded in
-[the M7 ledger](docs/superpowers/plans/2026-09-07-portfolio-optimizer-m7-evidence.md).
-M8 fixture evidence is recorded in
-[the M8 ledger](docs/superpowers/plans/2026-09-07-portfolio-optimizer-m8-evidence.md).
-U1 Panel implementation is accepted after final Opus `CODE_REVIEW_PASS` and
-committed separately as `7ddbb94` with its evidence ledger.
-Стартовые
-research-only DD/free-margin/MM limits
-описаны в D5 и [ADR-0029](docs/decisions/0029-portfolio-optimizer-research-risk-profile-v1.md)
-как `portfolio_optimizer_research_risk_v1`. D6 закрепляет exact `FINALIST`
-universe, seven-day liquidity distribution, maximum current symbol-level leverage
-и per-strategy DD ceiling from current portfolio equity; его numerical profile cap,
-PnL, liquidity/freshness policies и точное ranking согласуются позже, без них нет
-финальных рекомендаций. Текущая
-документационная работа не разрешает запуск tester/bot и не изменяет Performance runtime.
-Прохождение research thresholds не разрешает implementation, tester run,
-`RECOMMENDATION_READY`, trading admission или live use; все remaining gates
-(PnL floor, liquidity/freshness limits, profile ranking) остаются open blockers.
-
-Минимальный интерфейс Panel выделен в отдельную сквозную дорожку: U0
-документации и U1 реализации приняты. Последовательная передача Stage 2
-реализована только на fixtures/fakes: один job отправляет все кандидаты
-зафиксированного Stage 1 artifact по порядку и показывает результаты каждого.
-Stage 1 публикует точное число кандидатов для подтверждения; независимое
-CODE_REVIEW_PASS получен. Широкий модульный запуск выявил известную ошибку
-неизменённого schema-v9 test fixture; focused проверки изменённых путей прошли.
-Реальный tester не запускался. Его запуск остаётся закрытым до M5/M6 и
-отдельного свежего разрешения пользователя. M5 не зависит от UI. README не
-меняется до появления проверенного публичного способа запуска.
-
-## Реестр активной документации
+## Реестр документации и статусов
 
 | Статус | Документ | Назначение | Зависимости |
 | --- | --- | --- | --- |
 | Closeout / merge pending | [Heavy database optimization](docs/specs/2026-09-28-heavy-database-optimization.md), [closeout plan](docs/superpowers/plans/2026-09-28-heavy-database-optimization.md), [deferred follow-ups](docs/superpowers/plans/2026-10-01-deferred-heavy-db-follow-ups.md) | проверенные мелкие хвосты PerformanceDB; Source/materialization и дорогие profile-gated задачи отложены в новую ветку | актуальные контракты каждого модуля; Performance import boundary на `8f59c2c` |
 | Implemented / independently reviewed | [Performance v2 optional commission evidence](docs/specs/2026-09-30-performance-v2-optional-commission-evidence.md), [ADR-0049](docs/decisions/0049-performance-v2-optional-commission-evidence.md), [verification](progress.md) | `SINGLE_MODE`/collections can import verified HTML without tester fee settings; unknown `commission_rate` is SQL `NULL` in schema v7 | legacy FAST/RUNS and v1 contracts, HTML fee/PnL facts, v5/v6 read compatibility |
 | Accepted | [Repository foundation](docs/specs/2026-08-10-mrs3-v07-repository-foundation.md) | структура репозитория и workflow | — |
-| Active prerequisite | [Safe runner smoke-test](docs/specs/2026-08-10-v06-runner-safe-root-json-smoke.md) | безопасная проверка панели и одного реального прогона | локальный tester; до v0.7 implementation |
-| Active | [v0.7 legacy selection](docs/specs/2026-08-10-v07-legacy-selection.md) | последовательность import → materializer → unified input → selector | v4 evidence, event-filter spec |
-| Active | [v0.7 event source packs](docs/specs/2026-08-10-v07-event-source-packs.md) | CSV/DuckDB пакеты, event modes и closed-cycle audit | v4 evidence, event-filter spec |
-| Implemented / Verified | [v0.7 DuckDB analysis storage and importer](docs/specs/2026-08-11-v07-duckdb-analysis-storage-and-importer.md) | единый source DuckDB, импорт из панели, analysis DuckDB и plateau lineage | event source packs, event-filter spec |
-| Implemented / verified on production archive | [Trusted v4 migration performance](docs/specs/2026-08-11-v07-trusted-v4-migration-performance.md) | bounded v4-to-v5 production migration | DuckDB analysis storage |
-| Optional / Deferred | [v0.7 CSV-DuckDB overlay](docs/specs/2026-08-11-v07-optional-csv-duckdb-overlay.md) | необязательное объединение CSV coarse-grid и DuckDB fine-grid | DuckDB analysis storage, event-filter spec |
-| Accepted | [ADR-0002](docs/decisions/0002-source-summary-and-window-metrics-verification.md) | раздельная full-horizon/windowed verification для real packages v2 | event source packs |
-| Active dependency | [Event filter and shortlist](docs/specs/v07-event-filter-and-shortlist.md) | правила `PointEventCount`, representative и shortlist | unified input |
+| Historical / superseded | [Safe runner smoke-test](docs/specs/2026-08-10-v06-runner-safe-root-json-smoke.md) | прежняя проверка панели и одного прогона; не является текущим workflow | текущие Panel/tester contracts |
+| Historical / superseded | [v0.7 legacy selection](docs/specs/2026-08-10-v07-legacy-selection.md) | прежний import → materializer → selector контур | текущие Performance v2 и Canonical Phase 1 contracts |
+| Historical / superseded | [v0.7 event source packs](docs/specs/2026-08-10-v07-event-source-packs.md) | прежний CSV/DuckDB package и event-mode контракт | текущие source/PerformanceDB contracts |
+| Implemented / provenance | [v0.7 DuckDB analysis storage and importer](docs/specs/2026-08-11-v07-duckdb-analysis-storage-and-importer.md) | реализованный слой source/analysis DuckDB и lineage | Canonical Phase 1 |
+| Historical / provenance | [Trusted v4 migration performance](docs/specs/2026-08-11-v07-trusted-v4-migration-performance.md) | историческое evidence миграции v4→v5 | DuckDB analysis storage |
+| Deferred / historical | [v0.7 CSV-DuckDB overlay](docs/specs/2026-08-11-v07-optional-csv-duckdb-overlay.md) | необязательное старое объединение CSV и DuckDB | только отдельная согласованная задача |
+| Historical / accepted provenance | [ADR-0002](docs/decisions/0002-source-summary-and-window-metrics-verification.md) | раздельная full-horizon/windowed verification для прежних source packages | historical event-source contract |
+| Superseded / historical | [Event filter and shortlist](docs/specs/v07-event-filter-and-shortlist.md) | прежние правила event-filter и shortlist | текущие Shortlist filters v2 и Canonical Phase 1 |
 | Implemented / verified on production sample | [Pair screener](docs/specs/2026-09-18-pair-screener.md), [implementation plan](docs/superpowers/plans/2026-09-18-pair-screener-implementation.md) | дешёвый 304-точечный прогон на пару для отсева пар до полного 5472-точечного сбора; CSV-only оценка (6.1a закрыт); LONG+SHORT; реестр ликвидности (`input/bybit_tradfi_liquidity.xlsx`, лист «Скрининг»); экран SCREENER 01 (карточка, оценка, экспорт, передача в RUNNER 01) | RUNNER 01/`LocalTestingService`; полная кросс-валидация раздела 9 пропущена по решению пользователя, пороги не подтверждены на новых парах; вердикты по исходным 16 парам перепроверены 2026-09-19 через реальный `evaluate_pairs` на реальных отчётах — совпали побитово с первым прогоном (GO 3 / CHECK 8 / STOP 5) |
 | Superseded / historical | [Source-potential calibration](docs/specs/v07-posttest-calibration-source-potential.md) | legacy posttest calibration retained for provenance | Performance DB v2 RETEST |
-| Draft D7 / M0–M5 accepted | [Portfolio Optimizer phased spec](docs/specs/2026-09-05-portfolio-optimizer.md), [plan](docs/superpowers/plans/2026-09-05-portfolio-optimizer.md), [M0 evidence](docs/superpowers/plans/2026-09-06-portfolio-optimizer-m0-evidence.md), [M1 evidence](docs/superpowers/plans/2026-09-06-portfolio-optimizer-m1-evidence.md), [M2 evidence](docs/superpowers/plans/2026-09-06-portfolio-optimizer-m2-evidence.md), [M3 evidence](docs/superpowers/plans/2026-09-06-portfolio-optimizer-m3-evidence.md), [M4 evidence](docs/superpowers/plans/2026-09-06-portfolio-optimizer-m4-evidence.md), [M5 evidence](docs/superpowers/plans/2026-09-06-portfolio-optimizer-m5-evidence.md) | joint tick-tests, separate Cross portfolios, immutable evidence, phased recommendations | Performance v2, collector ADR-0024, M6 metrics, open PnL/liquidity/freshness/ranking and runtime gates |
-| U1 accepted / Stage 2 independently reviewed | [Portfolio Optimizer Panel UI](docs/specs/2026-09-06-portfolio-optimizer-panel-ui.md), [ADR-0031](docs/decisions/0031-portfolio-optimizer-panel-ui-and-campaign-boundary.md), [ADR-0059](docs/decisions/0059-portfolio-stage2-sequential-batch.md), [implementation plan](docs/superpowers/plans/2026-10-07-portfolio-stage2-sequential-batch.md) | local launch form, persisted Stage 1 job, settings CAS, summary/XLSX, fake-only ordered Stage 2 batch and per-candidate progress | CODE_REVIEW_PASS; no real tester run; real execution requires M5/M6 and separate fresh user authorization; broad suite has a documented unrelated schema-v9 fixture failure |
-| Phase 2A accepted / Phase 2B server accepted | [Phase 2A spec](docs/specs/2026-09-07-portfolio-optimizer-phase2a-execution-research.md), [Phase 2A evidence](docs/superpowers/plans/2026-09-08-portfolio-optimizer-phase2a-evidence.md), [Phase 2B spec](docs/specs/2026-09-07-portfolio-optimizer-phase2b-live-account-monitor.md), [Phase 2B server evidence](docs/superpowers/plans/2026-09-09-portfolio-optimizer-phase2b-server-evidence.md), [Revision 6 plan](docs/superpowers/plans/2026-09-07-portfolio-optimizer-phase2a-2b.md), [ADR-0032](docs/decisions/0032-portfolio-live-monitor-storage-and-reconcile.md) | immutable execution research; fixture/fake LiveStore, reconcile, read models, order projection and exact charts accepted; Panel 2B-9 pending | no real REST/WS, credentials, tester, trading, admission or deployment |
-| Accepted Stage-1 amendment / implemented read-only | [ADR-0034](docs/decisions/0034-portfolio-optimizer-pretest-search-and-sizing.md) | PRETEST_PROXY period, shared-cap sizing, mandatory search budget, deterministic bounded process search from machine-wide workers, top-N preliminary output and metric labels | no tester/runtime/recommendation |
-| Phase 9 accepted / Phase 7 off-only baseline / Phase 13 limiter work open | [weighted-search spec](docs/specs/2026-09-14-portfolio-optimizer-weighted-search.md), [ADR-0040](docs/decisions/0040-portfolio-optimizer-phase7-off-only-local-stage2.md), [plan](docs/superpowers/plans/2026-09-12-portfolio-optimizer-weighted-search-discussion.md) | current Stage 1 admits only `L=0` with canonical priority 1; Phase 7 is off-only joint baseline | Phase 7 run/results and all Phase 13 limiter runtime/release/replay work remain open; bounded local-only off-only tester permission exists but no run/result is complete; no exchange, trading or production DB permission |
-| Implemented / accepted | [Performance v2 optimizer prepared inputs](docs/specs/2026-09-17-performance-v2-optimizer-prepared-inputs.md), [Phase 8 evidence](docs/superpowers/plans/2026-09-17-performance-v2-optimizer-prepared-inputs-evidence.md), [ADR-0037](docs/decisions/0037-performance-v2-optimizer-prepared-inputs.md), [ADR-0038](docs/decisions/0038-performance-v2-prepared-canonicalization-and-locking.md) | schema v5 typed Price/Cost and WS1.1 sizing facts; private digest-bound per-result prepared input | no tester/runtime/recommendation/live permission |
-| Proposed | [ADR-0025](docs/decisions/0025-portfolio-optimizer-evidence-and-phases.md) | optimizer data boundaries, replay and MVP/post-MVP scope | ADR-0001/0020/0024; approval deferred |
-| Accepted | [ADR-0029](docs/decisions/0029-portfolio-optimizer-research-risk-profile-v1.md) | research-only DD/free-margin/MM profile defaults | Portfolio Optimizer D5; not runtime/trading permission |
-| Accepted | [ADR-0030](docs/decisions/0030-portfolio-optimizer-m2-admission-and-sizing-contract.md) | FINALIST admission, liquidity/lot ceiling, leverage and individual-DD sizing semantics | Portfolio Optimizer D6; not runtime/trading permission |
-| Accepted | [ADR-0031](docs/decisions/0031-portfolio-optimizer-panel-ui-and-campaign-boundary.md) | local Panel UI, immutable Campaign, persisted job, config CAS and success-only XLSX | Portfolio Optimizer D7; U1 and tester runtime not authorized |
-| Accepted | [ADR-0026](docs/decisions/0026-bybit-orderbook-data-health.md) | preserve snapshots received before ACK; separate transport connectivity from data health | Bybit collector specification |
-| Accepted | [ADR-0027](docs/decisions/0027-bybit-runtime-mode-markers.md) | explicit production versus accelerated smoke health markers | Bybit collector specification |
-| Accepted | [ADR-0028](docs/decisions/0028-bybit-side-depth-completeness.md) | preserve combined depth completeness and add bid/ask ratios in schema v2 | Bybit collector specification |
+| Implemented locally / fixture-gated | [Portfolio Optimizer phased spec](docs/specs/2026-09-05-portfolio-optimizer.md), [Panel UI contract](docs/specs/2026-09-06-portfolio-optimizer-panel-ui.md), [unified liquidity](docs/specs/2026-09-27-liquidity-lot-model.md), [Stage 2 decision](docs/decisions/0059-portfolio-stage2-sequential-batch.md) | optimizer UI, prepared inputs and ordered Stage 2 batch are implemented/reviewed; fixture evidence does not authorize real tester, trading or live PerformanceDB writes | open PnL/liquidity/freshness/ranking/limiter gates and fresh user authorization; current status in `progress.md` |
+| Implemented / accepted | [Performance v2 optimizer prepared inputs](docs/specs/2026-09-17-performance-v2-optimizer-prepared-inputs.md), [ADR-0037](docs/decisions/0037-performance-v2-optimizer-prepared-inputs.md), [ADR-0038](docs/decisions/0038-performance-v2-prepared-canonicalization-and-locking.md) | typed Price/Cost and sizing facts used by optimizer inputs | no live execution or trading permission |
+| Accepted | [ADR-0026](docs/decisions/0026-bybit-orderbook-data-health.md), [ADR-0027](docs/decisions/0027-bybit-runtime-mode-markers.md), [ADR-0028](docs/decisions/0028-bybit-side-depth-completeness.md) | Bybit collector data-health and runtime-marker decisions | Bybit collector specification |
 | Predecessor / Queued | [Portfolio Analyzer v0.4](docs/specs/2026-08-09-portfolio-analyzer-v04.md) | предшествующий контракт до принятия нового optimizer design | historical provenance; no new runtime activation |
-| Accepted | [ADR-0001](docs/decisions/0001-repository-and-documentation-model.md) | root v0.7 и модель документации | — |
 | Superseded / historical | [Strategy performance DuckDB governing spec](docs/specs/2026-08-14-strategy-performance-duckdb.md) | former transactional import and DD5 contract; retained only for provenance | [ADR-0004](docs/decisions/0004-strategy-performance-evidence-store.md) |
-| Planned | [Panel Phase 2 structural filters](docs/specs/2026-08-25-panel-phase2-structural-filters.md) | immutable fresh-analysis shortlist filtering, server-authoritative READY generation and audit | event filter and shortlist, Panel Web |
+| Superseded / predecessor | [Panel Phase 2 structural filters](docs/specs/2026-08-25-panel-phase2-structural-filters.md) | predecessor design for fresh-analysis shortlist filtering; current behavior is governed by Shortlist filters v2 and its linked ADR | [Shortlist filters v2](docs/specs/2026-09-27-shortlist-filters-v2.md), Panel Web |
 | Implemented / independently reviewed | [Shortlist filters v2](docs/specs/2026-09-27-shortlist-filters-v2.md), [plan](docs/superpowers/plans/2026-09-27-shortlist-filters-v2.md), [ADR-0047](docs/decisions/0047-fresh-shortlist-applied-selection-v2.md) | preserve A/B, add Open MA proximity and one joint per-order Pareto, explicit apply, consistent audit/JSON selection and plateau totals | D3 PLAN_APPROVED; merged-tree suite 5363 passed, 8 skipped; Opus 5 CODE_REVIEW_PASS; browser/live smoke not run |
-| Implemented / independently reviewed | [Fresh shortlist Minimum Shift](docs/specs/2026-10-08-fresh-shortlist-minimum-shift.md), [ADR-0060](docs/decisions/0060-fresh-shortlist-minimum-shift.md) | optional first-order-only threshold for 1ORD/2ORD/3ORD, exact percent-to-bp gate, canonical shortlist/audit/READY/RUNS provenance, legacy engine-1 compatibility | focused fresh shortlist/generation/export/tester/UI suites pass; Opus 5 CODE_REVIEW_PASS; no live tester or database run |
+| Implemented / independently reviewed | [Fresh shortlist Minimum Shift](docs/specs/2026-10-08-fresh-shortlist-minimum-shift.md), [ADR-0060](docs/decisions/0060-fresh-shortlist-minimum-shift.md), [plan](docs/superpowers/plans/2026-10-08-fresh-shortlist-minimum-shift.md) | optional first-order-only threshold for 1ORD/2ORD/3ORD, exact percent-to-bp gate, canonical shortlist/audit/READY/RUNS provenance, legacy engine-1 compatibility | focused fresh shortlist/generation/export/tester/UI suites pass; Opus 5 CODE_REVIEW_PASS; no live tester or database run; Panel restart remains pending |
 | Implemented / verified | [SINGLE_MODE report collection](docs/specs/2026-09-28-single-mode-report-collection.md), [implementation plan](docs/superpowers/plans/2026-09-28-single-mode-report-collection.md) | opt-in server-owned collection controls in the ordinary tester card, exact collection verify/import handoff and non-destructive clear | native SINGLE_MODE tester, Performance v2 metadata inbox; RETEST unchanged |
 | Active | [Panel Fresh Analysis Settings](docs/specs/2026-09-10-panel-fresh-analysis-settings.md) | explicit listing-date input and safe actionable fresh-analysis configuration errors | Panel Web, local configuration |
 | Implemented / verified | [Panel Analysis Profile](docs/superpowers/specs/2026-09-10-panel-analysis-profile-design.md) | local typed editor for values that affect future fresh Source v6 analysis; atomic save and shared-worker notice | Panel Web, `config.local.json` |
 | Implemented / verified | [Local tester preparation](docs/specs/2026-09-10-panel-local-tester-preparation.md) | opt-in stale-report cleanup, file preparation and Files-tab local tester start; per-strategy Table wizard remains excluded | Panel Web, local tester runner |
 | Implemented / verified | [Tester run files](docs/specs/2026-08-25-tester-run-files.md) | five isolated tester snapshots from filtered READY candidates; manual `run_tester.bat` execution | Panel Web, local tester runner |
 | Retired / superseded | [Panel Fast Strategy Test](docs/specs/2026-08-27-panel-fast-strategy-test.md) | historical bounded strategy-batch design; active panel dispatch/API/retry contour removed, with shared runner machinery retained for native `SINGLE_MODE` | READY generation manifest, local tester primitives |
-| Implemented / verified | [Multi-order plateau admission](docs/specs/2026-08-25-multi-order-plateau-admission.md) | pre-combination 2ORD--4ORD structural width and independent-event admission | canonical Phase 1, event filter and shortlist |
+| Implemented / verified | [Multi-order plateau admission](docs/specs/2026-08-25-multi-order-plateau-admission.md) | pre-combination 2ORD--4ORD structural width and independent-event admission | Canonical Phase 1, Shortlist filters v2 |
 | Superseded / historical | [Performance report import to DuckDB](docs/specs/2026-08-14-performance-report-import-duckdb.md) | former HTML import and cleanup contract; retained only for provenance | Strategy performance DuckDB, ADR-0004--0006 |
 | Superseded / historical | [DD5 calculation and finalist selection](docs/specs/2026-08-14-dd5-finalist-selection.md) | former DD5/Pareto/XLSX contract; retained only for provenance | Performance report import to DuckDB |
 | Implemented / independently reviewed | [Performance v2 robust finalist ranking](docs/specs/2026-09-01-performance-v2-robust-finalist-ranking.md) | best-trade and temporal robustness filters, Shift-aware near-tie preference and deterministic Top-50 | Performance v2 finalist selection and XLSX |
-| Implemented / independently reviewed | [Performance v2 fixed filter sequence](docs/specs/2026-10-01-performance-v2-filter-sequence.md), [plan](docs/superpowers/plans/2026-10-01-performance-v2-filter-implementation.md), [ADR-0052](docs/decisions/0052-performance-v2-hard-cutoff-rejected.md), [ADR-0053](docs/decisions/0053-performance-v2-dd-profit-guard.md), [ADR-0058](docs/decisions/0058-performance-v2-filter-rejected-status.md) | fixed Equity, Lot, hard-cutoff, A/B, top-five, minimum-Shift and PnL/structural prefix; minimum Shift is enabled by default at 0.3% and runs immediately before PnL DD5/30 + PnL B/30; guarded full-DD cutoff uses full PnL/30d; time windows remain diagnostics; published exclusions at Lot, hard-cutoff and A/B gain source-specific `User Status=REJECTED`; `RESERVE` rows count as excluded from later stages | focused selection/UI suite 401 passed; broader selection/panel/export consumers 341 passed with 4 platform symlink skips; stale XLSX-header expectation aligned with the column contract; independent Opus `CODE_REVIEW_PASS`; no live database or tester run |
+| Implemented / independently reviewed | [Performance v2 fixed filter sequence](docs/specs/2026-10-01-performance-v2-filter-sequence.md), [plan](docs/superpowers/plans/2026-10-01-performance-v2-filter-implementation.md), [ADR-0052](docs/decisions/0052-performance-v2-hard-cutoff-rejected.md), [ADR-0053](docs/decisions/0053-performance-v2-dd-profit-guard.md), [ADR-0058](docs/decisions/0058-performance-v2-filter-rejected-status.md) | fixed Equity, Lot, hard-cutoff, A/B, top-five, **Performance v2 fixed-filter Minimum Shift** and PnL/structural prefix; the fixed-filter Minimum Shift is enabled by default at 0.3% and runs immediately before PnL DD5/30 + PnL B/30; guarded full-DD cutoff uses full PnL/30d; time windows remain diagnostics; published exclusions at Lot, hard-cutoff and A/B gain source-specific `User Status=REJECTED`; `RESERVE` rows count as excluded from later stages | focused selection/UI suite 401 passed; broader selection/panel/export consumers 341 passed with 4 platform symlink skips; stale XLSX-header expectation aligned with the column contract; independent Opus `CODE_REVIEW_PASS`; no live database or tester run |
 | Implemented / independently reviewed | [Performance v2 selection review import](docs/specs/2026-09-02-performance-v2-selection-review-import.md) | weighted Top-20, exact analog representatives, immutable selection snapshots, strict full-workbook review, and card-6 partial XLSX restore of User Status/Rank with per-file progress and log | 102 selection-review tests passed; 19 focused partial-import/API/UI tests passed; Opus `CODE_REVIEW_PASS`; no live database access |
 | R7.3 approved; M0–M4 accepted; M5 partial evidence | [Performance v2 equity quality](docs/specs/2026-09-25-performance-v2-equity-quality.md), [XLSX column contract](docs/specs/2026-10-07-performance-v2-xlsx-column-contract.md), [implementation plan](docs/superpowers/plans/2026-09-25-performance-v2-equity-quality.md), [M0 evidence](docs/superpowers/plans/2026-09-25-performance-v2-equity-quality-evidence.md), [M5 slice evidence](docs/superpowers/plans/2026-09-26-performance-v2-equity-quality-m5-slice-evidence.md), [ADR-0044](docs/decisions/0044-performance-v2-equity-quality-facts.md) | independent filter #2 and optional equity Top N; right-continuous equity-only 7/14/28d grid, quiet periods carried flat, short corrections demote only selected equity ranking while H grows (robust unchanged), explicit block rules prevent stale R7.3 cache from changing new/regime XLSX headers | 190/14,463 bounded M0 sample; M1–M4 independent `CODE_REVIEW_PASS`; M5 current-runtime warm preview measured on 512 strategies and cold/backfill worker profiles on 64, with three measured repeats; prior-runtime timing gates withdrawn by user; full-corpus and one-REPLACE timing plus user speed acceptance remain open; no predictive claims |
 | Implemented and independently reviewed; live migration pending | [Equity regime status map](docs/specs/2026-10-03-equity-regime-status-map.md), [production plan](docs/superpowers/plans/2026-10-04-equity-regime-production.md), [M3 research](docs/reports/2026-10-04-equity-regime-m3-research.md), [ADR-0055](docs/decisions/0055-equity-filter-rejected-and-manual-fact-cleanup.md), [ADR-0056](docs/decisions/0056-equity-rejection-source-lifecycle.md) | geometry-based GROWING/WEAKENING/RESUMED/STALLED; hard equity failures publish existing effective `User Status=REJECTED`; card-9 manual maintenance physically deletes detail rows without cleanup markers or deletion timestamps under ADR-0057 | local classifier, v9 schema, cache, selection, Panel and Excel integration; 627 tests passed, 4 skipped; frozen 30,940-result replay deterministic; independent Opus `CODE_REVIEW_PASS`; safe live v8 migration remains open; no live database mutation |
 | Implemented / root verified | [Performance v2 global finalist retest control](docs/specs/2026-09-09-performance-v2-finalist-retest-control.md) | server-frozen FINALIST/optional RESERVE retest, exact successful-cohort ranking, one combined atomic control XLSX, and explicit asynchronous `Применить эквити фильтр` for the frozen imported cohort with typed progress/errors | existing SINGLE_MODE, REPLACE, selection review, [ADR-0034](docs/decisions/0034-performance-v2-global-finalist-retest-control.md) |
 | Implemented / independently reviewed | [Bybit base-lot XLSX export](docs/specs/2026-10-07-bybit-base-lot-export.md) | one-command reuse/backfill of the optimizer's seven-day minute-liquidity window; writes `K*V25*A15` to `Actual` column C and current date/errors to column D | standalone script; no Panel, database, optimizer, tester, or live execution |
 | Active implementation contract | [PerformanceDB XLSX export](docs/specs/2026-09-24-performance-db-xlsx-export.md), [ADR-0043](docs/decisions/0043-performance-db-read-only-xlsx-export.md) | read-only XLSX of current ACTIVE FINALIST/RESERVE/RETEST categories or all ACTIVE, and sequential cards 4–8 | Performance DB v2; no tester, import, recalculation, database write, or client identity filter |
-| Implemented; independent Opus review passed | [PerformanceDB manual maintenance](docs/specs/2026-10-06-performance-db-maintenance.md), [implementation plan](docs/superpowers/plans/2026-10-06-performance-db-maintenance.md), [ADR-0057](docs/decisions/0057-performance-db-manual-maintenance.md) | card 9: previewed physical cleanup of selected REJECTED details or all pair-scoped strategy/selection data; full deletion also clears global import journals; transient confirmed progress and actionable errors | unchanged schema v9; integrated synthetic-fixture verification: 458 passed, 4 skipped before final focused recovery/progress fixes; after those fixes, 15 Panel/static UI tests and 42 maintenance service tests passed; workers 1/8 produced identical data, with no sequential-delete speedup; no live database touched |
+| Implemented; independent Opus review passed | [PerformanceDB manual maintenance](docs/specs/2026-10-06-performance-db-maintenance.md), [implementation plan](docs/superpowers/plans/2026-10-06-performance-db-maintenance.md), [ADR-0057](docs/decisions/0057-performance-db-manual-maintenance.md), [ADR-0061](docs/decisions/0061-performance-db-rejected-retirement.md) | card 9: `Удалить Rejected` physically removes per-strategy facts, caches and selection rows, compacts the retained result to interval/provenance identity, retains only typed strategy identity/orders plus the tombstone for dedup, and marks the row `DISCARDED`; full deletion removes the retained tombstone and clears global import journals; transient progress and actionable errors | unchanged schema v9; maintenance 52, selection 239, importer 120 and XLSX export 11 passed after retirement expansion; Panel discarded-catalog check, node syntax and diff checks passed; no live database touched |
 | Active implementation contract | [Tester Report Library and Fast Identity](docs/specs/2026-08-14-tester-report-library-and-fast-identity.md) | verified report library, fast embedded identity and deferred workflow/CLI integration | [Name-only runner contract](docs/specs/2026-08-14-tester-name-only-verification.md) |
-| Active — implementation pending | [MRS3 v0.7 Canonical Phase 1](docs/specs/2026-08-16-mrs3-v07-canonical-phase1.md) | fresh canonical `30..550` surfaces, six CloseMA readiness, exact audit/preflight replay, parallel materialization, frozen CMA/BASE and independent 1ORD | [ADR-0009](docs/decisions/0009-canonical-phase1-surface-selection-contract.md), DuckDB analysis storage, event filter |
-| Accepted | [ADR-0009](docs/decisions/0009-canonical-phase1-surface-selection-contract.md) | supersedes conflicting ADR-0007/0008 readiness semantics for fresh Phase 1 surfaces without rewriting historical ADRs | Canonical Phase 1 spec |
-| Implemented / Verified Priority-1 patch — historical runtime evidence | [DuckDB surface coverage review](docs/specs/2026-08-14-duckdb-surface-coverage-review.md) | verified old one-MA-pair runtime and Priority-1 operational fixes; future canonical behavior is defined by the active 2026-08-16 Phase 1 spec | DuckDB analysis storage, ADR-0007, ADR-0008 |
-| Accepted | [ADR-0007](docs/decisions/0007-observed-sparse-surface-contract.md) | V1 unchanged; V2 evidence in existing `grid_contract_json`; one read transaction prepares selected sides; LONG then SHORT; `PARTIAL`/manual rerun; deferred retry/lease/path/schema-v5 | DuckDB surface coverage review |
-| Accepted | [ADR-0008](docs/decisions/0008-common-close-ma-readiness-and-degenerate-row-isolation.md) | common Close MA `2..7` interval and six scope witnesses; structurally zero-duration rows ignored, other empty intersections fail closed | DuckDB surface coverage review |
+| Active — Task 12C fresh real-source smoke/performance pending | [MRS3 v0.7 Canonical Phase 1](docs/specs/2026-08-16-mrs3-v07-canonical-phase1.md), [implementation plan](docs/superpowers/plans/2026-08-16-mrs3-v07-canonical-phase1.md) | fresh canonical `30..550` surfaces, six CloseMA readiness, exact audit/preflight replay, parallel materialization, frozen CMA/BASE and independent 1ORD | [ADR-0009](docs/decisions/0009-canonical-phase1-surface-selection-contract.md), DuckDB analysis storage |
+| Accepted | [ADR-0009](docs/decisions/0009-canonical-phase1-surface-selection-contract.md) | current readiness semantics for fresh Phase 1 surfaces | Canonical Phase 1 spec |
+| Historical / superseded | [DuckDB surface coverage review](docs/specs/2026-08-14-duckdb-surface-coverage-review.md), [ADR-0007](docs/decisions/0007-observed-sparse-surface-contract.md), [ADR-0008](docs/decisions/0008-common-close-ma-readiness-and-degenerate-row-isolation.md) | former one-MA-pair/readiness contracts kept for provenance | Canonical Phase 1 |
 
 Полная навигация: [docs/README.md](docs/README.md). Оперативная точка: [progress.md](progress.md).
 
-## Bybit public market-data collector v1 (2026-09-05)
+## Исторические приложения
+
+Разделы ниже сохранены для происхождения решений и старых acceptance records.
+Они не являются текущими требованиями. Для новой работы использовать реестр
+выше, `progress.md` и ссылку на активный контракт конкретной функции.
+
+## Bybit public market-data collector v1 (historical record, 2026-09-05)
 
 The approved [Revision 2 specification](docs/specs/2026-09-05-bybit-market-data-collector.md)
-is an active implementation contract for a public, no-key Bybit linear market-data
-collector. The implementation is delivered on `main`: strict UTF-8 TOML
+records the implementation contract for a public, no-key Bybit linear market-data
+collector. The implementation was delivered on `main`: strict UTF-8 TOML
 configuration, five-second UTC scheduling and `liquidity_1m` aggregation, SQLite
 WAL spool, hourly immutable Parquet, paginated reference data/raw JSON.gz, one
 public linear WebSocket connection, symbol events, atomic health, CLI commands,

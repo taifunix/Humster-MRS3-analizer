@@ -25,6 +25,7 @@ from mrs3.performance_v2_import import (
 from mrs3.panel import PanelController, create_panel_server
 from mrs3.performance_v2_html import parse_current_performance_v2_html
 from mrs3.performance_v2_input import PerformanceV2InputError, read_performance_v2_inbox
+from mrs3.performance_v2_maintenance import apply_preview, create_preview
 from mrs3.performance_v2_store import (
     PerformanceV2Config,
     PerformanceV2StoreError,
@@ -3193,7 +3194,7 @@ def test_add_replaces_canonical_result_only_for_a_strict_interval_superset(tmp_p
         assert connection.execute("select report_end_utc from strategy_results").fetchone()[0].date().isoformat() == "2026-01-10"
 
 
-def test_add_equal_reimport_stays_deduped_after_detail_delete_then_wider_rebuilds_details(tmp_path: Path) -> None:
+def test_add_equal_or_wider_reimport_stays_deduped_after_discarded_detail_delete(tmp_path: Path) -> None:
     request, _ = _request(tmp_path)
     assert import_performance_v2(request).imported_count == 1
     target = performance_v2_database_path(request.config)
@@ -3206,24 +3207,99 @@ def test_add_equal_reimport_stays_deduped_after_detail_delete_then_wider_rebuild
         for table in ("strategy_actions", "strategy_equity"):
             assert connection.execute(f"select count(*) from {table} where result_id = ?", [result_id]).fetchone()[0] > 0
             connection.execute(f"delete from {table} where result_id = ?", [result_id])
+        connection.execute("update strategies set lifecycle_status = 'DISCARDED' where strategy_id = ?", [strategy_id])
 
     equal = import_performance_v2(request)
     assert (equal.imported_count, equal.skipped_count) == (0, 1)
     with duckdb.connect(str(target), read_only=True) as connection:
+        assert connection.execute(
+            "select status from import_files order by import_file_id desc limit 1"
+        ).fetchone() == ("SKIPPED:DISCARDED_TOMBSTONE",)
         assert connection.execute("select current_result_id from strategies where strategy_id = ?", [strategy_id]).fetchone() == (result_id,)
+        assert connection.execute("select lifecycle_status from strategies where strategy_id = ?", [strategy_id]).fetchone() == ("DISCARDED",)
         for table in ("strategy_actions", "strategy_equity"):
             assert connection.execute(f"select count(*) from {table} where result_id = ?", [result_id]).fetchone() == (0,)
+
+    prepared = read_performance_v2_inbox(request.inbox, request.report_root)
+    parsed = parse_current_performance_v2_html(FIXTURE.read_bytes(), request.config)
+    parsed = replace(
+        parsed,
+        reported_start_utc=datetime(2026, 1, 2, tzinfo=timezone.utc),
+        reported_end_utc=datetime(2026, 1, 8, tzinfo=timezone.utc),
+        effective_start_utc=datetime(2026, 1, 2, tzinfo=timezone.utc),
+        effective_end_utc=datetime(2026, 1, 8, tzinfo=timezone.utc),
+    )
+    with duckdb.connect(str(target)) as connection:
+        assert import_module._publish(connection, request, prepared, (parsed,), "narrower-discarded") == (0, 1, 0)
 
     wider = FIXTURE.read_bytes().replace(
         b"2026-01-01 - 2026-01-09", b"2025-12-20 - 2026-01-10"
     )
     _rewrite_report(request, wider)
-    rebuilt = import_performance_v2(request)
-    assert (rebuilt.imported_count, rebuilt.skipped_count) == (1, 0)
+    wider_result = import_performance_v2(request)
+    assert (wider_result.imported_count, wider_result.skipped_count) == (0, 1)
     with duckdb.connect(str(target), read_only=True) as connection:
         assert connection.execute("select current_result_id from strategies where strategy_id = ?", [strategy_id]).fetchone() == (result_id,)
+        assert connection.execute("select lifecycle_status from strategies where strategy_id = ?", [strategy_id]).fetchone() == ("DISCARDED",)
         for table in ("strategy_actions", "strategy_equity"):
-            assert connection.execute(f"select count(*) from {table} where result_id = ?", [result_id]).fetchone()[0] > 0
+            assert connection.execute(f"select count(*) from {table} where result_id = ?", [result_id]).fetchone() == (0,)
+
+    with duckdb.connect(str(target)) as connection:
+        full = create_preview(connection, ["ONUSDT"], "full")
+        apply_preview(connection, full)
+        assert connection.execute("select count(*) from strategies").fetchone() == (0,)
+    reintroduced = import_performance_v2(request)
+    assert (reintroduced.imported_count, reintroduced.skipped_count) == (1, 0)
+
+
+def test_add_fails_closed_on_duplicate_discarded_typed_key(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path)
+    assert import_performance_v2(request).imported_count == 1
+    target = performance_v2_database_path(request.config)
+    with duckdb.connect(str(target)) as connection:
+        original_id, result_id = connection.execute(
+            "select strategy_id, current_result_id from strategies where strategy_name = 'alpha'"
+        ).fetchone()
+        duplicate_id = connection.execute(
+            """insert into strategies (
+                   strategy_name, symbol, side, timeframe, close_ma_len, order_count,
+                   analysis_run_id, candidate_identity, lifecycle_status, created_at_utc, updated_at_utc
+               ) select 'discarded-duplicate', symbol, side, timeframe, close_ma_len, order_count,
+                        analysis_run_id, 'candidate-duplicate', 'DISCARDED', created_at_utc, updated_at_utc
+                   from strategies where strategy_id = ? returning strategy_id""",
+            [original_id],
+        ).fetchone()[0]
+        connection.execute(
+            """insert into strategy_orders (
+                   strategy_id, order_id, open_ma_len, open_multiplier, shift_bp, lot_x,
+                   analysis_run_id, plateau_id, base_point_trades
+               ) select ?, order_id, open_ma_len, open_multiplier, shift_bp, lot_x,
+                        analysis_run_id, plateau_id, base_point_trades
+                   from strategy_orders where strategy_id = ?""",
+            [duplicate_id, original_id],
+        )
+        duplicate_result = connection.execute(
+            """insert into strategy_results (
+                   strategy_id, report_start_utc, report_end_utc, exchange,
+                   commission_rate, initial_balance, final_balance, total_pnl,
+                   total_pnl_pct, max_drawdown, max_drawdown_pct, total_fees,
+                   total_trades, imported_at_utc
+               ) select ?, report_start_utc, report_end_utc, exchange,
+                        commission_rate, initial_balance, final_balance, total_pnl,
+                        total_pnl_pct, max_drawdown, max_drawdown_pct, total_fees,
+                        total_trades, imported_at_utc
+                   from strategy_results where result_id = ? returning result_id""",
+            [duplicate_id, result_id],
+        ).fetchone()[0]
+        connection.execute("update strategies set current_result_id = ? where strategy_id = ?", [duplicate_result, duplicate_id])
+
+    active_wins = import_performance_v2(request)
+    assert (active_wins.imported_count, active_wins.skipped_count) == (0, 1)
+    with duckdb.connect(str(target)) as connection:
+        connection.execute("update strategies set lifecycle_status = 'DISCARDED' where strategy_id = ?", [original_id])
+
+    with pytest.raises(PerformanceV2ImportError, match="multiple DISCARDED strategies"):
+        import_performance_v2(request)
 
 
 def test_add_superset_does_not_clear_a_retest_tag(tmp_path: Path) -> None:

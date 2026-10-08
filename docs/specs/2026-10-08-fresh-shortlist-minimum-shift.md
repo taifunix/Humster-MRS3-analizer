@@ -1,6 +1,7 @@
 # Fresh Shortlist Minimum Shift Gate
 
-Status: accepted for implementation after independent Advisor `PLAN_APPROVED`.
+Status: implemented and independently reviewed; deployment remains pending the
+required Panel server and browser reload.
 
 ## Goal
 
@@ -85,6 +86,10 @@ fields.
   and static UI tests pass;
 - `node --check src/mrs3/panel_web/app.js` and `git diff --check` pass;
 - independent implementation review returns `CODE_REVIEW_PASS`.
+
+Implementation evidence is recorded in `progress.md`: focused shortlist,
+generation, export, tester-provenance, Panel and UI suites passed; no live
+database, tester, migration, or Panel restart was performed.
 
 Deployment requires reloading the Panel server and the browser assets. No
 database migration, cache rebuild, or tester run is part of this feature.

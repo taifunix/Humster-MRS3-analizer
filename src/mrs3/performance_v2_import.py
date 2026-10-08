@@ -1428,6 +1428,7 @@ def _publish(
                 raise PerformanceV2ImportError(f"typed plateau mismatch for {fact.plateau_id!r}")
 
         active_by_key: dict[tuple[object, ...], list[tuple[object, ...]]] = {}
+        discarded_by_key: dict[tuple[object, ...], list[tuple[object, ...]]] = {}
         stored_keys: dict[int, tuple[object, ...] | None] = {}
         for name, row in existing.items():
             strategy_id = int(row[1])
@@ -1447,8 +1448,24 @@ def _publish(
                         )
                 elif key in incoming_keys:
                     active_by_key.setdefault(key, []).append(row)
+            elif str(row[9]) == "DISCARDED" and key is not None and key in incoming_keys:
+                discarded_by_key.setdefault(key, []).append(row)
         if any(len(rows) > 1 for rows in active_by_key.values()):
             raise PerformanceV2ImportError("multiple ACTIVE strategies share a typed key")
+        for key, rows in discarded_by_key.items():
+            if active_by_key.get(key):
+                continue
+            if len(rows) > 1:
+                raise PerformanceV2ImportError(
+                    f"multiple DISCARDED strategies share typed key {key!r}; "
+                    "delete the pair fully before reimporting"
+                )
+            row = rows[0]
+            if row[10] is None or int(row[10]) not in existing_results:
+                raise PerformanceV2ImportError(
+                    f"DISCARDED strategy {row[1]!r} has no current result for typed key {key!r}; "
+                    "delete the pair fully before reimporting"
+                )
 
         if request.mode == "REPLACE":
             if set(request.replacement_strategy_ids) != set(names):
@@ -1567,7 +1584,16 @@ def _publish(
                 resolved[key] = ("REPLACE", row)
                 continue
             # An active canonical key wins over a retired alias with the same
-            # incoming name; the latter cannot shadow a valid dedup target.
+            # incoming name. This precedence is deterministic: an ACTIVE
+            # typed key is the only normal ADD target, while a DISCARDED key
+            # is consulted only when no ACTIVE row exists.
+            discarded_rows = discarded_by_key.get(key, []) if not active_rows else []
+            if discarded_rows:
+                # A retired row is a permanent tombstone. Its retained
+                # current result supplies identity/provenance only; no
+                # report can reactivate it through the normal importer.
+                resolved[key] = ("SKIPPED", discarded_rows[0])
+                continue
             row = active_rows[0] if active_rows else name_row
             if row is None:
                 resolved[key] = ("ADD", None)
@@ -1672,7 +1698,12 @@ def _publish(
                 result_files.setdefault(record[1], record)
                 continue
             if decision == "SKIPPED":
-                record = (entry.report_path.name, report_hash(entry), entry.report_path.stat().st_size, len(report.actions), len(report.equity_series), "SKIPPED")
+                skip_status = (
+                    "SKIPPED:DISCARDED_TOMBSTONE"
+                    if old is not None and str(old[9]) == "DISCARDED"
+                    else "SKIPPED"
+                )
+                record = (entry.report_path.name, report_hash(entry), entry.report_path.stat().st_size, len(report.actions), len(report.equity_series), skip_status)
                 previous = result_files.get(record[1])
                 if previous is None or status_priority[record[5].split(":", 1)[0]] > status_priority[previous[5].split(":", 1)[0]]:
                     result_files[record[1]] = record
