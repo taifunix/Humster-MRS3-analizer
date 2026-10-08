@@ -474,12 +474,23 @@ class PanelJobRegistry:
                 job.pop("runtime", None)
             self._save()
 
-    def recover_committed(self, job_id: str, *, runtime: dict) -> dict:
-        """Commit only a restart-interrupted job whose owner revalidated its artifacts."""
+    def recover_committed(
+        self,
+        job_id: str,
+        *,
+        runtime: dict,
+        expected_state: str | None = None,
+        expected_error: dict | None = None,
+    ) -> dict:
+        """Commit a revalidated job, optionally guarded by an exact state/error CAS."""
         with self.lock:
             job = self.jobs.get(job_id)
             recoverable = job is not None and (job.get("state") == "FAILED" or (job.get("state") == "RUNNING" and job.get("phase") == "RECOVERING_INBOX"))
-            if not recoverable:
+            if (
+                not recoverable
+                or (expected_state is not None and job.get("state") != expected_state)
+                or (expected_error is not None and job.get("error") != expected_error)
+            ):
                 raise PanelJobError("INVALID_REQUEST")
             inbox_path = runtime.get("inbox_path") if isinstance(runtime, dict) else None
             job.update(

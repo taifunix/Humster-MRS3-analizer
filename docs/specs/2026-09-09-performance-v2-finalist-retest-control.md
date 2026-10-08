@@ -213,6 +213,18 @@ Panel показывает frozen cohort count, даты, прогресс, чи
 - After a Panel restart, an orphaned nonterminal bulk-retest job becomes a
   terminal interrupted failure and releases the shared tester resource. Panel
   never resumes or imports that partial batch automatically.
+- An existing bulk finalist RETEST job in `FAILED` state is recoverable only
+  when its error is exactly `{ "code": "INTERRUPTED" }`. Recovery reuses the
+  existing `LocalFastStrategyTestService` evidence scan with
+  `force_single_mode=True`; it must capture a metadata inbox and validate that
+  the inbox manifest contains every frozen cohort strategy exactly once. The
+  inbox is validated by content, not by report filename or batch numbering.
+  Validation completes before the same parent job is atomically moved from
+  `FAILED` to `COMMITTED` with `inbox_ready=true`. Partial, foreign,
+  malformed, or otherwise failed evidence never changes the failed job state,
+  and ordinary failure reasons remain unrecoverable.
+- After that durable commit, updating the in-memory tester-service marker is
+  best effort; a marker failure must not undo the committed registry state.
 
 ## Non-goals
 

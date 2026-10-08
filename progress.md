@@ -131,3 +131,13 @@ PerformanceDB was modified.
 Panel maintenance recovery checks also pass 14 tests. The remaining catalog
 endpoint full-audit cost is a separate performance follow-up; it does not
 run in targeted preview and is not part of this fix.
+
+Interrupted finalist RETEST recovery (2026-10-08): recovered the existing
+2360 indexed reports plus the already-tested manual finalist report into the
+same 2361-member frozen cohort; no strategy was resubmitted. The metadata inbox
+and replacement import both committed: 2361 imported/successful, 0 skipped,
+0 rejected, 0 failures; cohort outcomes are finalized and the equity filter is
+eligible for all 2361 strategies. Targeted recovery suites pass 180 tests with
+1 Windows symlink-capability skip. The live PerformanceDB was intentionally
+updated by this import. Next step: run the eligible equity filter when desired;
+no full finalist RETEST is needed. Blockers: none.

@@ -91,6 +91,77 @@ def test_recover_committed_marks_owner_validated_inbox_ready(tmp_path):
     assert registry.runtime(job["job_id"])["inbox_path"] == str(tmp_path / "verified-inbox")
 
 
+def test_recover_committed_cas_is_atomic_for_interrupted_failure(tmp_path):
+    registry = PanelJobRegistry(tmp_path / "jobs.json", recover_on_load=False)
+    job = registry.submit(
+        "strategies.performance.v2.finalist-retest", {}, "recover-cas", job_id="recover-cas",
+    )
+    registry.transition(job["job_id"], "RUNNING")
+    registry.sync(job["job_id"], {"state": "FAILED", "phase": "FAILED", "error": {"code": "INTERRUPTED"}})
+    barrier = threading.Barrier(2)
+    committed: list[dict] = []
+    rejected: list[str] = []
+    saved_states: list[tuple[str, str, object]] = []
+    real_save = registry._save
+
+    def capture_save() -> None:
+        snapshot = registry.get(job["job_id"])
+        saved_states.append((snapshot["state"], snapshot["phase"], snapshot["error"]))
+        real_save()
+
+    registry._save = capture_save
+
+    def recover() -> None:
+        barrier.wait()
+        try:
+            committed.append(registry.recover_committed(
+                job["job_id"],
+                runtime={"inbox_path": str(tmp_path / "verified-inbox")},
+                expected_state="FAILED",
+                expected_error={"code": "INTERRUPTED"},
+            ))
+        except PanelJobError as error:
+            rejected.append(error.code)
+
+    threads = [threading.Thread(target=recover) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert len(committed) == 1
+    assert rejected == ["INVALID_REQUEST"]
+    assert saved_states == [("COMMITTED", "COMMITTED", None)]
+    assert registry.get(job["job_id"])["state"] == "COMMITTED"
+
+
+@pytest.mark.parametrize(
+    ("stored_error", "expected_error"),
+    [
+        ({"code": "INTERRUPTED"}, {"code": "INTERRUPTED", "message": "restart"}),
+        ({"code": "INTERRUPTED", "message": "restart"}, {"code": "INTERRUPTED"}),
+    ],
+)
+def test_recover_committed_cas_rejects_any_error_payload_mismatch_without_mutation(
+    tmp_path, stored_error: dict, expected_error: dict
+):
+    registry = PanelJobRegistry(tmp_path / "jobs.json", recover_on_load=False)
+    job = registry.submit("strategies.performance.v2.finalist-retest", {}, "recover-cas-error")
+    registry.transition(job["job_id"], "RUNNING")
+    registry.sync(job["job_id"], {"state": "FAILED", "phase": "FAILED", "error": stored_error})
+    before = deepcopy(registry.get(job["job_id"]))
+
+    with pytest.raises(PanelJobError, match="INVALID_REQUEST"):
+        registry.recover_committed(
+            job["job_id"],
+            runtime={"inbox_path": str(tmp_path / "verified-inbox")},
+            expected_state="FAILED",
+            expected_error=expected_error,
+        )
+
+    assert registry.get(job["job_id"]) == before
+
+
 def test_registry_rejected_runtime_reservation_leaves_journal_clean(tmp_path):
     path = tmp_path / "jobs.json"
     registry = PanelJobRegistry(path)

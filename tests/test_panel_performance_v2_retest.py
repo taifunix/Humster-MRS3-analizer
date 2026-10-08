@@ -21,6 +21,7 @@ from mrs3.panel import PerformanceV2ApiError, PanelController, _control_score, c
 from mrs3.performance_v2_store import initialize_performance_v2
 from mrs3.performance_v2_retest import RetestBatch
 from mrs3.performance_v2_finalist_retest import FinalistRetestError, validate_combined_control_workbook
+from mrs3.panel_jobs import PanelJobRegistry
 
 
 def _controller(tmp_path: Path, *, seed: bool = True) -> PanelController:
@@ -1037,6 +1038,304 @@ def test_committed_native_retest_verify_survives_restart_with_stale_tester_manif
 
     assert result["job_id"] == tester_job_id
     assert result["inbox_ready"] is True
+
+
+def _interrupted_bulk_retest_job(
+    controller: PanelController,
+    *,
+    job_id: str,
+    cohort_names: tuple[str, ...] = ("alpha",),
+) -> str:
+    controller._panel_jobs.submit(
+        "strategies.performance.v2.finalist-retest",
+        {"retest": True},
+        f"panel:{job_id}",
+        ("strategies.tester",),
+        job_id=job_id,
+    )
+    controller._panel_jobs.transition(job_id, "RUNNING")
+    controller._panel_jobs.sync(
+        job_id,
+        {"state": "FAILED", "phase": "FAILED", "error": {"code": "INTERRUPTED"}},
+        runtime={
+            "bulk_retest": True,
+            "cohort_members": [{"strategy_name": name} for name in cohort_names],
+        },
+    )
+    return job_id
+
+
+def test_interrupted_bulk_finalist_retest_recovers_complete_cohort_before_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    controller = _controller(tmp_path)
+    job_id = _interrupted_bulk_retest_job(controller, job_id="bulk-interrupted-recover")
+    cohort_before = controller._panel_jobs.runtime(job_id)["cohort_members"]
+    inbox = tmp_path / "inbox" / job_id
+    inbox.mkdir(parents=True)
+    (inbox / "inbox_manifest.json").write_text(json.dumps({
+        "schema_version": 1,
+        "batch_id": job_id,
+        "run_mode": "SINGLE_MODE",
+        "source_mode": "metadata_only",
+        "inbox_ready": True,
+        "expected_strategy_names": ["alpha"],
+        "entries": [{
+            "strategy_name": "alpha",
+            "strategy_path": "strategies/alpha.json",
+            "report_path": "001_of_001.html",
+        }],
+    }), encoding="utf-8")
+    calls: list[tuple[object, ...]] = []
+
+    class FakeTester:
+        def capture_inbox(self, captured_job_id: str, *, force_single_mode: bool = False) -> Path:
+            calls.append(("capture", captured_job_id, force_single_mode))
+            return inbox
+
+        def mark_inbox_ready(self, captured_job_id: str, captured_inbox: Path) -> None:
+            calls.append(("mark", captured_job_id, captured_inbox))
+
+    validated: list[Path] = []
+    monkeypatch.setattr(controller, "_single_mode_strategy_test", lambda: FakeTester())
+    monkeypatch.setattr(controller, "_validate_metadata_inbox", validated.append)
+
+    result = controller.strategies_tester_verify_inbox(job_id)
+
+    assert result["state"] == "COMMITTED"
+    assert result["phase"] == "COMMITTED"
+    assert result["inbox_ready"] is True
+    assert controller._panel_jobs.get(job_id)["error"] is None
+    assert controller._panel_jobs.runtime(job_id)["inbox_path"] == str(inbox.resolve())
+    assert controller._panel_jobs.runtime(job_id)["cohort_members"] == cohort_before
+    reloaded_registry = PanelJobRegistry(tmp_path / ".panel-jobs.json", recover_on_load=False)
+    persisted_job = reloaded_registry.get(job_id)
+    persisted_runtime = reloaded_registry.runtime(job_id)
+    assert persisted_job["state"] == "COMMITTED"
+    assert persisted_job["phase"] == "COMMITTED"
+    assert persisted_job["error"] is None
+    assert persisted_job["inbox_ready"] is True
+    assert persisted_runtime["mode"] == "SINGLE_MODE"
+    assert persisted_runtime["inbox_ready"] is True
+    assert persisted_runtime["inbox_path"] == str(inbox.resolve())
+    assert calls == [("capture", job_id, True), ("mark", job_id, inbox.resolve())]
+    assert validated == [inbox.resolve()]
+
+
+def test_interrupted_bulk_retest_keeps_durable_commit_when_service_marker_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    controller = _controller(tmp_path)
+    job_id = _interrupted_bulk_retest_job(controller, job_id="bulk-interrupted-marker-fails")
+    inbox = tmp_path / "inbox" / job_id
+    inbox.mkdir(parents=True)
+    (inbox / "inbox_manifest.json").write_text(json.dumps({
+        "schema_version": 1,
+        "batch_id": job_id,
+        "run_mode": "SINGLE_MODE",
+        "source_mode": "metadata_only",
+        "inbox_ready": True,
+        "expected_strategy_names": ["alpha"],
+        "entries": [{
+            "strategy_name": "alpha",
+            "strategy_path": "strategies/alpha.json",
+            "report_path": "001_of_001.html",
+        }],
+    }), encoding="utf-8")
+    calls: list[str] = []
+
+    class FakeTester:
+        def capture_inbox(self, captured_job_id: str, *, force_single_mode: bool = False) -> Path:
+            calls.append(f"capture:{captured_job_id}:{force_single_mode}")
+            return inbox
+
+        def mark_inbox_ready(self, *_args: object) -> None:
+            calls.append("mark")
+            raise RuntimeError("ephemeral marker unavailable")
+
+    monkeypatch.setattr(controller, "_single_mode_strategy_test", lambda: FakeTester())
+    monkeypatch.setattr(controller, "_validate_metadata_inbox", lambda _inbox: None)
+
+    first = controller.strategies_tester_verify_inbox(job_id)
+    runtime_after_first = controller._panel_jobs.runtime(job_id)
+    second = controller.strategies_tester_verify_inbox(job_id)
+
+    assert first["state"] == second["state"] == "COMMITTED"
+    assert first["inbox_ready"] is True
+    assert second["inbox_ready"] is True
+    assert controller._panel_jobs.runtime(job_id) == runtime_after_first
+    assert controller._panel_jobs.runtime(job_id)["cohort_members"] == [{"strategy_name": "alpha"}]
+    assert calls == [f"capture:{job_id}:True", "mark", "mark"]
+
+
+def test_interrupted_bulk_recovery_does_not_sync_again_after_durable_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    controller = _controller(tmp_path)
+    job_id = _interrupted_bulk_retest_job(controller, job_id="bulk-interrupted-sync-fails")
+    inbox = tmp_path / "inbox" / job_id
+    inbox.mkdir(parents=True)
+    (inbox / "inbox_manifest.json").write_text(json.dumps({
+        "schema_version": 1,
+        "batch_id": job_id,
+        "run_mode": "SINGLE_MODE",
+        "source_mode": "metadata_only",
+        "inbox_ready": True,
+        "expected_strategy_names": ["alpha"],
+        "entries": [{
+            "strategy_name": "alpha",
+            "strategy_path": "strategies/alpha.json",
+            "report_path": "001_of_001.html",
+        }],
+    }), encoding="utf-8")
+
+    class FakeTester:
+        def capture_inbox(self, _job_id: str, *, force_single_mode: bool = False) -> Path:
+            assert force_single_mode is True
+            return inbox
+
+        def mark_inbox_ready(self, _job_id: str, _inbox: Path) -> None:
+            return None
+
+    monkeypatch.setattr(controller, "_single_mode_strategy_test", lambda: FakeTester())
+    monkeypatch.setattr(controller, "_validate_metadata_inbox", lambda _inbox: None)
+
+    def fail_post_commit_sync(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("post-commit sync unavailable")
+
+    monkeypatch.setattr(
+        controller._panel_jobs,
+        "sync",
+        fail_post_commit_sync,
+    )
+
+    result = controller.strategies_tester_verify_inbox(job_id)
+
+    assert result["state"] == "COMMITTED"
+    assert result["inbox_ready"] is True
+    assert controller._panel_jobs.runtime(job_id)["inbox_path"] == str(inbox.resolve())
+
+
+@pytest.mark.parametrize(
+    "entries",
+    [
+        [],
+        [{
+            "strategy_name": "foreign",
+            "strategy_path": "strategies/foreign.json",
+            "report_path": "001_of_001.html",
+        }],
+    ],
+)
+def test_interrupted_bulk_finalist_retest_rejects_partial_or_foreign_evidence_without_transition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, entries: list[dict[str, str]]
+) -> None:
+    controller = _controller(tmp_path)
+    job_id = _interrupted_bulk_retest_job(controller, job_id="bulk-interrupted-partial")
+    runtime_before = controller._panel_jobs.runtime(job_id)
+    inbox = tmp_path / "inbox" / job_id
+    inbox.mkdir(parents=True)
+    (inbox / "inbox_manifest.json").write_text(json.dumps({
+        "schema_version": 1,
+        "batch_id": job_id,
+        "run_mode": "SINGLE_MODE",
+        "source_mode": "metadata_only",
+        "inbox_ready": True,
+        "expected_strategy_names": ["alpha"],
+        "entries": entries,
+    }), encoding="utf-8")
+    calls: list[str] = []
+
+    class FakeTester:
+        def capture_inbox(self, captured_job_id: str, *, force_single_mode: bool = False) -> Path:
+            calls.append(f"capture:{captured_job_id}:{force_single_mode}")
+            return inbox
+
+        def mark_inbox_ready(self, *_args: object) -> None:
+            calls.append("mark")
+
+    monkeypatch.setattr(controller, "_single_mode_strategy_test", lambda: FakeTester())
+    monkeypatch.setattr(controller, "_validate_metadata_inbox", lambda _inbox: pytest.fail("partial inbox must not validate"))
+
+    with pytest.raises(ValueError, match="frozen cohort"):
+        controller.strategies_tester_verify_inbox(job_id)
+
+    assert calls == [f"capture:{job_id}:True"]
+    assert controller._panel_jobs.get(job_id)["state"] == "FAILED"
+    assert controller._panel_jobs.get(job_id)["error"] == {"code": "INTERRUPTED"}
+    assert controller._panel_jobs.runtime(job_id) == runtime_before
+
+
+def test_interrupted_bulk_finalist_retest_rejects_duplicate_entry_and_preserves_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    controller = _controller(tmp_path)
+    job_id = _interrupted_bulk_retest_job(
+        controller, job_id="bulk-interrupted-duplicate", cohort_names=("alpha", "beta"),
+    )
+    runtime_before = controller._panel_jobs.runtime(job_id)
+    inbox = tmp_path / "inbox" / job_id
+    inbox.mkdir(parents=True)
+    duplicate = {
+        "strategy_name": "alpha",
+        "strategy_path": "strategies/alpha.json",
+        "report_path": "001_of_001.html",
+    }
+    (inbox / "inbox_manifest.json").write_text(json.dumps({
+        "schema_version": 1,
+        "batch_id": job_id,
+        "run_mode": "SINGLE_MODE",
+        "source_mode": "metadata_only",
+        "inbox_ready": True,
+        "expected_strategy_names": ["alpha", "beta"],
+        "entries": [duplicate, duplicate],
+    }), encoding="utf-8")
+
+    class FakeTester:
+        def capture_inbox(self, _job_id: str, *, force_single_mode: bool = False) -> Path:
+            assert force_single_mode is True
+            return inbox
+
+        def mark_inbox_ready(self, *_args: object) -> None:
+            pytest.fail("duplicate evidence must not be marked ready")
+
+    monkeypatch.setattr(controller, "_single_mode_strategy_test", lambda: FakeTester())
+    monkeypatch.setattr(
+        controller,
+        "_validate_metadata_inbox",
+        lambda _inbox: pytest.fail("duplicate evidence must not be fully validated"),
+    )
+
+    with pytest.raises(ValueError, match="frozen cohort"):
+        controller.strategies_tester_verify_inbox(job_id)
+
+    assert controller._panel_jobs.get(job_id)["state"] == "FAILED"
+    assert controller._panel_jobs.get(job_id)["error"] == {"code": "INTERRUPTED"}
+    assert controller._panel_jobs.runtime(job_id) == runtime_before
+
+
+@pytest.mark.parametrize(
+    "failure_error",
+    [
+        {"code": "TESTER_FAILED"},
+        {"code": "INTERRUPTED", "message": "restart"},
+    ],
+)
+def test_bulk_finalist_retest_recovery_rejects_non_exact_interrupted_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_error: dict[str, str]
+) -> None:
+    controller = _controller(tmp_path)
+    job_id = _interrupted_bulk_retest_job(controller, job_id="bulk-failed-other")
+    controller._panel_jobs.sync(job_id, {"state": "FAILED", "phase": "FAILED", "error": failure_error})
+    monkeypatch.setattr(
+        controller, "_single_mode_strategy_test", lambda: pytest.fail("ordinary failures must not capture evidence")
+    )
+
+    with pytest.raises(ValueError, match="not committed"):
+        controller.strategies_tester_verify_inbox(job_id)
+
+    assert controller._panel_jobs.get(job_id)["state"] == "FAILED"
+    assert controller._panel_jobs.get(job_id)["error"] == failure_error
 
 
 @pytest.mark.parametrize(

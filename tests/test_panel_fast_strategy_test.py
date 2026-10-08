@@ -1497,6 +1497,91 @@ def test_single_mode_captures_finished_reports_after_panel_restart(tmp_path: Pat
     assert inbox_manifest["expected_strategy_names"] == list(names)
 
 
+def test_bulk_finalist_retest_restart_rebuilds_indexed_batch_and_manual_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    generation_manifest, names = _generation(tmp_path / "Output", 2361)
+    config = _config(tmp_path)
+    config.report_dir.mkdir(parents=True)
+    report_template = CURRENT_REPORT.read_text(encoding="utf-8")
+    indexed_reports: dict[str, str] = {}
+    for index, name in enumerate(names[:-1], 1):
+        filename = f"my_test_run_{index:04d}_of_2361_original.html"
+        (config.report_dir / filename).write_text(
+            report_template
+            .replace('"name":"MRS3 Current v2"', f'"name":"{name}"', 1)
+            .replace('"symbol":"ONUSDT"', '"symbol":"BTCUSDT"', 1),
+            encoding="utf-8",
+        )
+        indexed_reports[name] = filename
+    manual_name = names[-1]
+    manual_filename = "001_of_001.html"
+    (config.report_dir / manual_filename).write_text(
+        report_template
+        .replace('"name":"MRS3 Current v2"', f'"name":"{manual_name}"', 1)
+        .replace('"symbol":"ONUSDT"', '"symbol":"BTCUSDT"', 1),
+        encoding="utf-8",
+    )
+    config.wizard_result.parent.mkdir(parents=True, exist_ok=True)
+    config.wizard_result.write_text(json.dumps([{
+        "runId": "manual-single-run",
+        "strategies": [manual_name],
+        "chartUrl": f"/tester/report/{manual_filename}",
+    }]), encoding="utf-8")
+    job_id = "bulk-finalist-retest-restart"
+    expected_names = tuple(sorted(names))
+    (config.report_dir / "tester_manifest.json").write_text(json.dumps({
+        "job_id": job_id,
+        "mode": "SINGLE_MODE",
+        "phase": "RUNNING",
+        "generation_manifest_path": str(generation_manifest),
+        "expected_names": list(expected_names),
+        "start_date": "2026-01-01",
+        "end_date": "2026-01-09",
+        "attempt_counts": {name: 1 for name in names},
+        "verified_reports": indexed_reports,
+        "failed_names": [],
+    }), encoding="utf-8")
+    config_path = tmp_path / "config.local.json"
+    config_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(
+        panel_module.RunnerConfig, "from_json", staticmethod(lambda _path: config),
+    )
+    monkeypatch.setattr(
+        LocalSingleModeStrategyTestService,
+        "start",
+        lambda *_args, **_kwargs: pytest.fail("recovery must not submit strategies"),
+    )
+
+    first = PanelController(tmp_path, config_path)
+    first._panel_jobs.submit(
+        "strategies.performance.v2.finalist-retest", {}, f"panel:{job_id}",
+        ("strategies.tester",), job_id=job_id,
+    )
+    first._panel_jobs.transition(job_id, "RUNNING")
+    frozen_cohort = [{"strategy_name": name} for name in names]
+    first._panel_jobs.sync(
+        job_id,
+        {"state": "FAILED", "phase": "FAILED", "error": {"code": "INTERRUPTED"}},
+        runtime={"bulk_retest": True, "cohort_members": frozen_cohort},
+    )
+
+    restarted = PanelController(tmp_path, config_path)
+    assert isinstance(restarted._single_mode_strategy_test(), LocalSingleModeStrategyTestService)
+    result = restarted.strategies_tester_verify_inbox(job_id)
+
+    assert result["state"] == "COMMITTED"
+    assert result["inbox_ready"] is True
+    assert restarted._panel_jobs.runtime(job_id)["cohort_members"] == frozen_cohort
+    inbox = Path(restarted._panel_jobs.runtime(job_id)["inbox_path"])
+    inbox_manifest = json.loads((inbox / "inbox_manifest.json").read_text(encoding="utf-8"))
+    assert len(inbox_manifest["entries"]) == 2361
+    assert {entry["strategy_name"] for entry in inbox_manifest["entries"]} == set(names)
+    manual_entry = next(entry for entry in inbox_manifest["entries"] if entry["strategy_name"] == manual_name)
+    assert manual_entry["report_path"] == manual_filename
+    assert json.loads(config.wizard_result.read_text(encoding="utf-8"))[0]["chartUrl"].endswith(manual_filename)
+
+
 def test_finalist_import_click_captures_persisted_html_then_starts_replace_after_panel_restart(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

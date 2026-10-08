@@ -3935,12 +3935,16 @@ class PanelController:
         saved_runtime = self._panel_jobs.runtime(job_id) if runtime is None else dict(runtime)
         if tracked.get("kind") != "strategies.performance.v2.finalist-retest" or saved_runtime.get("bulk_retest") is not True:
             raise ValueError("job is not a bulk finalist RETEST")
-        if tracked.get("state") != "COMMITTED":
+        recovering_interrupted = (
+            tracked.get("state") == "FAILED"
+            and tracked.get("error") == {"code": "INTERRUPTED"}
+        )
+        if tracked.get("state") != "COMMITTED" and not recovering_interrupted:
             raise ValueError("bulk RETEST tester job is not committed")
         config = RunnerConfig.from_json(self.default_config)
         inbox_root = Path(config.inbox_root).resolve()
         raw_inbox = saved_runtime.get("inbox_path")
-        if tracked.get("inbox_ready") is True or saved_runtime.get("inbox_ready") is True:
+        if not recovering_interrupted and (tracked.get("inbox_ready") is True or saved_runtime.get("inbox_ready") is True):
             if not isinstance(raw_inbox, str) or not raw_inbox.strip():
                 raise ValueError("committed bulk RETEST inbox path is unavailable")
             inbox = Path(raw_inbox).resolve()
@@ -3991,13 +3995,28 @@ class PanelController:
             raise ValueError("committed bulk RETEST inbox does not match its frozen cohort")
         self._validate_metadata_inbox(inbox)
         service = self._single_mode_strategy_test()
-        service.mark_inbox_ready(job_id, inbox)
         saved_runtime.update({"inbox_path": str(inbox), "inbox_ready": True, "mode": "SINGLE_MODE"})
-        self._panel_jobs.sync(
-            job_id,
-            {"state": "COMMITTED", "phase": "COMMITTED", "inbox_ready": True},
-            runtime=saved_runtime,
-        )
+        if recovering_interrupted:
+            self._panel_jobs.recover_committed(
+                job_id,
+                runtime=saved_runtime,
+                expected_state="FAILED",
+                expected_error={"code": "INTERRUPTED"},
+            )
+        try:
+            service.mark_inbox_ready(job_id, inbox)
+        except Exception:
+            # The registry commit above is durable and authoritative.  The
+            # service marker is only an in-memory restart aid, so a stale or
+            # unavailable service must not turn a committed recovery into a
+            # failed verification.
+            _LOGGER.warning("tester service inbox marker unavailable after durable commit", exc_info=True)
+        if not recovering_interrupted:
+            self._panel_jobs.sync(
+                job_id,
+                {"state": "COMMITTED", "phase": "COMMITTED", "inbox_ready": True},
+                runtime=saved_runtime,
+            )
         self._strategy_batch_inboxes[job_id] = inbox
         return self._panel_jobs.get(job_id)
 
