@@ -263,6 +263,7 @@ from .performance_v2_selection import (
     SelectionRequest,
     SelectionStage,
     SelectionConfig,
+    finalist_reserved_strategy_ids,
     load_selection_candidates,
     load_selection_config,
     parse_selection_request,
@@ -5209,7 +5210,10 @@ class PanelController:
             return parse_selection_request(payload)
         if not isinstance(raw_job, str) or not raw_job.strip():
             raise PerformanceV2SelectionError("RETEST_COHORT_INVALID")
-        if set(payload) != {"symbol", "side", "stages", "bulk_retest_job_id"}:
+        expected = {"symbol", "side", "stages", "bulk_retest_job_id"}
+        if "finalists_only" in payload:
+            expected.add("finalists_only")
+        if set(payload) != expected:
             # This route accepts exactly one server-owned handle.  In
             # particular, cohort/strategy/result overrides must never reach
             # the selection layer, even if they are hidden in a browser body.
@@ -6831,6 +6835,11 @@ class PanelController:
                         self._selection_candidate_cache.move_to_end(cache_key)
                         while len(self._selection_candidate_cache) > 8:
                             self._selection_candidate_cache.popitem(last=False)
+                if request.finalists_only:
+                    eligible = finalist_reserved_strategy_ids(
+                        connection, [int(strategy_id) for strategy_id in candidates["strategy_id"]],
+                    )
+                    candidates = candidates.loc[candidates["strategy_id"].isin(eligible)].copy()
                 result = run_selection(apply_prior_rejected(connection, candidates), request, selection_config)
                 result.attrs["source_revisions"] = _current_equity_revisions(
                     connection, [int(strategy_id) for strategy_id in result["strategy_id"]]
@@ -6944,12 +6953,15 @@ class PanelController:
         return {"stages": result.attrs["stage_counts"]}
 
     def strategies_performance_v2_selection_cache_status(self, payload: Mapping[str, object]) -> dict[str, object]:
-        if not isinstance(payload, Mapping) or set(payload).difference({"symbol", "side", "stages", "bulk_retest_job_id"}):
+        allowed = {"symbol", "side", "stages", "bulk_retest_job_id", "finalists_only"}
+        if not isinstance(payload, Mapping) or set(payload).difference(allowed):
             raise PerformanceV2ApiError("INVALID_REQUEST", status=400, message="unsupported selection cache fields")
         selection_payload = {
             "symbol": payload.get("symbol"), "side": payload.get("side"),
             "stages": payload.get("stages", []),
         }
+        if "finalists_only" in payload:
+            selection_payload["finalists_only"] = payload["finalists_only"]
         if "bulk_retest_job_id" in payload:
             selection_payload["bulk_retest_job_id"] = payload.get("bulk_retest_job_id")
         request = self._selection_request(selection_payload)

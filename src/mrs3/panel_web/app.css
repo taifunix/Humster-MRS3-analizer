@@ -254,6 +254,8 @@ tbody th { font-weight: 750; }
 .selection-preview-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
 .selection-preview-heading h3, .selection-objectives h3 { margin: 0; font-size: .86rem; }
 .selection-preview-note { color: var(--muted); font-size: .7rem; }
+.selection-finalists-only { gap: 7px; margin-bottom: 10px; line-height: 1.2; }
+.selection-finalists-only input[type="checkbox"] { width: 1.2em; min-width: 1.2em; height: 1.2em; min-height: 1.2em; }
 .selection-stage-list { display: grid; gap: 7px; margin: 0; padding: 0; list-style: none; }
 .selection-stage { display: grid; grid-template-columns: 28px 24px minmax(0, 1fr) 112px 78px 175px minmax(80px, 105px) 66px; gap: 16px; align-items: center; padding: 8px 9px; border: 1px solid var(--line); border-radius: 8px; background: #fff; }
 .selection-stage-position { color: var(--muted); font-size: .7rem; font-weight: 800; text-align: center; }

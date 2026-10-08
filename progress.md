@@ -86,9 +86,18 @@ the first operational step below.
 - Campaign combination preflight: the configured limit and server-side rejection of over-limit job creation are implemented. The form still does not calculate or display the exact finalist combination product before submission. See the [Portfolio Optimizer UI specification](docs/specs/2026-09-06-portfolio-optimizer-panel-ui.md).
 ## Next steps
 
-1. Restart or reload the Panel before using the newly implemented Minimum Shift and finalist equity-filter controls; no live restart was performed during verification.
+1. Restart or reload the Panel before using the Minimum Shift, finalist equity-filter and Finalist/Reserved-only selection controls; no live restart was performed during verification.
 2. Run a fresh finalist retest from 2026-06-01 through 2026-10-05; then review the per-strategy import outcome before confirming it.
 3. Confirm the live PURR recalculation after the Panel lock change.
 4. Verify the READY JSON job state and identify the supported recovery procedure; do not edit the journal.
 5. Keep the remaining Performance v2, database profiling, collector, and Portfolio Optimizer gates within their linked plans and specifications.
 6. Do not make final MRS3 performance claims until real tick-test results and DD5 retesting are available.
+
+Finalist/Reserved-only Performance v2 mode: implemented and independently
+reviewed. Targeted request, UI, pipeline, readiness and XLSX checks pass (7
+tests); the six-module selection/UI/export batch reports 798 passed and 5
+platform skips. Its 3 failures were reproduced on clean HEAD: the maintenance
+card string expectation, a Windows Node command-line length error, and the
+PARETO reason-alias expectation. The UI toggle was exercised with a Node event
+simulation; no live database or browser smoke was run. Reload the Panel before
+using the checkbox.

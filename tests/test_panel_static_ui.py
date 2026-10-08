@@ -120,6 +120,46 @@ def test_researched_filters_have_fixed_order_and_editable_settings() -> None:
     assert ".selection-stage-controls { grid-column: 8;" in css
 
 
+def test_finalist_reserved_mode_is_above_stage_order_and_submitted_with_selection() -> None:
+    html, js, css = _read("index.html"), _read("app.js"), _read("app.css")
+    card = html.split('id="performance-v2-selection-card"', 1)[1].split("</details>", 1)[0]
+    checkbox = '<input id="performance-v2-selection-finalists-only" type="checkbox">'
+    assert card.index("id=\"performance-v2-selection-pipeline-title\"") < card.index(checkbox)
+    assert card.index(checkbox) < card.index('<ol id="performance-v2-selection-order"')
+    assert "Finalist &amp; Reserved" in card
+    assert '<input id="performance-v2-selection-finalists-only" type="checkbox" checked' not in card
+    assert ".selection-finalists-only input[type=\"checkbox\"]" in css
+    selection_payload = js.split("const selectionPayload = () =>", 1)[1].split(";", 1)[0]
+    assert "finalists_only: Boolean(selectionFinalistsOnly?.checked)" in selection_payload
+    assert "selectionFinalistsOnly?.addEventListener('change'" in js
+    assert js.count("body: JSON.stringify(payload)") >= 2
+    assert "body: JSON.stringify(selectionPayload())" in js
+
+    payload_definition = js[js.index("const selectionPayload = () =>"):].split(";", 1)[0] + ";"
+    listener_definition = js[js.index("selectionFinalistsOnly?.addEventListener('change'"):].split("\n  });", 1)[0] + "\n  });"
+    function_body = payload_definition + "\n" + listener_definition + "\nreturn selectionPayload;"
+    script = r"""
+const assert = require('node:assert/strict');
+let changed;
+let dirtyCount = 0;
+let refreshCount = 0;
+const checkbox = { checked: false, addEventListener: (event, callback) => { assert.equal(event, 'change'); changed = callback; } };
+const create = new Function('performanceV2SelectionPair', 'performanceV2SelectionSide', 'selectionStages', 'selectionFinalistsOnly', 'markSelectionPreviewDirty', 'refreshSelectionCacheStatus', __FUNCTION_BODY__);
+const getPayload = create({value:'BTCUSDT'}, {value:'LONG'}, () => [], checkbox, () => { dirtyCount += 1; }, () => { refreshCount += 1; });
+assert.equal(getPayload().finalists_only, false);
+checkbox.checked = true;
+changed();
+assert.equal(getPayload().finalists_only, true);
+checkbox.checked = false;
+changed();
+assert.equal(getPayload().finalists_only, false);
+assert.equal(dirtyCount, 2);
+assert.equal(refreshCount, 2);
+""".replace("__FUNCTION_BODY__", json.dumps(function_body))
+    completed = subprocess.run(("node", "-e", script), capture_output=True, text=True)
+    assert completed.returncode == 0, completed.stderr or completed.stdout
+
+
 def test_selection_catalog_defaults_to_a_valid_scope_and_refreshes_counts() -> None:
     js = _read("app.js")
     sync_body = js.split("const syncPerformanceV2SelectionScope = () => {", 1)[1].split("\n  };", 1)[0]

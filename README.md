@@ -86,6 +86,12 @@ import, publication and analysis, but does not change calculated results.
 
 Перед запуском на production данных прочитайте активную спецификацию: [v0.7 legacy selection](docs/specs/2026-08-10-v07-legacy-selection.md).
 
+На экране Performance v2 selection можно включить режим только для стратегий
+с последним импортированным `User Status` `FINALIST` или `RESERVE`. Режим
+выключен по умолчанию и одинаково ограничивает preview, готовность кэша,
+стадии отбора и обе таблицы XLSX; подробности — в [спецификации фильтров
+Performance v2](docs/specs/2026-10-01-performance-v2-filter-sequence.md).
+
 ## Важные ограничения
 
 - Не удаляйте HTML до успешного v4 import audit.

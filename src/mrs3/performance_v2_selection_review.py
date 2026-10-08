@@ -85,6 +85,8 @@ def canonical_json(value: object) -> str:
 
 def canonical_contract(request: SelectionRequest, config: SelectionConfig) -> tuple[str, str, str, str]:
     request_data = asdict(request)
+    if not request.finalists_only:
+        request_data.pop("finalists_only")
     for stage in request_data["stages"]:
         if stage["method"] in (None, "robust_v1") or not stage["enabled"]:
             stage.pop("method")
@@ -1214,6 +1216,7 @@ def import_selection_review(connection: duckdb.DuckDBPyConnection, data: bytes) 
             saved_request = parse_selection_request({
                 "symbol": request_document.get("symbol"),
                 "side": request_document.get("side"),
+                "finalists_only": request_document.get("finalists_only", False),
                 "stages": parsed_stages,
             }, allow_retired_enabled=True)
             config_document = json.loads(run[4])

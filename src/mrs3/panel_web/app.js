@@ -3487,6 +3487,7 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
     }
   });
   const selectionPreviewOrder = document.querySelector('#performance-v2-selection-order');
+  const selectionFinalistsOnly = document.querySelector('#performance-v2-selection-finalists-only');
   const selectionPreviewStatus = document.querySelector('#performance-v2-selection-status');
   const selectionPreviewBadge = document.querySelector('#performance-v2-selection-badge');
   const selectionRankStage = document.querySelector('[data-selection-rank]');
@@ -3597,7 +3598,7 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
     ...(selectionMethod !== 'robust_v1' ? { method: selectionMethod } : {}),
   }];
   };
-  const selectionPayload = () => ({ symbol: performanceV2SelectionPair?.value || '', side: performanceV2SelectionSide?.value || '', stages: selectionStages() });
+  const selectionPayload = () => ({ symbol: performanceV2SelectionPair?.value || '', side: performanceV2SelectionSide?.value || '', finalists_only: Boolean(selectionFinalistsOnly?.checked), stages: selectionStages() });
   const selectionXlsButton = document.querySelector('#performance-v2-selection-xls');
   const selectionReviewFile = document.querySelector('#performance-v2-selection-review-file');
   const selectionReviewImportButton = document.querySelector('#performance-v2-selection-review-import');
@@ -3682,6 +3683,10 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
       markSelectionPreviewDirty(orderedSelectionStages().indexOf(stage));
       if (stage === selectionEquityStage) refreshSelectionCacheStatus();
     });
+  });
+  selectionFinalistsOnly?.addEventListener('change', () => {
+    markSelectionPreviewDirty();
+    refreshSelectionCacheStatus();
   });
   document.querySelectorAll('[data-selection-scope]').forEach((input) => {
     input.addEventListener('change', () => markSelectionPreviewDirty(orderedSelectionStages().indexOf(input.closest('[data-selection-stage]'))));

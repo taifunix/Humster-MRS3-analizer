@@ -3749,6 +3749,195 @@ def test_selection_http_downloads_xlsx_and_persists_exact_selection_state(tmp_pa
     assert controller._panel_jobs.list() == []
 
 
+def test_selection_finalist_reserved_mode_filters_pipeline_cache_and_xlsx(tmp_path: Path) -> None:
+    controller, database, alpha_result_id = _controller_for_windows(tmp_path)
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    with duckdb.connect(str(database)) as connection:
+        alpha_id = int(connection.execute(
+            "select strategy_id from strategies where strategy_name = 'alpha'",
+        ).fetchone()[0])
+        strategy_ids = {"alpha": alpha_id}
+        for name in ("beta", "gamma", "delta"):
+            strategy_id = int(connection.execute(
+                """insert into strategies (strategy_name, symbol, side, timeframe, close_ma_len,
+                       order_count, analysis_run_id, candidate_identity, lifecycle_status,
+                       created_at_utc, updated_at_utc)
+                   values (?, 'BTCUSDT', 'LONG', '1h', 3, 1, 'run', ?, 'ACTIVE', ?, ?)
+                   returning strategy_id""",
+                [name, f"candidate-{name}", now, now],
+            ).fetchone()[0])
+            strategy_ids[name] = strategy_id
+            result_id = int(connection.execute(
+                """insert into strategy_results (strategy_id, report_start_utc, report_end_utc,
+                       exchange, commission_rate, initial_balance, final_balance, total_pnl,
+                       total_pnl_pct, max_drawdown, max_drawdown_pct, total_fees, total_trades,
+                       imported_at_utc)
+                   select ?, report_start_utc, report_end_utc, exchange, commission_rate,
+                          initial_balance, final_balance, total_pnl, total_pnl_pct, max_drawdown,
+                          max_drawdown_pct, total_fees, total_trades, imported_at_utc
+                     from strategy_results where result_id = ? returning result_id""",
+                [strategy_id, alpha_result_id],
+            ).fetchone()[0])
+            connection.execute(
+                "update strategies set current_result_id = ? where strategy_id = ?",
+                [result_id, strategy_id],
+            )
+            connection.execute(
+                """insert into strategy_orders (strategy_id, order_id, open_ma_len, open_multiplier,
+                       shift_bp, lot_x, analysis_run_id, plateau_id, base_point_trades)
+                   select ?, order_id, open_ma_len, open_multiplier, shift_bp, lot_x,
+                          analysis_run_id, plateau_id, base_point_trades
+                     from strategy_orders where strategy_id = ?""",
+                [strategy_id, alpha_id],
+            )
+            connection.execute(
+                """insert into strategy_actions (result_id, action_index, timestamp_utc, symbol,
+                       order_id, action, size, post_size, post_side, pnl, fee, balance, price, cost,
+                       raw_action_json)
+                   select ?, action_index, timestamp_utc, symbol, order_id, action, size, post_size,
+                          post_side, pnl, fee, balance, price, cost, raw_action_json
+                     from strategy_actions where result_id = ?""",
+                [result_id, alpha_result_id],
+            )
+            connection.execute(
+                """insert into strategy_equity
+                   select ?, sample_index, timestamp_utc, wallet, equity
+                     from strategy_equity where result_id = ?""",
+                [result_id, alpha_result_id],
+            )
+
+    assert controller.strategies_performance_v2_recalculate(
+        {"symbol": "BTCUSDT", "side": "LONG"},
+    ) == {"status": "READY"}
+    _, baseline = controller.strategies_performance_v2_selection({
+        "symbol": "BTCUSDT", "side": "LONG", "stages": [],
+    })
+    workbook = load_workbook(BytesIO(baseline))
+    sheet = workbook["All candidates"]
+    headers = {cell.value: cell.column for cell in sheet[1]}
+    duplicate_workbook = load_workbook(BytesIO(baseline))
+    duplicate_sheet = duplicate_workbook["All candidates"]
+    duplicate_headers = {cell.value: cell.column for cell in duplicate_sheet[1]}
+    duplicate_sheet.cell(2, duplicate_headers["User Status"]).value = "FINALIST"
+    duplicate_sheet.cell(3, duplicate_headers["User Status"]).value = "FINALIST"
+    duplicate_sheet.cell(3, duplicate_headers["ID"]).value = duplicate_sheet.cell(2, duplicate_headers["ID"]).value
+    duplicate_bytes = BytesIO()
+    duplicate_workbook.save(duplicate_bytes)
+    with pytest.raises(PerformanceV2ApiError) as duplicate:
+        controller.strategies_performance_v2_selection_user_fields_import(duplicate_bytes.getvalue())
+    assert duplicate.value.code == "SELECTION_REVIEW_ROWSET_MISMATCH"
+
+    statuses = {"alpha": " finalist ", "beta": "Reserve", "gamma": "REJECTED", "delta": None}
+    for row in range(2, sheet.max_row + 1):
+        strategy_id = int(sheet.cell(row, headers["ID"]).value)
+        name = next(name for name, value in strategy_ids.items() if value == strategy_id)
+        sheet.cell(row, headers["User Status"]).value = statuses[name]
+        sheet.cell(row, headers["User Rank"]).value = 1 if name == "alpha" else None
+    reviewed = BytesIO()
+    workbook.save(reviewed)
+    imported = controller.strategies_performance_v2_selection_user_fields_import(reviewed.getvalue())
+    assert imported["applied_count"] == 3
+
+    all_request = {"symbol": "BTCUSDT", "side": "LONG", "stages": []}
+    finalists_request = {**all_request, "finalists_only": True}
+    with duckdb.connect(str(database)) as connection:
+        nonfinalist_result_id = int(connection.execute(
+            "select current_result_id from strategies where strategy_id = ?", [strategy_ids["gamma"]],
+        ).fetchone()[0])
+        connection.execute("delete from window_metrics where result_id = ?", [nonfinalist_result_id])
+    all_cache = controller.strategies_performance_v2_selection_cache_status(all_request)
+    finalists_cache = controller.strategies_performance_v2_selection_cache_status(finalists_request)
+    assert all_cache["ready"] is False and all_cache["missing"] > 0
+    assert finalists_cache["ready"] is True and finalists_cache["missing"] == 0
+    assert controller.strategies_performance_v2_recalculate({"symbol": "BTCUSDT", "side": "LONG"}) == {"status": "READY"}
+
+    _, all_candidates = controller._performance_v2_selection_result(all_request)
+    _, finalists = controller._performance_v2_selection_result(finalists_request)
+    assert set(all_candidates["strategy_id"]) == set(strategy_ids.values())
+    assert set(finalists["strategy_id"]) == {strategy_ids["alpha"], strategy_ids["beta"]}
+    assert controller.strategies_performance_v2_selection_cache_status(all_request)["total"] == 4
+    assert controller.strategies_performance_v2_selection_cache_status(finalists_request)["total"] == 2
+
+    ranked_request = {
+        **finalists_request,
+        "stages": [{"id": "rank_robust_top_n", "enabled": True, "scope": "pair_side", "top_n": 1}],
+    }
+    _, ranked = controller._performance_v2_selection_result(ranked_request)
+    assert set(ranked["strategy_id"]) == {strategy_ids["alpha"], strategy_ids["beta"]}
+    assert int(ranked["finalist"].sum()) == 1
+    assert ranked.attrs["stage_counts"]["rank_robust_top_n"]["remaining"] == 1
+
+    _, filtered_xlsx = controller.strategies_performance_v2_selection(finalists_request)
+    exported = load_workbook(BytesIO(filtered_xlsx), data_only=True)
+    for sheet_name in ("All candidates", "Finalists"):
+        exported_sheet = exported[sheet_name]
+        exported_headers = {cell.value: cell.column for cell in exported_sheet[1]}
+        exported_ids = {
+            int(exported_sheet.cell(row, exported_headers["ID"]).value)
+            for row in range(2, exported_sheet.max_row + 1)
+        }
+        assert exported_ids == {strategy_ids["alpha"], strategy_ids["beta"]}
+    with duckdb.connect(str(database), read_only=True) as connection:
+        snapshot = connection.execute(
+            "select request_json, candidate_count from selection_runs order by created_at_utc desc limit 1",
+        ).fetchone()
+    assert json.loads(snapshot[0])["finalists_only"] is True
+    assert snapshot[1] == 2
+
+    _, all_rows_xlsx = controller.strategies_performance_v2_selection(all_request)
+    all_rows = load_workbook(BytesIO(all_rows_xlsx))
+    all_candidates_sheet = all_rows["All candidates"]
+    all_headers = {cell.value: cell.column for cell in all_candidates_sheet[1]}
+    for row in range(2, all_candidates_sheet.max_row + 1):
+        all_candidates_sheet.cell(row, all_headers["User Status"]).value = "REJECTED"
+        all_candidates_sheet.cell(row, all_headers["User Rank"]).value = None
+    rejected_workbook = BytesIO()
+    all_rows.save(rejected_workbook)
+    controller.strategies_performance_v2_selection_user_fields_import(rejected_workbook.getvalue())
+    _, no_finalists = controller._performance_v2_selection_result(finalists_request)
+    assert no_finalists.empty
+    no_finalist_cache = controller.strategies_performance_v2_selection_cache_status(finalists_request)
+    assert no_finalist_cache["total"] == 0
+    assert no_finalist_cache["ready"] is True
+    assert controller.strategies_performance_v2_selection_preview(finalists_request)["stages"] == {}
+
+    _, empty_xlsx = controller.strategies_performance_v2_selection(finalists_request)
+    empty_workbook = load_workbook(BytesIO(empty_xlsx), data_only=True)
+    for sheet_name in ("All candidates", "Finalists"):
+        empty_sheet = empty_workbook[sheet_name]
+        assert empty_sheet.max_row == 1
+        assert empty_sheet.max_column > 1
+
+    _, latest_review_xlsx = controller.strategies_performance_v2_selection(all_request)
+    latest_review = load_workbook(BytesIO(latest_review_xlsx))
+    latest_sheet = latest_review["All candidates"]
+    latest_headers = {cell.value: cell.column for cell in latest_sheet[1]}
+    for row in range(2, latest_sheet.max_row + 1):
+        strategy_id = int(latest_sheet.cell(row, latest_headers["ID"]).value)
+        latest_sheet.cell(row, latest_headers["User Status"]).value = (
+            "FINALIST" if strategy_id == strategy_ids["delta"] else "REJECTED"
+        )
+        latest_sheet.cell(row, latest_headers["User Rank"]).value = 1 if strategy_id == strategy_ids["delta"] else None
+    latest_review_bytes = BytesIO()
+    latest_review.save(latest_review_bytes)
+    controller.strategies_performance_v2_selection_user_fields_import(latest_review_bytes.getvalue())
+    _, latest_candidates = controller._performance_v2_selection_result(finalists_request)
+    assert set(latest_candidates["strategy_id"]) == {strategy_ids["delta"]}
+    assert controller.strategies_performance_v2_selection_cache_status(finalists_request)["total"] == 1
+    latest_preview = controller.strategies_performance_v2_selection_preview(ranked_request)
+    assert latest_preview["stages"]["rank_robust_top_n"]["remaining"] == 1
+    _, latest_xlsx = controller.strategies_performance_v2_selection(finalists_request)
+    latest_workbook = load_workbook(BytesIO(latest_xlsx), data_only=True)
+    for sheet_name in ("All candidates", "Finalists"):
+        latest_sheet = latest_workbook[sheet_name]
+        latest_headers = {cell.value: cell.column for cell in latest_sheet[1]}
+        latest_ids = {
+            int(latest_sheet.cell(row, latest_headers["ID"]).value)
+            for row in range(2, latest_sheet.max_row + 1)
+        }
+        assert latest_ids == {strategy_ids["delta"]}
+
+
 def test_selection_http_missing_cache_returns_typed_json_without_xlsx(tmp_path: Path) -> None:
     controller, _, _ = _controller_for_windows(tmp_path)
     server, thread = _http_server(controller)

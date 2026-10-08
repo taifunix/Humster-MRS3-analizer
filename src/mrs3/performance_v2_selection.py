@@ -141,6 +141,7 @@ class SelectionRequest:
     symbol: str
     side: Literal["LONG", "SHORT"]
     stages: tuple[SelectionStage, ...]
+    finalists_only: bool = False
     ranking_scope: Literal["ORDINARY", "RETEST_COHORT"] = "ORDINARY"
     bulk_retest_job_id: str | None = None
     cohort_members: tuple[tuple[int, int], ...] = ()
@@ -226,17 +227,20 @@ def _error(code: str) -> PerformanceV2SelectionError:
 def parse_selection_request(
     payload: Mapping[str, object], *, allow_retired_enabled: bool = False,
 ) -> SelectionRequest:
-    if set(payload) != {"symbol", "side", "stages"}:
+    if set(payload) not in ({"symbol", "side", "stages"}, {"symbol", "side", "stages", "finalists_only"}):
         raise _error("INVALID_REQUEST")
     symbol = payload["symbol"]
     side = payload["side"]
     stages = payload["stages"]
+    finalists_only = payload.get("finalists_only", False)
     if not isinstance(symbol, str) or not symbol.strip():
         raise _error("INVALID_SYMBOL")
     if side not in {"LONG", "SHORT"}:
         raise _error("INVALID_SIDE")
     if not isinstance(stages, list):
         raise _error("INVALID_STAGES")
+    if not isinstance(finalists_only, bool):
+        raise _error("INVALID_REQUEST")
 
     parsed: list[SelectionStage] = []
     seen: set[str] = set()
@@ -286,7 +290,7 @@ def parse_selection_request(
         parsed.append(SelectionStage(stage_id, enabled, scope, min_shift_pct, pnl_tolerance_pct, top_n, method))
     if any(stage.id == "rank_robust_top_n" for stage in parsed) and parsed[-1].id != "rank_robust_top_n":
         raise _error("RANK_STAGE_MUST_BE_LAST")
-    return SelectionRequest(symbol.strip(), side, tuple(parsed))
+    return SelectionRequest(symbol.strip(), side, tuple(parsed), finalists_only=finalists_only)
 
 
 def retest_cohort_request(
@@ -314,6 +318,31 @@ def _cohort_clause(request: SelectionRequest, alias: str = "s") -> tuple[str, li
         raise PerformanceV2SelectionError("RETEST_COHORT_NO_SUCCESSFUL_MEMBERS")
     ids = tuple(strategy_id for strategy_id, _ in request.cohort_members)
     return f" and {alias}.strategy_id in ({','.join('?' for _ in ids)})", list(ids)
+
+
+def finalist_reserved_strategy_ids(
+    connection: duckdb.DuckDBPyConnection, strategy_ids: Sequence[int],
+) -> set[int]:
+    """Return IDs whose newest imported User Status is FINALIST or RESERVE."""
+    ids = tuple(dict.fromkeys(int(strategy_id) for strategy_id in strategy_ids))
+    if not ids:
+        return set()
+    rows = connection.execute(
+        """with latest as (
+               select rows.strategy_id, rows.user_status,
+                      row_number() over (
+                          partition by rows.strategy_id
+                          order by imports.imported_at_utc desc, imports.review_import_id desc
+                      ) as review_order
+                 from selection_review_rows rows
+                 join selection_review_imports imports using (review_import_id)
+                where rows.strategy_id in (select unnest(?::bigint[]))
+           )
+           select strategy_id from latest
+            where review_order = 1 and user_status in ('FINALIST', 'RESERVE')""",
+        [list(ids)],
+    ).fetchall()
+    return {int(row[0]) for row in rows}
 
 
 def _verify_retest_cohort(connection: duckdb.DuckDBPyConnection, request: SelectionRequest) -> None:
@@ -1623,6 +1652,9 @@ def selection_cache_status(
             where s.lifecycle_status = 'ACTIVE' and s.symbol = ? and s.side = ?""" + cohort_sql,
         [request.symbol, request.side, *cohort_params],
     ).fetchall()
+    if request.finalists_only:
+        eligible = finalist_reserved_strategy_ids(connection, [int(row[0]) for row in rows])
+        rows = [row for row in rows if int(row[0]) in eligible]
     regime_consumer = _selection_requires_equity_regime(request)
     quality_rank_consumer = any(
         stage.enabled and stage.id == "rank_robust_top_n" and stage.method == "equity_quality_v1"
@@ -1655,7 +1687,10 @@ def selection_cache_status(
         warm_missing += int(current_warm_missing)
         if old_missing or current_equity_missing or current_regime_missing:
             missing += 1
-    status: dict[str, int | bool] = {"total": len(rows), "missing": missing, "ready": bool(rows) and missing == 0}
+    status: dict[str, int | bool] = {
+        "total": len(rows), "missing": missing,
+        "ready": (bool(rows) or request.finalists_only) and missing == 0,
+    }
     if include_readiness_breakdown:
         status["window_missing"] = window_missing
         status["equity_missing"] = equity_missing

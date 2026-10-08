@@ -569,8 +569,10 @@ def test_equity_rank_disabled_method_does_not_require_facts_or_change_result() -
 
 
 def test_equity_regime_stage_has_fixed_pair_side_scope_and_legacy_absence_is_unchanged() -> None:
+    from mrs3.performance_v2_selection_review import canonical_contract
+
     legacy = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
-    encoded = json.dumps(asdict(legacy), sort_keys=True, separators=(",", ":"))
+    encoded = canonical_contract(legacy, SelectionConfig())[0]
     assert hashlib.sha256(encoded.encode()).hexdigest() == "40080afb14245d0729d4124794ce647e089521725624767bdfb94de87cc6edb4"
 
     request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
@@ -583,6 +585,25 @@ def test_equity_regime_stage_has_fixed_pair_side_scope_and_legacy_absence_is_unc
         parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
             {"id": "filter_equity_regime", "enabled": True, "scope": "pair_side_timeframe"},
         ]})
+
+
+def test_finalists_only_request_is_strict_boolean_and_preserves_legacy_hash() -> None:
+    from mrs3.performance_v2_selection_review import canonical_contract
+
+    base = {"symbol": "BTCUSDT", "side": "LONG", "stages": []}
+    absent = parse_selection_request(base)
+    explicit_false = parse_selection_request({**base, "finalists_only": False})
+    enabled = parse_selection_request({**base, "finalists_only": True})
+
+    assert not absent.finalists_only
+    assert not explicit_false.finalists_only
+    assert canonical_contract(absent, SelectionConfig()) == canonical_contract(explicit_false, SelectionConfig())
+    enabled_json, enabled_hash, *_ = canonical_contract(enabled, SelectionConfig())
+    assert json.loads(enabled_json)["finalists_only"] is True
+    assert enabled_hash != canonical_contract(absent, SelectionConfig())[1]
+    for invalid in ("true", "on", 1, None, ""):
+        with pytest.raises(PerformanceV2SelectionError, match="INVALID_REQUEST"):
+            parse_selection_request({**base, "finalists_only": invalid})
 
 
 def test_legacy_robust_request_json_stays_byte_identical() -> None:

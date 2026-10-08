@@ -24,6 +24,18 @@ portfolio simulation and historical snapshot rewriting are outside scope.
 
 ## Stage order and request contract
 
+The Panel may enable the `Только Finalist & Reserved` mode for one selection
+request. It defaults OFF and reads each strategy's newest imported `User
+Status` review value. When ON, only exact `FINALIST` and `RESERVE` values enter
+the first stage; missing or any other status is excluded. The same candidate
+set is used by preview, cache readiness, every ordered stage and the selection
+XLSX. Relative thresholds, Pareto comparisons, ranking and stage counts are
+computed over this eligible subset. An empty filtered set is ready and produces
+an empty preview/workbook with the normal headers.
+The mode is part of the typed request and immutable selection snapshot;
+requests that omit it preserve the existing unfiltered behavior. It does not
+change source fact recalculation.
+
 The server and Panel fix this prefix, independent of submitted order:
 
 1. `filter_equity_regime` (existing rule, still default OFF);
@@ -218,6 +230,11 @@ the effective configured thresholds; the A/B stage loses its `PLANNED` badge.
 - TDD checks for fixed order on server and Panel, enabled defaults and all
   fixed-stage reasons/booleans, including the Lot 10/10, B boundaries and
   minimum-Shift placement before the PnL stage.
+- The Finalist & Reserved mode defaults off, uses the newest imported status,
+  admits only FINALIST/RESERVE, filters cache readiness and both XLSX sheets,
+  applies relative stages within the eligible set, accepts an empty filtered
+  set with a header-only XLSX, and records its request setting in the immutable
+  selection snapshot. Omitted/false mode preserves legacy request hashes.
 - DD guard boundaries 23 and 3x, including missing full PnL/30d; A/B
   boundaries 4/15/55, 24/25 cycles, missing A/B facts and independent
   branches; top-five 45 days/25 profits/80%, nonpositive net and incomplete
