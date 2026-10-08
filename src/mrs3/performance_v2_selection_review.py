@@ -389,20 +389,37 @@ def _equity_snapshot_stale_ids(
     return sorted(stale)
 
 
-def _rejected_strategy_ids(connection: duckdb.DuckDBPyConnection) -> set[int]:
-    query = """select strategy_id from strategy_tags where tag = 'REJECTED'
-               union select strategy_id from strategy_rejection_sources"""
+def _rejected_strategy_ids(
+    connection: duckdb.DuckDBPyConnection,
+    strategy_ids: Sequence[int] | None = None,
+) -> set[int]:
+    if strategy_ids is not None and not strategy_ids:
+        return set()
+    ids = None if strategy_ids is None else list(strategy_ids)
+    if ids is None:
+        query = """select strategy_id from strategy_tags where tag = 'REJECTED'
+                   union select strategy_id from strategy_rejection_sources"""
+        params: list[object] = []
+    else:
+        query = """select strategy_id from strategy_tags where tag = 'REJECTED'
+                    and strategy_id in (select unnest(?::bigint[]))
+                   union select strategy_id from strategy_rejection_sources
+                    where strategy_id in (select unnest(?::bigint[]))"""
+        params = [ids, ids]
     try:
-        rows = connection.execute(query).fetchall()
+        rows = connection.execute(query, params).fetchall()
     except duckdb.CatalogException:
         version_row = connection.execute(
             "select value from schema_info where key = 'schema_version'"
         ).fetchone()
         if version_row is None or str(version_row[0]) not in {"5", "6", "7", "8"}:
             raise
-        rows = connection.execute(
-            "select strategy_id from strategy_tags where tag = 'REJECTED'"
-        ).fetchall()
+        fallback = "select strategy_id from strategy_tags where tag = 'REJECTED'"
+        fallback_params: list[object] = []
+        if ids is not None:
+            fallback += " and strategy_id in (select unnest(?::bigint[]))"
+            fallback_params = [ids]
+        rows = connection.execute(fallback, fallback_params).fetchall()
     return {int(row[0]) for row in rows}
 
 
@@ -1448,6 +1465,7 @@ def effective_selection_decisions(
     connection: duckdb.DuckDBPyConnection,
     *,
     symbol: str | None = None,
+    strategy_ids: Sequence[int] | None = None,
 ) -> dict[int, tuple[str, int | None, str | None]]:
     """Resolve ordinary selection snapshots and reviewed scoped overlays.
 
@@ -1457,6 +1475,17 @@ def effective_selection_decisions(
     dormant until a review is imported, then only its reviewed rows overlay the
     prior decision.
     """
+    if strategy_ids is not None:
+        strategy_ids = tuple(strategy_ids)
+        if symbol is None:
+            raise ValueError("symbol is required when strategy_ids is supplied")
+        if len(set(strategy_ids)) != len(strategy_ids):
+            raise ValueError("strategy_ids must not contain duplicate IDs")
+        if not strategy_ids:
+            return {}
+    # The run/review queries below stay Pair+Side scoped so overlay activation
+    # sees the complete history for the selected symbol. Their per-strategy
+    # payload is narrowed separately by strategy_ids in review/result queries.
     run_scope = "where runs.symbol = ?" if symbol is not None else ""
     scope_params = [symbol] if symbol is not None else []
     runs = connection.execute(
@@ -1465,7 +1494,7 @@ def effective_selection_decisions(
               order by runs.created_at_utc asc, runs.selection_run_id asc""", scope_params
     ).fetchall()
     states: dict[tuple[str, str], dict[int, tuple[str, int | None, str | None]]] = {}
-    latest_reviews = latest_user_reviews_by_strategy(connection)
+    latest_reviews = latest_user_reviews_by_strategy(connection, strategy_ids)
     overlay_run_ids: set[str] = set()
     for run_id, _run_symbol, _run_side, raw_request in runs:
         try:
@@ -1477,6 +1506,13 @@ def effective_selection_decisions(
 
     review_strategy_ids_by_run: dict[str, set[int]] = {}
     reviewed_runs: set[str] = set()
+    # Review membership is run-level and therefore remains symbol-scoped; the
+    # selected strategy IDs only control which payload rows can enter a state.
+    review_row_scope = ""
+    review_params = list(scope_params)
+    if strategy_ids is not None:
+        review_row_scope = " and (rows.strategy_id is null or rows.strategy_id in (select unnest(?::bigint[])))"
+        review_params.append(list(strategy_ids))
     for run_id, strategy_id in connection.execute(
         f"""with latest_imports as (
                    select ranked.selection_run_id, ranked.review_import_id
@@ -1495,8 +1531,9 @@ def effective_selection_decisions(
                select latest_imports.selection_run_id, rows.strategy_id
                  from latest_imports
                  left join selection_review_rows rows
-                   on rows.review_import_id = latest_imports.review_import_id""",
-        scope_params,
+                    on rows.review_import_id = latest_imports.review_import_id
+                   {review_row_scope}""",
+         review_params,
     ).fetchall():
         run_key = str(run_id)
         if run_key not in overlay_run_ids:
@@ -1506,13 +1543,20 @@ def effective_selection_decisions(
             review_strategy_ids_by_run.setdefault(run_key, set()).add(int(strategy_id))
 
     run_positions = {str(run[0]): index for index, run in enumerate(runs)}
+    result_scope = run_scope
+    result_params = list(scope_params)
+    if strategy_ids is not None:
+        result_scope += (" and" if result_scope else "where") + (
+            " results.strategy_id in (select unnest(?::bigint[]))"
+        )
+        result_params.append(list(strategy_ids))
     result_cursor = connection.execute(
         f"""select results.selection_run_id, results.strategy_id, results.prior_rejected
                from selection_results results
                join selection_runs runs using (selection_run_id)
-              {run_scope}
+              {result_scope}
               order by runs.created_at_utc asc, runs.selection_run_id asc, results.rowid asc""",
-        scope_params,
+        result_params,
     )
     def result_rows():
         while batch := result_cursor.fetchmany(1024):
@@ -1560,7 +1604,7 @@ def effective_selection_decisions(
             raise ValueError("selection results out of order")
         pending_result = next(result_iter, None)
     decisions = {strategy_id: decision for state in states.values() for strategy_id, decision in state.items()}
-    for strategy_id in _rejected_strategy_ids(connection):
+    for strategy_id in _rejected_strategy_ids(connection, strategy_ids):
         if strategy_id in latest_run_for_strategy:
             prior = decisions.get(strategy_id)
             rank = (prior[1] if prior else latest_reviews.get(strategy_id, {}).get("user_rank"))

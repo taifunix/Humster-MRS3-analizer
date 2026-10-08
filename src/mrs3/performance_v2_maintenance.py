@@ -349,12 +349,33 @@ def create_preview(
     # an interrupted earlier run may have archived a row before its detail
     # delete completed, and the next cleanup must remove those residual facts.
     strategy_ids_by_symbol = _ids_by_symbol(connection, selected)
+    seen_strategy_ids: dict[int, str] = {}
+    for symbol, identifiers in strategy_ids_by_symbol.items():
+        for identifier in identifiers:
+            identifier = int(identifier)
+            previous_symbol = seen_strategy_ids.get(identifier)
+            if previous_symbol is not None:
+                raise PerformanceV2MaintenanceError(
+                    f"duplicate strategy ID {identifier} is mapped to both {previous_symbol} and {symbol}"
+                )
+            seen_strategy_ids[identifier] = symbol
     strategy_ids = [identifier for identifiers in strategy_ids_by_symbol.values() for identifier in identifiers]
     rejected_ids: set[int] = set()
     discarded_ids: set[int] = set()
     rejected_strategy_counts: Counter[str] = Counter()
     if operation == "rejected":
-        decisions = effective_selection_decisions(connection)
+        decisions: dict[int, tuple[str, int | None, str | None]] = {}
+        for symbol in selected:
+            symbol_strategy_ids = strategy_ids_by_symbol.get(symbol, ())
+            if not symbol_strategy_ids:
+                continue
+            decisions.update(
+                effective_selection_decisions(
+                    connection,
+                    symbol=symbol,
+                    strategy_ids=symbol_strategy_ids,
+                )
+            )
         rejected_ids = {
             identifier for identifier in strategy_ids
             if decisions.get(identifier, (None, None, None))[0] == "REJECTED"

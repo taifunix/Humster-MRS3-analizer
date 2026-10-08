@@ -224,3 +224,15 @@ measured limit rather than making writes concurrent.
   timing/RSS evidence on fixtures at one and configured worker counts.
 - No tester, live PerformanceDB or source database is mutated during
   implementation verification.
+
+## Preview decision-scope constraint
+
+The rejected preview must resolve effective selection decisions only for the
+selected symbols and their strategy IDs. It must not materialize selection
+runs, review rows, or rejection IDs for the rest of the database. When several
+symbols are selected, process each symbol-scoped decision set independently
+and merge only the resulting IDs. This bounds peak memory by the selected
+cohort instead of the complete PerformanceDB.
+The resolver must require a symbol whenever an ID scope is supplied, keep
+overlay activation symbol-scoped, and filter review/result/rejection payload
+rows by the selected IDs. An empty selected-ID set is a no-op.

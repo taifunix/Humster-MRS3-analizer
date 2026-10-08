@@ -93,6 +93,13 @@ the first operational step below.
 5. Keep the remaining Performance v2, database profiling, collector, and Portfolio Optimizer gates within their linked plans and specifications.
 6. Do not make final MRS3 performance claims until real tick-test results and DD5 retesting are available.
 
+Maintenance preview memory fix: rejected preview decision resolution is now
+scoped to each selected symbol and its strategy IDs instead of loading the
+entire selection/review history. Focused maintenance and selection-review
+regressions pass; the final targeted suites pass
+161 tests, and the Opus implementation review returned CODE_REVIEW_PASS. Live
+PerformanceDB was not used.
+
 Finalist/Reserved-only Performance v2 mode: implemented and independently
 reviewed. Targeted request, UI, pipeline, readiness and XLSX checks pass (7
 tests); the six-module selection/UI/export batch reports 798 passed and 5

@@ -43,6 +43,7 @@ from mrs3.performance_v2_selection_review import (
     new_run_metadata,
     persist_selection_snapshot,
     effective_selection_decisions,
+    _rejected_strategy_ids,
     _selection_rows,
     automatic_filter_rejected_strategy_ids,
 )
@@ -801,6 +802,22 @@ def test_effective_selection_decisions_scoped_symbol_keeps_global_latest_review_
     connection.execute(
         "insert into selection_review_rows values ('btc-review', 11, 'FINALIST', 1, null, null)",
     )
+    _insert_decision_run(
+        connection, "btc-sibling-reviewed", start + timedelta(seconds=6),
+        '{"ranking_scope":"CURRENT_EFFECTIVE"}', symbol="BTCUSDT", side="LONG",
+        result_rows=((2, False), (11, False), (20, False), (21, False)),
+    )
+    connection.execute(
+        "insert into selection_review_imports values ('btc-sibling-review', 'btc-sibling-reviewed', 'btc-sibling-hash', ?, 1)",
+        [start + timedelta(seconds=70)],
+    )
+    connection.execute(
+        "insert into selection_review_rows values ('btc-sibling-review', 2, 'RESERVE', 2, null, null)",
+    )
+    connection.execute(
+        "insert into strategy_tags values (2, 'REJECTED', 'scoped-fixture', 'sibling', ?)",
+        [start + timedelta(seconds=70)],
+    )
     connection.execute(
         "insert into selection_review_imports values ('eth-review', 'eth-reviewed', 'eth-hash', ?, 2)",
         [start + timedelta(seconds=60)],
@@ -814,6 +831,14 @@ def test_effective_selection_decisions_scoped_symbol_keeps_global_latest_review_
     all_decisions = effective_selection_decisions(connection)
     counted = _CountingConnection(connection)
     btc_decisions = effective_selection_decisions(counted, symbol="BTCUSDT")
+    filtered_counted = _CountingConnection(connection)
+    btc_filtered_decisions = effective_selection_decisions(
+        filtered_counted, symbol="BTCUSDT", strategy_ids=[2, 11, 20, 21],
+    )
+    strict_counted = _CountingConnection(connection)
+    btc_strict_decisions = effective_selection_decisions(
+        strict_counted, symbol="BTCUSDT", strategy_ids=(11,),
+    )
     btc_lineage = {
         strategy_id: decision
         for strategy_id, decision in all_decisions.items()
@@ -821,14 +846,64 @@ def test_effective_selection_decisions_scoped_symbol_keeps_global_latest_review_
     }
 
     assert btc_decisions == btc_lineage == {
+        2: ("REJECTED", 2, "btc-sibling-reviewed"),
         11: ("RESERVE", 88, "btc-reviewed"),
         20: ("REJECTED", None, "btc-base"),
         21: ("REJECTED", None, "btc-base"),
     }
+    assert btc_filtered_decisions == btc_lineage
+    assert btc_strict_decisions == {11: ("RESERVE", 88, "btc-reviewed")}
+    assert any("rows.strategy_id in" in sql.lower() for sql, _ in filtered_counted.calls)
+    assert any(
+        "from selection_review_rows rows" in sql.lower()
+        and "where rows.strategy_id in" in sql.lower()
+        and parameters == [[11]]
+        for sql, parameters in strict_counted.calls
+    )
     assert 12 not in btc_decisions
     assert all_decisions[12] == ("FINALIST", 77, "eth-reviewed")
     assert len(counted.calls) == 5
     assert sum(parameters == ["BTCUSDT"] for _, parameters in counted.calls) == 3
+
+
+@pytest.mark.parametrize("schema_version", ["5", "8"])
+def test_rejected_strategy_ids_scopes_legacy_schema_fallback(
+    tmp_path: Path, schema_version: str,
+) -> None:
+    connection = _database(tmp_path)
+    now = datetime(2026, 9, 3, tzinfo=UTC)
+    connection.execute(
+        "insert into strategy_tags values (1, 'REJECTED', 'legacy-fixture', 'legacy', ?)", [now]
+    )
+    connection.execute("drop table strategy_rejection_sources")
+    connection.execute("update schema_info set value = ? where key = 'schema_version'", [schema_version])
+
+    assert _rejected_strategy_ids(connection, [1]) == {1}
+    assert _rejected_strategy_ids(connection, [2]) == set()
+
+
+def test_rejected_strategy_ids_scopes_rejection_sources(tmp_path: Path) -> None:
+    connection = _database(tmp_path)
+    now = datetime(2026, 9, 3, tzinfo=UTC)
+    connection.execute(
+        """insert into strategy_rejection_sources (
+               strategy_id, source_kind, reason_code, first_result_id,
+               first_selection_run_id, classifier_algo_version, source_revision,
+               facts_sha256, created_at_utc
+           ) values
+               (1, 'EQUITY_REGIME_FILTER', 'DD_14_7_GTE_23', 101, 'fixture-run', 'v1', 'rev', 'one', ?),
+               (2, 'EQUITY_REGIME_FILTER', 'DD_14_7_GTE_23', 102, 'fixture-run', 'v1', 'rev', 'two', ?)""",
+        [now, now],
+    )
+
+    assert _rejected_strategy_ids(connection, [1]) == {1}
+
+
+def test_effective_selection_decisions_requires_symbol_for_strategy_scope(tmp_path: Path) -> None:
+    connection = _database(tmp_path)
+    with pytest.raises(ValueError, match="symbol is required"):
+        effective_selection_decisions(connection, strategy_ids=[1])
+    assert effective_selection_decisions(connection, symbol="BTCUSDT", strategy_ids=()) == {}
 
 
 def test_effective_selection_decisions_streams_results_across_fetchmany_boundary(

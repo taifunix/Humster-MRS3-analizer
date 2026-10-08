@@ -596,6 +596,52 @@ def test_rejected_preview_uses_effective_review_and_sticky_equity_source(mainten
     assert preview["global_counts"] == {}
 
 
+def test_rejected_preview_scopes_effective_decisions_to_selected_pairs(
+    maintenance_db: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: list[tuple[str | None, tuple[int, ...] | None]] = []
+    original = maintenance.effective_selection_decisions
+
+    def legacy_unscoped(connection, *, symbol=None, strategy_ids=None):
+        return original(connection)
+
+    monkeypatch.setattr(maintenance, "effective_selection_decisions", legacy_unscoped)
+    with duckdb.connect(str(maintenance_db), read_only=True) as connection:
+        legacy_preview = create_preview(connection, ["BTCUSDT", "ETHUSDT"], "rejected")
+
+    def scoped(connection, *, symbol=None, strategy_ids=None):
+        observed.append((symbol, None if strategy_ids is None else tuple(strategy_ids)))
+        return original(connection, symbol=symbol, strategy_ids=strategy_ids)
+
+    monkeypatch.setattr(maintenance, "effective_selection_decisions", scoped)
+    with duckdb.connect(str(maintenance_db), read_only=True) as connection:
+        scoped_preview = create_preview(connection, ["BTCUSDT", "ETHUSDT"], "rejected")
+
+    assert observed == [("BTCUSDT", (1,)), ("ETHUSDT", (2,))]
+    assert scoped_preview["_targets"]["rejected_strategy_ids"] == legacy_preview["_targets"]["rejected_strategy_ids"]
+    assert scoped_preview["pair_scoped_total"] == legacy_preview["pair_scoped_total"]
+    assert [
+        (pair["symbol"], pair["strategy_count"], pair["rows"])
+        for pair in scoped_preview["pairs"]
+    ] == [
+        (pair["symbol"], pair["strategy_count"], pair["rows"])
+        for pair in legacy_preview["pairs"]
+    ]
+
+
+def test_rejected_preview_fails_closed_on_duplicate_strategy_ids(
+    maintenance_db: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        maintenance,
+        "_ids_by_symbol",
+        lambda connection, symbols: {"BTCUSDT": [1], "ETHUSDT": [1]},
+    )
+    with duckdb.connect(str(maintenance_db), read_only=True) as connection:
+        with pytest.raises(PerformanceV2MaintenanceError, match="duplicate strategy ID"):
+            create_preview(connection, ["BTCUSDT", "ETHUSDT"], "rejected")
+
+
 def test_rejected_apply_retains_dedup_identity_and_removes_operational_facts(maintenance_db: Path) -> None:
     with _writable_fixture(maintenance_db, maintenance_db.parent) as connection:
         preview = create_preview(connection, ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"], "rejected")
