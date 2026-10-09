@@ -156,6 +156,18 @@ class PortfolioPanelError(ValueError):
         super().__init__(message or code)
 
 
+def _portfolio_panel_job_error(error: PanelJobError) -> PortfolioPanelError:
+    if error.code == "JOB_PERSISTENCE_FAILED":
+        return PortfolioPanelError(
+            error.code,
+            "Panel could not save the job journal.",
+            status=503,
+        )
+    if error.code in {"RESOURCE_BUSY", "JOB_CAPACITY_EXHAUSTED"}:
+        return PortfolioPanelError("PORTFOLIO_JOB_BUSY", "portfolio optimizer is busy", status=409)
+    return PortfolioPanelError(error.code, error.code, status=400)
+
+
 class _PortfolioProgressReporter:
     """Small in-memory progress state; it deliberately stores no event history."""
 
@@ -1892,8 +1904,7 @@ class PortfolioPanelService:
                     "portfolio.prepare_finalists", {}, "portfolio:prepare-finalists", ("portfolio_optimizer",),
                 )
             except PanelJobError as error:
-                code = "PORTFOLIO_JOB_BUSY" if error.code in {"RESOURCE_BUSY", "JOB_CAPACITY_EXHAUSTED"} else error.code
-                raise PortfolioPanelError(code, "portfolio optimizer is busy" if code == "PORTFOLIO_JOB_BUSY" else code, status=409 if code == "PORTFOLIO_JOB_BUSY" else 400) from error
+                raise _portfolio_panel_job_error(error) from error
             try:
                 self.registry.reserve_runtime(
                     saved["job_id"], "preparation", {**preparation, "finalists": len(finalists)},
@@ -2058,8 +2069,7 @@ class PortfolioPanelService:
                 self.registry.reserve_runtime(saved["job_id"], "campaign", campaign)
             except PanelJobError as error:
                 discard_created_job()
-                code = "PORTFOLIO_JOB_BUSY" if error.code in {"RESOURCE_BUSY", "JOB_CAPACITY_EXHAUSTED"} else error.code
-                raise PortfolioPanelError(code, "portfolio optimizer is busy" if code == "PORTFOLIO_JOB_BUSY" else code, status=409 if code == "PORTFOLIO_JOB_BUSY" else 400) from error
+                raise _portfolio_panel_job_error(error) from error
             except Exception as error:
                 discard_created_job()
                 raise PortfolioPanelError("PORTFOLIO_JOB_START_FAILED", "portfolio job could not start", status=503) from error
@@ -3965,8 +3975,7 @@ class PortfolioPanelService:
                         self.registry.discard_queued(created_job_id)
                     except Exception:
                         pass
-                code = "PORTFOLIO_JOB_BUSY" if error.code in {"RESOURCE_BUSY", "JOB_CAPACITY_EXHAUSTED"} else error.code
-                raise PortfolioPanelError(code, "portfolio optimizer is busy" if code == "PORTFOLIO_JOB_BUSY" else code, status=409 if code == "PORTFOLIO_JOB_BUSY" else 400) from error
+                raise _portfolio_panel_job_error(error) from error
             except Exception as error:
                 if created_job_id is not None:
                     try:

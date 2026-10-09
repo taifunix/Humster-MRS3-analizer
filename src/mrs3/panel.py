@@ -10487,6 +10487,16 @@ class _PanelHandler(BaseHTTPRequestHandler):
             self._portfolio_error(error)
             return
         except PanelJobError as error:
+            if error.code == "JOB_PERSISTENCE_FAILED":
+                _LOGGER.exception("Panel job submission failed while persisting the job journal")
+                self._json(
+                    503,
+                    {"error": {
+                        "code": error.code,
+                        "message": "Panel could not save the job journal.",
+                    }},
+                )
+                return
             self._json(409 if error.code in {"RESOURCE_BUSY", "JOB_CAPACITY_EXHAUSTED", "IDEMPOTENCY_CONFLICT", "RESTART_BLOCKED"} else 400, {"error": error.code})
             return
         except FinalistRetestError as error:

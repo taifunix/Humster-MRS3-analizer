@@ -15,6 +15,8 @@ import pytest
 
 from mrs3.config import AlgorithmConfig
 from mrs3.panel import PanelController, create_panel_server
+import mrs3.panel_jobs as panel_jobs_module
+from mrs3.panel_report_collection import PanelReportCollection
 from mrs3.panel_jobs import PanelJobError
 from mrs3.panel_tester_runs import LocalRunsBatchService, _RunsJob
 
@@ -682,6 +684,102 @@ def test_tester_start_http_rejects_invalid_initial_balance_before_creating_job(t
     assert 400 <= response.status < 500
     assert body == {"error": "invalid settings"}
     assert controller._panel_jobs.list() == []
+
+
+def test_tester_start_http_reports_journal_write_failure_without_ghost_job(tmp_path: Path, monkeypatch) -> None:
+    controller = PanelController(tmp_path, tmp_path / "config.local.json", analysis_config_loader=lambda _: AlgorithmConfig.defaults())
+    monkeypatch.setattr(controller, "_fresh_strategy_manifest", lambda _analysis_id: tmp_path / "strategy_manifest.json")
+    tester_started: list[str] = []
+    monkeypatch.setattr(
+        controller,
+        "_single_mode_strategy_test",
+        lambda: SimpleNamespace(start=lambda _manifest, **kwargs: tester_started.append(kwargs["job_id"])),
+    )
+
+    def fail_replace(_source, destination):
+        raise PermissionError(13, "access denied", str(destination))
+
+    monkeypatch.setattr(panel_jobs_module.os, "replace", fail_replace)
+    server = create_panel_server("127.0.0.1", 0, controller)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+    try:
+        connection.request(
+            "POST", "/api/v2/jobs",
+            json.dumps({"kind": "strategies.tester.start", "request": {
+                "analysis_run_id": "a" * 64, "start_date": "2026-01-01", "end_date": "2026-01-31", "initial_balance": 100,
+            }}).encode("utf-8"),
+            {"Content-Type": "application/json"},
+        )
+        response = connection.getresponse()
+        body = json.loads(response.read().decode("utf-8"))
+    finally:
+        connection.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert response.status == 503
+    assert body == {"error": {"code": "JOB_PERSISTENCE_FAILED", "message": "Panel could not save the job journal."}}
+    assert controller._panel_jobs.list() == []
+    assert tester_started == []
+
+
+def test_tester_start_http_reports_collection_journal_failure(tmp_path: Path, monkeypatch) -> None:
+    config_path = tmp_path / "config.local.json"
+    config_path.write_text("{}", encoding="utf-8")
+    controller = PanelController(tmp_path, config_path, analysis_config_loader=lambda _: AlgorithmConfig.defaults())
+    monkeypatch.setattr(controller, "_fresh_strategy_manifest", lambda _analysis_id: tmp_path / "strategy_manifest.json")
+    monkeypatch.setattr(controller, "_manifest_strategy_names", lambda _manifest: ("strategy-a",))
+    collection = PanelReportCollection(
+        controller._panel_jobs,
+        inbox_root=tmp_path / "inbox",
+        report_root=tmp_path / "reports",
+        trusted_strategy_root=tmp_path / "strategies",
+    )
+    monkeypatch.setattr(controller, "_report_collection", lambda **_kwargs: collection)
+    tester_started: list[str] = []
+    monkeypatch.setattr(
+        controller,
+        "_single_mode_strategy_test",
+        lambda: SimpleNamespace(start=lambda _manifest, **kwargs: tester_started.append(kwargs["job_id"])),
+    )
+    original_replace = panel_jobs_module.os.replace
+    calls = []
+
+    def fail_collection_submit(source, destination):
+        calls.append(destination)
+        if len(calls) == 3:
+            raise PermissionError(13, "access denied", str(destination))
+        return original_replace(source, destination)
+
+    monkeypatch.setattr(panel_jobs_module.os, "replace", fail_collection_submit)
+    server = create_panel_server("127.0.0.1", 0, controller)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+    try:
+        connection.request(
+            "POST", "/api/v2/jobs",
+            json.dumps({"kind": "strategies.tester.start", "request": {
+                "analysis_run_id": "a" * 64, "start_date": "2026-01-01", "end_date": "2026-01-31",
+                "initial_balance": 100, "collect_reports": True,
+            }}).encode("utf-8"),
+            {"Content-Type": "application/json"},
+        )
+        response = connection.getresponse()
+        body = json.loads(response.read().decode("utf-8"))
+    finally:
+        connection.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert response.status == 503
+    assert body == {"error": {"code": "JOB_PERSISTENCE_FAILED", "message": "Panel could not save the job journal."}}
+    assert not any(job.get("kind") == "strategies.tester.collection" for job in controller._panel_jobs.list())
+    assert tester_started == []
 
 
 @pytest.mark.parametrize("kind", ("strategies.tester.fast.start", "strategies.tester.fast.retry"))

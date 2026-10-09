@@ -711,3 +711,44 @@ def test_registry_save_lock_excludes_volatile_mutation_until_save_releases(tmp_p
     assert len(replacements) == replacements_before_retry + 1
     assert registry._journal_dirty is False
     assert PanelJobRegistry(registry.journal).get(job["job_id"])["progress"] == {"current": 1, "total": 1}
+
+
+def test_registry_retries_transient_windows_replace_denial(tmp_path, monkeypatch):
+    path = tmp_path / "jobs.json"
+    registry = PanelJobRegistry(path)
+    real_replace = panel_jobs_module.os.replace
+    attempts = 0
+
+    def fail_once(source, destination):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            error = PermissionError(13, "access denied", str(destination))
+            error.winerror = 5
+            raise error
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(panel_jobs_module.os, "replace", fail_once)
+
+    job = registry.submit("strategies.tester.start", {}, "retry-access-denied", ("strategies.tester",))
+
+    assert attempts == 2
+    assert PanelJobRegistry(path, recover_on_load=False).get(job["job_id"])["state"] == "QUEUED"
+
+
+def test_registry_failed_submit_does_not_reserve_resource_in_memory(tmp_path, monkeypatch):
+    path = tmp_path / "jobs.json"
+    registry = PanelJobRegistry(path)
+
+    def fail_replace(_source, destination):
+        error = PermissionError(13, "access denied", str(destination))
+        error.winerror = 5
+        raise error
+
+    monkeypatch.setattr(panel_jobs_module.os, "replace", fail_replace)
+
+    with pytest.raises(PanelJobError, match="JOB_PERSISTENCE_FAILED"):
+        registry.submit("strategies.tester.start", {}, "failed-admission", ("strategies.tester",))
+
+    assert registry.list() == []
+    assert not path.exists()

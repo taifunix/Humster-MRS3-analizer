@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 from threading import RLock
 import tempfile
+import time
 from uuid import uuid4
 
 
@@ -19,6 +20,9 @@ _TRANSITIONS = {
     "RUNNING": {"CANCELLING", "COMMITTED", "FAILED"},
     "CANCELLING": {"CANCELLED", "FAILED"},
 }
+_WINDOWS_REPLACE_RETRIES = 5
+_WINDOWS_REPLACE_RETRY_DELAY_SECONDS = 0.1
+_WINDOWS_TRANSIENT_REPLACE_ERRORS = frozenset({5, 32, 33})
 
 
 class PanelJobError(ValueError):
@@ -153,7 +157,17 @@ class PanelJobRegistry:
                 handle.flush()
                 os.fsync(handle.fileno())
                 temporary = Path(handle.name)
-            os.replace(temporary, self.journal)
+            for attempt in range(_WINDOWS_REPLACE_RETRIES):
+                try:
+                    os.replace(temporary, self.journal)
+                    break
+                except PermissionError as error:
+                    if (
+                        getattr(error, "winerror", None) not in _WINDOWS_TRANSIENT_REPLACE_ERRORS
+                        or attempt + 1 == _WINDOWS_REPLACE_RETRIES
+                    ):
+                        raise
+                    time.sleep(_WINDOWS_REPLACE_RETRY_DELAY_SECONDS)
             temporary = None
             self._journal_dirty = False
         finally:
@@ -226,7 +240,16 @@ class PanelJobRegistry:
                 job["campaign_id"] = request["campaign_id"]
             if request.get("retest") is True:
                 job["retest"] = True
-            self.jobs[job["job_id"]] = job; self._save(); return self._copy(job)
+            self.jobs[job["job_id"]] = job
+            try:
+                self._save()
+            except BaseException as error:
+                self.jobs.pop(job["job_id"], None)
+                self._journal_dirty = True
+                if isinstance(error, Exception):
+                    raise PanelJobError("JOB_PERSISTENCE_FAILED") from error
+                raise
+            return self._copy(job)
 
     def get(self, job_id: str) -> dict:
         try: return self._copy(self.jobs[job_id])

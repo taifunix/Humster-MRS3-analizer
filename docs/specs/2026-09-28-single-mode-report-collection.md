@@ -128,6 +128,13 @@ rate. An absent rate persists as SQL `NULL`; HTML fees and PnL remain authoritat
     and drops pending IDs whose tracked import job is missing or terminal;
     a durable COMMITTED import completes the generation as IMPORTED. The
     collection service is initialized once under the same controller lock.
+14. A SINGLE_MODE launch is admitted only after its QUEUED job is durably saved
+    in `.panel-jobs.json`. If persistence fails, the in-memory admission is
+    rolled back, the tester runner is not called, and the Panel returns an
+    explicit persistence error. Bounded retries apply only to transient
+    Windows replace denials; exhausted retries remain fail-closed. Wrapping
+    Panel services preserve the machine-readable `JOB_PERSISTENCE_FAILED`
+    code and HTTP 503 status.
 
 ## Failure behavior
 
@@ -144,6 +151,14 @@ rate. An absent rate persists as SQL `NULL`; HTML fees and PnL remain authoritat
 - Concurrent register/verify, clear/verify, and clear/import operations fail
   closed or serialize at the durable revision boundary without losing a
   member or overwriting a committed import.
+- A journal replace that keeps failing does not leave an in-memory job holding
+  `strategies.tester`; the start request returns HTTP 503 and no tester starts.
+- A transient Windows journal replace denial that clears within the bounded
+  retry window saves the job and proceeds through the ordinary SINGLE_MODE
+  flow.
+- A journal persistence failure exposed through a service wrapper, including
+  portfolio job submission, remains HTTP 503 with
+  `JOB_PERSISTENCE_FAILED` rather than being reclassified as a client error.
 
 ## Acceptance evidence
 

@@ -8,6 +8,24 @@ Use [PRD.md](PRD.md) for the feature registry and [docs/README.md](docs/README.m
 for the documentation map. Read the linked contract only for the active task;
 do not treat this file as a replacement for a feature specification.
 
+## Panel job admission reliability (2026-10-09)
+
+Panel job submission now persists `QUEUED` before worker dispatch, removes an
+unsaved admission from memory, retries only transient Windows journal replace
+errors (5/32/33) up to five attempts, and returns `JOB_PERSISTENCE_FAILED` with
+HTTP 503 through direct routes and portfolio service wrappers. Contract:
+[SINGLE_MODE report collection](docs/specs/2026-09-28-single-mode-report-collection.md);
+safety decision: [ADR-0063](docs/decisions/0063-panel-job-admission-on-journal-persistence.md).
+
+Verification: 9 focused journal/portfolio/report-collection regressions passed;
+the related combined run had 467 passed, 1 skipped, and 1 pre-existing fixture
+failure. The same failure was reproduced from a clean `HEAD` archive: the
+portfolio test helper supplies 11 values to the 12-column `selection_results`
+table. `git diff --check` passed. Live Panel restart and status check are still
+complete: Panel API on port 8766 responds, the stale in-memory QUEUED job is
+gone, and no `hb_c.exe` process is running. No tester run or PerformanceDB was
+used.
+
 ## PerformanceDB maintenance
 
 The maintenance card is implemented in the Strategy and DD5 tab. It supports pair selection, strategy-count previews, Rejected retirement, full pair deletion, progress reporting, elapsed time, and actionable database errors. `Удалить Rejected` now physically removes per-strategy facts, window/equity caches, tags, rejection sources, and selection rows, compacts the retained result to interval/provenance identity, then atomically marks the typed identity as `DISCARDED`; only strategy settings/orders and that compact tombstone remain for deduplication. The code targets schema v10 and adds no cleanup markers, deletion timestamps, backups, or maintenance tables. Contract: [PerformanceDB maintenance](docs/specs/2026-10-06-performance-db-maintenance.md); retirement decision: [ADR-0061](docs/decisions/0061-performance-db-rejected-retirement.md).
