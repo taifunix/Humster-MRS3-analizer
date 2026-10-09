@@ -466,7 +466,7 @@ def test_current_control_export_import_keeps_multiple_pair_side_groups_local(tmp
 
         decisions = effective_selection_decisions(connection)
     assert decisions[1][:2] == ("REJECTED", None)
-    assert decisions[eth_id][:2] == ("RESERVE", 1)
+    assert decisions[eth_id][:2] == ("RESERVE", None)
 
 
 def test_retest_status_is_db_authoritative_and_defaults_from_current_result(tmp_path: Path) -> None:

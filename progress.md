@@ -54,8 +54,12 @@ implemented locally; its live migration remains open. Evidence and exact
 status rules are linked from the [equity status map](docs/specs/2026-10-03-equity-regime-status-map.md).
 
 Card 6 partial selection review import and the global finalist retest control
-are implemented. Blank `User Status` and `User Rank` cells now clear saved
-values. Final focused verification with
+are implemented. In the Card 6 `Импортировать статусы и ранги из XLSX` path,
+each import now reconciles prior FINALIST decisions for only the imported
+Pair + Side: an absent ID or a row without FINALIST plus rank becomes RESERVE
+with no rank; explicit REJECTED remains REJECTED with no rank. The ledger stays
+append-only. Other blank `User Status` and `User Rank` cells retain the
+documented clear behavior. Final focused verification with
 `.venv\Scripts\python.exe -m pytest -p no:cacheprovider tests/test_performance_v2_selection_review.py tests/test_performance_v2_store.py tests/test_performance_v2_compact.py tests/test_performance_v2_maintenance.py tests/test_panel_performance_v2.py`
 passed 477 tests with 4 platform skips. This covers transactional v9-to-v10
 migration, rollback/retry, and Panel schema preflight. A separate clean-HEAD
@@ -65,6 +69,15 @@ The live v9 database migration is still pending: after deploying this version,
 the Panel schema preflight must run before the Card 6 import. No live database
 mutation or Panel restart was performed. Independent code review returned
 `CODE_REVIEW_PASS`.
+
+### 2026-10-09 - Card 6 XLSX imports: reconcile prior finalists
+
+- Both Card 6 import paths reconcile prior FINALIST decisions for the exact Pair + Side: a prior FINALIST remains FINALIST only when re-imported with FINALIST and a non-empty rank; explicit REJECTED remains REJECTED and clears rank; every other prior FINALIST, including IDs absent from the current selection run, is appended as RESERVE with rank NULL. Existing review comments/history are preserved. The selection-review button contract is [ADR-0065](docs/decisions/0065-performance-v2-card6-partial-import-finalist-reconciliation.md); the combined-control path is covered by [ADR-0064](docs/decisions/0064-performance-v2-finalist-retest-review-reconciliation.md).
+- Verification after review fixes: `.venv\Scripts\python.exe -m pytest -p no:cacheprovider --basetemp <unique C:\Temp folder> --tb=short tests/test_performance_v2_selection_review.py tests/test_performance_v2_finalist_retest.py tests/test_panel_performance_v2_retest.py -k "not PARETO_PLATEAU_POINTS_PER_ORDER"`: 215 passed, 1 skipped, 1 deselected; temp folder removed. Four later edge-case regressions also passed. The skip is Windows symlink availability.
+- The 215-test run and four edge-case runs preceded the final REJECTED-tag-scope patch. Tests were not rerun after that patch per the user's explicit instruction. The final tag-sync change is therefore unverified; if testing is later authorized, cover both preservation of an omitted finalist's existing REJECTED tag and cleanup/re-add of the tag for a submitted REJECTED row.
+- Three unrelated broader-suite failures were reproduced on clean HEAD `8b755c4a292e0107ea6e2b701df6b865f9d792a9`: PARETO reason-alias rendering fails before import; v4 import migration test expects schema v9 though migration returns v10; prune fixture inserts 11 values into the 12-column `selection_results`. No production change was made for them. The Panel endpoints serialize writers with process and cross-process PerformanceDB locks; the import transaction covers finalist lookup, review append, and REJECTED tag synchronization.
+- The user imported `AMGN.xlsx`. Read-only verification matched its workbook hash to an import journal entry for AMGNUSDT/LONG (15 rows): 3 FINALIST (ranks 1–3), 8 RESERVE, 4 blank. No database mutation by the agent; no Panel restart performed by the agent. Independent code review returned `CODE_REVIEW_PASS`. Next: after restarting Panel from this checkout, the user can re-import the 81 workbooks; the final tag-scope patch remains unverified by tests at the user's request.
+
 ## Other verified Panel changes
 
 Panel PerformanceDB recalculation now serializes access through the controller

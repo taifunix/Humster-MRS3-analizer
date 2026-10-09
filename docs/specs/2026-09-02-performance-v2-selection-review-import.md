@@ -5,7 +5,8 @@
 **Depends on:**
 [Performance v2 robust finalist ranking](2026-09-01-performance-v2-robust-finalist-ranking.md),
 [ADR-0021](../decisions/0021-performance-v2-persisted-selection-snapshots.md),
-[ADR-0062](../decisions/0062-performance-v2-selection-review-clear-fields.md)
+[ADR-0062](../decisions/0062-performance-v2-selection-review-clear-fields.md),
+[ADR-0065](../decisions/0065-performance-v2-card6-partial-import-finalist-reconciliation.md)
 
 ## Purpose
 
@@ -440,24 +441,57 @@ removes the strategy from the effective user-status cohort. Clearing a
 `REJECTED` status also removes its current `REJECTED` tag. A blank-only file is
 therefore a real import when it contains candidate rows: it validates database
 identity, run and strategy membership, then appends clear decisions atomically.
-Nonblank statuses are limited to `FINALIST`, `RESERVE`, and `REJECTED`. A
-nonblank `User Rank` is accepted only for `FINALIST` or a blank status; therefore
-a rank may be stored while status is blank, and it does not participate in
-FINALIST uniqueness until that row is later promoted to `FINALIST`. The rank
-must be a positive integer, and ranks on submitted `FINALIST` rows must be
+Nonblank statuses are limited to `FINALIST`, `RESERVE`, and `REJECTED`. For
+statuses other than `REJECTED`, a nonblank `User Rank` is accepted only for
+`FINALIST` or a blank status; therefore a rank may be stored while status is
+blank, and it does not participate in FINALIST uniqueness until that row is
+later promoted to `FINALIST`. An explicit `REJECTED` ignores any workbook rank
+and stores NULL. An accepted rank must be a positive integer, and ranks on
+submitted `FINALIST` rows must be
 unique among effective FINALIST reviews within the selection run after applying
 the submitted rows. Missing FINALIST ranks are allowed and do not participate
 in uniqueness comparison. A FINALIST with a blank rank clears its previous user rank.
-A rank on `RESERVE` or `REJECTED` is rejected with
-`SELECTION_REVIEW_INVALID_RANK`; the importer does not silently normalize
-submitted values.
+
+Before appending the partial import, Card 6 also reconciles prior explicit
+FINALIST decisions for the imported run's exact Pair + Side, across historical
+selection runs (not only IDs in the current run snapshot). A prior FINALIST
+remains FINALIST only when that strategy ID is submitted as FINALIST with a
+non-empty rank. An explicit REJECTED remains REJECTED and its User Rank is
+stored as SQL `NULL`, even if the workbook carries a stale rank. Every other
+prior FINALIST—including a submitted RESERVE, blank status, rankless FINALIST,
+or an ID absent from the partial workbook—is appended as RESERVE with User
+Rank NULL. This reconciliation is restricted to the same Pair + Side; it does
+not affect other strategies or directions. A synthesized RESERVE row for an
+ID absent from the current run's `selection_results` changes its global
+effective user decision only; it does not add a selection result or modify
+strategy/result facts. Non-prior-finalist rows retain the existing
+partial-field rules, except that an explicit REJECTED rank is cleared.
+
+For non-prior-finalist rows, a non-empty User Rank is accepted only for
+FINALIST or a blank status. Ranks on RESERVE are rejected with
+`SELECTION_REVIEW_INVALID_RANK`; the prior-finalist and REJECTED cases above
+normalize stale ranks to NULL without validating the stale cell's contents.
+This includes a malformed or non-positive rank left beside a prior FINALIST
+whose submitted status is RESERVE or blank; the replacement status/rank is
+RESERVE/NULL. A malformed rank on a prior FINALIST submitted as FINALIST is
+still rejected atomically; it is not silently converted to RESERVE. A blank
+rank on a prior FINALIST submitted as FINALIST instead demotes it to
+RESERVE/NULL. The pre-existing rule still permits a non-prior strategy to be
+submitted as FINALIST without a rank; that row is effective FINALIST with a
+NULL rank for this import, and is subject to the prior-finalist reconciliation
+on a later import. The importer evaluates FINALIST rank uniqueness after
+reconciliation, including any synthesized RESERVE rows. Only the latest
+explicit non-NULL status per strategy determines whether it is a prior
+FINALIST, so a previously rejected strategy is not reintroduced as RESERVE.
 
 Each accepted file is one transaction in the existing
 `selection_review_imports` and `selection_review_rows` ledger. It appends all
-submitted rows, including clear decisions, stores rank only where supplied for
-FINALIST or blank status, and synchronizes the REJECTED tag for only those
-submitted strategy IDs: clear the prior REJECTED tag, then add it back only
-where the new status is REJECTED. It preserves prior comments and does not
+submitted rows, clear decisions, and synthesized RESERVE rows for absent prior
+finalists; history is never overwritten or deleted. It stores rank only where
+accepted above and synchronizes the REJECTED tag only for strategy IDs present
+in the workbook: clear the prior REJECTED tag, then add it back only where the
+submitted status is REJECTED. A synthesized RESERVE row for an omitted ID does
+not change that ID's tags. It preserves prior comments and does not
 modify RETEST, automatic fields, selection results, or strategy/result facts.
 Since this import accepts no ANALOG status, it clears a prior analog target on
 each row whose status it replaces. Workbook SHA-256

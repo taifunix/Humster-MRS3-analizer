@@ -26,7 +26,11 @@ from .performance_v2_store import (
     require_performance_v2_readable,
 )
 from .performance_v2_selection import SELECTION_REASON_ALIASES
-from .performance_v2_selection_review import effective_selection_decisions
+from .performance_v2_selection_review import (
+    _prior_finalist_ids_for_pair_side,
+    _reconcile_prior_finalist_user_fields,
+    effective_selection_decisions,
+)
 from .strategy_json import generate_strategy
 
 
@@ -552,13 +556,14 @@ def validate_combined_control_workbook(data: bytes) -> tuple[dict[str, object], 
                 raise FinalistRetestError("CONTROL_INVALID_STATUS")
             raw_rank = row["User Rank"]
             if raw_rank not in (None, ""):
-                if isinstance(raw_rank, bool) or int(raw_rank) != raw_rank or int(raw_rank) <= 0 or status not in {"FINALIST", "RESERVE"}:
+                if isinstance(raw_rank, bool) or int(raw_rank) != raw_rank or int(raw_rank) <= 0 or status not in {"FINALIST", "RESERVE", "REJECTED"}:
                     raise FinalistRetestError("CONTROL_INVALID_RANK")
-                group = (row["Pair"], row["Direction"])
-                rank = int(raw_rank)
-                if rank in ranks.setdefault(group, set()):
-                    raise FinalistRetestError("CONTROL_DUPLICATE_RANK")
-                ranks[group].add(rank)
+                if status != "REJECTED":
+                    group = (row["Pair"], row["Direction"])
+                    rank = int(raw_rank)
+                    if rank in ranks.setdefault(group, set()):
+                        raise FinalistRetestError("CONTROL_DUPLICATE_RANK")
+                    ranks[group].add(rank)
             if row["RETEST"] not in (None, "", "RETEST"):
                 raise FinalistRetestError("CONTROL_INVALID_RETEST")
             if row["Comment"] is not None and len(str(row["Comment"])) > 1000:
@@ -607,6 +612,61 @@ def validate_combined_control_workbook(data: bytes) -> tuple[dict[str, object], 
 
 
 read_combined_control_workbook = validate_combined_control_workbook
+
+
+def _reconciled_control_decisions(
+    connection: duckdb.DuckDBPyConnection,
+    symbol: str,
+    side: str,
+    review_id: str,
+    rows: Sequence[Mapping[str, object]],
+) -> list[list[object]]:
+    prior_finalists = _prior_finalist_ids_for_pair_side(connection, symbol, side)
+    submitted_ids: set[int] = set()
+    decisions: list[list[object]] = []
+    submitted_fields: dict[int, tuple[str, int | None]] = {}
+    for row in rows:
+        strategy_id = int(row["Strategy ID"])
+        status = str(row["User Status"]).strip().upper()
+        rank = None if row["User Rank"] in (None, "") else int(row["User Rank"])
+        submitted_fields[strategy_id] = (status, rank)
+    reconciled_fields = _reconcile_prior_finalist_user_fields(submitted_fields, prior_finalists)
+    for row in rows:
+        strategy_id = int(row["Strategy ID"])
+        submitted_ids.add(strategy_id)
+        status, rank = reconciled_fields[strategy_id]
+        analog = None if row["Analog Of ID"] in (None, "") else int(row["Analog Of ID"])
+        if strategy_id in prior_finalists and status == "RESERVE":
+            analog = None
+        decisions.append([
+            review_id, strategy_id, status, rank, analog,
+            "" if row["Comment"] is None else str(row["Comment"]),
+        ])
+
+    missing = sorted(prior_finalists - submitted_ids)
+    if missing:
+        comments = dict(connection.execute(
+            """select strategy_id, comment from (
+                   select rows.strategy_id, rows.comment,
+                          row_number() over (
+                              partition by rows.strategy_id
+                              order by imports.imported_at_utc desc, imports.review_import_id desc
+                          ) as newest
+                     from selection_review_rows rows
+                     join selection_review_imports imports using (review_import_id)
+                     join selection_runs runs using (selection_run_id)
+                     join strategies using (strategy_id)
+                    where rows.strategy_id in (select unnest(?::bigint[]))
+                      and runs.symbol = ? and runs.side = ?
+                       and strategies.symbol = runs.symbol and strategies.side = runs.side
+               ) where newest = 1""",
+            [missing, symbol, side],
+        ).fetchall())
+        decisions.extend([
+            [review_id, strategy_id, "RESERVE", None, None, comments.get(strategy_id)]
+            for strategy_id in missing
+        ])
+    return decisions
 
 
 def _legacy_import_combined_control_workbook(
@@ -695,19 +755,16 @@ def _legacy_import_combined_control_workbook(
             if connection.execute("select 1 from selection_review_imports where workbook_sha256 = ?", [review_id]).fetchone():
                 review_ids.append(review_id)
                 continue
-            connection.execute(
-                "insert into selection_review_imports (review_import_id, selection_run_id, workbook_sha256, imported_at_utc, row_count) values (?, ?, ?, ?, ?)",
-                [review_id, run_id, review_id, now, len(group_rows)],
-            )
-            decision_rows = []
+            decision_rows = _reconciled_control_decisions(connection, symbol, side, review_id, group_rows)
             retest_ids = []
             for row in group_rows:
                 strategy_id = int(row["Strategy ID"])
-                rank = None if row["User Rank"] in (None, "") else int(row["User Rank"])
-                analog = None if row["Analog Of ID"] in (None, "") else int(row["Analog Of ID"])
-                decision_rows.append([review_id, strategy_id, str(row["User Status"]).strip().upper(), rank, analog, "" if row["Comment"] is None else str(row["Comment"])])
                 if row["RETEST"] == "RETEST":
                     retest_ids.append(strategy_id)
+            connection.execute(
+                "insert into selection_review_imports (review_import_id, selection_run_id, workbook_sha256, imported_at_utc, row_count) values (?, ?, ?, ?, ?)",
+                [review_id, run_id, review_id, now, len(decision_rows)],
+            )
             connection.executemany(
                 "insert into selection_review_rows (review_import_id, strategy_id, user_status, user_rank, user_analog_of_strategy_id, comment) values (?, ?, ?, ?, ?, ?)",
                 decision_rows,
@@ -929,20 +986,16 @@ def import_combined_control_workbook(
             if existing:
                 review_ids.append(review_id)
                 continue
-            connection.execute(
-                "insert into selection_review_imports (review_import_id, selection_run_id, workbook_sha256, imported_at_utc, row_count) values (?, ?, ?, ?, ?)",
-                [review_id, run_id, review_id, now, len(group)],
-            )
-            decisions = []
+            decisions = _reconciled_control_decisions(connection, _symbol, _side, review_id, group)
             retest_ids = []
             for row in group:
                 strategy_id = int(row["Strategy ID"])
-                rank = None if row["User Rank"] in (None, "") else int(row["User Rank"])
-                analog = None if row["Analog Of ID"] in (None, "") else int(row["Analog Of ID"])
-                status = str(row["User Status"]).strip().upper()
-                decisions.append([review_id, strategy_id, status, rank, analog, "" if row["Comment"] is None else str(row["Comment"])])
                 if row["RETEST"] == "RETEST":
                     retest_ids.append(strategy_id)
+            connection.execute(
+                "insert into selection_review_imports (review_import_id, selection_run_id, workbook_sha256, imported_at_utc, row_count) values (?, ?, ?, ?, ?)",
+                [review_id, run_id, review_id, now, len(decisions)],
+            )
             connection.executemany("insert into selection_review_rows (review_import_id, strategy_id, user_status, user_rank, user_analog_of_strategy_id, comment) values (?, ?, ?, ?, ?, ?)", decisions)
             ids = [int(row["Strategy ID"]) for row in group]
             connection.execute("delete from strategy_tags where tag = 'REJECTED' and strategy_id in (select unnest(?::bigint[]))", [ids])

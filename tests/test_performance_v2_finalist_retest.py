@@ -476,6 +476,49 @@ def test_combined_control_import_is_atomic_and_idempotent() -> None:
         )
         connection.execute("insert into selection_runs values ('sel', (select value from schema_info where key='database_instance_id'), 'BTCUSDT', 'LONG', 'v1', '{}', ?, '{}', ?, 1, 1, 1, 20, ?, ?)", ["a" * 64, "b" * 64, "c" * 64, now])
         connection.execute("insert into selection_results (selection_run_id, strategy_id, result_id_at_selection, auto_status, auto_rank, prior_rejected, stage_trace_json) values ('sel', 1, 11, 'FINALIST', 1, false, '{}')")
+        connection.execute(
+            "insert into strategies values (2, 'two', 'BTCUSDT', 'LONG', '1h', 5, 1, 'run', 'two', 'ACTIVE', 12, ?, ?)",
+            [now, now],
+        )
+        connection.execute(
+            "insert into strategies values (3, 'three', 'BTCUSDT', 'SHORT', '1h', 5, 1, 'run', 'three', 'ACTIVE', 13, ?, ?)",
+            [now, now],
+        )
+        previous_imported = datetime(2025, 12, 31, tzinfo=UTC)
+        cleared_imported = datetime(2026, 1, 1, 12, tzinfo=UTC)
+        connection.execute(
+            "insert into selection_review_imports values ('review-old', 'sel', ?, ?, 2)",
+            ["d" * 64, previous_imported],
+        )
+        connection.execute(
+            "insert into selection_review_rows values ('review-old', 1, 'FINALIST', 7, null, 'old finalist')"
+        )
+        connection.execute(
+            "insert into selection_review_rows values ('review-old', 2, 'FINALIST', 8, null, 'old finalist')"
+        )
+        # A review row can be malformed or synthetic; it must not make a
+        # strategy from another direction eligible for this LONG reconciliation.
+        connection.execute(
+            "insert into selection_review_rows values ('review-old', 3, 'FINALIST', 9, null, 'wrong direction')"
+        )
+        connection.execute(
+            "insert into selection_review_imports values ('review-clear', 'sel', ?, ?, 1)",
+            ["e" * 64, cleared_imported],
+        )
+        connection.execute(
+            "insert into selection_review_rows values ('review-clear', 2, null, null, null, 'keep this comment')"
+        )
+        connection.execute(
+            "insert into selection_runs values ('sel-short', (select value from schema_info where key='database_instance_id'), 'BTCUSDT', 'SHORT', 'v1', '{}', ?, '{}', ?, 1, 1, 1, 20, ?, ?)",
+            ["f" * 64, "g" * 64, "h" * 64, previous_imported],
+        )
+        connection.execute(
+            "insert into selection_review_imports values ('review-short', 'sel-short', ?, ?, 1)",
+            ["i" * 64, previous_imported],
+        )
+        connection.execute(
+            "insert into selection_review_rows values ('review-short', 3, 'FINALIST', 1, null, 'short finalist')"
+        )
         instance = connection.execute("select value from schema_info where key='database_instance_id'").fetchone()[0]
         data = combined_control_workbook_bytes(
             [{"symbol": "BTCUSDT", "side": "LONG", "strategy_id": 1, "result_id": 11, "user_status": "REJECTED", "user_rank": None, "auto_status": "FINALIST", "auto_rank": 1}],
@@ -487,8 +530,24 @@ def test_combined_control_import_is_atomic_and_idempotent() -> None:
         result = import_combined_control_workbook(connection, data)
         assert result["group_count"] == 1
         assert connection.execute("select tag from strategy_tags where strategy_id=1").fetchall() == [("REJECTED",)]
+        imported_rows = connection.execute(
+            "select strategy_id, user_status, user_rank, comment from selection_review_rows where review_import_id = ? order by strategy_id",
+            [result["review_import_ids"][0]],
+        ).fetchall()
+        assert imported_rows == [
+            (1, "REJECTED", None, ""),
+            (2, "RESERVE", None, "keep this comment"),
+        ]
+        assert connection.execute(
+            "select row_count from selection_review_imports where review_import_id = ?",
+            [result["review_import_ids"][0]],
+        ).fetchone() == (2,)
         replay = import_combined_control_workbook(connection, data)
         assert replay["review_import_ids"] == result["review_import_ids"]
+        assert connection.execute(
+            "select count(*) from selection_review_rows where review_import_id = ?",
+            [result["review_import_ids"][0]],
+        ).fetchone() == (2,)
 
 
 @pytest.mark.parametrize("reason", [
@@ -572,6 +631,13 @@ def test_server_issued_control_accepts_user_edits_and_failure_only_group(reason:
                 auto_reason, analog_group_key, auto_analog_of_strategy_id, prior_rejected, stage_trace_json)
                 values ('sel', 1, 11, 'FINALIST', 5.5, 1, ?, null, null, false, '{}')""", [reason]
         )
+        connection.execute(
+            "insert into selection_review_imports values ('review-prior', 'sel', ?, ?, 1)",
+            ["p" * 64, datetime(2025, 12, 31, tzinfo=UTC)],
+        )
+        connection.execute(
+            "insert into selection_review_rows values ('review-prior', 1, 'FINALIST', 9, null, 'prior rank')"
+        )
 
         workbook = load_workbook(BytesIO(issued))
         headers = {cell.value: cell.column for cell in workbook["Candidates"][1]}
@@ -583,7 +649,11 @@ def test_server_issued_control_accepts_user_edits_and_failure_only_group(reason:
         assert rendered_reason == expected_reason
         unedited = import_combined_control_workbook(connection, issued)
         assert unedited["group_count"] == unedited["row_count"] == 1
-        workbook["Candidates"].cell(2, headers["User Status"]).value = "RESERVE"
+        assert connection.execute(
+            "select user_status, user_rank from selection_review_rows where review_import_id = ? and strategy_id = 1",
+            [unedited["review_import_ids"][0]],
+        ).fetchone() == ("RESERVE", None)
+        workbook["Candidates"].cell(2, headers["User Status"]).value = "FINALIST"
         workbook["Candidates"].cell(2, headers["User Rank"]).value = 1
         edited_io = BytesIO()
         workbook.save(edited_io)
@@ -595,7 +665,19 @@ def test_server_issued_control_accepts_user_edits_and_failure_only_group(reason:
         assert replay["review_import_ids"] == imported["review_import_ids"]
         assert connection.execute(
             "select user_status, user_rank from selection_review_rows order by rowid desc limit 1"
-        ).fetchone() == ("RESERVE", 1)
+        ).fetchone() == ("FINALIST", 1)
+
+        rejected = load_workbook(BytesIO(issued))
+        rejected_headers = {cell.value: cell.column for cell in rejected["Candidates"][1]}
+        rejected["Candidates"].cell(2, rejected_headers["User Status"]).value = "REJECTED"
+        rejected["Candidates"].cell(2, rejected_headers["User Rank"]).value = 1
+        rejected_io = BytesIO()
+        rejected.save(rejected_io)
+        rejected_result = import_combined_control_workbook(connection, rejected_io.getvalue())
+        assert connection.execute(
+            "select user_status, user_rank from selection_review_rows where review_import_id = ? and strategy_id = 1",
+            [rejected_result["review_import_ids"][0]],
+        ).fetchone() == ("REJECTED", None)
 
         tampered = load_workbook(BytesIO(issued))
         tampered_headers = {cell.value: cell.column for cell in tampered["Candidates"][1]}

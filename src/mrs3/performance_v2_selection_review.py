@@ -1004,12 +1004,11 @@ def _validate_selection_user_field_ranks(
 def import_selection_user_fields(
     connection: duckdb.DuckDBPyConnection, data: bytes,
 ) -> dict[str, object]:
-    """Append operator status/rank cells, treating blanks as explicit clears."""
+    """Append operator fields and reconcile prior finalists for this Pair + Side."""
     metadata, submitted_rows = _parse_selection_user_fields_workbook(data)
     run_id = metadata["selection_run_id"]
-    decisions: list[list[object]] = []
+    parsed_rows: list[tuple[int, str | None, object]] = []
     strategy_ids: set[int] = set()
-    ranks: set[int] = set()
     for raw_id, raw_status, raw_rank in submitted_rows:
         status_text = "" if raw_status is None else str(raw_status).strip().upper()
         if status_text and status_text not in {"FINALIST", "RESERVE", "REJECTED"}:
@@ -1021,27 +1020,9 @@ def import_selection_user_fields(
         if strategy_id in strategy_ids:
             raise SelectionReviewError("SELECTION_REVIEW_ROWSET_MISMATCH", "Strategy IDs must be unique in the workbook")
         strategy_ids.add(strategy_id)
-        rank = None
-        if raw_rank not in (None, ""):
-            if status_text not in {"", "FINALIST"}:
-                raise SelectionReviewError(
-                    "SELECTION_REVIEW_INVALID_RANK", "User Rank must be blank for RESERVE and REJECTED",
-                )
-            try:
-                rank = _whole_number(raw_rank, "SELECTION_REVIEW_INVALID_RANK", optional=False)
-            except SelectionReviewError:
-                raise SelectionReviewError(
-                    "SELECTION_REVIEW_INVALID_RANK", "FINALIST User Rank must be a positive integer",
-                ) from None
-            if status_text == "FINALIST" and rank in ranks:
-                raise SelectionReviewError(
-                    "SELECTION_REVIEW_INVALID_RANK", "FINALIST User Rank values must be unique in the workbook",
-                )
-            if status_text == "FINALIST":
-                ranks.add(rank)
-        decisions.append([strategy_id, status_text or None, rank])
+        parsed_rows.append((strategy_id, status_text or None, raw_rank))
 
-    if not decisions:
+    if not parsed_rows:
         return {
             "selection_run_id": run_id,
             "row_count": 0,
@@ -1059,7 +1040,8 @@ def import_selection_user_fields(
         if metadata["database_instance_id"] != instance_id:
             raise SelectionReviewError("SELECTION_REVIEW_DATABASE_MISMATCH")
         run = connection.execute(
-            "select database_instance_id, selection_contract_version from selection_runs where selection_run_id = ?",
+            "select database_instance_id, selection_contract_version, symbol, side "
+            "from selection_runs where selection_run_id = ?",
             [run_id],
         ).fetchone()
         if not run:
@@ -1071,8 +1053,27 @@ def import_selection_user_fields(
         ).fetchone():
             raise SelectionReviewError("SELECTION_REVIEW_ALREADY_IMPORTED")
         _validate_selection_user_field_ids(connection, run_id, tuple(strategy_ids))
-        run_reviews = _validate_selection_user_field_ranks(connection, run_id, decisions)
-        prior_reviews = run_reviews if run_reviews is not None else latest_user_reviews_by_strategy(
+        prior_finalists = _prior_finalist_ids_for_pair_side(connection, str(run[2]), str(run[3]))
+        submitted_fields: dict[int, tuple[str | None, int | None]] = {}
+        for strategy_id, status, raw_rank in parsed_rows:
+            rank = None
+            stale_prior_rank = strategy_id in prior_finalists and status != "FINALIST"
+            if status != "REJECTED" and not stale_prior_rank and raw_rank not in (None, ""):
+                if status not in {None, "FINALIST"}:
+                    raise SelectionReviewError(
+                        "SELECTION_REVIEW_INVALID_RANK", "User Rank must be blank for RESERVE",
+                    )
+                try:
+                    rank = _whole_number(raw_rank, "SELECTION_REVIEW_INVALID_RANK", optional=False)
+                except SelectionReviewError:
+                    raise SelectionReviewError(
+                        "SELECTION_REVIEW_INVALID_RANK", "FINALIST User Rank must be a positive integer",
+                    ) from None
+            submitted_fields[strategy_id] = (status, rank)
+        reconciled_fields = _reconcile_prior_finalist_user_fields(submitted_fields, prior_finalists)
+        decisions = [[strategy_id, status, rank] for strategy_id, (status, rank) in reconciled_fields.items()]
+        _validate_selection_user_field_ranks(connection, run_id, decisions)
+        prior_reviews = latest_user_reviews_by_strategy(
             connection, [row[0] for row in decisions],
         )
         connection.execute(
@@ -1091,11 +1092,11 @@ def import_selection_user_fields(
             "review_import_id", "strategy_id", "user_status", "user_rank",
             "user_analog_of_strategy_id", "comment",
         ), review_rows)
-        applied_ids = [row[0] for row in decisions]
-        if applied_ids:
+        submitted_ids = sorted(strategy_ids)
+        if submitted_ids:
             connection.execute(
                 "delete from strategy_tags where tag = 'REJECTED' and strategy_id in (select unnest(?::bigint[]))",
-                [applied_ids],
+                [submitted_ids],
             )
             rejected = [
                 [strategy_id, "REJECTED", "SELECTION_REVIEW", review_id, now]
@@ -1455,6 +1456,46 @@ def latest_user_reviews_by_strategy(
             "comment": comment,
         })
     return reviews
+
+
+def _prior_finalist_ids_for_pair_side(
+    connection: duckdb.DuckDBPyConnection, symbol: str, side: str,
+) -> set[int]:
+    return {
+        int(row[0]) for row in connection.execute(
+            """select strategy_id from (
+                   select rows.strategy_id, rows.user_status,
+                          row_number() over (
+                              partition by rows.strategy_id
+                              order by imports.imported_at_utc desc, imports.review_import_id desc
+                          ) as newest
+                     from selection_review_rows rows
+                     join selection_review_imports imports using (review_import_id)
+                     join selection_runs runs using (selection_run_id)
+                     join strategies using (strategy_id)
+                    where rows.user_status is not null
+                      and runs.symbol = ? and runs.side = ?
+                      and strategies.symbol = runs.symbol and strategies.side = runs.side
+               ) where newest = 1 and user_status = 'FINALIST'""",
+            [symbol, side],
+        ).fetchall()
+    }
+
+
+def _reconcile_prior_finalist_user_fields(
+    submitted: Mapping[int, tuple[str | None, int | None]],
+    prior_finalist_ids: set[int],
+) -> dict[int, tuple[str | None, int | None]]:
+    reconciled: dict[int, tuple[str | None, int | None]] = {}
+    for strategy_id, (status, rank) in submitted.items():
+        if status == "REJECTED":
+            rank = None
+        elif strategy_id in prior_finalist_ids and (status != "FINALIST" or rank is None):
+            status, rank = "RESERVE", None
+        reconciled[strategy_id] = (status, rank)
+    for strategy_id in sorted(prior_finalist_ids.difference(submitted)):
+        reconciled[strategy_id] = ("RESERVE", None)
+    return reconciled
 
 
 def effective_selection_decisions(
