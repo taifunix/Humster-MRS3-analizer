@@ -1073,3 +1073,17 @@ Calculate-blocking part of the 2026-09-24 combination preflight.
   relabellings are not repeated. The adapter evaluates only the selected
   compositions per profile. On the real 117-finalist snapshot (4·10^14
   compositions), one solve takes 9–60 s.
+
+### Executable identity liquidity evidence amendment (2026-10-10)
+
+The lot-model enrichment stores `liquidity_v25_usdt` and `liquidity_a15` as
+exact `Decimal` values. The weighted executable identity binds both evidence
+fields as exact, finite canonical decimal text (`_weighted_decimal_text`), the
+same encoding it uses for sizes and the bank. A non-finite value is
+`WEIGHTED_EXECUTABLE_IDENTITY_INVALID`. Other evidence, including
+`optimizer_source_metadata`, still must already be plain JSON, and an embedded
+`Decimal` there remains `WEIGHTED_EXECUTABLE_IDENTITY_INVALID`. Before this
+change every real lot-model Campaign failed post-search with
+`WEIGHTED_EXECUTABLE_IDENTITY_INVALID`, because those two fields were not JSON
+serializable. Acceptance: a regression test binds the Decimal V25/A15 values,
+and a real 61-pair Campaign passes the identity stage.

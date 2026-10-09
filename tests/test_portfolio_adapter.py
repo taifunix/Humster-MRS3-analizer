@@ -3483,6 +3483,35 @@ def test_weighted_executable_identity_binds_ordered_zero_member_source_rows():
     assert first != second
 
 
+def test_weighted_executable_identity_encodes_decimal_liquidity_evidence_exactly():
+    # Real lot-model enrichment stores V25/A15 as Decimal; the identity must accept and bind them.
+    campaign = weighted_campaign()
+    member = {"symbol": "BTCUSDT", "side": "LONG", "strategy_id": 11, "result_id": 101, "x_usdt": "100"}
+    payload = {
+        "strategy": {"name": "PORTFOLIO_BTCUSDT_11_101", "basic": {"symbol": "BTCUSDT"}},
+        "account": {}, "facts": {},
+    }
+    enriched = dict(_weighted_required_evidence(member), liquidity_v25_usdt=Decimal("123.40"), liquidity_a15=Decimal("0.5"))
+
+    identity = adapter_module._weighted_executable_identity(
+        campaign, "AGGRESSIVE", "AGGRESSIVE", Decimal("1000"), (member,), (enriched,), (payload,),
+    )
+
+    assert len(identity) == 64
+    assert identity == adapter_module._weighted_executable_identity(
+        campaign, "AGGRESSIVE", "AGGRESSIVE", Decimal("1000"), (member,), (dict(enriched, liquidity_v25_usdt=Decimal("123.4")),), (payload,),
+    )
+    assert identity != adapter_module._weighted_executable_identity(
+        campaign, "AGGRESSIVE", "AGGRESSIVE", Decimal("1000"), (member,), (dict(enriched, liquidity_a15=Decimal("0.6")),), (payload,),
+    )
+    for bad in (Decimal("NaN"), Decimal("Infinity")):
+        with pytest.raises(CampaignContractError) as error:
+            adapter_module._weighted_executable_identity(
+                campaign, "AGGRESSIVE", "AGGRESSIVE", Decimal("1000"), (member,), (dict(enriched, liquidity_v25_usdt=bad),), (payload,),
+            )
+        assert error.value.code == "WEIGHTED_EXECUTABLE_IDENTITY_INVALID"
+
+
 def test_weighted_executable_identity_binds_provenance_sizing_and_mask_evidence():
     campaign = weighted_campaign()
     member = {"symbol": "BTCUSDT", "side": "LONG", "strategy_id": 11, "result_id": 101, "x_usdt": "100"}

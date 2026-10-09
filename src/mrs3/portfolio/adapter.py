@@ -1451,6 +1451,14 @@ def _round_weighted_candidate_members(
     return tuple(executable), tuple(raw_exclusions)
 
 
+def _identity_evidence_decimal_text(value: Decimal) -> str:
+    """Encode exact, finite Decimal evidence; anything else fails the identity closed."""
+    try:
+        return _weighted_decimal_text(_weighted_decimal(value))
+    except CampaignContractError as error:
+        raise CampaignContractError(WEIGHTED_EXECUTABLE_IDENTITY_INVALID) from error
+
+
 def _weighted_executable_identity(
     campaign: Mapping[str, Any],
     profile_id: str,
@@ -1598,7 +1606,12 @@ def _weighted_executable_identity(
                 },
                 "solver_x_usdt": _weighted_decimal_text(_weighted_decimal(solver_member.get("x_usdt"))),
                 "executable_member": _plain_json_executable_member(executable),
-                "evidence": {field: evidence[field] for field in evidence_fields if field in evidence},
+                "evidence": {
+                    field: _identity_evidence_decimal_text(evidence[field])
+                    if field in {"liquidity_v25_usdt", "liquidity_a15"} and isinstance(evidence[field], Decimal)
+                    else evidence[field]
+                    for field in evidence_fields if field in evidence
+                },
                 "payload": payload,
             })
 

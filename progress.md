@@ -44,6 +44,21 @@ ETA. Next step: restart Panel to load the code, then rerun the
 full-universe Campaign. No PerformanceDB or
 tester was used.
 
+## Portfolio executable identity on real lot-model data (2026-10-10)
+
+Every real lot-model Campaign failed post-search with
+`WEIGHTED_EXECUTABLE_IDENTITY_INVALID`: the Decimal `liquidity_v25_usdt` and
+`liquidity_a15` evidence was not JSON serializable. A real-data probe found no
+other Decimal path. Both fields are now bound as exact, finite canonical text;
+non-finite values fail closed. Contract: the 2026-10-10 identity amendment in the
+[UI spec](docs/specs/2026-09-06-portfolio-optimizer-panel-ui.md). Verification:
+adapter and selection suites, 366 passed; a restarted Panel run of the 61-pair
+5×2 Campaign passed composition 0 and continued. Independent review passed.
+The earlier run of that Campaign hung in a Windows multiprocessing spawn: a
+bootstrap child died at start-up while the parent was blocked writing to its
+pipe. It needed a Panel restart. The bootstrap pool spawn path is unchanged,
+and this remains an open reliability risk.
+
 ## Panel job admission reliability (2026-10-09)
 
 Panel job submission now persists `QUEUED` before worker dispatch, removes an
