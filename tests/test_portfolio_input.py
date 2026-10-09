@@ -75,7 +75,10 @@ def _add_review(
         [run_id, instance_id, symbol, side, f"request-hash-{run_id}", f"config-hash-{run_id}", f"workbook-hash-{run_id}", selection_time],
     )
     connection.execute(
-        """insert into selection_results values
+        """insert into selection_results
+           (selection_run_id, strategy_id, result_id_at_selection, auto_status,
+            auto_score, auto_rank, auto_reason, analog_group_key,
+            auto_analog_of_strategy_id, prior_rejected, stage_trace_json) values
            (?, ?, ?, 'FINALIST', 1, 1, 'selected', '{}', null, false, '{}')""",
         [run_id, strategy_id, result_id],
     )
@@ -1361,21 +1364,49 @@ def test_read_current_finalists_can_skip_large_series_for_metadata_consumers(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    database = _database(tmp_path)
+    class MetadataConnection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, query, _parameters=None):
+            assert query == "begin transaction"
+            return self
+
+    facts = {
+        ("BTCUSDT", "LONG", 1, 11): {
+            "user_status": "FINALIST",
+            "user_rank": 1,
+            "selection_run_id": "run",
+            "review_import_id": "review",
+        },
+    }
     calls: list[str] = []
-    original = portfolio_input._records_for_ids
 
-    def checked(connection, table, column, ids):
+    def unexpected_records(_connection, table, _column, _ids):
         calls.append(table)
-        return original(connection, table, column, ids)
+        raise AssertionError(f"metadata reader loaded {table}")
 
-    monkeypatch.setattr(portfolio_input, "_records_for_ids", checked)
-    row = read_current_finalists(database, [("BTCUSDT", "LONG")], False)[0]
+    monkeypatch.setattr(portfolio_input.duckdb, "connect", lambda *_args, **_kwargs: MetadataConnection())
+    monkeypatch.setattr(portfolio_input, "require_performance_v2_readable", lambda *_args: None)
+    monkeypatch.setattr(portfolio_input, "_current_review_facts", lambda *_args, **_kwargs: (facts, set(facts), ()))
+    monkeypatch.setattr(portfolio_input, "_records_for_ids", unexpected_records)
 
+    row = read_current_finalists(tmp_path / "performance.duckdb", [("BTCUSDT", "LONG")], False)[0]
+
+    assert "strategies" not in calls
+    assert "strategy_results" not in calls
+    assert "strategy_orders" not in calls
     assert "strategy_actions" not in calls
     assert "strategy_equity" not in calls
-    assert "actions" not in row
-    assert "equity" not in row
+    assert set(row) == {
+        "strategy_id", "result_id", "symbol", "side", "user_status", "user_rank",
+        "selection_run_id", "review_import_id",
+    }
+    assert row["selection_run_id"] == "run"
+    assert row["review_import_id"] == "review"
     assert "action_series" not in row
     assert "equity_series" not in row
 

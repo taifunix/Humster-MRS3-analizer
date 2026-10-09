@@ -1,7 +1,7 @@
 import json
 from collections.abc import Mapping
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import importlib
 import inspect
@@ -133,6 +133,195 @@ def test_weighted_composition_preflight_rejects_product_overflow_before_build() 
     )
     with pytest.raises(CampaignContractError, match="COMBINATION_LIMIT_EXCEEDED"):
         adapter_module._enumerate_weighted_compositions(rows, launch, 5)
+
+
+def _oversized_universe_campaign(max_candidates: int = 2):
+    campaign = _weighted_build_campaign()
+    campaign["config_document"]["search"]["max_enumerated_combinations"] = 5
+    campaign["launch"] = {
+        "pairs": ({"pair": "S", "max_finalist_long": 2, "max_finalist_short": 3},),
+        "profiles": (
+            {"profile_id": "BALANCED", "bank_available_usdt": Decimal("1000"), "max_candidates": max_candidates},
+            {"profile_id": "AGGRESSIVE", "bank_available_usdt": None, "max_candidates": 1},
+        ),
+    }
+    selected = tuple(
+        {"symbol": "S", "side": side, "user_rank": index, "strategy_id": index, "result_id": index}
+        for side, count, start in (("LONG", 2, 1), ("SHORT", 3, 3))
+        for index in range(start, start + count)
+    )
+    return campaign, selected
+
+
+def test_build_adapter_reports_exact_count_when_composition_selection_is_unavailable(monkeypatch) -> None:
+    campaign, selected = _oversized_universe_campaign()
+    def unavailable(*_args, **_kwargs):
+        raise CampaignContractError("COMMON_PERIOD_UNAVAILABLE")
+    monkeypatch.setattr(adapter_module, "_milp_union_inputs", unavailable)
+    monkeypatch.setattr(adapter_module, "_build_portfolio_candidates_single", lambda *args, **kwargs: pytest.fail("evaluated"))
+
+    result = build_portfolio_candidates(
+        selected,
+        campaign,
+        capacities={},
+        reference=None,
+        mark_prices={},
+        spread_observations={},
+        spread_history_statuses={"S": "READY"},
+        now_ms=0,
+    )
+
+    assert result.status == "FAIL"
+    assert result.blockers == ("COMPOSITION_SELECTION_UNAVAILABLE:COMMON_PERIOD_UNAVAILABLE",)
+    assert result.diagnostics == {
+        "combination_count": 6,
+        "combination_limit": 5,
+    }
+
+
+def test_build_adapter_fails_closed_when_a_profile_ranking_has_no_solution(monkeypatch) -> None:
+    campaign, selected = _oversized_universe_campaign()
+    monkeypatch.setattr(adapter_module, "_milp_union_inputs", lambda *args, **kwargs: object())
+    calls = []
+    def ranking(slots, union, profile_campaign, profile, **kwargs):
+        calls.append(profile["profile_id"])
+        if profile["profile_id"] == "AGGRESSIVE":
+            raise ValueError("COMPOSITION_SELECTION_NO_SOLUTION")
+        return ((slots[0][2][0], slots[1][2][0]),)
+    monkeypatch.setattr(adapter_module, "_milp_ranked_compositions", ranking)
+    monkeypatch.setattr(adapter_module, "_build_portfolio_candidates_single", lambda *args, **kwargs: pytest.fail("evaluated"))
+
+    result = build_portfolio_candidates(
+        selected, campaign, capacities={}, reference=None, mark_prices={}, spread_observations={},
+        spread_history_statuses={"S": "READY"}, now_ms=0,
+    )
+
+    assert calls == ["BALANCED", "AGGRESSIVE"]
+    assert result.blockers == ("COMPOSITION_SELECTION_UNAVAILABLE:COMPOSITION_SELECTION_NO_SOLUTION",)
+    assert result.diagnostics == {"combination_count": 6, "combination_limit": 5}
+
+
+def test_build_adapter_evaluates_only_milp_ranked_compositions_per_profile(monkeypatch) -> None:
+    campaign, selected = _oversized_universe_campaign(max_candidates=2)
+    union = object()
+    union_calls = []
+    def union_inputs(slots, union_campaign, **kwargs):
+        union_calls.append(len(slots))
+        return union
+    selector_calls: list[tuple[str, int, int]] = []
+    progress_events = []
+    def selector(slots, received_union, profile_campaign, profile, *, limit, progress=None):
+        assert received_union is union
+        selector_calls.append((profile["profile_id"], limit, len(slots)))
+        progress({"completed": 1, "total": limit, "status": 0})
+        long_rows, short_rows = slots[0][2], slots[1][2]
+        ranked = ((long_rows[1], short_rows[2]), (long_rows[0], short_rows[0]))
+        return ranked[:limit]
+    evaluated: list[tuple[str, tuple[int, ...]]] = []
+    def fake_single(composition, profile_campaign, *args, **kwargs):
+        profiles = profile_campaign["launch"]["profiles"]
+        assert len(profiles) == 1
+        ids = tuple(row["strategy_id"] for row in composition)
+        evaluated.append((profiles[0]["profile_id"], ids))
+        return adapter_module.AdapterResult(
+            "PASS",
+            variants=({"identity": f"{profiles[0]['profile_id']}-{ids[0]}-{ids[1]}", "profile_id": profiles[0]["profile_id"], "metrics": {"p30_common_usdt_30d": Decimal(str(sum(ids))), "cdar_peak80_usdt": Decimal("1"), "required_bank_usdt": Decimal("1")}},),
+        )
+    monkeypatch.setattr(adapter_module, "_milp_union_inputs", union_inputs)
+    monkeypatch.setattr(adapter_module, "_milp_ranked_compositions", selector)
+    monkeypatch.setattr(adapter_module, "_build_portfolio_candidates_single", fake_single)
+
+    result = build_portfolio_candidates(
+        selected, campaign, capacities={}, reference=None, mark_prices={}, spread_observations={},
+        spread_history_statuses={"S": "READY"}, now_ms=0, progress_callback=progress_events.append,
+    )
+
+    assert result.status == "PASS"
+    assert union_calls == [2]
+    assert selector_calls == [("BALANCED", 4, 2), ("AGGRESSIVE", 2, 2)]
+    assert evaluated == [
+        ("BALANCED", (2, 5)), ("BALANCED", (1, 3)),
+        ("AGGRESSIVE", (2, 5)), ("AGGRESSIVE", (1, 3)),
+    ]
+    assert [item["identity"] for item in result.variants] == ["BALANCED-2-5", "BALANCED-1-3", "AGGRESSIVE-2-5"]
+    assert "COMPOSITION_SELECTION_MILP:COMBINATIONS=6;EVALUATED=4" in result.warnings
+    selection_events = [event for event in progress_events if event.get("substage") == "COMPOSITION_SELECTION"]
+    # Same-substage events inside the 0.25 s throttle window may be coalesced.
+    assert (selection_events[0]["completed"], selection_events[0]["total"]) == (1, 4)
+    assert selection_events[0]["detail"] == "profile BALANCED MILP solve 1"
+
+
+def _layered_union_fixture(monkeypatch):
+    from mrs3.portfolio.input import PreparedWeightedInput
+
+    start = datetime(2026, 9, 1, tzinfo=timezone.utc)
+    grid = tuple(start + timedelta(days=index) for index in range(6))
+    def prepared(ids, first, last, offset):
+        rows = tuple(
+            tuple(Decimal(offset + 10 * column + t) for column in range(len(ids)))
+            for t in range(first, last)
+        )
+        return PreparedWeightedInput(grid[first], grid[last], 5, grid[first:last + 1], tuple(ids), rows, (), (), {}, {}, "k")
+    layers = {
+        (1, 3): prepared((1, 3), 0, 5, 0),
+        (2, 4): prepared((2, 4), 1, 5, 100),
+        (2, 5): prepared((2, 5), 1, 4, 200),
+    }
+    def layer_inputs(rows, *_args, **_kwargs):
+        ids = tuple(row["strategy_id"] for row in rows)
+        members = tuple({"strategy_id": strategy_id, "position_size_usdt": Decimal(strategy_id * 100)} for strategy_id in ids)
+        margins = {strategy_id: {"a": Decimal("0.1"), "b": Decimal("0.01")} for strategy_id in ids}
+        return members, layers[ids], margins
+    monkeypatch.setattr(adapter_module, "_selector_layer_inputs", layer_inputs)
+    campaign, selected = _oversized_universe_campaign()
+    slots, _total = adapter_module._weighted_slot_pools(selected, campaign["launch"])
+    return campaign, slots
+
+
+def test_milp_selector_merges_layers_on_common_grid_and_maps_choices(monkeypatch) -> None:
+    campaign, slots = _layered_union_fixture(monkeypatch)
+    captured = {}
+    def rank(delta, caps, milp_slots, **kwargs):
+        captured.update(delta=delta, caps=caps, slots=milp_slots, kwargs=kwargs)
+        return (weighted_search_module.RankedComposition((2, 3), Decimal("9")),)
+    monkeypatch.setattr(weighted_search_module, "rank_slot_compositions", rank)
+
+    union = adapter_module._milp_union_inputs(
+        slots, campaign, capacities={}, reference=None, mark_prices={}, now_ms=0, margin_coefficients=None,
+    )
+    ranked = adapter_module._milp_ranked_compositions(slots, union, campaign, campaign["launch"]["profiles"][0], limit=3)
+
+    # Union columns follow first appearance: 1, 3 (layer 0), 2, 4 (layer 1), 5 (layer 2);
+    # rows are the common grid [day 1, day 4) of all three layers.
+    assert captured["slots"] == ((0, 2), (1, 3, 4))
+    assert captured["caps"] == tuple(Decimal(value) for value in (100, 300, 200, 400, 500))
+    assert [row[0] for row in captured["delta"]] == [Decimal(1), Decimal(2), Decimal(3)]
+    assert [row[4] for row in captured["delta"]] == [Decimal(211), Decimal(212), Decimal(213)]
+    assert captured["kwargs"]["common_days"] == Decimal(3)
+    assert captured["kwargs"]["bank_available"] == Decimal("1000")
+    assert captured["kwargs"]["limit"] == 3
+    assert [tuple(row["strategy_id"] for row in composition) for composition in ranked] == [(2, 4)]
+
+
+def test_milp_union_rejects_a_common_grid_shorter_than_minimum_common_days(monkeypatch) -> None:
+    campaign, slots = _layered_union_fixture(monkeypatch)
+    campaign["config_document"]["search"]["composition"]["parameters"]["minimum_common_days"] = 4
+
+    with pytest.raises(CampaignContractError, match="COMMON_PERIOD_UNAVAILABLE"):
+        adapter_module._milp_union_inputs(
+            slots, campaign, capacities={}, reference=None, mark_prices={}, now_ms=0, margin_coefficients=None,
+        )
+
+
+def test_milp_union_rejects_duplicate_strategy_inside_one_slot() -> None:
+    campaign, _selected = _oversized_universe_campaign()
+    row = {"symbol": "S", "side": "LONG", "user_rank": 1, "strategy_id": 1, "result_id": 1}
+    slots = (("S", "LONG", (row, {**row, "user_rank": 2, "result_id": 2})),)
+
+    with pytest.raises(CampaignContractError, match="COMPOSITION_SELECTION_DUPLICATE_STRATEGY"):
+        adapter_module._milp_union_inputs(
+            slots, campaign, capacities={}, reference=None, mark_prices={}, now_ms=0, margin_coefficients=None,
+        )
 
 
 def test_weighted_composition_rejects_canonical_launch_pair_collision() -> None:

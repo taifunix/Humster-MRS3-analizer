@@ -8,6 +8,42 @@ Use [PRD.md](PRD.md) for the feature registry and [docs/README.md](docs/README.m
 for the documentation map. Read the linked contract only for the active task;
 do not treat this file as a replacement for a feature specification.
 
+## Portfolio MILP composition selection (2026-10-10)
+
+Stage 1 no longer fails when the finalist product exceeds
+`search.max_enumerated_combinations`. Above the bound, one MILP per profile
+over the union of slot options ranks up to `2 × max_candidates` distinct
+portfolios; each is then evaluated by the unchanged exact path. The form
+shows the live combination count, the bound and the mode. Contract:
+[UI spec amendment 2026-10-10](docs/specs/2026-09-06-portfolio-optimizer-panel-ui.md);
+decision: [ADR-0066](docs/decisions/0066-portfolio-milp-composition-selection.md).
+The adapter progress sink lacked `import time`, which silently dropped every
+adapter-level progress event. That is fixed in the same change. The change
+also carries the 2026-10-09 lightweight readiness and combination-limit detail
+hunks.
+
+Diagnosis evidence: one composition × one profile costs about 49 s with 30
+workers (106 s single-threaded). Only bootstrap is parallel, and it spawns a
+process pool per call. On the real 117-finalist snapshot, facts took 102 s
+(minute files are reused, about 0.2 s per symbol) and layer preparation 58 s.
+Each MILP solve took 9–130 s, rising as cuts accumulate; 20 solves took 19 min.
+The earlier 32-minute facts stage did not reproduce. Measured overheads:
+per-request SSL context creation in the market snapshot, and a full 14 MB
+`.panel-jobs.json` rewrite on each progress/journal sync.
+
+Verification: composition selection 10 passed; adapter + selection 365
+passed. A broad run of portfolio/Panel modules gave 1143 passed and 1 skipped.
+Its 34 failures are known and pre-existing: 32 `ab_decline_cap_pct` /
+11-of-12-column fixtures, the maintenance copy expectation, and the Windows
+Node command-line length. `node --check` and `git diff --check` passed.
+Independent review: one MAJOR (silent profile loss on a selector time-out) and
+the MINOR findings were fixed; the re-review passed. Adapter progress now
+reaches the Panel for the first time. The Panel reporter marks the total
+inconsistent after the first substage switch, so later progress shows no
+ETA. Next step: restart Panel to load the code, then rerun the
+full-universe Campaign. No PerformanceDB or
+tester was used.
+
 ## Panel job admission reliability (2026-10-09)
 
 Panel job submission now persists `QUEUED` before worker dispatch, removes an
@@ -130,7 +166,7 @@ the first operational step below.
 - Bybit collector: phases 1 through 8 are delivered; live integration and soak evidence in phase 9 remain open. See the [collector specification](docs/specs/2026-09-05-bybit-market-data-collector.md) and [implementation plan](docs/superpowers/plans/2026-09-05-bybit-market-data-collector.md).
 - Canonical Phase 1: Tasks 0–12B are recorded complete; Task 12C fresh real-source smoke/performance remains open. Follow the [active specification](docs/specs/2026-08-16-mrs3-v07-canonical-phase1.md) and [implementation plan](docs/superpowers/plans/2026-08-16-mrs3-v07-canonical-phase1.md).
 - Portfolio Optimizer: Stage 2 ordered-batch implementation has fixture/fake evidence and independent `CODE_REVIEW_PASS`; no real tester run occurred. M6–M8 evidence ledgers are unadopted until the governing phased specification is reconciled. This does not authorize a real joint tester run, recommendation, trading admission, or live use. M5/M6 readiness, PnL floor, individual-DD ceiling, liquidity/freshness limits, profile ranking, and fresh user authorization remain open gates. The Phase 13 limiter work remains off-only while the bot limiter is not operational. See the [optimizer specification](docs/specs/2026-09-05-portfolio-optimizer.md), [UI contract](docs/specs/2026-09-06-portfolio-optimizer-panel-ui.md), [batch decision](docs/decisions/0059-portfolio-stage2-sequential-batch.md), and [implementation plan](docs/superpowers/plans/2026-10-07-portfolio-stage2-sequential-batch.md).
-- Campaign combination preflight: the configured limit and server-side rejection of over-limit job creation are implemented. The form still does not calculate or display the exact finalist combination product before submission. See the [Portfolio Optimizer UI specification](docs/specs/2026-09-06-portfolio-optimizer-panel-ui.md).
+- Portfolio MILP selection: oversized universes rank by the discovery-LP proxy; the union grid can be shorter than a composition's own period and LONG+SHORT symbols use an approximate one-way mask. Near-duplicate finalists can yield micro-variant candidates. Lightweight readiness does not compare prepared `source_digest`; a stale preparation is caught only at Campaign creation/run. See [ADR-0066](docs/decisions/0066-portfolio-milp-composition-selection.md).
 ## Next steps
 
 1. Restart or reload the Panel before using the Minimum Shift, finalist equity-filter and Finalist/Reserved-only selection controls; no live restart was performed during verification.
@@ -194,3 +230,30 @@ eligible for all 2361 strategies. Targeted recovery suites pass 180 tests with
 1 Windows symlink-capability skip. The live PerformanceDB was intentionally
 updated by this import. Next step: run the eligible equity filter when desired;
 no full finalist RETEST is needed. Blockers: none.
+
+Portfolio Optimizer lightweight readiness (2026-10-09): startup readiness now
+reads current FINALIST identity/count metadata and prepared-row headers only;
+it does not load strategy/action/equity payloads or decode `prepared_json`.
+Explicit finalist preparation and Campaign submission retain the strict
+prepared-artifact validation. Recovery keeps the latest terminal Campaign
+visible while unlocking Stage 1 for `SUCCEEDED`, `FAILED`, `CANCELLED`, and
+`INTERRUPTED`; only a nonterminal job freezes the form. Focused checks pass 9
+tests; review follow-up coverage passes 12 tests. Full Panel UI/Portfolio
+modules report 444 passed, 1 platform skip, and 3 known unrelated failures
+(maintenance copy expectation, Windows Node command-line length, and the
+11/12-column selection fixture). The shared selection insert was made
+column-explicit for schema compatibility; the full `test_portfolio_input.py`
+run then reports 117 passed and 32 unrelated failures from the in-progress
+`SelectionConfig.ab_decline_cap_pct` snapshot contract and remaining historical
+raw inserts. A separate strict-series/light-metadata contract run passes all 7
+tests. The maintenance copy failure reproduces from an isolated clean `HEAD`
+archive. No live database or Panel process was changed. Next step:
+restart/reload Panel and confirm the pair picker becomes editable without a
+full startup audit.
+
+Portfolio combination-limit error detail (2026-10-09): when weighted finalist
+composition enumeration exceeds `search.max_enumerated_combinations`, the
+persisted failed-Campaign message now retains `COMBINATION_LIMIT_EXCEEDED` and
+adds the exact product and configured limit. The adapter count/limit regression
+and persisted Panel status regression pass (3 focused tests). Reload Panel
+before the next run; the failed status will show `COMBINATIONS=N; LIMIT=M`.

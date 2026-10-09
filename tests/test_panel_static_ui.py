@@ -3776,6 +3776,33 @@ def test_portfolio_duplicate_or_busy_recovers_and_keeps_campaign_frozen() -> Non
     assert "PORTFOLIO_JOB_BUSY" in portfolio
 
 
+def test_portfolio_terminal_job_remains_visible_without_freezing_stage1_form() -> None:
+    js = _read("app.js")
+    portfolio = js.split("function loadPortfolioScreen", 1)[1].split("function loadPortfolioSettings", 1)[0]
+    recover = portfolio.split("const recoverPortfolioJob", 1)[1].split("const refreshPortfolio", 1)[0]
+    poll = portfolio.split("const pollPortfolioJob", 1)[1].split("const startPortfolioPolling", 1)[0]
+
+    assert "setLocked(!terminal(candidate))" in recover
+    assert "if (terminal(state.job)) setLocked(false)" in recover
+    assert "else setLocked(false)" in poll
+    assert "newButton.disabled = preparationState === 'PREPARING' || !jobTerminal" in portfolio
+
+
+def test_portfolio_form_shows_live_combination_count_and_selection_mode() -> None:
+    html = _read("index.html")
+    js = _read("app.js")
+    portfolio = js.split("function loadPortfolioScreen", 1)[1].split("function loadPortfolioSettings", 1)[0]
+    controls = portfolio.split("const updateControls", 1)[1].split("const renderJournal", 1)[0]
+
+    assert 'id="portfolio-combination-count"' in html
+    assert "portfolioCombinationCount(launch.selectedPairs)" in controls
+    assert "Number.isSafeInteger(value) && value > 0" in portfolio
+    assert "portfolioCombinationFactor(row.long, row.finalistLong)" in portfolio
+    assert "state.readiness?.combination_limit" in controls
+    assert "MILP" in controls
+    assert "#portfolio-combination-count" in controls
+
+
 def test_portfolio_overall_progress_does_not_claim_unknown_stage_is_known() -> None:
     js = _read("app.js")
     portfolio = js.split("function loadPortfolioScreen", 1)[1].split("function loadPortfolioSettings", 1)[0]

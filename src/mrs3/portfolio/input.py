@@ -1283,6 +1283,25 @@ def read_current_finalists(
                 key for key, fact in facts.items()
                 if key[:2] in pair_values and fact.get("user_status") == "FINALIST"
             ]
+            if not include_series:
+                pair_order = {pair: index for index, pair in enumerate(pair_values)}
+                return tuple(
+                    {
+                        "strategy_id": strategy_id,
+                        "result_id": result_id,
+                        "symbol": symbol,
+                        "side": side,
+                        "user_status": "FINALIST",
+                        "user_rank": _user_rank(facts[key].get("user_rank")),
+                        "selection_run_id": facts[key].get("selection_run_id"),
+                        "review_import_id": facts[key].get("review_import_id"),
+                    }
+                    for key in sorted(
+                        finalist_keys,
+                        key=lambda item: (pair_order[item[:2]], _user_rank(facts[item].get("user_rank")) or 0, item[2], item[3]),
+                    )
+                    for symbol, side, strategy_id, result_id in (key,)
+                )
             strategy_ids = tuple(dict.fromkeys(key[2] for key in finalist_keys))
             result_ids = tuple(dict.fromkeys(key[3] for key in finalist_keys))
             strategy_rows = _records_for_ids(connection, "strategies", "strategy_id", strategy_ids)

@@ -48,6 +48,7 @@ from .config import load_duckdb_import_settings
 from .performance_v2_optimizer import (
     MissingPreparedOptimizerInput,
     OptimizerIntegrityError,
+    PREPARATION_VERSION,
     prepare_current_optimizer_inputs,
     read_prepared_optimizer_inputs,
 )
@@ -1425,6 +1426,32 @@ class PortfolioPanelService:
             return {"state": "READY", "required": required, "ready": available}
         return {"state": "ERROR", "required": required, "ready": available}
 
+    @staticmethod
+    def _prepared_finalists_metadata_state(database: Path, result_ids: Sequence[int]) -> dict[str, Any]:
+        requested = tuple(dict.fromkeys(int(result_id) for result_id in result_ids))
+        required = len(requested)
+        if not required:
+            return {"state": "READY", "required": 0, "ready": 0}
+        placeholders = ",".join("?" for _ in requested)
+        with duckdb.connect(str(database), read_only=True) as connection:
+            rows = connection.execute(
+                f"""select result_id, preparation_version, availability_status,
+                           unavailable_reason
+                      from optimizer_prepared_inputs
+                     where result_id in ({placeholders})""",
+                list(requested),
+            ).fetchall()
+        by_id = {int(row[0]): row for row in rows}
+        if any(result_id not in by_id for result_id in requested):
+            return {"state": "NEEDS_PREPARATION", "required": required, "ready": 0}
+        ready = sum(
+            1 for result_id in requested
+            if by_id[result_id][1] == PREPARATION_VERSION
+            and by_id[result_id][2] == "AVAILABLE"
+            and by_id[result_id][3] is None
+        )
+        return {"state": "READY" if ready == required else "ERROR", "required": required, "ready": ready}
+
     def _latest_finalist_preparation_failed(self) -> bool:
         jobs = [
             saved for saved in self.registry.list()
@@ -1468,7 +1495,7 @@ class PortfolioPanelService:
                     if active is not None and active.get("kind") == "FINALIST_PREPARATION":
                         preparation = {"state": "PREPARING", "required": len(result_ids), "ready": 0}
                     elif self._uses_production_finalists_reader:
-                        preparation = self._prepared_finalists_state(database, result_ids)
+                        preparation = self._prepared_finalists_metadata_state(database, result_ids)
                     else:
                         preparation = {"state": "READY", "required": len(result_ids), "ready": len(result_ids)}
                     if pairs and preparation["state"] != "READY":
@@ -1485,6 +1512,8 @@ class PortfolioPanelService:
         if active is not None:
             stage1.append("PORTFOLIO_JOB_ACTIVE")
         stage1 = list(dict.fromkeys(stage1))
+        search = document.get("search") if document else None
+        combination_limit = search.get("max_enumerated_combinations") if isinstance(search, Mapping) else None
         return {
             "stage1": {"enabled": not stage1, "blockers": stage1},
             "stage2": {"enabled": False, "blockers": ["PORTFOLIO_JOB_STAGE2_NOT_AUTHORIZED"]},
@@ -1495,6 +1524,7 @@ class PortfolioPanelService:
             "available_pairs": pairs,
             "current_finalists": finalists,
             "preparation": preparation,
+            "combination_limit": combination_limit if type(combination_limit) is int and combination_limit > 0 else None,
         }
 
     def _snapshot_finalists(self, document: Mapping[str, Any], launch: Mapping[str, Any]) -> tuple[tuple[dict[str, Any], ...], tuple[dict[str, Any], ...]]:
@@ -1602,9 +1632,16 @@ class PortfolioPanelService:
             result = run_portfolio_adapter(selected, campaign, **adapter_kwargs)
         except Exception as error:
             raise PortfolioPanelError("PORTFOLIO_JOB_FAILED", "portfolio adapter failed", status=500) from error
+        blockers = list(result.blockers)
+        diagnostics = getattr(result, "diagnostics", None)
+        if isinstance(diagnostics, Mapping):
+            count = diagnostics.get("combination_count")
+            limit = diagnostics.get("combination_limit")
+            if type(count) is int and count > 0 and type(limit) is int and limit > 0 and count > limit:
+                blockers.append(f"COMBINATIONS={count}; LIMIT={limit}")
         return {
             "variants": result.variants,
-            "blockers": list(result.blockers),
+            "blockers": blockers,
             "excluded": result.excluded,
             "warnings": result.warnings,
             "status": getattr(result, "status", "PASS"),

@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import importlib
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import json
 from itertools import product
 from pathlib import Path
+import time
 from types import MappingProxyType
 from typing import Any, Mapping, Sequence
 
@@ -60,14 +62,22 @@ WEIGHTED_EXECUTABLE_IDENTITY_INVALID = "WEIGHTED_EXECUTABLE_IDENTITY_INVALID"
 PORTFOLIO_INPUT_GEOMETRY_INVALID = "PORTFOLIO_INPUT_GEOMETRY_INVALID"
 _WEIGHTED_SEARCH_CONFIG_INVALID = "WEIGHTED_SEARCH_CONFIG_INVALID"
 _LEGACY_PROFILE_FIELD_UNSUPPORTED = "LEGACY_PROFILE_FIELD_UNSUPPORTED"
+COMPOSITION_SELECTION_UNAVAILABLE = "COMPOSITION_SELECTION_UNAVAILABLE"
+COMPOSITION_SELECTION_MILP = "COMPOSITION_SELECTION_MILP"
 
 
 class CampaignContractError(ValueError):
     """A stable fail-closed Campaign contract error."""
 
-    def __init__(self, code: str, exclusions: Sequence[Mapping[str, Any]] = ()) -> None:
+    def __init__(
+        self,
+        code: str,
+        exclusions: Sequence[Mapping[str, Any]] = (),
+        diagnostics: Mapping[str, Any] | None = None,
+    ) -> None:
         self.code = code
         self.exclusions = tuple(exclusions)
+        self.diagnostics = dict(diagnostics or {})
         super().__init__(code)
 
 
@@ -409,18 +419,15 @@ def _weighted_input_identity(row: Any) -> tuple[str, str, int, int]:
     return symbol.strip().upper(), str(side).strip().upper(), strategy_id, result_id
 
 
-def _enumerate_weighted_compositions(
+def _weighted_slot_pools(
     selected_rows: Sequence[Mapping[str, Any]],
     launch: Mapping[str, Any],
-    max_enumerated_combinations: int,
-) -> tuple[tuple[Mapping[str, Any], ...], ...]:
-    """Build the exact Cartesian product of enabled finalist slot pools."""
+) -> tuple[tuple[tuple[str, str, tuple[Mapping[str, Any], ...]], ...], int]:
+    """Return ordered, cutoff finalist slot pools and their exact product size."""
     if (
         isinstance(selected_rows, (str, bytes))
         or not isinstance(selected_rows, Sequence)
         or not isinstance(launch, Mapping)
-        or type(max_enumerated_combinations) is not int
-        or max_enumerated_combinations <= 0
     ):
         raise CampaignContractError(_WEIGHTED_SEARCH_CONFIG_INVALID)
     pairs = launch.get("pairs")
@@ -494,9 +501,234 @@ def _enumerate_weighted_compositions(
     total = 1
     for _symbol, _side, rows in slots:
         total *= len(rows)
+    return tuple(slots), total
+
+
+def _enumerate_weighted_compositions(
+    selected_rows: Sequence[Mapping[str, Any]],
+    launch: Mapping[str, Any],
+    max_enumerated_combinations: int,
+) -> tuple[tuple[Mapping[str, Any], ...], ...]:
+    """Build the exact Cartesian product of enabled finalist slot pools."""
+    if type(max_enumerated_combinations) is not int or max_enumerated_combinations <= 0:
+        raise CampaignContractError(_WEIGHTED_SEARCH_CONFIG_INVALID)
+    slots, total = _weighted_slot_pools(selected_rows, launch)
     if total > max_enumerated_combinations:
-        raise CampaignContractError("COMBINATION_LIMIT_EXCEEDED")
+        raise CampaignContractError(
+            "COMBINATION_LIMIT_EXCEEDED",
+            diagnostics={
+                "combination_count": total,
+                "combination_limit": max_enumerated_combinations,
+            },
+        )
     return tuple(tuple(choice for choice in choices) for choices in product(*(rows for _symbol, _side, rows in slots)))
+
+
+def _selector_layer_inputs(
+    rows: Sequence[Mapping[str, Any]],
+    campaign: Mapping[str, Any],
+    *,
+    capacities: Mapping[str, MinuteCapacityResult],
+    reference: ReferenceSnapshot,
+    mark_prices: Mapping[str, Any],
+    now_ms: int,
+    margin_coefficients: Any,
+) -> tuple[tuple[Mapping[str, Any], ...], Any, Any]:
+    """Size, prepare and margin one valid one-option-per-slot layer composition."""
+    config_document = campaign["config_document"]
+    liquidity = config_document["liquidity"]
+    parameters = liquidity["parameters"]
+    sizing = enrich_finalist_rows(
+        rows,
+        capacities,
+        reference,
+        mark_prices,
+        now_ms=now_ms,
+        maximum_age_hours=liquidity["maximum_age_hours"],
+        lot_model_settings={
+            "lot_model_base_coefficient": parameters.get("lot_model_base_coefficient"),
+            "lot_model_max_shift_bonus": parameters.get("lot_model_max_shift_bonus"),
+        },
+    )
+    members = getattr(sizing, "rows", None)
+    if getattr(sizing, "status", None) != "PASS" or not members:
+        raise CampaignContractError(getattr(sizing, "reason", None) or "LIQUIDITY_MODEL_NO_ELIGIBLE_CANDIDATE")
+    members = tuple(members)
+    prepared = _prepare_frozen_weighted_input(members, campaign)
+    if margin_coefficients is None:
+        margin = config_document["margin"]
+        margin_parameters = margin["parameters"]
+        derived = derive_reference_margin_coefficients(
+            reference,
+            members,
+            open_fee_rate=margin_parameters["open_fee_rate"],
+            close_fee_rate=margin_parameters["close_fee_rate"],
+            order_loss_rate=margin_parameters.get("order_loss_rate", Decimal("0")),
+            policy_id=margin["policy_id"],
+        )
+        if derived is None or derived.status != "PASS":
+            raise CampaignContractError(MARGIN_BOUND_UNAVAILABLE)
+        margin_coefficients = derived.by_strategy
+    return members, prepared, margin_coefficients
+
+
+def _grid_instant(value: Any) -> datetime:
+    if isinstance(value, datetime):
+        return value
+    return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+
+
+@dataclass(frozen=True, slots=True)
+class _MilpUnion:
+    """Union series and per-column facts shared by every profile's MILP ranking."""
+
+    delta: tuple[tuple[Decimal, ...], ...]
+    caps: tuple[Decimal, ...]
+    margin_a: tuple[Decimal, ...]
+    margin_b: tuple[Decimal, ...]
+    slots: tuple[tuple[int, ...], ...]
+    slot_positions: tuple[int, ...]
+    strategy_of: Mapping[int, int]
+    common_days: Decimal
+
+
+def _milp_union_inputs(
+    slots: Sequence[tuple[str, str, Sequence[Mapping[str, Any]]]],
+    campaign: Mapping[str, Any],
+    *,
+    capacities: Mapping[str, MinuteCapacityResult],
+    reference: ReferenceSnapshot,
+    mark_prices: Mapping[str, Any],
+    now_ms: int,
+    margin_coefficients: Any,
+) -> _MilpUnion:
+    """Assemble the union of all slot options once per Campaign.
+
+    The union series are assembled from valid layer compositions (layer ``j``
+    takes the ``j``-th finalist of each slot, or its last one), so the strict
+    one-member-per-slot preparation contract is never relaxed. All layers are
+    cut to their common time grid, which must still cover the Campaign's
+    ``minimum_common_days``. Each column keeps the one-way admission of the
+    layer it first appears in.
+    """
+    weighted_search_module = importlib.import_module(".weighted_search", __package__)
+
+    for _symbol, _side, rows in slots:
+        strategy_ids = [row["strategy_id"] for row in rows]
+        if len(set(strategy_ids)) != len(strategy_ids):
+            raise CampaignContractError("COMPOSITION_SELECTION_DUPLICATE_STRATEGY")
+    depth = max(len(rows) for _symbol, _side, rows in slots)
+    layers = []
+    members_by_id: dict[int, Mapping[str, Any]] = {}
+    for level in range(depth):
+        layer_rows = tuple(rows[min(level, len(rows) - 1)] for _symbol, _side, rows in slots)
+        members, prepared, layer_margins = _selector_layer_inputs(
+            layer_rows,
+            campaign,
+            capacities=capacities,
+            reference=reference,
+            mark_prices=mark_prices,
+            now_ms=now_ms,
+            margin_coefficients=margin_coefficients,
+        )
+        for member in members:
+            members_by_id.setdefault(member["strategy_id"], member)
+        margin_a, margin_b = weighted_search_module._ordered_margin_bounds(layer_margins, prepared.strategy_ids)
+        layers.append((prepared, margin_a, margin_b))
+    grids = [tuple(_grid_instant(value) for value in prepared.timestamps_utc) for prepared, _a, _b in layers]
+    start = max(grid[0] for grid in grids)
+    end = min(grid[-1] for grid in grids)
+    windows: list[tuple[int, int]] = []
+    for grid in grids:
+        try:
+            first, last = grid.index(start), grid.index(end)
+        except ValueError:
+            raise CampaignContractError("COMMON_GRID_UNAVAILABLE") from None
+        windows.append((first, last))
+    reference_grid = grids[0][windows[0][0]:windows[0][1] + 1]
+    if len(reference_grid) < 2 or any(grid[first:last + 1] != reference_grid for grid, (first, last) in zip(grids, windows)):
+        raise CampaignContractError("COMMON_GRID_UNAVAILABLE")
+    span = end - start
+    common_days = (Decimal(span.days * 86400 + span.seconds) + Decimal(span.microseconds) / Decimal(1_000_000)) / Decimal(86400)
+    minimum_common_days = campaign["config_document"]["search"]["composition"]["parameters"]["minimum_common_days"]
+    if common_days < Decimal(minimum_common_days):
+        raise CampaignContractError("COMMON_PERIOD_UNAVAILABLE")
+    columns: list[tuple[int, int]] = []
+    column_of: dict[int, int] = {}
+    caps: list[Decimal] = []
+    margin_a_values: list[Decimal] = []
+    margin_b_values: list[Decimal] = []
+    for layer_index, (prepared, margin_a, margin_b) in enumerate(layers):
+        for column, strategy_id in enumerate(prepared.strategy_ids):
+            if strategy_id in column_of:
+                continue
+            column_of[strategy_id] = len(columns)
+            columns.append((layer_index, column))
+            caps.append(members_by_id[strategy_id]["position_size_usdt"])
+            margin_a_values.append(margin_a[column])
+            margin_b_values.append(margin_b[column])
+    delta = tuple(
+        tuple(layers[layer_index][0].normalized_delta[windows[layer_index][0] + offset][column] for layer_index, column in columns)
+        for offset in range(len(reference_grid) - 1)
+    )
+    milp_slots: list[tuple[int, ...]] = []
+    slot_positions: list[int] = []
+    for position, (_symbol, _side, rows) in enumerate(slots):
+        options = tuple(column_of[row["strategy_id"]] for row in rows if row["strategy_id"] in column_of)
+        if options:
+            milp_slots.append(options)
+            slot_positions.append(position)
+    return _MilpUnion(
+        delta,
+        tuple(caps),
+        tuple(margin_a_values),
+        tuple(margin_b_values),
+        tuple(milp_slots),
+        tuple(slot_positions),
+        MappingProxyType({column: strategy_id for strategy_id, column in column_of.items()}),
+        common_days,
+    )
+
+
+def _milp_ranked_compositions(
+    slots: Sequence[tuple[str, str, Sequence[Mapping[str, Any]]]],
+    union: _MilpUnion,
+    campaign: Mapping[str, Any],
+    profile: Mapping[str, Any],
+    *,
+    limit: int,
+    progress: Callable[[Mapping[str, Any]], Any] | None = None,
+) -> tuple[tuple[Mapping[str, Any], ...], ...]:
+    """Rank one profile's finalist compositions by the union MILP.
+
+    The ranking is a selector only: every returned composition is still
+    evaluated by the exact single-composition path.
+    """
+    weighted_search_module = importlib.import_module(".weighted_search", __package__)
+    policy = _frozen_profile_risk(campaign, str(profile["profile_id"]))
+    search = campaign["config_document"]["search"]
+    ranked = weighted_search_module.rank_slot_compositions(
+        union.delta,
+        union.caps,
+        union.slots,
+        max_dd=policy["max_actual_equity_dd_pct"] / Decimal("100"),
+        common_days=union.common_days,
+        bank_available=profile.get("bank_available_usdt"),
+        margin_a=union.margin_a,
+        margin_b=union.margin_b,
+        max_mm_load=policy["max_calculated_account_mm_load_pct"] / Decimal("100"),
+        limit=limit,
+        time_limit=search["weighted_search"]["wall_time_seconds"],
+        progress=progress,
+    )
+    compositions = []
+    for item in ranked:
+        chosen = {position: union.strategy_of[column] for position, column in zip(union.slot_positions, item.choice)}
+        compositions.append(tuple(
+            next(row for row in rows if row["strategy_id"] == chosen[position]) if position in chosen else rows[0]
+            for position, (_symbol, _side, rows) in enumerate(slots)
+        ))
+    return tuple(compositions)
 
 
 def _weighted_geometry_int(value: Any, *, minimum: int) -> int:
@@ -704,12 +936,15 @@ class AdapterResult:
     excluded: tuple[Mapping[str, Any], ...] = ()
     blockers: tuple[str, ...] = ()
     warnings: tuple[str, ...] = ()
+    diagnostics: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "variants", tuple(_freeze(item) for item in self.variants))
         object.__setattr__(self, "excluded", tuple(_freeze(item) for item in self.excluded))
         object.__setattr__(self, "blockers", tuple(dict.fromkeys(self.blockers)))
         object.__setattr__(self, "warnings", tuple(dict.fromkeys(self.warnings)))
+        if self.diagnostics is not None:
+            object.__setattr__(self, "diagnostics", _freeze(dict(self.diagnostics)))
 
 def _adapter_gate(campaign: Any) -> AdapterResult:
     try:
@@ -1990,12 +2225,15 @@ def build_portfolio_candidates(
         config_document = campaign.get("config_document")
         search = config_document.get("search") if isinstance(config_document, Mapping) else None
         max_combinations = search.get("max_enumerated_combinations") if isinstance(search, Mapping) else None
-        compositions = _enumerate_weighted_compositions(tuple(eligible_rows), launch, max_combinations)
+        if type(max_combinations) is not int or max_combinations <= 0:
+            raise CampaignContractError(_WEIGHTED_SEARCH_CONFIG_INVALID)
+        slots, combination_count = _weighted_slot_pools(tuple(eligible_rows), launch)
     except CampaignContractError as error:
         return AdapterResult(
             "FAIL",
             excluded=tuple(spread_excluded) + tuple(error.exclusions),
             blockers=(error.code,),
+            diagnostics=error.diagnostics or None,
         )
     raw_profiles = launch.get("profiles")
     if isinstance(raw_profiles, (str, bytes)) or not isinstance(raw_profiles, Sequence) or not raw_profiles:
@@ -2057,7 +2295,65 @@ def build_portfolio_candidates(
             raise CampaignContractError(WEIGHTED_CANDIDATE_SHAPE_INVALID)
         raise CampaignContractError(WEIGHTED_CANDIDATE_SHAPE_INVALID)
 
-    for ordinal, composition in enumerate(compositions):
+    work: list[tuple[Mapping[str, Any], tuple[Mapping[str, Any], ...]]] = []
+    if combination_count <= max_combinations:
+        work.extend((campaign, tuple(choices)) for choices in product(*(rows for _symbol, _side, rows in slots)))
+    else:
+        def selection_failure(error: Exception) -> AdapterResult:
+            if isinstance(error, CampaignContractError):
+                code = error.code
+            elif isinstance(error, ValueError) and str(error).replace("_", "").isalnum() and str(error).isupper():
+                code = str(error)
+            else:
+                code = type(error).__name__
+            return AdapterResult(
+                "FAIL",
+                excluded=tuple(excluded),
+                blockers=(f"{COMPOSITION_SELECTION_UNAVAILABLE}:{code}",),
+                diagnostics={"combination_count": combination_count, "combination_limit": max_combinations},
+            )
+
+        try:
+            union = _milp_union_inputs(
+                slots,
+                campaign,
+                capacities=capacities,
+                reference=reference,
+                mark_prices=mark_prices,
+                now_ms=now_ms,
+                margin_coefficients=margin_coefficients,
+            )
+        except Exception as error:
+            return selection_failure(error)
+        selection_progress = _progress_sink(progress_callback)
+        for profile_id, profile in profiles_by_id.items():
+            profile_campaign = {**campaign, "launch": {**launch, "profiles": (profile,)}}
+
+            def solve_progress(event: Mapping[str, Any], profile_id: str = profile_id) -> None:
+                if selection_progress is not None:
+                    selection_progress({
+                        "substage": "COMPOSITION_SELECTION",
+                        "unit": "composition",
+                        "completed": event["completed"],
+                        "total": event["total"],
+                        "detail": f"profile {profile_id} MILP solve {event['completed']}",
+                    })
+
+            try:
+                ranked = _milp_ranked_compositions(
+                    slots,
+                    union,
+                    profile_campaign,
+                    profile,
+                    limit=min(combination_count, 2 * profile["max_candidates"]),
+                    progress=solve_progress,
+                )
+            except Exception as error:
+                return selection_failure(error)
+            work.extend((profile_campaign, composition) for composition in ranked)
+        warnings.append(f"{COMPOSITION_SELECTION_MILP}:COMBINATIONS={combination_count};EVALUATED={len(work)}")
+
+    for ordinal, (work_campaign, composition) in enumerate(work):
         composition_identity = tuple(
             (
                 str(row.get("symbol", "")).strip().upper(),
@@ -2069,7 +2365,7 @@ def build_portfolio_candidates(
         )
         result = _build_portfolio_candidates_single(
             composition,
-            campaign,
+            work_campaign,
             capacities=capacities,
             reference=reference,
             mark_prices=mark_prices,

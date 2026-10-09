@@ -41,7 +41,7 @@ from mrs3.panel_portfolio import (
 from mrs3.panel_jobs import PanelJobError, PanelJobRegistry
 from mrs3.config import DuckDBImportSettings
 from mrs3.performance_v2_store import PerformanceV2StoreError
-from mrs3.performance_v2_optimizer import OptimizerIntegrityError
+from mrs3.performance_v2_optimizer import OptimizerIntegrityError, PREPARATION_VERSION
 from mrs3.portfolio.config import WEIGHTED_SEARCH_DEFAULTS, PortfolioConfigError, migrate_portfolio_config_document
 from mrs3.portfolio.adapter import (
     CAMPAIGN_CONTRACT_VERSION,
@@ -922,6 +922,7 @@ def test_readiness_reports_exact_config_digest(tmp_path: Path) -> None:
     assert readiness["config_digest"] == digest
     assert readiness["schema_version"] == 3
     assert readiness["policy_version"] == "portfolio_optimizer_research_risk_v1"
+    assert readiness["combination_limit"] == json.loads(path.read_text(encoding="utf-8"))["search"]["max_enumerated_combinations"]
     assert "search" not in readiness
 
 
@@ -959,6 +960,112 @@ def test_readiness_requests_metadata_only_finalists(tmp_path: Path) -> None:
     assert readiness["available_pairs"] == ["BTCUSDT|LONG"]
     assert len(calls) == 1
     assert calls[0][-1] is False
+
+
+def test_readiness_blocks_stage1_when_metadata_reader_returns_no_finalists(tmp_path: Path) -> None:
+    path = tmp_path / "portfolio_optimizer.local.json"
+    _write_config(path)
+    with duckdb.connect(str(tmp_path / "performance.duckdb")) as connection:
+        connection.execute("create table selection_runs(symbol varchar, side varchar)")
+        connection.execute("insert into selection_runs values ('BTCUSDT', 'LONG')")
+    service = PortfolioPanelService(tmp_path, path, finalists_reader=lambda *_args: ())
+
+    readiness = service.readiness()
+
+    assert readiness["preparation"] == {"state": "READY", "required": 0, "ready": 0}
+    assert readiness["stage1"]["enabled"] is False
+    assert readiness["stage1"]["blockers"] == ["NO_FINALISTS"]
+
+
+def test_readiness_uses_lightweight_preparation_metadata_without_strict_artifact_audit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "portfolio_optimizer.local.json"
+    _write_config(path)
+    database = tmp_path / "performance.duckdb"
+    with duckdb.connect(str(database)):
+        pass
+    service = PortfolioPanelService(tmp_path, path)
+    monkeypatch.setattr(
+        service,
+        "_current_finalist_metadata",
+        lambda *_args, **_kwargs: (database, ["BTCUSDT|LONG"], {"BTCUSDT|LONG": 1}, (11,)),
+    )
+    monkeypatch.setattr(
+        service,
+        "_prepared_finalists_metadata_state",
+        lambda *_args, **_kwargs: {"state": "READY", "required": 1, "ready": 1},
+        raising=False,
+    )
+    monkeypatch.setattr(
+        service,
+        "_prepared_finalists_state",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("strict audit must not run in readiness")),
+    )
+
+    readiness = service.readiness()
+
+    assert readiness["preparation"] == {"state": "READY", "required": 1, "ready": 1}
+    assert readiness["stage1"]["enabled"] is True
+
+
+def test_prepared_finalists_metadata_state_does_not_decode_prepared_payload(tmp_path: Path) -> None:
+    database = tmp_path / "performance.duckdb"
+    with duckdb.connect(str(database)) as connection:
+        connection.execute(
+            """create table optimizer_prepared_inputs(
+                   result_id bigint,
+                   preparation_version varchar,
+                   availability_status varchar,
+                   unavailable_reason varchar,
+                   prepared_json varchar
+               )"""
+        )
+        connection.execute(
+            "insert into optimizer_prepared_inputs values (?, ?, 'AVAILABLE', null, 'not-json')",
+            [11, PREPARATION_VERSION],
+        )
+
+    state = PortfolioPanelService._prepared_finalists_metadata_state(database, (11,))
+
+    assert state == {"state": "READY", "required": 1, "ready": 1}
+
+
+def test_prepared_finalists_metadata_state_reports_missing_and_stale_rows(tmp_path: Path) -> None:
+    database = tmp_path / "performance.duckdb"
+    with duckdb.connect(str(database)) as connection:
+        connection.execute(
+            """create table optimizer_prepared_inputs(
+                   result_id bigint,
+                   preparation_version varchar,
+                   availability_status varchar,
+                   unavailable_reason varchar,
+                   prepared_json varchar
+               )"""
+        )
+        connection.execute(
+            "insert into optimizer_prepared_inputs values (11, 'old', 'AVAILABLE', null, '{}')"
+        )
+        connection.execute(
+            "insert into optimizer_prepared_inputs values (?, ?, 'UNAVAILABLE', 'MISSING_ACTIONS', null)",
+            [13, PREPARATION_VERSION],
+        )
+
+    assert PortfolioPanelService._prepared_finalists_metadata_state(database, (11, 12)) == {
+        "state": "NEEDS_PREPARATION",
+        "required": 2,
+        "ready": 0,
+    }
+    assert PortfolioPanelService._prepared_finalists_metadata_state(database, (11,)) == {
+        "state": "ERROR",
+        "required": 1,
+        "ready": 0,
+    }
+    assert PortfolioPanelService._prepared_finalists_metadata_state(database, (13,)) == {
+        "state": "ERROR",
+        "required": 1,
+        "ready": 0,
+    }
 
 
 def test_active_campaign_conflict_is_reported_before_source_snapshot(tmp_path: Path) -> None:
@@ -5350,3 +5457,42 @@ def test_http_results_partial_runtime_is_typed(tmp_path: Path) -> None:
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
+
+
+def test_combination_limit_count_is_visible_in_failed_campaign_status(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    adapter_result = SimpleNamespace(
+        status="FAIL",
+        variants=(),
+        blockers=("COMBINATION_LIMIT_EXCEEDED",),
+        excluded=(),
+        warnings=(),
+        diagnostics={"combination_count": 6, "combination_limit": 5},
+    )
+    monkeypatch.setattr(
+        "mrs3.portfolio.adapter.run_portfolio_adapter",
+        lambda *_args, **_kwargs: adapter_result,
+    )
+    config = tmp_path / "portfolio_optimizer.local.json"
+    digest = _write_config(config)
+    service = PortfolioPanelService(
+        tmp_path,
+        config,
+        finalists_reader=lambda *_: [_finalist()],
+    )
+    service.variant_generator = service._package_variant_generator
+    result = service.submit_campaign({
+        "pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}],
+        "profiles": [{"profile_id": "BALANCED", "bank_available_usdt": "10000", "max_candidates": 1}],
+        "expected_config_digest": digest,
+    })
+
+    job = _wait_stage1(service, result)
+    diagnostic = service.registry.runtime(result["job_id"])["diagnostics"][0]["message"]
+
+    assert job["status"] == "FAILED"
+    assert "COMBINATION_LIMIT_EXCEEDED" in diagnostic
+    assert "COMBINATIONS=6" in diagnostic
+    assert "LIMIT=5" in diagnostic

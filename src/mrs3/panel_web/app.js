@@ -4583,6 +4583,10 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
         const changed = job?.settings_changed_since_freeze === true || (state.configDigest && job?.config_digest && state.configDigest !== job.config_digest);
         if (changed) state.settingsChanged = true;
       };
+      const portfolioCombinationFactor = (value, available) => (Number.isSafeInteger(value) && value > 0 && Number.isSafeInteger(available) && available > 0 ? BigInt(Math.min(value, available)) : 1n);
+      const portfolioCombinationCount = (pairs) => pairs.reduce((total, row) => total
+        * portfolioCombinationFactor(row.long, row.finalistLong)
+        * portfolioCombinationFactor(row.short, row.finalistShort), 1n);
       const portfolioLaunchForm = () => {
         const rows = state.pairRows.map((row) => ({ ...row }));
         const byPair = new Map(rows.map((row) => [row.pair, row]));
@@ -4660,9 +4664,16 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
         const preparationState = state.readiness?.preparation?.state;
         if (formStatus && !state.locked) formStatus.textContent = launch.valid ? 'Кампания готова к фиксации.' : (launch.invalidPairLimits.length ? `Лимит превышает доступное число финалистов: ${launch.invalidPairLimits.join(', ')}.` : 'Заполните обязательные поля и исправьте недопустимые лимиты.');
         if (runButton) runButton.disabled = state.locked || !launch.valid;
+        const combinationNode = query('#portfolio-combination-count');
+        if (combinationNode) {
+          const combinations = launch.selectedPairs.length ? portfolioCombinationCount(launch.selectedPairs) : 0n;
+          const limit = state.readiness?.combination_limit;
+          const mode = !Number.isSafeInteger(limit) || combinations === 0n ? '' : (combinations <= BigInt(limit) ? ' · точный перебор всех составов' : ' · больше лимита: MILP-отбор лучших составов (до 2 × «Максимум кандидатов» на профиль), затем их точный расчёт');
+          combinationNode.textContent = combinations === 0n ? '' : `Комбинаций: ${combinations.toLocaleString('ru-RU')}${Number.isSafeInteger(limit) ? ` · лимит точного перебора: ${limit.toLocaleString('ru-RU')}` : ''}${mode}`;
+        }
         const jobTerminal = terminal(state.job);
         if (prepareButton) { prepareButton.textContent = preparationState === 'READY' ? 'Готово' : (preparationState === 'ERROR' ? 'Повторить' : 'Подготовить данные финалистов'); prepareButton.disabled = state.locked || preparationState === 'READY' || preparationState === 'PREPARING'; }
-        if (newButton) newButton.disabled = preparationState === 'PREPARING' || !state.locked || !jobTerminal;
+        if (newButton) newButton.disabled = preparationState === 'PREPARING' || !jobTerminal;
         if (cancelButton) cancelButton.disabled = !state.activeJobId || jobTerminal || ['CANCEL_REQUESTED', 'CANCELLING'].includes(statusOf(state.job));
         const stage2Ready = stage2Eligible();
         if (stage2Submit) {
@@ -4916,6 +4927,7 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
               state.activeJobId = ''; state.job = null; renderJob(null); setLocked(false);
               try { renderReadiness(await requestJson('/api/v2/portfolio/readiness')); } catch (_) { /* next refresh retains the server state. */ }
             }
+            else setLocked(false);
             updateControls();
           }
         } catch (_) { /* requestJson exposes the safe error while polling remains server-only. */ }
@@ -4924,7 +4936,7 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
       const recoverPortfolioJob = async (keepLocked = false) => {
         const active = await requestJson('/api/v2/portfolio/jobs/active'); const candidate = active.job;
         if (!candidate?.job_id) { state.activeJobId = ''; renderJob(null); if (!keepLocked) setLocked(false); window.clearInterval(state.poller); state.poller = 0; return; }
-        state.activeJobId = candidate.job_id; setLocked(true); await pollPortfolioJob(); if (!terminal(state.job)) startPortfolioPolling();
+        state.activeJobId = candidate.job_id; setLocked(!terminal(candidate)); await pollPortfolioJob(); if (terminal(state.job)) setLocked(false); else startPortfolioPolling();
       };
       const refreshPortfolio = async () => {
         if (state.refreshPromise) return state.refreshPromise;

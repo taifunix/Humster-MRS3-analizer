@@ -23,7 +23,7 @@ import warnings
 import numpy as np
 import psutil
 from scipy.optimize import OptimizeWarning
-from scipy.optimize import linprog
+from scipy.optimize import Bounds, LinearConstraint, linprog, milp
 from scipy.sparse import coo_matrix
 
 from mrs3._portfolio_process_worker import (
@@ -1419,43 +1419,23 @@ def _validated_lp_margin_coefficients(
     return a_values, b_values, mm_load
 
 
-def _solve_lp_unchecked(
-    normalized_delta: tuple[tuple[Decimal, ...], ...],
-    capacities: tuple[Decimal, ...],
-    coefficients: tuple[Decimal, ...],
+def _append_bank_constraints(
+    a_rows: list[int],
+    a_columns: list[int],
+    a_values: list[float],
+    b_ub: list[float],
+    cumulative: Sequence[Sequence[Decimal]],
     *,
+    n: int,
     max_dd: Decimal,
-    target: Decimal | None,
-    bank_available: Decimal | None,
-    maximize: bool,
-    margin_a: Sequence[Any] | None = None,
-    margin_b: Sequence[Any] | None = None,
-    max_mm_load: Any | None = None,
-    symbol_cap_groups: Mapping[str, Sequence[int]],
-    time_limit: Any = Decimal("30"),
-) -> _SolveOutcome:
-    t = len(normalized_delta)
-    n = len(capacities)
+    one_minus: Decimal,
+    margin_coefficients: tuple[tuple[Decimal, ...], tuple[Decimal, ...], Decimal] | None,
+) -> None:
+    """Append the shared bank/drawdown/margin rows over ``[bank, x(n), h(t)]``."""
     bank_index = 0
     x_start = 1
     h_start = 1 + n
-    size = 1 + n + t
-    c = [0.0] * size
-    if maximize:
-        c[x_start:x_start + n] = [-float(value) for value in coefficients]
-    else:
-        c[bank_index] = 1.0
-    margin_coefficients = _validated_lp_margin_coefficients(margin_a, margin_b, max_mm_load, n)
-    solver_time_limit = _decimal(time_limit, "time_limit", positive=True)
-    a_rows: list[int] = []
-    a_columns: list[int] = []
-    a_values: list[float] = []
-    b_ub: list[float] = []
-    with localcontext() as context:
-        context.prec = _precision_for(max_dd)
-        one_minus = Decimal(1) - max_dd
-    cumulative = _cumulative(normalized_delta, n)
-    for row, h_index in zip(cumulative, range(h_start, h_start + t)):
+    for row, h_index in zip(cumulative, range(h_start, h_start + len(cumulative))):
         # h_t >= g_t
         entries = [(x_start + index, float(value)) for index, value in enumerate(row)]
         entries.append((h_index, -1.0))
@@ -1499,6 +1479,48 @@ def _solve_lp_unchecked(
             ]),
             0.0,
         )
+
+
+def _solve_lp_unchecked(
+    normalized_delta: tuple[tuple[Decimal, ...], ...],
+    capacities: tuple[Decimal, ...],
+    coefficients: tuple[Decimal, ...],
+    *,
+    max_dd: Decimal,
+    target: Decimal | None,
+    bank_available: Decimal | None,
+    maximize: bool,
+    margin_a: Sequence[Any] | None = None,
+    margin_b: Sequence[Any] | None = None,
+    max_mm_load: Any | None = None,
+    symbol_cap_groups: Mapping[str, Sequence[int]],
+    time_limit: Any = Decimal("30"),
+) -> _SolveOutcome:
+    t = len(normalized_delta)
+    n = len(capacities)
+    bank_index = 0
+    x_start = 1
+    h_start = 1 + n
+    size = 1 + n + t
+    c = [0.0] * size
+    if maximize:
+        c[x_start:x_start + n] = [-float(value) for value in coefficients]
+    else:
+        c[bank_index] = 1.0
+    margin_coefficients = _validated_lp_margin_coefficients(margin_a, margin_b, max_mm_load, n)
+    solver_time_limit = _decimal(time_limit, "time_limit", positive=True)
+    a_rows: list[int] = []
+    a_columns: list[int] = []
+    a_values: list[float] = []
+    b_ub: list[float] = []
+    with localcontext() as context:
+        context.prec = _precision_for(max_dd)
+        one_minus = Decimal(1) - max_dd
+    cumulative = _cumulative(normalized_delta, n)
+    _append_bank_constraints(
+        a_rows, a_columns, a_values, b_ub, cumulative,
+        n=n, max_dd=max_dd, one_minus=one_minus, margin_coefficients=margin_coefficients,
+    )
     if target is not None:
         _append_sparse_constraint(
             a_rows,
@@ -1666,6 +1688,157 @@ def _solve_lp(*args: Any, **kwargs: Any) -> _SolveOutcome:
         return _solve_lp_unchecked(*args, **kwargs)
     except (ArithmeticError, ValueError, TypeError, RuntimeError):
         return _SolveOutcome("ERROR", reason="SOLVER_ERROR")
+
+
+@dataclass(frozen=True, slots=True)
+class RankedComposition:
+    """One slot choice from the composition MILP, best LP objective first."""
+
+    choice: tuple[int, ...]
+    p30: Decimal
+    active: tuple[int, ...] = ()
+    proven_optimal: bool = True
+
+
+def rank_slot_compositions(
+    normalized_delta: Sequence[Sequence[Any]],
+    capacities: Sequence[Any],
+    slots: Sequence[Sequence[int]],
+    *,
+    max_dd: Any,
+    common_days: Any,
+    bank_available: Any | None = None,
+    margin_a: Sequence[Any] | None = None,
+    margin_b: Sequence[Any] | None = None,
+    max_mm_load: Any | None = None,
+    limit: int,
+    time_limit: Any = Decimal("30"),
+    progress: Callable[[Mapping[str, Any]], Any] | None = None,
+) -> tuple[RankedComposition, ...]:
+    """Rank one-option-per-slot compositions by the discovery LP objective.
+
+    The model is the maximizing discovery LP of ``_solve_lp_unchecked`` over the
+    union of all slot options, plus one binary per option of a multi-option
+    slot: exactly one option is chosen per slot and an unchosen option has zero
+    weight. Each solution's positive-weight multi-option choices are excluded
+    by a no-good cut, so successive solves return the next best distinct
+    portfolio (not a zero-weight relabelling) until ``limit`` or exhaustion.
+    A time-limited solve keeps its feasible incumbent (``proven_optimal`` is
+    false) and ends the ranking; no solution at all raises
+    ``COMPOSITION_SELECTION_NO_SOLUTION``.
+    """
+    rows = tuple(tuple(_decimal(value, "normalized_delta") for value in row) for row in normalized_delta)
+    caps = tuple(_decimal(value, "capacity", nonnegative=True) for value in capacities)
+    n = len(caps)
+    if not rows or any(len(row) != n for row in rows):
+        raise ValueError("NORMALIZED_DELTA_SHAPE_MISMATCH")
+    slot_options = tuple(tuple(slot) for slot in slots)
+    flat = [column for slot in slot_options for column in slot]
+    if (
+        not slot_options
+        or any(not slot for slot in slot_options)
+        or any(type(column) is not int for column in flat)
+        or sorted(flat) != list(range(n))
+    ):
+        raise ValueError("COMPOSITION_SLOTS_INVALID")
+    if type(limit) is not int or limit <= 0:
+        raise ValueError("COMPOSITION_LIMIT_INVALID")
+    drawdown = _decimal(max_dd, "max_dd")
+    if not Decimal(0) < drawdown < Decimal(1):
+        raise ValueError("max_dd must be between zero and one")
+    days = _decimal(common_days, "common_days", positive=True)
+    available = None if bank_available is None else _decimal(bank_available, "bank_available", positive=True)
+    margin_coefficients = _validated_lp_margin_coefficients(margin_a, margin_b, max_mm_load, n)
+    solver_time_limit = float(_decimal(time_limit, "time_limit", positive=True))
+    coefficients = _coefficients(rows, n, days)
+    t = len(rows)
+    x_start = 1
+    z_start = 1 + n + t
+    binary_of: dict[int, int] = {}
+    for slot in slot_options:
+        if len(slot) > 1:
+            for column in slot:
+                binary_of[column] = z_start + len(binary_of)
+    size = z_start + len(binary_of)
+    a_rows: list[int] = []
+    a_columns: list[int] = []
+    a_values: list[float] = []
+    b_ub: list[float] = []
+    with localcontext() as context:
+        context.prec = _precision_for(drawdown)
+        one_minus = Decimal(1) - drawdown
+    _append_bank_constraints(
+        a_rows, a_columns, a_values, b_ub, _cumulative(rows, n),
+        n=n, max_dd=drawdown, one_minus=one_minus, margin_coefficients=margin_coefficients,
+    )
+    for column, z_index in binary_of.items():
+        # x_i <= C_i z_i
+        _append_sparse_constraint(
+            a_rows, a_columns, a_values, b_ub,
+            ((x_start + column, 1.0), (z_index, -float(caps[column]))),
+            0.0,
+        )
+    lower = [-np.inf] * len(b_ub)
+    for slot in slot_options:
+        if len(slot) > 1:
+            # exactly one option per slot
+            row_index = len(b_ub)
+            a_rows.extend([row_index] * len(slot))
+            a_columns.extend(binary_of[column] for column in slot)
+            a_values.extend([1.0] * len(slot))
+            b_ub.append(1.0)
+            lower.append(1.0)
+    c = np.zeros(size)
+    c[x_start:x_start + n] = [-float(value) for value in coefficients]
+    lb = np.zeros(size)
+    ub = np.full(size, np.inf)
+    lb[0] = 1.0
+    if available is not None:
+        ub[0] = float(available)
+    ub[x_start:x_start + n] = [float(value) for value in caps]
+    ub[z_start:] = 1.0
+    integrality = np.zeros(size)
+    integrality[z_start:] = 1
+    ranked: list[RankedComposition] = []
+    while len(ranked) < limit:
+        matrix = coo_matrix((a_values, (a_rows, a_columns)), shape=(len(b_ub), size), dtype=float).tocsr()
+        result = milp(
+            c,
+            constraints=LinearConstraint(matrix, np.asarray(lower), np.asarray(b_ub)),
+            bounds=Bounds(lb, ub),
+            integrality=integrality,
+            options={"time_limit": solver_time_limit, "mip_rel_gap": 1e-9},
+        )
+        status = getattr(result, "status", None)
+        if progress is not None:
+            progress({"completed": len(ranked) + 1, "total": limit, "status": status})
+        if status not in (0, 1) or result.x is None:
+            break
+        values = result.x
+        choice = tuple(
+            slot[0] if len(slot) == 1 else max(slot, key=lambda column: (values[binary_of[column]], -column))
+            for slot in slot_options
+        )
+        x = tuple(min(caps[column], max(Decimal(0), Decimal(str(values[x_start + column])))) for column in range(n))
+        with localcontext() as context:
+            context.prec = _precision_for(coefficients, x)
+            p30 = _sum_products(coefficients, x)
+        chosen = [
+            column for slot, column in zip(slot_options, choice)
+            if len(slot) > 1 and values[x_start + column] > 1e-7 * max(1.0, float(caps[column]))
+        ]
+        ranked.append(RankedComposition(choice, p30, tuple(chosen), status == 0))
+        if not chosen or status != 0:
+            break
+        row_index = len(b_ub)
+        a_rows.extend([row_index] * len(chosen))
+        a_columns.extend(binary_of[column] for column in chosen)
+        a_values.extend([1.0] * len(chosen))
+        b_ub.append(float(len(chosen) - 1))
+        lower.append(-np.inf)
+    if not ranked:
+        raise ValueError("COMPOSITION_SELECTION_NO_SOLUTION")
+    return tuple(ranked)
 
 
 def _cdar_money(drawdowns: Sequence[Any], tail_fraction: Any) -> Decimal:
@@ -4582,4 +4755,5 @@ __all__ = [
     "WEIGHTED_V1", "LimiterReplayResult", "derive_priorities", "priority_details",
     "replay_limiter", "bank_for_path", "evaluate_weighted_path", "weighted_search",
     "nearest_rank", "stationary_bootstrap_indices", "bootstrap_banks",
+    "RankedComposition", "rank_slot_compositions",
 ]

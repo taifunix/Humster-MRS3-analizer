@@ -1005,3 +1005,71 @@ current finalist set. Until READY, Calculate is disabled. During PREPARING all
 three Stage 1 actions are disabled. Campaign creation repeats the READY check;
 it never fills the prepared-input cache implicitly. A replaced current result
 therefore cannot borrow the prior revision's prepared data.
+
+### Lightweight readiness and terminal Campaign editing amendment (2026-10-09)
+
+`GET /api/v2/portfolio/readiness` is a metadata-only UI query. It may read the
+current FINALIST identities/counts and the small `optimizer_prepared_inputs`
+row headers needed to distinguish missing, available, and invalid preparation,
+but it must not load or decode `prepared_json`, `strategy_actions`, or
+`strategy_equity`. The strict preparation version/source digest/artifact check
+remains mandatory in both explicit `POST /api/v2/portfolio/finalist-inputs`
+handling and Campaign creation before a job is admitted. A lightweight READY
+response is therefore permission to edit the form, not proof that the later
+strict snapshot will succeed.
+
+Startup recovery may return the latest terminal Stage 1/Stage 2 Campaign so its
+status and results remain visible. `SUCCEEDED`, `FAILED`, `CANCELLED`, and
+`INTERRUPTED` jobs do not freeze the Stage 1 form; only a nonterminal active job
+does. The operator can immediately change pairs/profiles and submit a new
+Campaign without first pressing `New calculation`. The button still clears the
+displayed terminal Campaign when an empty result view is desired.
+
+### Combination-limit failure detail amendment (2026-10-09)
+
+When exact weighted finalist composition enumeration exceeds
+`search.max_enumerated_combinations`, the failed Campaign keeps the stable
+`COMBINATION_LIMIT_EXCEEDED` blocker and displays both the exact computed
+composition count and configured limit in its persisted error message. The
+count is the product of the eligible, cutoff finalist pools actually used by
+the server; it is not a UI estimate or the number of generated candidates.
+
+### MILP composition selection amendment (2026-10-10)
+
+Decision: [ADR-0066](../decisions/0066-portfolio-milp-composition-selection.md).
+This amendment supersedes the fail-closed overflow above and the
+Calculate-blocking part of the 2026-09-24 combination preflight.
+
+- Goal: a Campaign with any finalist universe size finishes in bounded time
+  without abandoning the exact evaluation of the portfolios it returns.
+- Non-goals: no change to the exact single-composition search, ranking,
+  retention, `max_candidates`, Stage 2, Settings schema, or PerformanceDB.
+- Input: the cutoff slot pools (product size `N`),
+  `search.max_enumerated_combinations` (`M`), and each launch profile.
+- `N <= M`: exhaustive enumeration in product order, unchanged.
+- `N > M`: per profile, `rank_slot_compositions` returns up to
+  `min(N, 2 × max_candidates)` distinct portfolios, best by the discovery-LP
+  objective first. It is one MILP over the union of slot options, with exactly
+  one option per slot. A no-good cut over the positive-weight choices is added
+  after each solve, and each solve is limited by
+  `weighted_search.wall_time_seconds`. Each returned composition is evaluated
+  by the exact path for that profile only. The result carries the warning
+  `COMPOSITION_SELECTION_MILP:COMBINATIONS=N;EVALUATED=<count>`.
+- The union of slot options is assembled once per Campaign. Its common UTC
+  grid must cover `minimum_common_days`. A time-limited solve keeps its feasible
+  incumbent and ends that profile's ranking. Each solve emits a
+  `COMPOSITION_SELECTION` progress event.
+- Selector failure: blocker `COMPOSITION_SELECTION_UNAVAILABLE:<code>`. This
+  includes a profile with no MILP solution, a short union grid, and a duplicate
+  strategy inside one slot. The Panel message keeps `COMBINATIONS=N; LIMIT=M`.
+- Readiness adds `combination_limit` (`M`, or `null` when unavailable). Below
+  the pair table the form shows `Комбинаций: N · лимит точного перебора: M` and
+  the mode that will run. Calculate is not disabled by `N`.
+- Invariants: no prepared input ever contains two members of one Pair + Side,
+  because the union is assembled from valid layer compositions cut to their
+  common UTC grid. The MILP output is a selector, never a published metric.
+- Acceptance evidence: on small universes the MILP order equals exhaustive
+  `_solve_lp` maximization, with and without margin bounds. Zero-weight
+  relabellings are not repeated. The adapter evaluates only the selected
+  compositions per profile. On the real 117-finalist snapshot (4·10^14
+  compositions), one solve takes 9–60 s.
