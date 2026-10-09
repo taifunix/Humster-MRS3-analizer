@@ -1,6 +1,6 @@
 # MRS3 Current Status
 
-Last updated: 2026-10-08
+Last updated: 2026-10-09
 
 This file is a current-status snapshot, not a session log. Earlier progress notes remain in Git history; feature contracts and detailed evidence belong in the linked specs, reports, and plans.
 
@@ -15,6 +15,14 @@ The maintenance card is implemented in the Strategy and DD5 tab. It supports pai
 Retirement verification after the expansion: maintenance 52 passed, selection 239 passed, importer 120 passed, XLSX export 11 passed, and the Panel discarded-catalog check passed; `node --check src/mrs3/panel_web/app.js`, `py_compile`, and `git diff --check` passed. All database tests used isolated temporary DuckDB fixtures; no live PerformanceDB or Panel process was used.
 
 The legacy v6-to-v7 migration fix and the narrowly scoped recovery for the known v9 catalog error are included. The feature contract is [PerformanceDB maintenance](docs/specs/2026-10-06-performance-db-maintenance.md). Independent Claude Opus review passed. Focused migration, maintenance, static UI, and Panel HTTP checks passed. No live PerformanceDB was accessed or modified during verification.
+On 2026-10-08 a live reproduction with only `AALUSDT` selected showed that
+Rejected preview memory growth came from a repeated correlated residual check,
+not from the selected pair set. The residual recovery lookup is now one
+set-based query. The focused regression and full maintenance suite passed:
+`60 passed`; an isolated AAL preview completed in `0.79 s` with a 4 GB DuckDB
+memory limit. The Panel process was stopped after the reproduction; no live
+database rows were changed.
+
 ## Performance v2 selection and equity regime
 
 The Performance v2 fixed-filter sequence is implemented and independently

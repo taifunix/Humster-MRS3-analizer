@@ -266,3 +266,9 @@ schema validation and the symbol lookup. The audited `catalog()` helper remains
 available for integrity checks and tests, but it is not called while loading
 the UI picker. Loading the maintenance screen must therefore not scan the
 large fact tables before the user requests a preview.
+
+Rejected preview residual recovery uses one set-based lookup over the selected
+discarded strategy IDs and their result owners. It must not repeat correlated
+`EXISTS` predicates for every detail table when counting residual work; this
+keeps the preview bounded for pairs with large equity/action tables while
+preserving the same retry behavior for interrupted retirement.

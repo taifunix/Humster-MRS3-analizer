@@ -434,6 +434,20 @@ def test_preview_skips_global_reachability_audit(
     assert preview["symbols"] == ["BTCUSDT"]
 
 
+def test_rejected_preview_uses_one_set_based_residual_lookup(maintenance_db: Path) -> None:
+    with duckdb.connect(str(maintenance_db), read_only=True) as connection:
+        recorder = _RecordingConnection(connection)
+        create_preview(recorder, ["BTCUSDT"], "rejected")
+
+    residual_queries = [
+        sql.casefold()
+        for sql in recorder.sql
+        if "lifecycle_status = 'discarded'" in sql.casefold()
+    ]
+    assert len(residual_queries) == 1
+    assert all("exists (select 1 from strategy_equity" not in sql for sql in residual_queries)
+
+
 def test_schema_table_classifier_rejects_duplicate_declarations(
     maintenance_db: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

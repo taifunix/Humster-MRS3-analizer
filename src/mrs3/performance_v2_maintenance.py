@@ -33,19 +33,6 @@ _REJECTED_TABLES = (
     "optimizer_prepared_inputs", "equity_quality_metrics",
     "strategy_tags", "strategy_rejection_sources",
 )
-_REJECTED_RESIDUAL_EXISTS = {
-    "selection_review_rows": "exists (select 1 from selection_review_rows where strategy_id = strategies.strategy_id)",
-    "selection_results": "exists (select 1 from selection_results where strategy_id = strategies.strategy_id)",
-    "strategy_actions": "exists (select 1 from strategy_actions facts where facts.result_id in (select result_id from strategy_results where strategy_id = strategies.strategy_id union all select strategies.current_result_id))",
-    "strategy_equity": "exists (select 1 from strategy_equity facts where facts.result_id in (select result_id from strategy_results where strategy_id = strategies.strategy_id union all select strategies.current_result_id))",
-    "window_metrics": "exists (select 1 from window_metrics facts where facts.result_id in (select result_id from strategy_results where strategy_id = strategies.strategy_id union all select strategies.current_result_id))",
-    "optimizer_prepared_inputs": "exists (select 1 from optimizer_prepared_inputs facts where facts.result_id in (select result_id from strategy_results where strategy_id = strategies.strategy_id union all select strategies.current_result_id))",
-    "equity_quality_metrics": "exists (select 1 from equity_quality_metrics facts where facts.result_id in (select result_id from strategy_results where strategy_id = strategies.strategy_id union all select strategies.current_result_id))",
-    "strategy_tags": "exists (select 1 from strategy_tags where strategy_id = strategies.strategy_id)",
-    "strategy_rejection_sources": "exists (select 1 from strategy_rejection_sources where strategy_id = strategies.strategy_id)",
-}
-if set(_REJECTED_RESIDUAL_EXISTS) != set(_REJECTED_TABLES):
-    raise RuntimeError("rejected retirement residual map must cover every deleted table")
 _GLOBAL_JOURNAL_TABLES = frozenset({"import_files", "import_runs"})
 _PRESERVED_METADATA_TABLES = frozenset({"schema_info"})
 _LEGACY_V7_RESULTS_TABLE = "__performance_v2_v7_strategy_results"
@@ -245,6 +232,79 @@ def _ids_by_symbol(
     ).fetchall():
         grouped[str(symbol)].append(int(identifier))
     return grouped
+
+
+def _discarded_strategy_ids_with_residuals(
+    connection: duckdb.DuckDBPyConnection,
+    strategy_ids: Sequence[int],
+) -> set[int]:
+    """Find discarded strategies that still own removable detail rows.
+
+    Keep this as one set-based query.  The previous correlated ``EXISTS``
+    expression was repeated for every selected strategy and every detail
+    table; on a large equity table DuckDB could materialize that plan for
+    minutes and consume the machine's memory before the preview appeared.
+    """
+    if not strategy_ids:
+        return set()
+    rows = connection.execute(
+        """
+        with selected as (
+            select strategy_id
+              from strategies
+             where strategy_id in (select unnest(?::bigint[]))
+               and lifecycle_status = 'DISCARDED'
+        ), result_owner as (
+            select results.strategy_id, results.result_id
+              from strategy_results results
+              join selected using (strategy_id)
+            union
+            select selected.strategy_id, strategies.current_result_id
+              from selected
+              join strategies using (strategy_id)
+             where strategies.current_result_id is not null
+        ), residual_strategy_ids as (
+            select rows.strategy_id
+              from selection_review_rows rows
+              join selected using (strategy_id)
+            union
+            select rows.strategy_id
+              from selection_results rows
+              join selected using (strategy_id)
+            union
+            select owners.strategy_id
+              from strategy_actions facts
+              join result_owner owners using (result_id)
+            union
+            select owners.strategy_id
+              from strategy_equity facts
+              join result_owner owners using (result_id)
+            union
+            select owners.strategy_id
+              from window_metrics facts
+              join result_owner owners using (result_id)
+            union
+            select owners.strategy_id
+              from optimizer_prepared_inputs facts
+              join result_owner owners using (result_id)
+            union
+            select owners.strategy_id
+              from equity_quality_metrics facts
+              join result_owner owners using (result_id)
+            union
+            select tags.strategy_id
+              from strategy_tags tags
+              join selected using (strategy_id)
+            union
+            select sources.strategy_id
+              from strategy_rejection_sources sources
+              join selected using (strategy_id)
+        )
+        select strategy_id from residual_strategy_ids
+        """,
+        [list(strategy_ids)],
+    ).fetchall()
+    return {int(row[0]) for row in rows}
 
 
 def _check_selection_ownership(
@@ -468,35 +528,23 @@ def create_preview(
         # interrupted after archiving, a DISCARDED tombstone with residual
         # operational rows is still valid cleanup work even though it no
         # longer resolves through the active User Status union.
-        residual_sql = " or ".join(_REJECTED_RESIDUAL_EXISTS[table] for table in _REJECTED_TABLES)
-        residual_discarded_ids = {
-            int(row[0]) for row in connection.execute(
-                f"""select distinct strategies.strategy_id
-                     from strategies
-                    where strategies.strategy_id in (select unnest(?::bigint[]))
-                      and strategies.lifecycle_status = 'DISCARDED'
-                      and ({residual_sql})""",
-                [strategy_ids],
-            ).fetchall()
-        }
+        residual_discarded_ids = _discarded_strategy_ids_with_residuals(connection, strategy_ids)
         rejected_ids.update(residual_discarded_ids)
         # Retirement applies to every matching rejected strategy, including a
         # row whose large detail facts were already removed by an earlier run.
         # The detail-table scan below remains limited to physical rows that
         # still exist, while this complete set drives the lifecycle update.
         discarded_ids = set(rejected_ids)
-        for symbol, count in connection.execute(
-            f"""select strategies.symbol, count(distinct strategies.strategy_id)
-                 from strategies
-                 where strategies.strategy_id in (select unnest(?::bigint[]))
-                   and (
-                       strategies.lifecycle_status = 'ACTIVE'
-                        or ({residual_sql})
-                   )
-                group by strategies.symbol""",
-            [sorted(rejected_ids)],
-        ).fetchall():
-            rejected_strategy_counts[str(symbol)] = int(count)
+        if rejected_ids:
+            statuses = connection.execute(
+                """select strategy_id, symbol, lifecycle_status
+                     from strategies
+                    where strategy_id in (select unnest(?::bigint[]))""",
+                [sorted(rejected_ids)],
+            ).fetchall()
+            for strategy_id, symbol, lifecycle_status in statuses:
+                if str(lifecycle_status) == "ACTIVE" or int(strategy_id) in residual_discarded_ids:
+                    rejected_strategy_counts[str(symbol)] += 1
     targets = {
         "operation": operation,
         "symbols": list(selected),
