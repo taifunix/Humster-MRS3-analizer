@@ -10,6 +10,7 @@ from pathlib import Path
 from threading import RLock
 import tempfile
 import time
+from typing import Any
 from uuid import uuid4
 
 
@@ -23,6 +24,18 @@ _TRANSITIONS = {
 _WINDOWS_REPLACE_RETRIES = 5
 _WINDOWS_REPLACE_RETRY_DELAY_SECONDS = 0.1
 _WINDOWS_TRANSIENT_REPLACE_ERRORS = frozenset({5, 32, 33})
+# Runtime values written once and then only read. They are shared by reference
+# between runtime copies instead of being JSON round-tripped on every progress
+# update (a frozen portfolio Campaign is tens of megabytes). Callers must copy
+# before mutating a shared value; an in-place edit would change registry state.
+_SHARED_RUNTIME_KEYS = frozenset({"campaign"})
+
+
+def _copy_runtime(value: dict) -> dict:
+    shared = {key: value[key] for key in _SHARED_RUNTIME_KEYS if key in value}
+    copied = json.loads(json.dumps({key: item for key, item in value.items() if key not in shared}))
+    copied.update(shared)
+    return copied
 
 
 class PanelJobError(ValueError):
@@ -146,14 +159,17 @@ class PanelJobRegistry:
         # Portfolio Campaign inputs live in their own verified gzip snapshot.
         # Keep the in-process compatibility copy for old callers, but never
         # write that payload into the shared journal.
-        persisted = json.loads(json.dumps(self.jobs))
-        for job in persisted.values():
+        persisted: dict[str, Any] = {}
+        for job_id, job in self.jobs.items():
             runtime = job.get("runtime")
-            if isinstance(runtime, dict) and isinstance(runtime.get("campaign_snapshot"), dict):
-                runtime.pop("campaign", None)
+            if isinstance(runtime, dict) and "campaign" in runtime and isinstance(runtime.get("campaign_snapshot"), dict):
+                # The frozen Campaign is never serialized here, not even to be dropped.
+                job = {**job, "runtime": {key: value for key, value in runtime.items() if key != "campaign"}}
+            persisted[job_id] = job
+        encoded = json.dumps(persisted, sort_keys=True, separators=(",", ":"))
         try:
             with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=self.journal.parent, delete=False) as handle:
-                json.dump(persisted, handle, sort_keys=True, separators=(",", ":"))
+                handle.write(encoded)
                 handle.flush()
                 os.fsync(handle.fileno())
                 temporary = Path(handle.name)
@@ -420,7 +436,7 @@ class PanelJobRegistry:
             if runtime is not None:
                 if not isinstance(runtime, dict):
                     raise PanelJobError("INVALID_REQUEST")
-                candidate["runtime"] = json.loads(json.dumps(runtime))
+                candidate["runtime"] = _copy_runtime(runtime)
             if skip_save_if_unchanged and candidate == job and not self._journal_dirty:
                 return self._copy(job)
             job.clear()
@@ -437,7 +453,7 @@ class PanelJobRegistry:
             if job is None:
                 raise PanelJobError("NOT_FOUND")
             value = job.get("runtime", {})
-            return json.loads(json.dumps(value)) if isinstance(value, dict) else {}
+            return _copy_runtime(value) if isinstance(value, dict) else {}
 
     def recover_interrupted(self) -> bool:
         """Durably project every nonterminal job to the existing restart state."""

@@ -752,3 +752,55 @@ def test_registry_failed_submit_does_not_reserve_resource_in_memory(tmp_path, mo
 
     assert registry.list() == []
     assert not path.exists()
+
+
+class _NotSerializable:
+    """A frozen Campaign stand-in that fails if anything tries to JSON-serialize it."""
+
+
+def test_registry_keeps_snapshotted_campaign_by_reference_and_out_of_the_journal(tmp_path):
+    path = tmp_path / "jobs.json"
+    registry = PanelJobRegistry(path)
+    job = registry.submit("portfolio.stage1", {}, "campaign-reference", job_id="stage1")
+    registry.reserve_runtime("stage1", "campaign_snapshot", {"campaign_id": "c1", "state": "available"})
+    registry.reserve_runtime("stage1", "campaign", {"campaign_id": "c1"})
+    frozen = _NotSerializable()
+    registry.jobs["stage1"]["runtime"]["campaign"] = frozen
+
+    runtime = registry.runtime("stage1")
+    assert runtime["campaign"] is frozen
+    runtime["optimizer_progress"] = {"completed": 1}
+    registry.transition("stage1", "RUNNING")
+    registry.sync("stage1", {"state": "RUNNING"}, runtime=runtime)
+
+    assert registry.runtime("stage1")["campaign"] is frozen
+    assert registry.runtime("stage1")["optimizer_progress"] == {"completed": 1}
+    persisted = json.loads(path.read_text(encoding="utf-8"))
+    assert "campaign" not in persisted["stage1"]["runtime"]
+    assert persisted["stage1"]["runtime"]["campaign_snapshot"]["campaign_id"] == "c1"
+
+
+def test_registry_runtime_copies_are_independent_except_the_frozen_campaign(tmp_path):
+    registry = PanelJobRegistry(tmp_path / "jobs.json")
+    registry.submit("portfolio.stage1", {}, "campaign-copy", job_id="stage1")
+    registry.reserve_runtime("stage1", "journal", [{"code": "A"}])
+    registry.reserve_runtime("stage1", "campaign", {"campaign_id": "legacy"})
+
+    first = registry.runtime("stage1")
+    first["journal"].append({"code": "B"})
+
+    assert registry.runtime("stage1")["journal"] == [{"code": "A"}]
+    # Without a snapshot descriptor the legacy embedded Campaign is still persisted.
+    persisted = json.loads((tmp_path / "jobs.json").read_text(encoding="utf-8"))
+    assert persisted["stage1"]["runtime"]["campaign"] == {"campaign_id": "legacy"}
+
+
+def test_registry_failed_serialization_leaves_no_temporary_file(tmp_path):
+    registry = PanelJobRegistry(tmp_path / "jobs.json")
+    registry.submit("testing.local", {}, "bad-payload", job_id="bad")
+    registry.jobs["bad"]["runtime"] = {"private": _NotSerializable()}
+
+    with pytest.raises(TypeError):
+        registry._save()
+
+    assert sorted(item.name for item in tmp_path.iterdir()) == ["jobs.json"]

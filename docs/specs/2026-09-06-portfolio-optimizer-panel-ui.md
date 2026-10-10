@@ -1087,3 +1087,16 @@ change every real lot-model Campaign failed post-search with
 `WEIGHTED_EXECUTABLE_IDENTITY_INVALID`, because those two fields were not JSON
 serializable. Acceptance: a regression test binds the Decimal V25/A15 values,
 and a real 61-pair Campaign passes the identity stage.
+
+### Job-journal persistence cost amendment (2026-10-10)
+
+A running Stage 1 job keeps its frozen Campaign (tens of MB) in
+`runtime["campaign"]` next to `campaign_snapshot`. Progress and journal updates
+used to JSON round-trip that Campaign in `runtime()` and `sync()`, then
+serialize it once more in `_save` only to drop it. That cost about 2.3 s per
+update with a 16 MB Campaign, inside the calculation thread. The registry now
+shares `runtime["campaign"]` by reference between runtime copies, since it is
+written once at admission and only read afterwards. `_save` never serializes a
+Campaign that has a snapshot descriptor; a legacy Campaign without a
+descriptor is still persisted. Every other runtime key keeps its deep copy.
+Measured with the real 14 MB journal: 2.26 s → 0.16 s per progress update.
