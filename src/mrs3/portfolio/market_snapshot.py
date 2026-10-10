@@ -26,9 +26,21 @@ class MarketSnapshotError(ValueError):
 class ApiRateLimiter:
     """One injected, persisted limiter for all market-reference requests."""
 
-    def __init__(self, state_path: str | Path | None = None, *, clock: Callable[[], datetime] | None = None, sleep: Callable[[float], None] | None = None) -> None:
+    def __init__(
+        self,
+        state_path: str | Path | None = None,
+        *,
+        clock: Callable[[], datetime] | None = None,
+        sleep: Callable[[float], None] | None = None,
+        min_interval_seconds: float = 0.1,
+    ) -> None:
         if state_path is None:
             raise MarketSnapshotError("persisted limiter state_path is required")
+        if isinstance(min_interval_seconds, bool) or not isinstance(min_interval_seconds, (int, float)) or not 0 < min_interval_seconds <= 60:
+            raise ValueError("min_interval_seconds must be within (0, 60]")
+        # Bybit public market endpoints allow 600 requests per 5 s per IP; 10/s
+        # keeps a wide margin while 429/403 still trigger retry and cooldown.
+        self.min_interval = timedelta(seconds=float(min_interval_seconds))
         self.state_path = Path(state_path)
         self.clock = clock or (lambda: datetime.now(timezone.utc))
         self.sleep = sleep or __import__("time").sleep
@@ -130,7 +142,7 @@ class ApiRateLimiter:
                 delay = max(0.0, (self._next_allowed - now).total_seconds())
                 if delay:
                     self.sleep(delay)
-                self._next_allowed = self._now() + timedelta(seconds=0.5)
+                self._next_allowed = self._now() + self.min_interval
                 try:
                     payload = fetcher(feed, params)
                 except Exception as error:
@@ -166,10 +178,11 @@ class MarketSnapshot:
     content_digest: str
 
 
-def _http_fetch(feed: str, params: Mapping[str, str]) -> Mapping[str, Any]:
+def _http_fetch(feed: str, params: Mapping[str, str], client: Any = None) -> Mapping[str, Any]:
     import httpx
 
-    response = httpx.get(f"{BASE_URL}/{feed}", params=dict(params), timeout=30.0)
+    url = f"{BASE_URL}/{feed}"
+    response = client.get(url, params=dict(params)) if client is not None else httpx.get(url, params=dict(params), timeout=30.0)
     response.raise_for_status()
     payload = response.json()
     if not isinstance(payload, Mapping):
@@ -249,46 +262,58 @@ def load_market_snapshot(
 
     if fetcher is None and limiter is None:
         raise MarketSnapshotError("default market fetcher requires a persisted API limiter")
-    get = fetcher or _http_fetch
+    client = None
+    if fetcher is None:
+        import httpx
+
+        # One keep-alive client: a TLS context per request dominated the cost.
+        client = httpx.Client(timeout=30.0)
+        get = lambda feed, params: _http_fetch(feed, params, client)
+    else:
+        get = fetcher
     if limiter is not None:
         raw_get = get
         get = lambda feed, params: limiter.call(raw_get, feed, params)
-    instruments: list[Mapping[str, Any]] = []
-    risk_tiers: list[Mapping[str, Any]] = []
-    marks: dict[str, Decimal] = {}
     try:
-        for symbol in sorted(values):
-            active = [
-                item
-                for item in _pages(get, "instruments-info", symbol)
-                if item.get("status") == "Trading" and item.get("contractType") == "LinearPerpetual"
-            ]
-            if len(active) != 1:
-                raise MarketSnapshotError(f"{symbol} must have exactly one active LinearPerpetual instrument")
-            tiers = _pages(get, "risk-limit", symbol)
-            if not tiers:
-                raise MarketSnapshotError(f"{symbol} must have at least one risk tier")
-            instruments.extend(active)
-            risk_tiers.extend(tiers)
-            marks[symbol] = _mark_price(get, symbol)
-        reference = ReferenceReader.from_records(
-            instruments=instruments, risk_tiers=risk_tiers, captured_at_ms=captured_at_ms
-        )
-    except MarketSnapshotError:
-        raise
-    except Exception as exc:
-        raise MarketSnapshotError(f"market snapshot fetch failed: {exc}") from exc
+        instruments: list[Mapping[str, Any]] = []
+        risk_tiers: list[Mapping[str, Any]] = []
+        marks: dict[str, Decimal] = {}
+        try:
+            for symbol in sorted(values):
+                active = [
+                    item
+                    for item in _pages(get, "instruments-info", symbol)
+                    if item.get("status") == "Trading" and item.get("contractType") == "LinearPerpetual"
+                ]
+                if len(active) != 1:
+                    raise MarketSnapshotError(f"{symbol} must have exactly one active LinearPerpetual instrument")
+                tiers = _pages(get, "risk-limit", symbol)
+                if not tiers:
+                    raise MarketSnapshotError(f"{symbol} must have at least one risk tier")
+                instruments.extend(active)
+                risk_tiers.extend(tiers)
+                marks[symbol] = _mark_price(get, symbol)
+            reference = ReferenceReader.from_records(
+                instruments=instruments, risk_tiers=risk_tiers, captured_at_ms=captured_at_ms
+            )
+        except MarketSnapshotError:
+            raise
+        except Exception as exc:
+            raise MarketSnapshotError(f"market snapshot fetch failed: {exc}") from exc
 
-    prices = MappingProxyType(dict(sorted(marks.items())))
-    digest = _digest(
-        {
-            "captured_at_ms": captured_at_ms,
-            "reference_digest": reference.content_digest,
-            "mark_prices": prices,
-        },
-        schema_id="portfolio_market_snapshot_v1",
-    )
-    return MarketSnapshot(reference, prices, captured_at_ms, digest)
+        prices = MappingProxyType(dict(sorted(marks.items())))
+        digest = _digest(
+            {
+                "captured_at_ms": captured_at_ms,
+                "reference_digest": reference.content_digest,
+                "mark_prices": prices,
+            },
+            schema_id="portfolio_market_snapshot_v1",
+        )
+        return MarketSnapshot(reference, prices, captured_at_ms, digest)
+    finally:
+        if client is not None:
+            client.close()
 
 
 __all__ = ["ApiRateLimiter", "MarketSnapshot", "MarketSnapshotError", "load_market_snapshot"]

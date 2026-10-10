@@ -313,3 +313,66 @@ def test_shared_api_limiter_rejects_malformed_persisted_cooldown(tmp_path):
 
     with pytest.raises(MarketSnapshotError, match="persisted"):
         ApiRateLimiter(state, clock=lambda: datetime(2026, 1, 1, tzinfo=timezone.utc), sleep=lambda _seconds: None)
+
+
+def test_default_fetcher_reuses_one_http_client_and_closes_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    import httpx
+
+    fetch, calls = fetcher_for(("BTCUSDT", "ETHUSDT"))
+    clients: list["FakeClient"] = []
+
+    class FakeResponse:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self.payload
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.closed = False
+            self.gets = 0
+            clients.append(self)
+
+        def get(self, url, params=None):
+            self.gets += 1
+            return FakeResponse(fetch(url.rsplit("/", 1)[1], params))
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(httpx, "Client", FakeClient)
+    monkeypatch.setattr(httpx, "get", lambda *_args, **_kwargs: pytest.fail("per-request client"))
+
+    class Limiter:
+        def call(self, raw_fetch, feed, params):
+            return raw_fetch(feed, params)
+
+    snapshot = load_market_snapshot(("ETHUSDT", "BTCUSDT"), captured_at_ms=1, limiter=Limiter())  # type: ignore[arg-type]
+
+    assert snapshot.mark_prices == {"BTCUSDT": Decimal("50000"), "ETHUSDT": Decimal("3000")}
+    assert len(clients) == 1 and clients[0].closed and clients[0].gets == len(calls) == 6
+
+
+def test_shared_api_limiter_spaces_requests_by_its_minimum_interval(tmp_path):
+    now = [datetime(2026, 1, 1, tzinfo=timezone.utc)]
+    sleeps: list[float] = []
+    sleep = lambda seconds: (sleeps.append(seconds), now.__setitem__(0, now[0] + timedelta(seconds=seconds)))
+    ok = lambda *_: {"retCode": 0}
+
+    limiter = ApiRateLimiter(tmp_path / "a.json", clock=lambda: now[0], sleep=sleep)
+    limiter.call(ok, "tickers", {})
+    limiter.call(ok, "tickers", {})
+    assert sleeps == [pytest.approx(0.1)]
+
+    sleeps.clear()
+    slow = ApiRateLimiter(tmp_path / "b.json", clock=lambda: now[0], sleep=sleep, min_interval_seconds=0.5)
+    slow.call(ok, "tickers", {})
+    slow.call(ok, "tickers", {})
+    assert sleeps == [pytest.approx(0.5)]
+    with pytest.raises(ValueError):
+        ApiRateLimiter(tmp_path / "c.json", min_interval_seconds=0)

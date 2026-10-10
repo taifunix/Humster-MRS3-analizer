@@ -527,3 +527,14 @@ separately, the user authorized a bounded local-only off-only tester baseline
 on 2026-09-21. No tester run or result is complete, and execution remains gated
 by implementation, focused tests, and review. Exchange actions, trading, and
 production PerformanceDB writes are not authorized.
+
+## Throughput and solver-robustness amendment (2026-10-10)
+
+Measured on the real 61-pair snapshot and a 81-strategy synthetic composition.
+
+- **Market reference.** One keep-alive HTTP client serves a whole snapshot
+  load. Requests stay sequential (concurrency 1) through the shared persisted
+  limiter, but the spacing is now 10 requests/sec (`min_interval_seconds=0.1`,
+  configurable) instead of the initial 2/sec. Bybit's public market endpoints
+  allow 600 requests per 5 s per IP. Retry, 429/10006 handling and the 10 min
+  persisted 403 cooldown are unchanged. Measured on 10 symbols: 14.9 s → 6.0 s.
