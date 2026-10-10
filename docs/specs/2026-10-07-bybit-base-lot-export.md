@@ -42,11 +42,15 @@ and converted through the existing validated backfill path.
 
 Columns A and B (pair and listing date) remain unchanged. On first run, the
 recognized legacy layout (`Actual!D1` is `Дата актуализации`) is replaced by
-ten size columns C:L for the latest ten UTC dates, oldest to newest. Each date
-is the header of a size column; its cells contain numeric lot sizes calculated
-from the seven complete UTC dates immediately preceding that header date
-using `K*V25*A15`. Existing data in E:L blocks initialization rather than
-being overwritten. Other columns after L remain in place. The worksheet
+ten size columns C:L for the latest ten UTC dates, oldest to newest. The first
+run calculates every eligible pair for all ten dates, not just the current
+date. Each date is the header of a size column; its cells contain numeric lot
+sizes calculated from the seven complete UTC dates immediately preceding that
+header date using `K*V25*A15`. Existing data in E:L blocks initialization
+rather than being overwritten. Other columns after L remain in place. The
+`--rebuild-history` option explicitly recalculates all ten current date columns
+when recovering a partially initialized workbook. Values use integer format
+`#,##0`, without a decimal separator. The worksheet
 AutoFilter includes all columns A:L (and extends through any populated columns
 after L); one is created if the sheet has none. Criteria on A/B and columns
 after L are retained, while criteria on rewritten output columns are cleared.
@@ -66,6 +70,14 @@ from the date they first appear onward. Per-pair/date failures are written as
 `ERROR: ...` with a light-red fill. The command saves once through a temporary
 sibling file and atomic replacement.
 
+The explicit `--rebuild-history` operation replaces all ten overlapping output
+columns only after every eligible symbol/date calculation succeeds. If any
+calculation fails, the command reports the failure and leaves the workbook
+unchanged. Its anchor must not be older than the newest existing history date.
+The exported floor step must be a whole number so the integer display format
+cannot round a fractional lot value; preserved fractional legacy cells retain
+a decimal format until they are recalculated.
+
 The export accepts ordinary `.xlsx` workbooks only. The raw XLSX package is
 checked for modern chart, drawing/image, table, pivot, slicer, OLE, and VBA
 parts before openpyxl loads it; legacy VML comment drawings are allowed because
@@ -82,8 +94,10 @@ validation errors fail without replacing it.
 - Existing official files are reused; missing files use official archive
   backfill with no more than 16 workers.
 - First run preserves pair/listing columns and filter criteria on A/B, replaces
-  recognized legacy outputs with the ten date columns, and rejects unexpected
-  populated output ranges; daily runs rotate, retries do not, and date gaps
+  recognized legacy outputs with the ten date columns and calculates all ten
+  dates; `--rebuild-history` repairs a partially initialized ten-date sheet.
+  Both paths reject unexpected populated output ranges; daily runs rotate,
+  retries do not, and date gaps
   rebuild a contiguous ten-day history without mislabeling overlapping values.
 - Errors in retained history are retried; future listing dates remain blank
   until the date is reached.

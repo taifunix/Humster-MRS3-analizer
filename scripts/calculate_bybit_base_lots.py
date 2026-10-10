@@ -41,7 +41,8 @@ DEFAULT_WORKERS = 16
 HISTORY_DAYS = 10
 HISTORY_FIRST_COLUMN = 3
 LEGACY_ACTUALIZATION_HEADER = "\u0414\u0430\u0442\u0430 \u0430\u043a\u0442\u0443\u0430\u043b\u0438\u0437\u0430\u0446\u0438\u0438"
-LOT_NUMBER_FORMAT = "#,##0.##########"
+LOT_NUMBER_FORMAT = "#,##0"
+FRACTIONAL_NUMBER_FORMAT = "#,##0.##########"
 ERROR_FILL = PatternFill(fill_type="solid", fgColor="FFC7CE")
 _CLEAR_FILL = PatternFill(fill_type=None)
 _SYMBOL = re.compile(r"[A-Z0-9]+\Z", re.ASCII)
@@ -85,6 +86,18 @@ def _date_header(value: object) -> date | None:
     if isinstance(value, date):
         return value
     return None
+
+
+def _number_format_for_value(value: object) -> str:
+    if isinstance(value, str):
+        return "General"
+    if isinstance(value, (int, float, Decimal)) and not isinstance(value, bool):
+        try:
+            if Decimal(str(value)) != Decimal(str(value)).to_integral_value():
+                return FRACTIONAL_NUMBER_FORMAT
+        except InvalidOperation:
+            pass
+    return LOT_NUMBER_FORMAT
 
 
 def _calculation_anchor(target_date: date, publication_lag_hours: int) -> datetime:
@@ -176,23 +189,31 @@ def _initialize_history(sheet, dates: tuple[date, ...]) -> None:
     _clear_output_filters(sheet)
 
 
-def _reset_history(sheet, dates: tuple[date, ...], previous_dates: tuple[date, ...]) -> None:
+def _reset_history(
+    sheet,
+    dates: tuple[date, ...],
+    previous_dates: tuple[date, ...],
+    *,
+    preserve_existing: bool = True,
+) -> None:
     previous_columns = {}
-    for old_column, old_date in enumerate(previous_dates, start=HISTORY_FIRST_COLUMN):
-        previous_columns[old_date] = [
-            (sheet.cell(row, old_column).value, copy(sheet.cell(row, old_column)._style), copy(sheet.cell(row, old_column).comment) if sheet.cell(row, old_column).comment else None)
-            for row in range(2, sheet.max_row + 1)
-        ]
+    if preserve_existing:
+        for old_column, old_date in enumerate(previous_dates, start=HISTORY_FIRST_COLUMN):
+            previous_columns[old_date] = [
+                (sheet.cell(row, old_column).value, copy(sheet.cell(row, old_column)._style), copy(sheet.cell(row, old_column).comment) if sheet.cell(row, old_column).comment else None)
+                for row in range(2, sheet.max_row + 1)
+            ]
     for col, target_date in enumerate(dates, start=HISTORY_FIRST_COLUMN):
         header = sheet.cell(1, col)
         header.value = target_date
         header.number_format = "yyyy-mm-dd"
-        if target_date in previous_columns:
+        if preserve_existing and target_date in previous_columns:
             for row, (value, style, comment) in enumerate(previous_columns[target_date], start=2):
                 cell = sheet.cell(row, col)
                 cell.value = value
                 cell._style = copy(style)
                 cell.comment = comment
+                cell.number_format = _number_format_for_value(value)
             continue
         for row in range(2, sheet.max_row + 1):
             cell = sheet.cell(row, col)
@@ -242,6 +263,8 @@ def calculate_base_lot(
     activity = _decimal(a15, "a15", nonnegative=True)
     coefficient = _decimal(k, "k", positive=True)
     step = _decimal(round_down_usdt, "round_down_usdt", positive=True)
+    if step != step.to_integral_value():
+        raise BaseLotExportError("round_down_usdt must be a whole number")
     precision = max(28, sum(len(value.as_tuple().digits) for value in (coefficient, turnover, activity)) + 8)
     with localcontext() as context:
         context.prec = precision
@@ -387,6 +410,7 @@ def run_export(
     round_down_usdt: object = DEFAULT_ROUND_DOWN_USDT,
     publication_lag_hours: int = DEFAULT_PUBLICATION_LAG_HOURS,
     workers: int = DEFAULT_WORKERS,
+    rebuild_history: bool = False,
     fetch_day: Callable[[str, object], bytes] | None = None,
 ) -> ExportResult:
     """Calculate and publish a rolling ten-date base-lot history."""
@@ -400,6 +424,8 @@ def run_export(
         raise BaseLotExportError("publication_lag_hours must be an integer from 0 through 48")
     coefficient = _decimal(k, "k", positive=True)
     step = _decimal(round_down_usdt, "round_down_usdt", positive=True)
+    if step != step.to_integral_value():
+        raise BaseLotExportError("round_down_usdt must be a whole number")
     if anchor_created_at is None:
         anchor_created_at = datetime.now(timezone.utc)
     if not isinstance(anchor_created_at, datetime) or anchor_created_at.tzinfo is None or anchor_created_at.utcoffset() is None:
@@ -428,7 +454,24 @@ def run_export(
         current_date_present = history_dates is not None and actualization_date in history_dates
         calculation_symbols: dict[date, tuple[str, ...]] = {}
         history_action = "initialize"
-        if current_date_present:
+        if rebuild_history:
+            if history_dates is not None and actualization_date < history_dates[-1]:
+                raise BaseLotExportError("anchor date is older than the newest date in the workbook history")
+            if history_dates is None:
+                _validate_legacy_history(workbook[sheet_name])
+                target_dates = tuple(actualization_date - timedelta(days=offset) for offset in range(HISTORY_DAYS - 1, -1, -1))
+                history_action = "initialize"
+            elif current_date_present:
+                target_dates = history_dates
+                history_action = "rebuild"
+            else:
+                target_dates = tuple(actualization_date - timedelta(days=offset) for offset in range(HISTORY_DAYS - 1, -1, -1))
+                history_action = "rebuild"
+            calculation_symbols = {
+                target_date: _symbols_listed_by(sheet, symbols, symbol_rows, target_date)
+                for target_date in target_dates
+            }
+        elif current_date_present:
             for target_date in history_dates:
                 column = HISTORY_FIRST_COLUMN + history_dates.index(target_date)
                 eligible_symbols = set(_symbols_listed_by(sheet, symbols, symbol_rows, target_date))
@@ -533,6 +576,14 @@ def run_export(
                 prefix = f"{symbol}: "
                 errors.append(ExportError(symbol, target_date, message[len(prefix):] if message.startswith(prefix) else message))
 
+    if rebuild_history and errors:
+        first_error = errors[0]
+        raise BaseLotExportError(
+            f"history rebuild failed for {len(errors)} symbol/date cell(s) "
+            f"(first: {first_error.symbol} {first_error.actualization_date}: {first_error.message}); "
+            "workbook unchanged"
+        )
+
     try:
         workbook = load_workbook(workbook_path, data_only=False)
     except (OSError, ValueError) as error:
@@ -549,7 +600,7 @@ def run_export(
         if history_action == "initialize":
             _initialize_history(sheet, target_dates)
         elif history_action == "rebuild":
-            _reset_history(sheet, target_dates, history_dates)
+            _reset_history(sheet, target_dates, history_dates, preserve_existing=not rebuild_history)
         elif history_action == "rotate":
             _rotate_history(sheet, actualization_date)
             _clear_output_filters(sheet)
@@ -610,6 +661,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--round-down-usdt", default=DEFAULT_ROUND_DOWN_USDT)
     parser.add_argument("--publication-lag-hours", type=int, default=DEFAULT_PUBLICATION_LAG_HOURS)
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
+    parser.add_argument(
+        "--rebuild-history",
+        action="store_true",
+        help="recalculate all ten date columns; keep the workbook unchanged if any cell fails",
+    )
     return parser
 
 

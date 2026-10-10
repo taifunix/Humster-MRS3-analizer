@@ -454,3 +454,15 @@ persisted failed-Campaign message now retains `COMBINATION_LIMIT_EXCEEDED` and
 adds the exact product and configured limit. The adapter count/limit regression
 and persisted Panel status regression pass (3 focused tests). Reload Panel
 before the next run; the failed status will show `COMBINATIONS=N; LIMIT=M`.
+
+## Bybit base-lot history repair (2026-10-10)
+
+The partially initialized Actual-sheet history was rebuilt for 2026-10-01 through
+2026-10-10. `--rebuild-history` recalculates all eligible pair/date cells,
+preserves the workbook if any calculation fails, clears stale output filters,
+and formats integral lot sizes without decimal digits. The workbook now has
+910 numeric values for 91 pairs and ten dates, zero calculation errors, and
+the expected 10 blank cells in the empty trailing row; AutoFilter is `A1:L93`.
+The focused suite passes 44 tests, `py_compile` and `git diff --check` pass, and
+independent Opus review returned `CODE_REVIEW_PASS`. Next step: normal daily
+execution uses the no-flag rotation path. Blockers: none.

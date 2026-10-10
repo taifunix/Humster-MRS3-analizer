@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from zipfile import ZipFile
 
 from openpyxl import Workbook, load_workbook
@@ -75,7 +76,9 @@ def _empty_workbook(path: Path) -> None:
 
 
 def test_calculate_base_lot_uses_decimal_formula_and_floors_without_b(tmp_path: Path) -> None:
-    assert calculate_base_lot("123.456", "0.75", k="9", round_down_usdt="10") == Decimal("830")
+    default_lot = calculate_base_lot("123.456", "0.75", k="9", round_down_usdt=base_lot_script.DEFAULT_ROUND_DOWN_USDT)
+    assert default_lot == Decimal("830")
+    assert default_lot % base_lot_script.DEFAULT_ROUND_DOWN_USDT == 0
     assert calculate_base_lot(Decimal("123.456"), Decimal("0.75"), k="9", round_down_usdt="1") == Decimal("833")
 
 
@@ -166,6 +169,7 @@ def test_run_export_creates_ten_date_size_columns_and_preserves_pair_listing(tmp
     assert [saved["Actual"].cell(1, col).value.date() for col in range(3, 13)] == [date(2026, 8, 30) + timedelta(days=offset) for offset in range(10)]
     assert all(saved["Actual"].cell(2, col).value == 10 for col in range(3, 13))
     assert all(saved["Actual"].cell(3, col).value == 10 for col in range(3, 13))
+    assert all(isinstance(saved["Actual"].cell(row, col).value, (int, float, Decimal)) for row in (2, 3) for col in range(3, 13))
     assert saved["Actual"]["A2"].value == "BTCUSDT"
     assert saved["Actual"]["B2"].value.date() == date(2026, 1, 1)
     assert saved["Actual"]["A3"].value == "ETHUSDT"
@@ -176,7 +180,106 @@ def test_run_export_creates_ten_date_size_columns_and_preserves_pair_listing(tmp
     assert saved["Actual"].auto_filter.filterColumn[0].filters.filter == ["listing filter"]
     assert saved["Actual"].auto_filter.filterColumn[1].filters.filter == ["keep"]
     assert saved["Actual"]["M3"].value == 999
+    assert all(saved["Actual"].cell(row, col).number_format == "#,##0" for row in (2, 3) for col in range(3, 13))
     assert saved["Other"]["A1"].value == "preserve"
+
+
+def test_rebuild_history_recalculates_all_ten_existing_dates(tmp_path: Path) -> None:
+    anchor = datetime(2026, 9, 8, 8, tzinfo=timezone.utc)
+    workbook_path = tmp_path / "partial-history.xlsx"
+    data_root = tmp_path / "bybit"
+    _workbook(workbook_path)
+    for symbol in ("BTCUSDT", "ETHUSDT"):
+        _write_daily_files(data_root, symbol, anchor)
+    run_export(workbook_path, data_root, anchor_created_at=anchor)
+
+    workbook = load_workbook(workbook_path)
+    workbook["Actual"].auto_filter.ref = "A1:M3"
+    workbook["Actual"].auto_filter.filterColumn = [
+        FilterColumn(colId=0, filters=Filters(filter=["pair"])),
+        FilterColumn(colId=1, filters=Filters(filter=["listing"])),
+        FilterColumn(colId=2, filters=Filters(filter=["stale output"])),
+        FilterColumn(colId=12, filters=Filters(filter=["other column"])),
+    ]
+    from openpyxl.comments import Comment
+    from openpyxl.styles import PatternFill
+
+    for row in (2, 3):
+        for col in range(3, 13):
+            cell = workbook["Actual"].cell(row, col)
+            cell.value = f"ERROR: stale {row}/{col}" if (row + col) % 2 else 9999
+            cell.fill = PatternFill(fill_type="solid", fgColor="FFC7CE")
+            cell.comment = Comment("stale history", "test")
+    workbook.save(workbook_path)
+    workbook.close()
+
+    result = run_export(workbook_path, data_root, anchor_created_at=anchor, rebuild_history=True)
+
+    saved = load_workbook(workbook_path, data_only=False)
+    assert result.rows_written == 20
+    assert result.errors == ()
+    assert all(saved["Actual"].cell(row, col).value == 10 for row in (2, 3) for col in range(3, 13))
+    assert all(isinstance(saved["Actual"].cell(row, col).value, (int, float, Decimal)) for row in (2, 3) for col in range(3, 13))
+    assert all(saved["Actual"].cell(row, col).number_format == "#,##0" for row in (2, 3) for col in range(3, 13))
+    assert all(saved["Actual"].cell(row, col).fill.fill_type is None for row in (2, 3) for col in range(3, 13))
+    assert all(saved["Actual"].cell(row, col).comment is None for row in (2, 3) for col in range(3, 13))
+    assert saved["Actual"].auto_filter.ref == "A1:M3"
+    assert [item.colId for item in saved["Actual"].auto_filter.filterColumn] == [0, 1, 12]
+    assert [item.filters.filter for item in saved["Actual"].auto_filter.filterColumn] == [["pair"], ["listing"], ["other column"]]
+    saved.close()
+
+
+def test_rebuild_history_aborts_without_replacing_workbook_on_calculation_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    anchor = datetime(2026, 9, 8, 8, tzinfo=timezone.utc)
+    workbook_path = tmp_path / "failed-rebuild.xlsx"
+    data_root = tmp_path / "bybit"
+    _workbook(workbook_path)
+    for symbol in ("BTCUSDT", "ETHUSDT"):
+        _write_daily_files(data_root, symbol, anchor)
+    run_export(workbook_path, data_root, anchor_created_at=anchor)
+    before = workbook_path.read_bytes()
+
+    original_calculate = base_lot_script.calculate_minute_capacity
+
+    def fail_one_date(root, symbol, **kwargs):
+        if symbol == "ETHUSDT" and kwargs["anchor_created_at"].date() == date(2026, 9, 4):
+            raise OSError("archive unavailable")
+        return original_calculate(root, symbol, **kwargs)
+
+    monkeypatch.setattr(base_lot_script, "calculate_minute_capacity", fail_one_date)
+    with pytest.raises(BaseLotExportError, match="workbook unchanged"):
+        run_export(workbook_path, data_root, anchor_created_at=anchor, rebuild_history=True)
+
+    assert workbook_path.read_bytes() == before
+
+
+def test_rebuild_history_rejects_anchor_older_than_history(tmp_path: Path) -> None:
+    anchor = datetime(2026, 9, 8, 8, tzinfo=timezone.utc)
+    workbook_path = tmp_path / "older-anchor.xlsx"
+    data_root = tmp_path / "bybit"
+    _workbook(workbook_path)
+    for symbol in ("BTCUSDT", "ETHUSDT"):
+        _write_daily_files(data_root, symbol, anchor)
+    run_export(workbook_path, data_root, anchor_created_at=anchor)
+    before = workbook_path.read_bytes()
+
+    with pytest.raises(BaseLotExportError, match="older than the newest date"):
+        run_export(
+            workbook_path,
+            data_root,
+            anchor_created_at=datetime(2026, 9, 7, 8, tzinfo=timezone.utc),
+            rebuild_history=True,
+        )
+
+    assert workbook_path.read_bytes() == before
+
+
+def test_export_rejects_fractional_round_down_step(tmp_path: Path) -> None:
+    workbook_path = tmp_path / "fractional-step.xlsx"
+    _workbook(workbook_path)
+
+    with pytest.raises(BaseLotExportError, match="round_down_usdt must be a whole number"):
+        run_export(workbook_path, tmp_path / "bybit", round_down_usdt="0.5")
 
 
 def test_legacy_blank_history_cells_get_numeric_size_format(tmp_path: Path) -> None:
@@ -195,7 +298,7 @@ def test_legacy_blank_history_cells_get_numeric_size_format(tmp_path: Path) -> N
 
     saved = load_workbook(workbook_path, data_only=False)
     assert saved["Actual"]["C4"].value is None
-    assert saved["Actual"]["C4"].number_format == "#,##0.##########"
+    assert saved["Actual"]["C4"].number_format == "#,##0"
 
 
 def test_end_to_end_run_preserves_filter_criteria_on_column_a(tmp_path: Path) -> None:
@@ -513,7 +616,7 @@ def test_successful_rerun_clears_previous_error_format(tmp_path: Path) -> None:
     assert [saved["Actual"].cell(1, col).value for col in range(3, 13)] == headers_before_retry
     assert saved["Actual"]["L2"].value == btc_value_before_retry
     assert saved["Actual"]["L3"].value == 10
-    assert saved["Actual"]["L3"].number_format == "#,##0.##########"
+    assert saved["Actual"]["L3"].number_format == "#,##0"
     assert saved["Actual"]["L3"].fill.fill_type is None
 
 
@@ -679,6 +782,18 @@ def test_unsupported_package_part_fails_without_replacement(tmp_path: Path, part
 def test_cli_prints_errors_to_stdout_and_returns_nonzero(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     assert main(["--input", str(tmp_path / "missing.xlsx")]) == 1
     assert "ERROR:" in capsys.readouterr().out
+
+
+def test_cli_forwards_rebuild_history_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        base_lot_script,
+        "run_export",
+        lambda **kwargs: captured.update(kwargs) or SimpleNamespace(skipped_existing_date=True, actualization_date=date(2026, 10, 10)),
+    )
+
+    assert main(["--rebuild-history"]) == 0
+    assert captured["rebuild_history"] is True
 
 
 def test_cli_reports_partial_failure_after_saving_workbook(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:

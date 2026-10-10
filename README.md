@@ -62,6 +62,8 @@ import, publication and analysis, but does not change calculated results.
 
 # Bybit base-lot values in the Actual sheet of the liquidity workbook
 .\scripts\calculate_bybit_base_lots.cmd
+# One-time rebuild of all ten dated columns after interrupted/partial initialization
+.\scripts\calculate_bybit_base_lots.cmd --rebuild-history
 
 ```
 
