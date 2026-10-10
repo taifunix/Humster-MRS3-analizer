@@ -344,6 +344,7 @@ const freshShortlistStateHelpers = (() => {
         selection_token: payload.selection_token,
         groups: Array.isArray(payload.groups) ? payload.groups : [],
         items: Array.isArray(payload.items) ? payload.items : [],
+        pretest_ab_available: payload.pretest_ab_available !== false,
       };
     };
     const beginAnalysis = () => {
@@ -2050,6 +2051,7 @@ if (typeof globalThis !== 'undefined') globalThis.portfolioSelectionHelpers = po
     strategyStatus(message);
   };
   let displayedFreshSnapshot;
+  const pretestAbUnavailable = new Set();
   const freshShortlistState = freshShortlistStateHelpers.create({
     controls: {
       pretest_ab_enabled: document.querySelector('#shortlist-filter-pretest-ab'),
@@ -2065,6 +2067,16 @@ if (typeof globalThis !== 'undefined') globalThis.portfolioSelectionHelpers = po
         displayedFreshSnapshot = state.snapshot;
         applyShortlist(state.snapshot);
       }
+      const abControl = document.querySelector('#shortlist-filter-pretest-ab');
+      if (state.snapshot?.pretest_ab_available === false) pretestAbUnavailable.add(state.snapshot.analysis_run_id);
+      const abUnavailable = pretestAbUnavailable.has(state.analysisRunId);
+      if (abControl) {
+        // CSV Direct analyses have no PRETEST A/B evidence: keep the gate off, never request it.
+        if (abUnavailable) abControl.checked = false;
+        abControl.disabled = abUnavailable;
+      }
+      const abNote = document.querySelector('#shortlist-filter-pretest-ab-note');
+      if (abNote) abNote.hidden = !abUnavailable;
       const status = document.querySelector('#shortlist-filter-status');
       if (status) status.textContent = state.busy
         ? (state.snapshot ? 'Обновление выполняется; пока используется предыдущий shortlist.' : 'Загрузка shortlist…')
@@ -2133,6 +2145,50 @@ if (typeof globalThis !== 'undefined') globalThis.portfolioSelectionHelpers = po
     } finally {
       clearInterval(analysisTimer);
       analyzeFresh.disabled = false;
+    }
+  });
+  const csvBrowse = document.querySelector('#analysis-csv-browse');
+  const csvSource = document.querySelector('#analysis-csv-source');
+  const csvStart = document.querySelector('#analysis-csv-start');
+  const csvStatus = document.querySelector('#analysis-csv-status');
+  csvBrowse?.addEventListener('click', async () => {
+    try {
+      const response = await remoteRequest('/api/browse', {kind: 'csv_analysis', multiple: false});
+      const chosen = Array.isArray(response.paths) ? response.paths[0] : '';
+      if (chosen && csvSource) csvSource.value = chosen;
+    } catch (error) { if (csvStatus) csvStatus.textContent = `Не удалось выбрать CSV: ${error?.message || 'unknown error'}`; }
+  });
+  csvStart?.addEventListener('click', async () => {
+    const source = csvSource?.value?.trim() || '';
+    if (!source) { if (csvStatus) csvStatus.textContent = 'Выберите CSV, ZIP или папку.'; return; }
+    const revision = freshShortlistState.beginAnalysis();
+    csvStart.disabled = true;
+    const started = Date.now();
+    const progress = () => { if (csvStatus && freshShortlistState.isCurrent(revision)) csvStatus.textContent = `CSV Direct · анализ выполняется · ${analysisElapsed(started)}`; };
+    progress();
+    const interval = setInterval(progress, 1000);
+    try {
+      const result = await remoteRequest('/api/v2/strategies/fresh/analyze-csv', {
+        source_path: source,
+        algorithm_version: document.querySelector('#settings-algorithm')?.value || '',
+        target_path: document.querySelector('#analysis-csv-target')?.value?.trim() || '',
+      });
+      if (!freshShortlistState.isCurrent(revision)) return;
+      if (result.phase !== 'COMMITTED') throw new Error(result.error || result.phase || 'Analysis failed');
+      if (!freshShortlistState.setAnalysis(result.analysis_run_id, revision)) throw new Error('Analysis identity missing');
+      if (!await freshShortlistState.load(revision)) throw new Error('Shortlist could not be loaded');
+      if (!freshShortlistState.isCurrent(revision, result.analysis_run_id)) return;
+      if (csvStatus) csvStatus.textContent = `Analysis DuckDB создана · ${result.point_count} точек · ${result.scope_count} scopes`;
+      analysisProgress('complete', `CSV Direct: ${shortlistItems.length} candidates available.`);
+      loadAnalysisCatalog().catch(() => {});
+    } catch (error) {
+      if (freshShortlistState.failAnalysis(revision, error)) {
+        if (csvStatus) csvStatus.textContent = `CSV Direct: ${error?.message || 'analysis failed'}`;
+        analysisProgress('failed', `CSV Direct: ${error?.message || 'analysis failed'}`);
+      }
+    } finally {
+      clearInterval(interval);
+      csvStart.disabled = false;
     }
   });
   const analysisExisting = document.querySelector('#analysis-existing');

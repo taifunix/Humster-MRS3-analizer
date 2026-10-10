@@ -1,12 +1,39 @@
 # MRS3 Current Status
 
-Last updated: 2026-10-09
+Last updated: 2026-10-10
 
 This file is a current-status snapshot, not a session log. Earlier progress notes remain in Git history; feature contracts and detailed evidence belong in the linked specs, reports, and plans.
 
 Use [PRD.md](PRD.md) for the feature registry and [docs/README.md](docs/README.md)
 for the documentation map. Read the linked contract only for the active task;
 do not treat this file as a replacement for a feature specification.
+
+## CSV Direct analysis (2026-10-10, branch `feat/csv-direct-analysis`)
+
+The tester's `reports_history.csv` plus its run snapshot now builds the fresh
+Analysis DuckDB directly, with no Source v6 DB and no surface. Panel route:
+`POST /api/v2/strategies/fresh/analyze-csv` (Strategies card 1, "CSV Direct").
+Contract: [CSV Direct analysis](docs/specs/2026-10-10-csv-direct-analysis.md);
+decision: [ADR-0070](docs/decisions/0070-csv-direct-analysis-from-tester-csv.md).
+The supplied delivery package ran the engine in `legacy_trades_proxy` and
+relabelled the result afterwards, which skips plateau-activity and multi-order
+admission and role-based BASE selection. That design was replaced: CSV rows
+become Source v6 analysis rows and run in `real_independent_events`. The only
+engine change is that `pipeline.py` accepts an exact `Decimal` 30-day activity.
+
+Evidence: on the real MARA/ZM analysis (10,944 points, 16 scopes, rebuilt as
+CSV) the CSV path and the Source v6 path give identical frames in every scope.
+Tester-style 2-decimal rounding changes internal values in 10 scopes but not
+READY (36/36). The package code gave 19 READY on the same data. On the real
+`Input/test1_new2` run, CSV `TotalTrades/Win/Los` equal Source v6 HTML round
+trips for 16 of 16 runs. The current Source v6 parser cannot read the new
+tester HTML (repeated metrics, merged-cell tables).
+
+Verification: affected suites (CSV Direct, pipeline, selection, fresh shortlist/strategies, Source v6 analysis, all Panel tests) 728 passed, 4 skipped, 3 failed; the 3 failures reproduce on clean HEAD. Full suite before the review fixes: 6286 passed, 82 failed, 15 skipped; 81 of the 82 fail on clean HEAD (Performance v2/portfolio fixtures, Panel static shell). The remaining one was the static-shell "no CSV" rule, which now exempts only the CSV Direct block. CSV Direct on 10,944 points: about 20 s (load 0.9 s, analysis 10 s, publish 9 s). Independent review: first pass CODE_REVIEW_FAIL (default name, relative target); all findings fixed; re-review CODE_REVIEW_PASS; its two remaining MINORs were fixed too. `node --check` and `git diff --check` passed.
+
+Next step: user acceptance on a full canonical CSV scan through the Panel
+(timing, READY list), then merge. Blockers: none. Known limits: 2-decimal
+DD%/WinRate in the CSV, no PRETEST A/B, synchronous endpoint.
 
 ## Portfolio MILP composition selection (2026-10-10)
 

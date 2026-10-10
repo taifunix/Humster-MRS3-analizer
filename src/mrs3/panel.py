@@ -212,6 +212,7 @@ from .screener.evaluate import PairVerdict, evaluate_and_record, evaluate_pairs,
 from .screener.registry import list_unscreened_symbols
 from .screener.render import render_screener_tester_config
 from .fresh_analysis_strategies import (
+    FINGERPRINT as FRESH_ANALYSIS_FINGERPRINT,
     fresh_shortlist_response,
     generate_fresh_analysis_strategies,
     load_fresh_ready_candidates,
@@ -480,6 +481,7 @@ _BROWSE_FILE_TYPES: dict[str, tuple[tuple[str, str], ...]] = {
     "template": (("Strategy template", "*.json"),),
     "config": (("Configuration", "*.json"),),
     "results_csv": (("Result CSV", "*.csv"),),
+    "csv_analysis": (("Tester reports CSV/ZIP", "*.csv;*.zip"),),
     "audit_xlsx": (("Audit workbook", "*.xlsx"),),
 }
 
@@ -1327,6 +1329,62 @@ class _StrategyJob:
     v6_confirmation: dict[str, object] = field(default_factory=dict)
     strategy_count: int = 0
     error: str | None = None
+
+
+def _publish_csv_direct_default(prepared: object, directory: Path) -> Path:
+    """Content-addressed default name; the same analysis is reused, never rewritten."""
+    from .csv_direct_analysis import publish_csv_direct_analysis
+
+    stem = f"csv-{prepared.analysis_id[:24]}"
+    suffix = 1
+    while True:
+        name = f"{stem}.analysis-v6.duckdb" if suffix == 1 else f"{stem}-{suffix}.analysis-v6.duckdb"
+        target = directory / name
+        if not target.exists():
+            return publish_csv_direct_analysis(prepared, directory, filename=name)
+        try:
+            if read_fresh_analysis_identity(target)["analysis_run_id"] == prepared.analysis_id:
+                return target
+        except (OSError, ValueError, KeyError, duckdb.Error):
+            pass
+        suffix += 1
+
+
+_CSV_DIRECT_ERRORS = {
+    "CSV_DIRECT_INVALID_SOURCE": "CSV Direct: выберите существующий CSV, ZIP или папку (не ярлык).",
+    "CSV_DIRECT_INVALID_TARGET": "CSV Direct: имя базы должно оканчиваться на .analysis-v6.duckdb.",
+    "CSV_DIRECT_TARGET_OUTSIDE_ANALYSIS_ROOT": "CSV Direct: базу можно сохранить только внутри папки Analysis DB.",
+    "CSV_DIRECT_TARGET_EXISTS": "CSV Direct: analysis DB с таким именем уже есть; укажите другое имя.",
+    "CSV_DIRECT_INVALID_ALGORITHM_VERSION": "CSV Direct: версия алгоритма должна быть текстом, а не числом или true/false.",
+    "CSV_DIRECT_ANALYSIS_FAILED": "CSV Direct: анализ не выполнен из-за внутренней ошибки; исходные файлы не изменены.",
+}
+
+
+def _csv_direct_error(message: str | None) -> str:
+    """Stable CSV Direct guidance; input errors keep their path-free detail."""
+    value = message or ""
+    code, _, detail = value.partition(": ")
+    if code == "CSV_DIRECT_INVALID_INPUT":
+        return f"CSV Direct: {detail}"
+    if code in _CSV_DIRECT_ERRORS:
+        return _CSV_DIRECT_ERRORS[code]
+    if "canonical shift" in value or "listing_dates does not cover" in value:
+        return f"CSV Direct: {value}"
+    return _fresh_analysis_error(value)
+
+
+def _fresh_analysis_has_pretest_ab(path: Path) -> bool:
+    """Only the current fresh fingerprint stores per-point PRETEST A/B evidence."""
+    try:
+        connection = duckdb.connect(str(path), read_only=True)
+        try:
+            row = connection.execute("select value from manifest where key = 'fingerprint'").fetchone()
+        finally:
+            connection.close()
+    except (OSError, duckdb.Error):
+        return False
+    return bool(row) and row[0] == FRESH_ANALYSIS_FINGERPRINT
+
 
 class PanelController:
     def __init__(
@@ -3103,6 +3161,99 @@ class PanelController:
         self._fresh_analysis_surfaces[analysis_id] = surface
         return {"phase": "COMMITTED", "analysis_run_id": analysis_id}
 
+    def strategies_fresh_analyze_csv(self, payload: Mapping[str, object]) -> dict[str, object]:
+        """Analyze tester reports_history CSV directly; register existing shortlist identity.
+
+        This is a separate opt-in route. The existing Source v6 analysis contour,
+        downstream shortlist, and READY JSON generation are not changed.
+        """
+        from .csv_direct_input import DirectCsvError, load_csv_direct
+        from .csv_direct_analysis import prepare_csv_direct_analysis, publish_csv_direct_analysis
+
+        source_value = Path(self._required(payload, "source_path")).expanduser()
+        unresolved_source = source_value if source_value.is_absolute() else self.root / source_value
+        if unresolved_source.is_symlink():
+            raise ValueError("CSV_DIRECT_INVALID_SOURCE")
+        source = self._path(unresolved_source)
+        if not source.exists() or (
+            not source.is_dir() and (not source.is_file() or source.suffix.casefold() not in {".csv", ".zip"})
+        ):
+            raise ValueError("CSV_DIRECT_INVALID_SOURCE")
+        dates_path = self._workflow_default("listing_dates_path")
+        if not dates_path.is_file():
+            raise ValueError(_FRESH_ANALYSIS_LISTING_DATES_ERROR)
+        analysis_root = self._panel_path("analysis_root")
+        if analysis_root.suffix.casefold() == ".duckdb" or analysis_root.is_file():
+            analysis_root = analysis_root.parent
+        analysis_root = analysis_root.resolve()
+        requested_target = self._optional_string(payload, "target_path")
+        if requested_target:
+            # A bare name or relative folder lives inside the Analysis DB folder.
+            candidate = Path(requested_target).expanduser()
+            target = (candidate if candidate.is_absolute() else analysis_root / candidate).resolve()
+            if target.name.endswith(".analysis-v6.duckdb"):
+                directory, filename = target.parent, target.name
+            elif target.suffix:
+                raise ValueError("CSV_DIRECT_INVALID_TARGET")
+            else:
+                directory, filename = target, None
+            try:
+                directory.relative_to(analysis_root)
+            except ValueError:
+                raise ValueError("CSV_DIRECT_TARGET_OUTSIDE_ANALYSIS_ROOT") from None
+        else:
+            directory, filename = analysis_root, None
+        algorithm_version = self._workflow_algorithm_version(payload.get("algorithm_version"))
+
+        with self._source_v6_lock:
+            current = self._source_v6_job
+            if current and current.get("phase") in {"RUNNING", "MERGE_RUNNING"}:
+                raise RuntimeError("another Source v6 write is already running")
+            job = {"phase": "RUNNING", "current": 0, "total": 1, "progress": 0.0,
+                   "error": None, "cancel_requested": False, "mode": "CSV_DIRECT"}
+            self._source_v6_job = job
+        try:
+            listing_dates = self._source_v6_listing_dates_loader(dates_path)
+            parsed = load_csv_direct([source], listing_dates=listing_dates,
+                                     allow_shared_snapshot_template=True)
+            config = self._analysis_config_loader(self.default_config)
+            prepared = prepare_csv_direct_analysis(
+                parsed, config, listing_dates=listing_dates, algorithm_version=algorithm_version,
+            )
+            if job["cancel_requested"]:
+                raise RuntimeError("CSV analysis cancelled")
+            if filename is None:
+                artifact = _publish_csv_direct_default(prepared, directory)
+            elif (directory / filename).exists():
+                raise ValueError("CSV_DIRECT_TARGET_EXISTS")
+            else:
+                artifact = publish_csv_direct_analysis(prepared, directory, filename=filename)
+            identity = read_fresh_analysis_identity(artifact)
+            analysis_id = str(identity["analysis_run_id"])
+            if analysis_id != prepared.analysis_id:
+                raise RuntimeError("CSV_DIRECT_IDENTITY_MISMATCH")
+            self._fresh_analysis_paths[analysis_id] = artifact
+            # Intentionally no physical surface; unchanged generator supports it.
+            self._fresh_analysis_surfaces.pop(analysis_id, None)
+            job.update({"phase": "COMMITTED", "current": 1, "progress": 1.0,
+                        "analysis_id": analysis_id, "analysis_path": str(artifact)})
+            return {"phase": "COMMITTED", "analysis_run_id": analysis_id,
+                    "scope_count": len(prepared.results), "point_count": prepared.point_count,
+                    "analysis_path": str(artifact)}
+        except DirectCsvError as error:
+            job.update({"phase": "FAILED", "error": "CSV_DIRECT_INVALID_INPUT"})
+            # Loader messages name files relative to the chosen input, never local paths.
+            raise ValueError(f"CSV_DIRECT_INVALID_INPUT: {error}") from None
+        except FileExistsError:
+            job.update({"phase": "FAILED", "error": "CSV_DIRECT_TARGET_EXISTS"})
+            raise ValueError("CSV_DIRECT_TARGET_EXISTS") from None
+        except Exception as error:
+            job.update({"phase": "FAILED", "error": "CSV_DIRECT_ANALYSIS_FAILED"})
+            if isinstance(error, ValueError):
+                raise
+            # Keep local input paths and internal failures out of HTTP error responses.
+            raise ValueError("CSV_DIRECT_ANALYSIS_FAILED") from None
+
     def strategies_fresh_generate(self, payload: Mapping[str, object]) -> dict[str, object]:
         if "output_dir" in payload:
             raise ValueError("output_dir is server-controlled")
@@ -3415,7 +3566,11 @@ class PanelController:
             finally:
                 staged.unlink(missing_ok=True)
             return {"filename": output.name}
-        return fresh_shortlist_response(prepared, evaluation)
+        response = fresh_shortlist_response(prepared, evaluation)
+        # CSV Direct and legacy v1 analyses carry no PRETEST A/B evidence; the
+        # UI shows the gate as unavailable instead of sending a request that fails.
+        response["pretest_ab_available"] = _fresh_analysis_has_pretest_ab(path)
+        return response
 
     def strategies_fresh_filter_audit(self, payload: Mapping[str, object]) -> dict[str, object]:
         options, min_shift_enabled, min_shift_pct = self._fresh_shortlist_settings(payload)
@@ -10220,7 +10375,7 @@ class _PanelHandler(BaseHTTPRequestHandler):
         portfolio_submission_route = bool(re.fullmatch(r"/api/v2/portfolio/campaigns/[^/]+/tester-submissions", endpoint))
         if equity_filter_endpoint:
             pass
-        elif bulk_retest_endpoint is None and endpoint != "/api/v2/strategies/performance-v2/selection-settings" and endpoint not in {"/api/start", "/api/browse", "/api/duckdb-import/settings", "/api/duckdb-import/preflight", "/api/duckdb-import/start", "/api/duckdb-import/cancel", "/api/duckdb-import/migrate", "/api/duckdb-direct/coverage", "/api/duckdb-direct/preflight", "/api/duckdb-direct/start", "/api/duckdb-direct/cancel", "/api/analysis/library", "/api/analysis/initialize", "/api/analysis/rerun", "/api/analysis/compare", "/api/analysis/export", "/api/analysis/shortlist", "/api/analysis/filter-export", "/api/analysis/strategies", "/api/source-v6/preflight", "/api/source-v6/start", "/api/source-v6/fresh/multiscope/start", "/api/source-v6/fresh/multiscope/analysis/start", "/api/source-v6/cancel", "/api/source-v6/merge", "/api/v2/panel/restart", "/api/v2/settings/validate", "/api/v2/settings/save", "/api/v2/settings/analysis-profile", "/api/v2/jobs", "/api/v2/strategies/tester/verify-inbox", "/api/v2/strategies/tester/report-collection/clear", "/api/v2/testing/local/fill", "/api/v2/testing/local/start", "/api/v2/testing/local/stop", "/api/v2/testing/screener/fill", "/api/v2/testing/screener/start", "/api/v2/testing/screener/stop", "/api/v2/testing/screener/evaluate", "/api/v2/testing/remote/check-paths", "/api/v2/testing/remote/prepare", "/api/v2/testing/remote/fill", "/api/v2/testing/remote/start", "/api/v2/source/local/import/preflight", "/api/v2/source/local/import/start", "/api/v2/source/local/merge/preflight", "/api/v2/source/local/merge/start", "/api/v2/source/local/cancel", "/api/v2/source/remote/start", "/api/v2/source/remote/cancel", "/api/v2/surfaces/preflight", "/api/v2/surfaces/select", "/api/v2/surfaces/publish", "/api/v2/surfaces/publish/start", "/api/v2/strategies/fresh/analyze", "/api/v2/strategies/fresh/generate", "/api/v2/strategies/fresh/runs", "/api/v2/strategies/fresh/shortlist", "/api/v2/strategies/fresh/open", "/api/v2/strategies/performance-v2/windows", "/api/v2/strategies/performance-v2/selection", "/api/v2/strategies/performance-v2/selection-preview", "/api/v2/strategies/performance-v2/selection-cache-status", "/api/v2/strategies/performance-v2/recalculate", "/api/v2/strategies/performance-v2/recalculate-all", "/api/v2/strategies/performance-v2/selection-review-import", "/api/v2/strategies/performance-v2/selection-user-fields-import", "/api/v2/strategies/performance-v2/retest-tags-import", "/api/v2/strategies/performance-v2/retest/start", "/api/v2/strategies/performance-v2/retest/import"} and not portfolio_route and not performance_v2_maintenance_endpoint:
+        elif bulk_retest_endpoint is None and endpoint != "/api/v2/strategies/performance-v2/selection-settings" and endpoint not in {"/api/start", "/api/browse", "/api/duckdb-import/settings", "/api/duckdb-import/preflight", "/api/duckdb-import/start", "/api/duckdb-import/cancel", "/api/duckdb-import/migrate", "/api/duckdb-direct/coverage", "/api/duckdb-direct/preflight", "/api/duckdb-direct/start", "/api/duckdb-direct/cancel", "/api/analysis/library", "/api/analysis/initialize", "/api/analysis/rerun", "/api/analysis/compare", "/api/analysis/export", "/api/analysis/shortlist", "/api/analysis/filter-export", "/api/analysis/strategies", "/api/source-v6/preflight", "/api/source-v6/start", "/api/source-v6/fresh/multiscope/start", "/api/source-v6/fresh/multiscope/analysis/start", "/api/source-v6/cancel", "/api/source-v6/merge", "/api/v2/panel/restart", "/api/v2/settings/validate", "/api/v2/settings/save", "/api/v2/settings/analysis-profile", "/api/v2/jobs", "/api/v2/strategies/tester/verify-inbox", "/api/v2/strategies/tester/report-collection/clear", "/api/v2/testing/local/fill", "/api/v2/testing/local/start", "/api/v2/testing/local/stop", "/api/v2/testing/screener/fill", "/api/v2/testing/screener/start", "/api/v2/testing/screener/stop", "/api/v2/testing/screener/evaluate", "/api/v2/testing/remote/check-paths", "/api/v2/testing/remote/prepare", "/api/v2/testing/remote/fill", "/api/v2/testing/remote/start", "/api/v2/source/local/import/preflight", "/api/v2/source/local/import/start", "/api/v2/source/local/merge/preflight", "/api/v2/source/local/merge/start", "/api/v2/source/local/cancel", "/api/v2/source/remote/start", "/api/v2/source/remote/cancel", "/api/v2/surfaces/preflight", "/api/v2/surfaces/select", "/api/v2/surfaces/publish", "/api/v2/surfaces/publish/start", "/api/v2/strategies/fresh/analyze", "/api/v2/strategies/fresh/analyze-csv", "/api/v2/strategies/fresh/generate", "/api/v2/strategies/fresh/runs", "/api/v2/strategies/fresh/shortlist", "/api/v2/strategies/fresh/open", "/api/v2/strategies/performance-v2/windows", "/api/v2/strategies/performance-v2/selection", "/api/v2/strategies/performance-v2/selection-preview", "/api/v2/strategies/performance-v2/selection-cache-status", "/api/v2/strategies/performance-v2/recalculate", "/api/v2/strategies/performance-v2/recalculate-all", "/api/v2/strategies/performance-v2/selection-review-import", "/api/v2/strategies/performance-v2/selection-user-fields-import", "/api/v2/strategies/performance-v2/retest-tags-import", "/api/v2/strategies/performance-v2/retest/start", "/api/v2/strategies/performance-v2/retest/import"} and not portfolio_route and not performance_v2_maintenance_endpoint:
             self._json(404, {"error": "not found"})
             return
         if endpoint in {"/api/v2/strategies/performance-v2/selection-review-import", "/api/v2/strategies/performance-v2/selection-user-fields-import", "/api/v2/strategies/performance-v2/retest-tags-import"}:
@@ -10370,6 +10525,8 @@ class _PanelHandler(BaseHTTPRequestHandler):
                 result = self.server.controller.surface_publish_start(document)
             elif endpoint == "/api/v2/strategies/fresh/analyze":
                 result = self.server.controller.strategies_fresh_analyze(document)
+            elif endpoint == "/api/v2/strategies/fresh/analyze-csv":
+                result = self.server.controller.strategies_fresh_analyze_csv(document)
             elif endpoint == "/api/v2/strategies/fresh/generate":
                 result = self.server.controller.strategies_fresh_generate(document)
             elif endpoint == "/api/v2/strategies/fresh/runs":
@@ -10550,6 +10707,8 @@ class _PanelHandler(BaseHTTPRequestHandler):
                 self._json(400, {"error": _fresh_generation_error(error)})
             elif endpoint == "/api/v2/strategies/fresh/analyze":
                 self._json(400, {"error": _fresh_analysis_error(str(error))})
+            elif endpoint == "/api/v2/strategies/fresh/analyze-csv":
+                self._json(400, {"error": _csv_direct_error(str(error))})
             elif endpoint == "/api/v2/settings/analysis-profile":
                 self._json(400, {"error": _analysis_profile_error(error)})
             else:

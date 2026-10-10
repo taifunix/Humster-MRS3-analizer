@@ -347,7 +347,10 @@ def test_static_shell_has_approved_navigation_and_exclusions() -> None:
     assert 'aria-disabled="true"' in html
     assert 'tabindex="-1"' in html
     assert 'id="artefacts"' not in html
-    assert "CSV" not in html
+    # CSV Direct (ADR-0070) is the only approved CSV workflow in the shell.
+    csv_start = html.index('<div class="field-group"><label for="analysis-csv-source">')
+    csv_end = html.index('</p>', html.index('id="analysis-csv-status"')) + len('</p>')
+    assert "CSV" not in html[:csv_start] + html[csv_end:]
     assert "DUCKDB_DIRECT" not in html
 
 
