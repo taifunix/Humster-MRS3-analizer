@@ -38,6 +38,7 @@ def _registry(path: Path) -> None:
     sheet.column_dimensions["A"].width = 21
     sheet.auto_filter.ref = "A1:P5"
     sheet.freeze_panes = "A2"
+    sheet.sheet_view.pane.topLeftCell = "A165"  # bottom pane scrolled down, as in the real registry
     validation = DataValidation(type="list", formula1='"СКРИН,АНАЛИЗ"')
     validation.add("E2:E5")
     sheet.add_data_validation(validation)

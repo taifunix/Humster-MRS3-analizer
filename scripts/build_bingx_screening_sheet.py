@@ -18,6 +18,7 @@ import sys
 from typing import Mapping, Sequence
 
 from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
 
 if __package__ in {None, ""}:  # Allow ``python scripts/build_bingx_screening_sheet.py``.
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -49,10 +50,21 @@ def _header(sheet) -> list[object]:
     return [cell.value for cell in sheet[1]]
 
 
+def _frozen_cell(sheet) -> str | None:
+    """Freeze cell from the pane split; ``freeze_panes`` returns the scroll position instead."""
+    pane = sheet.sheet_view.pane
+    if pane is None or pane.state not in {"frozen", "frozenSplit"}:
+        return None
+    columns, rows = int(pane.xSplit or 0), int(pane.ySplit or 0)
+    if not columns and not rows:
+        return None
+    return f"{get_column_letter(columns + 1)}{rows + 1}"
+
+
 def _copy_form(source, target) -> None:
     """Carry over what copy_worksheet does not: filter, freeze, validations, conditional formats."""
     target.auto_filter.ref = source.auto_filter.ref
-    target.freeze_panes = source.freeze_panes
+    target.freeze_panes = _frozen_cell(source)
     for validation in source.data_validations.dataValidation:
         target.add_data_validation(copy(validation))
     for formatting in source.conditional_formatting:
