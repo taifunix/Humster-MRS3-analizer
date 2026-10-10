@@ -329,9 +329,16 @@ database, tester or Panel process was used.
 ## Bybit base-lot XLSX export (2026-10-07)
 
 The one-command [Bybit base-lot export](docs/specs/2026-10-07-bybit-base-lot-export.md)
-reuses the validated seven-day minute-liquidity window, writes the base lot to
-`Actual!C`, and writes the UTC date or an explicit cell error to `Actual!D`.
-Focused tests and independent review passed; no live workbook or network run
+now maintains ten UTC-date size columns in `Actual!C:L`; each header is a date
+and each value uses the seven complete dates preceding that header date. The
+pair and listing-date columns A/B are preserved; legacy output columns C/D are
+replaced. Later runs rotate only the date columns. A complete current date is
+skipped unless retained error cells need retry. Missed dates rebuild a
+contiguous ten-day window while mapping overlapping values by date; future
+listing dates remain blank. Historical errors are retried and empty filters are
+created through L. The filter preserves criteria outside the rewritten dates.
+Focused verification: 39 tests passed; `git diff --check` and `py_compile`
+passed; independent Opus `CODE_REVIEW_PASS`. No live workbook or network run
 was performed.
 ## Fresh shortlist Minimum Shift gate (2026-10-08)
 
