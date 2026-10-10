@@ -7,17 +7,23 @@ eagerly imports the full optimizer and its SciPy stack on Windows spawn.
 from __future__ import annotations
 
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from contextlib import contextmanager
 from decimal import Decimal, InvalidOperation, localcontext
 import math
 import os
+from pathlib import Path
+import pickle
+import tempfile
+import threading
 import time
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Iterator, Mapping, Sequence
+import uuid
 
 import numpy as np
 
 
-_PROCESS_EVALUATOR: Callable[..., Any] | None = None
-_PROCESS_CONTEXT: Any = None
+_CONTEXT_CACHE: tuple[str, Any] | None = None
+_SHARED_POOL: "_SharedPool | None" = None
 
 
 class _ProcessBatchFailure(RuntimeError):
@@ -40,19 +46,29 @@ def _process_peak_rss_bytes() -> int:
     return int(getattr(info, "rss", 0) or 0)
 
 
-def _process_initializer(evaluator: Callable[..., Any], context: Any) -> None:
-    global _PROCESS_EVALUATOR, _PROCESS_CONTEXT
-    _PROCESS_EVALUATOR = evaluator
-    _PROCESS_CONTEXT = context
+def _load_context(path: str) -> Any:
+    """Load one bridge's context in a worker, caching the most recent file."""
+    global _CONTEXT_CACHE
+    if _CONTEXT_CACHE is None or _CONTEXT_CACHE[0] != path:
+        # Release the previous context first: never hold two in one worker.
+        _CONTEXT_CACHE = None
+        with open(path, "rb") as handle:
+            _CONTEXT_CACHE = (path, pickle.load(handle))
+    return _CONTEXT_CACHE[1]
 
 
-def _process_task(task: tuple[int, tuple[Mapping[str, Any], ...]]) -> tuple[int, Any]:
-    index, members = task
-    evaluator = _PROCESS_EVALUATOR
-    if evaluator is None:
-        return index, {"status": "UNKNOWN", "reason": "PROCESS_EVALUATOR_UNAVAILABLE"}
+def _process_task(payload: tuple[Callable[..., Any], str, tuple[int, tuple[Mapping[str, Any], ...]]]) -> tuple[int, Any]:
+    evaluator, context_path, (index, members) = payload
     try:
-        return index, evaluator(members, _PROCESS_CONTEXT)
+        context = _load_context(context_path)
+    except (OSError, EOFError, pickle.UnpicklingError) as error:
+        return index, {
+            "status": "UNKNOWN",
+            "reason": "PROCESS_CONTEXT_UNAVAILABLE",
+            "exception_type": type(error).__name__,
+        }
+    try:
+        return index, evaluator(members, context)
     except (ArithmeticError, KeyError, TypeError, ValueError, OSError) as error:
         return index, {
             "status": "UNKNOWN",
@@ -61,25 +77,116 @@ def _process_task(task: tuple[int, tuple[Mapping[str, Any], ...]]) -> tuple[int,
         }
 
 
+_CONTEXT_MAX_AGE_SECONDS = 86_400
+
+
+def _context_directory() -> Path:
+    """Dedicated context folder; files left by a killed process are swept after a day."""
+    directory = Path(tempfile.gettempdir()) / "mrs3-process-context"
+    directory.mkdir(parents=True, exist_ok=True)
+    cutoff = time.time() - _CONTEXT_MAX_AGE_SECONDS
+    for stale in directory.glob("*.pkl"):
+        try:
+            if stale.stat().st_mtime < cutoff:
+                stale.unlink(missing_ok=True)
+        except OSError:
+            pass
+    return directory
+
+
+def _pool_width(workers: int, task_count: int) -> int:
+    return min(max(1, int(workers)), max(1, int(task_count)), os.cpu_count() or 1, 61 if os.name == "nt" else 2**31 - 1)
+
+
+class _SharedPool:
+    """One process pool reused by every bridge inside ``shared_process_pool``."""
+
+    def __init__(self, workers: int) -> None:
+        self.width = _pool_width(workers, workers)
+        self.pool: ProcessPoolExecutor | None = None
+        # Only the thread that opened the scope may use it; a concurrent job in
+        # another thread keeps private pools instead of sharing a closing one.
+        self.owner = threading.get_ident()
+
+    def get(self) -> ProcessPoolExecutor:
+        if self.pool is None:
+            self.pool = ProcessPoolExecutor(max_workers=self.width)
+        return self.pool
+
+    def discard(self, pool: ProcessPoolExecutor) -> None:
+        if self.pool is pool:
+            self.pool = None
+        pool.shutdown(wait=True, cancel_futures=True)
+
+    def close(self) -> None:
+        if self.pool is not None:
+            self.pool.shutdown(wait=True, cancel_futures=True)
+            self.pool = None
+
+
+@contextmanager
+def shared_process_pool(workers: int) -> Iterator[None]:
+    """Reuse one worker pool for all process bridges created inside the block.
+
+    Spawning a fresh pool per bridge re-imports the application in every child
+    for every bootstrap call; one pool per Campaign removes that cost.
+    """
+    global _SHARED_POOL
+    if _SHARED_POOL is not None or type(workers) is not int or workers <= 1:
+        yield
+        return
+    _SHARED_POOL = _SharedPool(workers)
+    try:
+        yield
+    finally:
+        holder, _SHARED_POOL = _SHARED_POOL, None
+        holder.close()
+
+
 class _ProcessBatchEvaluator:
-    """Small bounded process bridge; the parent owns ordering and accounting."""
+    """Small bounded process bridge; the parent owns ordering and accounting.
+
+    The context reaches workers through a private temporary pickle file. It is
+    never written into a child's start-up pipe, so a child that dies at
+    start-up breaks the pool (``BrokenProcessPool``) instead of blocking the
+    parent forever. A broken pool is replaced and the unfinished tasks are
+    retried once.
+    """
 
     def __init__(self, evaluator: Callable[..., Any], context: Any, workers: int, task_count: int) -> None:
-        width = min(max(1, int(workers)), max(1, int(task_count)), os.cpu_count() or 1, 61 if os.name == "nt" else 2**31 - 1)
-        self.width = width
-        self.pool = ProcessPoolExecutor(
-            max_workers=width,
-            initializer=_process_initializer,
-            initargs=(evaluator, context),
-        )
+        self.evaluator = evaluator
+        shared = _SHARED_POOL
+        if shared is not None and shared.owner != threading.get_ident():
+            shared = None
+        width = _pool_width(workers, task_count)
+        self.width = min(width, shared.width) if shared is not None else width
+        self._shared = shared
+        directory = _context_directory()
+        handle, self.context_path = tempfile.mkstemp(prefix=f"{uuid.uuid4().hex}-", suffix=".pkl", dir=directory)
+        try:
+            with os.fdopen(handle, "wb") as stream:
+                pickle.dump(context, stream, protocol=pickle.HIGHEST_PROTOCOL)
+        except BaseException:
+            Path(self.context_path).unlink(missing_ok=True)
+            raise
+        self.pool = shared.get() if shared is not None else ProcessPoolExecutor(max_workers=self.width)
 
-    def __call__(self, tasks: Sequence[tuple[int, tuple[Mapping[str, Any], ...]]]) -> tuple[tuple[int, Any], ...]:
+    def _replace_pool(self) -> None:
+        broken = self.pool
+        if self._shared is not None:
+            self._shared.discard(broken)
+            self.pool = self._shared.get()
+        else:
+            broken.shutdown(wait=True, cancel_futures=True)
+            self.pool = ProcessPoolExecutor(max_workers=self.width)
+
+    def _run(self, tasks: Sequence[tuple[int, tuple[Mapping[str, Any], ...]]]) -> tuple[list[tuple[int, Any]], str | None]:
         futures: dict[Any, int] = {}
         results: list[tuple[int, Any]] = []
         failure_type: str | None = None
         for task in tasks:
             try:
-                futures[self.pool.submit(_process_task, task)] = task[0]
+                futures[self.pool.submit(_process_task, (self.evaluator, self.context_path, task))] = task[0]
             except (KeyboardInterrupt, SystemExit):
                 self.close()
                 raise
@@ -95,15 +202,28 @@ class _ProcessBatchEvaluator:
                     raise
                 except BaseException as error:
                     failure_type = failure_type or type(error).__name__
-            if failure_type is not None:
-                raise _ProcessBatchFailure(results, failure_type)
-            return tuple(sorted(results, key=lambda item: item[0]))
         except (KeyboardInterrupt, SystemExit):
             self.close()
             raise
+        return results, failure_type
+
+    def __call__(self, tasks: Sequence[tuple[int, tuple[Mapping[str, Any], ...]]]) -> tuple[tuple[int, Any], ...]:
+        results, failure_type = self._run(tasks)
+        if failure_type == "BrokenProcessPool":
+            done = {index for index, _payload in results}
+            self._replace_pool()
+            retried, failure_type = self._run(tuple(task for task in tasks if task[0] not in done))
+            results.extend(retried)
+        if failure_type is not None:
+            raise _ProcessBatchFailure(results, failure_type)
+        return tuple(sorted(results, key=lambda item: item[0]))
 
     def close(self) -> None:
-        self.pool.shutdown(wait=True)
+        try:
+            if self._shared is None:
+                self.pool.shutdown(wait=True)
+        finally:
+            Path(self.context_path).unlink(missing_ok=True)
 
 
 def _decimal(value: Any, field: str, *, positive: bool = False, nonnegative: bool = False) -> Decimal:

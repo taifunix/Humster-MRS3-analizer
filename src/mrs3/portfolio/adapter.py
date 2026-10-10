@@ -13,6 +13,7 @@ import time
 from types import MappingProxyType
 from typing import Any, Mapping, Sequence
 
+from .._portfolio_process_worker import shared_process_pool
 from ..config import AlgorithmConfig
 from ..lots import LotMethod
 from ..strategy_json import generate_strategy
@@ -2611,7 +2612,9 @@ def run_portfolio_adapter(
         }
         if progress_callback is not None:
             build_kwargs["progress_callback"] = progress_callback
-        result = build_portfolio_candidates(selected_rows, campaign, **build_kwargs)
+        # One worker pool serves every bootstrap of this Campaign.
+        with shared_process_pool(workers):
+            result = build_portfolio_candidates(selected_rows, campaign, **build_kwargs)
     except Exception:
         return AdapterResult(
             "FAIL",

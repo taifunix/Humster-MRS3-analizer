@@ -538,3 +538,14 @@ Measured on the real 61-pair snapshot and a 81-strategy synthetic composition.
   configurable) instead of the initial 2/sec. Bybit's public market endpoints
   allow 600 requests per 5 s per IP. Retry, 429/10006 handling and the 10 min
   persisted 403 cooldown are unchanged. Measured on 10 symbols: 14.9 s → 6.0 s.
+- **Bootstrap process bridge.** The worker context reaches workers through a
+  private temporary pickle file, not through the child's start-up pipe.
+  Before, a child that died at start-up left the parent blocked forever while
+  writing a multi-megabyte context to it. This was observed: a Panel job hung
+  for over an hour. Now it surfaces as `BrokenProcessPool`. The pool is
+  replaced and the batch retried once, then `WORKER_FAILURE` fails closed as
+  before.
+- **One pool per Campaign.** `run_portfolio_adapter` opens one shared worker
+  pool, still `duckdb_import.workers` wide, for every bootstrap of the
+  Campaign. This matches §9 "one compute pool". Measured: one composition
+  takes 49 s → 17 s with the file context, and about 12 s with the shared pool.

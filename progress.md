@@ -44,6 +44,31 @@ ETA. Next step: restart Panel to load the code, then rerun the
 full-universe Campaign. No PerformanceDB or
 tester was used.
 
+## Portfolio Stage 1 throughput and hang fix (2026-10-10)
+
+Three reviewed infrastructure changes. Contracts: the 2026-10-10 amendments in
+the [weighted-search spec](docs/specs/2026-09-14-portfolio-optimizer-weighted-search.md)
+and the [UI spec](docs/specs/2026-09-06-portfolio-optimizer-panel-ui.md).
+
+- **Job journal.** The frozen Campaign in a job runtime is shared by reference
+  and never serialized into `.panel-jobs.json`. Measured: 2.26 s → 0.16 s per
+  progress update with the real 14 MB journal and a 16 MB Campaign.
+- **Market reference.** One keep-alive HTTP client and 10 requests/sec instead
+  of 2/sec, with retry and cooldown unchanged. Measured: 14.9 s → 6.0 s on 10
+  symbols. The snapshot is taken once per Campaign per unique pair; it is not
+  repeated per strategy or portfolio.
+- **Bootstrap pool.** The worker context goes through a private temp file in
+  `%TEMP%\mrs3-process-context`, not the child start-up pipe. A child dying at
+  start-up now raises `BrokenProcessPool`; the pool is replaced and the
+  unfinished tasks are retried once. Before, the parent blocked forever; a
+  2026-10-09 Panel job hung for over an hour this way. One pool serves the
+  whole Campaign and is owned by the job thread. Measured: 49 s → about 12 s
+  per composition.
+
+Verification: focused suites pass (panel jobs 49, market snapshot 36, process
+worker 6). The independent review passed, and its MINOR findings (thread
+ownership, cache release, temp-file sweep) were fixed with tests.
+
 ## Portfolio executable identity on real lot-model data (2026-10-10)
 
 Every real lot-model Campaign failed post-search with
