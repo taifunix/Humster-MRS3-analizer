@@ -1,12 +1,20 @@
 # MRS3 Current Status
 
-Last updated: 2026-10-09
+Last updated: 2026-10-10
 
 This file is a current-status snapshot, not a session log. Earlier progress notes remain in Git history; feature contracts and detailed evidence belong in the linked specs, reports, and plans.
 
 Use [PRD.md](PRD.md) for the feature registry and [docs/README.md](docs/README.md)
 for the documentation map. Read the linked contract only for the active task;
 do not treat this file as a replacement for a feature specification.
+
+## BingX data downloader (2026-10-10)
+
+Draft contract: [BingX data downloader](docs/specs/2026-10-10-bingx-data-downloader.md).
+BingX API facts in the spec were verified with live public requests on
+2026-10-10. Next step: stage 1 downloader core with mocked-HTTP tests, then
+stage 2 Panel BingX mode. Open precondition: one probe run confirming the
+`bot_root` tester reads `tester\data\bingx\`; no tester run has been made.
 
 ## Panel job admission reliability (2026-10-09)
 
