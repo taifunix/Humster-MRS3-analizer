@@ -596,8 +596,24 @@ def test_local_testing_fill_prebuilt_does_not_render_or_run_tester(
     service.stop()
 
 
+def test_local_testing_fill_prebuilt_accepts_update_data_true(tmp_path: Path) -> None:
+    config = _runner_config(tmp_path)
+    document = json.loads(_prebuilt_config())
+    document["UpdateData"] = True
+    service = LocalTestingService(
+        config,
+        Path(__file__).parents[1],
+        stop_bot=lambda _config: None,
+        client_factory=lambda _config: (_ for _ in ()).throw(AssertionError("tester run")),
+    )
+
+    service.fill_prebuilt(tester_config_json=json.dumps(document), strategy_jsons=_prebuilt_strategies())
+    assert json.loads(config.tester_config.read_text(encoding="utf-8"))["UpdateData"] is True
+    service.stop()
+
+
 @pytest.mark.parametrize("field,value", [
-    ("single_mode", True), ("UpdateData", True), ("use_runs", True), ("parameter_mining", [{"name": "x"}]),
+    ("single_mode", True), ("UpdateData", "yes"), ("use_runs", True), ("parameter_mining", [{"name": "x"}]),
 ])
 def test_local_testing_fill_prebuilt_rejects_tester_flags_before_stop(
     tmp_path: Path, field: str, value: object

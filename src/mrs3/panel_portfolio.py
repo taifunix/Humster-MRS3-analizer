@@ -517,7 +517,7 @@ def _stage2_material(candidate: Mapping[str, Any]) -> dict[str, Any]:
         "EndDate": end.date().isoformat(),
         "InitialBalance": initial_balance,
         "single_mode": False,
-        "UpdateData": False,
+        "UpdateData": True,
     })
     if exchanges == {"Bybit"}:
         # Operator rule for Stage 2 tester runs: Bybit-only batches use MakerFee 0.

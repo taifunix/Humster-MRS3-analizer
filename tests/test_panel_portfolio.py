@@ -3604,7 +3604,7 @@ def test_stage2_baseline_preparation_uses_first_persisted_candidate_and_exact_pa
 
     config = json.loads(prepared["tester_config_json"])
     template = json.loads((Path(__file__).parents[1] / "templates/tester/mrs3/config_tester.json").read_text(encoding="utf-8"))
-    expected_config = {**template, "name_comment": "a" * 64, "StartDate": "2026-01-01", "EndDate": "2026-01-14", "InitialBalance": 10000, "single_mode": False, "UpdateData": False}
+    expected_config = {**template, "name_comment": "a" * 64, "StartDate": "2026-01-01", "EndDate": "2026-01-14", "InitialBalance": 10000, "single_mode": False, "UpdateData": True}
     assert config == expected_config
     assert type(config["InitialBalance"]) is int
     assert config["use_runs"] is False
@@ -5723,3 +5723,11 @@ def test_stage2_tester_maker_fee_is_zero_for_bybit_only() -> None:
 
     assert bybit["MakerFee"] == 0
     assert other["MakerFee"] == json.loads(pp.mrs3_tester_config_template().read_text(encoding="utf-8"))["MakerFee"]
+
+
+def test_stage2_tester_config_updates_data_and_keeps_report_settings_only_in_report() -> None:
+    config = json.loads(_stage2_material(_tester_strategy_candidate((0.5, 0.5)))["tester_config_json"])
+
+    assert config["UpdateData"] is True
+    assert set(config) & set(config["report"]) == set()
+    assert config["report"]["enable_html_report"] is True

@@ -228,13 +228,16 @@ def _write_fast_tester_config(
         "include_position_stats": False,
         "enable_timing_logs": False,
     }
-    document.update({"StartDate": start, "EndDate": end, "use_runs": False, "single_mode": single_mode, **report_settings})
+    document.update({"StartDate": start, "EndDate": end, "use_runs": False, "single_mode": single_mode})
     if initial_balance is not None:
         document["InitialBalance"] = parse_initial_balance(initial_balance)
     report = document.get("report")
     if not isinstance(report, dict):
         raise FastStrategyTestError("tester config report must be an object")
     report.update(report_settings)
+    # Report settings live only inside "report"; drop stale root copies.
+    for key in report_settings:
+        document.pop(key, None)
     document["max_parallel_runs"] = config.max_parallel_submissions
     temporary = path.with_name(path.name + ".tmp")
     try:

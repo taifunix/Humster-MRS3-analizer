@@ -53,8 +53,13 @@ non-positive last order fails closed. `MakerFee` is 0 for Bybit-only
 batches. Contract: the 2026-10-10 tester-rendering amendment in the
 [UI spec](docs/specs/2026-09-06-portfolio-optimizer-panel-ui.md).
 
-Open decision: rounding percentages up enlarges positions (small `q` the
-most) and can exceed the liquidity cap C. The spec records the consequence.
+Accepted by the operator: rounding percentages up enlarges positions (small
+`q` the most) and can exceed the liquidity cap C.
+
+Follow-up (operator rules): Stage 2 tester config uses `UpdateData=true`.
+Report settings live only inside `report`; the shared MRS3 tester template
+and the fast strategy-test writer no longer put them at the root. Both local
+exports were updated.
 
 Evidence: portfolios 01 (61 strategies, bank 716) and 10 (9 strategies,
 bank 72) of `campaign-df84e07d885f4fb8a7b5d9c97a05b5d2` were re-exported

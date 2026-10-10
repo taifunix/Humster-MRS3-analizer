@@ -1229,10 +1229,23 @@ and tester-config files. They are now rendered for the tester as follows:
 - Sizing receipts (`facts` B/C/q/x, `max_balance`) remain the exact artifact
   values. Only the rendered files carry the rounding, and the
   receipts/manifests hash those rendered bytes.
-- Known consequence (open operator decision): rounding a percentage up
-  enlarges every position of that strategy by `ceil(100q)/(100q)` and lets its
-  cap `max_balance·p/100` exceed the liquidity cap C. Small `q` are hit
-  hardest (q = 0.3% → ×3.3). Stage 2 therefore tests a somewhat larger
-  portfolio than the one Stage 1 sized.
+- Known consequence, accepted by the operator on 2026-10-10: rounding a
+  percentage up enlarges every position of that strategy by
+  `ceil(100q)/(100q)` and lets its cap `max_balance·p/100` exceed the
+  liquidity cap C. Small `q` are hit hardest (q = 0.3% → ×3.3). Stage 2
+  therefore tests a somewhat larger portfolio than the one Stage 1 sized.
 - Evidence: the 70 strategies of the two exported portfolios were checked for
   template order, whole percentages, cent `lot_x` and preserved totals.
+
+Tester config follow-up (2026-10-10, operator rule). This supersedes
+`UpdateData=false` in the Phase 7 local baseline paragraph (§11) and in the
+Stage 2 preparation paragraph before P7-R4:
+- Stage 2 writes `UpdateData=true`, so the tester refreshes its market data
+  before the run. `LocalTestingService.fill_prebuilt` still requires
+  `UpdateData` to be a boolean, but no longer requires `false`. Accepted
+  effects: reruns of the same candidate may see refreshed data, and the
+  download counts against the Stage 2 total wait (`stall_timeout_seconds`).
+- Report settings (`enable_html_report`, `include_*`, `enable_timing_logs`)
+  live only inside `report`. The canonical MRS3 tester template no longer
+  repeats them at the root. The fast strategy-test writer no longer writes
+  them at the root and drops stale root copies of those settings only.

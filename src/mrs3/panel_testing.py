@@ -446,7 +446,6 @@ class LocalTestingService:
             or type(tester_config.get("single_mode")) is not bool
             or tester_config.get("single_mode") is not False
             or type(tester_config.get("UpdateData")) is not bool
-            or tester_config.get("UpdateData") is not False
             or type(tester_config.get("use_runs")) is not bool
             or tester_config.get("use_runs") is not False
             or tester_config.get("parameter_mining") != []

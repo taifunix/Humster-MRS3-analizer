@@ -242,7 +242,8 @@ def test_fast_writer_starts_from_template_and_preserves_unrelated_keys(tmp_path:
     assert rendered["InitialBalance"] == 2500.5
     assert isinstance(rendered["InitialBalance"], float)
     assert rendered["max_parallel_runs"] == config.max_parallel_submissions
-    assert rendered["include_chart_balance"] is True
+    assert "include_chart_balance" not in rendered
+    assert set(rendered) & set(rendered["report"]) == set()
     assert rendered["report"]["include_chart_balance"] is True
     assert rendered["report"]["include_position_stats"] is False
     assert rendered["report"]["include_trades_table"] is True
