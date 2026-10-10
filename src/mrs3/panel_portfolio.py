@@ -1376,7 +1376,7 @@ class PortfolioPanelService:
         return (root / path).resolve() if not path.is_absolute() else path.resolve()
 
     def _current_finalist_metadata(
-        self, document: Mapping[str, Any], *, require_result_ids: bool = False,
+        self, document: Mapping[str, Any], *, require_result_ids: bool = False, rows_out: list | None = None,
     ) -> tuple[Path, list[str], dict[str, int], tuple[int, ...]]:
         inputs = document.get("inputs") if isinstance(document.get("inputs"), Mapping) else {}
         database = self._path_from_config(self.root, inputs.get("performance_db", ""))
@@ -1408,7 +1408,62 @@ class PortfolioPanelService:
                 )
             if type(result_id) is int:
                 result_ids.append(result_id)
+            if rows_out is not None:
+                rows_out.append(row)
         return database, sorted(finalists), finalists, tuple(dict.fromkeys(result_ids))
+
+    @staticmethod
+    def _finalist_history(database: Path, rows: Sequence[Mapping[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+        """Day-aligned history of each current finalist, grouped by Pair|Side in rank order.
+
+        Uses the optimizer's period rule: the complete effective range when it is
+        valid, otherwise the report range; starts round up and ends round down to
+        whole UTC days, as the common pretest period does.
+        """
+        identities = [
+            (f"{row['symbol'].strip().upper()}|{row['side'].strip().upper()}", row["result_id"], row.get("user_rank"))
+            for row in rows
+            if isinstance(row, Mapping) and isinstance(row.get("symbol"), str) and isinstance(row.get("side"), str)
+            and type(row.get("result_id")) is int
+        ]
+        if not identities:
+            return {}
+        placeholders = ",".join("?" for _ in identities)
+        with duckdb.connect(str(database), read_only=True) as connection:
+            periods = {
+                int(result_id): (report_start, report_end, effective_start, effective_end)
+                for result_id, report_start, report_end, effective_start, effective_end in connection.execute(
+                    "select result_id, report_start_utc, report_end_utc, effective_start_utc, effective_end_utc"
+                    f" from strategy_results where result_id in ({placeholders})",
+                    [result_id for _pair, result_id, _rank in identities],
+                ).fetchall()
+            }
+
+        def utc(value: Any) -> datetime | None:
+            if not isinstance(value, datetime):
+                return None
+            return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+
+        history: dict[str, list[dict[str, Any]]] = {}
+        for pair, result_id, rank in identities:
+            entry = {"rank": rank if type(rank) is int else None, "start": None, "end": None}
+            # A finalist without a usable period keeps its slot so the rank cutoff stays exact.
+            history.setdefault(pair, []).append(entry)
+            period = periods.get(result_id)
+            if period is None:
+                continue
+            report_start, report_end, effective_start, effective_end = (utc(value) for value in period)
+            if effective_start is not None and effective_end is not None and effective_end > effective_start:
+                start, end = effective_start, effective_end
+            elif report_start is not None and report_end is not None and report_end > report_start:
+                start, end = report_start, report_end
+            else:
+                continue
+            start_day = start.date() if start == datetime.combine(start.date(), datetime.min.time(), timezone.utc) else start.date() + timedelta(days=1)
+            entry.update(start=start_day.isoformat(), end=end.date().isoformat())
+        for items in history.values():
+            items.sort(key=lambda item: (item["rank"] is None, item["rank"] or 0))
+        return history
 
     @staticmethod
     def _prepared_finalists_state(database: Path, result_ids: Sequence[int]) -> dict[str, Any]:
@@ -1479,6 +1534,7 @@ class PortfolioPanelService:
         pairs: list[str] = []
         finalists: dict[str, int] = {}
         preparation = {"state": "NEEDS_PREPARATION", "required": 0, "ready": 0}
+        finalist_history: dict[str, list[dict[str, Any]]] = {}
         if state != "READY":
             stage1.append(f"SETTINGS_{state}")
         if state == "READY" and document is not None:
@@ -1488,9 +1544,15 @@ class PortfolioPanelService:
                 stage1.append("PERFORMANCE_DB_UNAVAILABLE")
             else:
                 try:
+                    finalist_rows: list = []
                     database, pairs, finalists, result_ids = self._current_finalist_metadata(
-                        document, require_result_ids=self._uses_production_finalists_reader,
+                        document, require_result_ids=self._uses_production_finalists_reader, rows_out=finalist_rows,
                     )
+                    try:
+                        finalist_history = self._finalist_history(database, finalist_rows)
+                    except Exception:
+                        # History is an editing aid; it never blocks Stage 1.
+                        finalist_history = {}
                     active = self.active_job()
                     if active is not None and active.get("kind") == "FINALIST_PREPARATION":
                         preparation = {"state": "PREPARING", "required": len(result_ids), "ready": 0}
@@ -1525,6 +1587,7 @@ class PortfolioPanelService:
             "current_finalists": finalists,
             "preparation": preparation,
             "combination_limit": combination_limit if type(combination_limit) is int and combination_limit > 0 else None,
+            "finalist_history": finalist_history,
         }
 
     def _snapshot_finalists(self, document: Mapping[str, Any], launch: Mapping[str, Any]) -> tuple[tuple[dict[str, Any], ...], tuple[dict[str, Any], ...]]:

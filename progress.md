@@ -44,6 +44,36 @@ ETA. Next step: restart Panel to load the code, then rerun the
 full-universe Campaign. No PerformanceDB or
 tester was used.
 
+## Portfolio pair history and selection summary (2026-10-10)
+
+The Stage 1 form now shows, for every pair, the history of the finalists its
+current limits would select. Under the table it shows the totals: pairs,
+finalists, the common history of the whole selection, and a rough runtime
+estimate. Readiness exposes `finalist_history` (day-aligned periods in rank
+order, with no series reads); a history failure never blocks Stage 1.
+Contract: the 2026-10-10 pair-history amendment in the
+[UI spec](docs/specs/2026-09-06-portfolio-optimizer-panel-ui.md).
+
+Live check: all 61 pairs and 117 finalists give ≈ 21 days of common history
+(16.09–07.10) and ≈ 17 min, against 16 min measured. The shortest histories,
+21 days each, are HORIZON, MEITU and SENSETIME.
+
+The "minimum risk at target P30" search mode is recorded as a planned option
+in the [optimizer spec](docs/specs/2026-09-05-portfolio-optimizer.md), Phase 4.
+It has only a prototype so far; the product keeps the bank-ladder frontier as
+"maximum P30 under a bounded risk/bank".
+
+Stage 2 dry run (read-only, no tester start): for all 10 candidates of
+`campaign-df84e07d885f4fb8a7b5d9c97a05b5d2`, `_stage2_material` built a tester
+config and strategy JSONs (61 → 9 strategies, 16.09–06.10, `InitialBalance` =
+required bank 716 → 72). Observation: candidate 10 has `InitialBalance` 72 while
+its strategies' `max_balance` is 72.17 (whole-USDT bank vs exact sizing). The
+real tester batch still needs explicit user authorization.
+
+Verification: Panel portfolio and static UI suites pass, except the 2 known
+pre-existing failures (maintenance copy, Windows `node -e` length).
+Independent review passed.
+
 ## Portfolio bank-ladder frontier (2026-10-10)
 
 Stage 1 now returns, per profile, up to `max_candidates` genuinely different

@@ -3,6 +3,8 @@ from pathlib import Path
 import re
 import subprocess
 
+import pytest
+
 
 PANEL_WEB = Path(__file__).parents[1] / "src" / "mrs3" / "panel_web"
 
@@ -3103,7 +3105,7 @@ def test_portfolio_pair_selection_preserves_per_row_limits() -> None:
     assert ".filter((row) => row.pair && (row.finalistLong > 0 || row.finalistShort > 0))" in js
     assert "Нет пар с финалистами LONG или SHORT." in portfolio
     assert "copyPortfolioMaximum" not in portfolio
-    assert "pairInfo.append(label, count); pairCell.append(pairInfo)" in portfolio
+    assert "pairInfo.append(label, count, historyNote); pairCell.append(pairInfo)" in portfolio
     assert "row.selected = selected.checked; updateControls();" in portfolio
     assert "portfolioSafeInteger(profile.candidates, 1) && Number(profile.candidates) <= 50" in portfolio
 
@@ -3859,3 +3861,62 @@ def test_portfolio_settings_has_editable_risk_controls_and_scoped_alignment() ->
     assert 'class="field-grid portfolio-settings-field-grid"' in html
     assert ".portfolio-settings-field-grid { align-items: start; }" in css
     assert ".portfolio-settings-field-grid .field-group > label" in css
+
+
+def _run_selection_helpers(script: str, tmp_path: Path) -> dict:
+    import shutil
+
+    node = shutil.which("node") or shutil.which("node", path=r"C:\Program Files\nodejs")
+    if node is None:
+        pytest.skip("node is not available")
+    js = _read("app.js")
+    start = js.index("/* portfolio-selection-helpers:start */")
+    end = js.index("/* portfolio-selection-helpers:end */")
+    source = tmp_path / "selection.js"
+    source.write_text(js[start:end] + "\n" + script, encoding="utf-8")
+    completed = subprocess.run((node, str(source)), capture_output=True, text=True, encoding="utf-8")
+    assert completed.returncode == 0, completed.stderr
+    return json.loads(completed.stdout)
+
+
+def test_portfolio_selection_summary_uses_rank_cutoff_history_and_estimates_runtime(tmp_path: Path) -> None:
+    result = _run_selection_helpers("""
+const h = portfolioSelectionHelpers;
+const history = {
+  'AAAUSDT|LONG': [{rank: 1, start: '2026-09-01', end: '2026-09-30'}, {rank: 2, start: '2026-09-10', end: '2026-09-25'}],
+  'BBBUSDT|SHORT': [{rank: 1, start: '2026-09-05', end: '2026-10-05'}],
+};
+const rows = [
+  {pair: 'AAAUSDT', long: 1, short: 0, finalistLong: 2, finalistShort: 0},
+  {pair: 'BBBUSDT', long: 0, short: 3, finalistLong: 0, finalistShort: 1},
+];
+const pairA = h.pairWindow(rows[0], history);
+const pairA2 = h.pairWindow({...rows[0], long: 2}, history);
+const summary = h.summary(rows, history, [{candidates: 10}]);
+const big = h.summary(Array.from({length: 61}, (_, i) => ({pair: `P${i}`, long: 2, short: 0, finalistLong: 2, finalistShort: 0})), {}, [{candidates: 10}]);
+console.log(JSON.stringify({pairA, pairA2, summary, label: h.label(summary.window), big: big.etaSeconds, empty: h.summary([], history, []), fractional: h.summary([{...rows[0], long: 1.5}], history, [])}));
+""", tmp_path)
+
+    assert result["pairA"]["days"] == 29
+    assert result["pairA2"]["days"] == 15
+    assert result["summary"]["pairs"] == 2
+    assert result["summary"]["finalists"] == 2
+    assert result["summary"]["window"]["days"] == 25
+    assert result["label"] == "≈ 25 д · 05.09–30.09"
+    assert 600 <= result["big"] <= 1800
+    assert result["empty"]["pairs"] == 0 and result["empty"]["window"] is None
+    assert result["fractional"]["finalists"] == 0
+
+
+def test_portfolio_pairs_show_history_and_selection_summary() -> None:
+    html = _read("index.html")
+    js = _read("app.js")
+    portfolio = js.split("function loadPortfolioScreen", 1)[1].split("function loadPortfolioSettings", 1)[0]
+    controls = portfolio.split("const updateControls", 1)[1].split("const renderJournal", 1)[0]
+
+    assert 'id="portfolio-selection-summary"' in html
+    assert "data-portfolio-history" in portfolio
+    assert "portfolioSelectionHelpers.summary(" in controls
+    assert "state.readiness?.finalist_history" in controls
+    assert "Выбрано пар:" in controls
+    assert "совместная история" in controls

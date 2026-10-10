@@ -5496,3 +5496,67 @@ def test_combination_limit_count_is_visible_in_failed_campaign_status(
     assert "COMBINATION_LIMIT_EXCEEDED" in diagnostic
     assert "COMBINATIONS=6" in diagnostic
     assert "LIMIT=5" in diagnostic
+
+
+def test_finalist_history_reports_day_aligned_periods_per_pair_side_in_rank_order(tmp_path: Path) -> None:
+    database = tmp_path / "history.duckdb"
+    with duckdb.connect(str(database)) as connection:
+        connection.execute(
+            "create table strategy_results (result_id bigint, report_start_utc timestamptz, report_end_utc timestamptz,"
+            " effective_start_utc timestamptz, effective_end_utc timestamptz)"
+        )
+        connection.execute(
+            "insert into strategy_results values"
+            " (1, '2026-09-01 05:00:00+00', '2026-09-30 12:00:00+00', '2026-09-03 00:00:00+00', '2026-09-29 18:00:00+00'),"
+            " (2, '2026-09-10 00:00:00+00', '2026-10-05 00:00:00+00', null, null),"
+            " (3, '2026-08-01 00:00:00+00', '2026-08-31 00:00:00+00', '2026-08-05 00:00:00+00', null)"
+        )
+    rows = (
+        {"symbol": "AAAUSDT", "side": "LONG", "result_id": 2, "user_rank": 2},
+        {"symbol": "AAAUSDT", "side": "LONG", "result_id": 1, "user_rank": 1},
+        {"symbol": "BBBUSDT", "side": "SHORT", "result_id": 3, "user_rank": None},
+        {"symbol": "BBBUSDT", "side": "SHORT", "result_id": 99, "user_rank": 1},
+    )
+
+    history = PortfolioPanelService._finalist_history(database, rows)
+
+    assert history == {
+        "AAAUSDT|LONG": [
+            {"rank": 1, "start": "2026-09-03", "end": "2026-09-29"},
+            {"rank": 2, "start": "2026-09-10", "end": "2026-10-05"},
+        ],
+        # A finalist without a usable period keeps its rank slot; an incomplete
+        # effective pair falls back to the whole report range.
+        "BBBUSDT|SHORT": [
+            {"rank": 1, "start": None, "end": None},
+            {"rank": None, "start": "2026-08-01", "end": "2026-08-31"},
+        ],
+    }
+
+
+def test_readiness_exposes_finalist_history_without_blocking_on_history_errors(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = tmp_path / "portfolio_optimizer.local.json"
+    _write_config(path)
+    database = tmp_path / "performance.duckdb"
+    with duckdb.connect(str(database)):
+        pass
+    service = PortfolioPanelService(tmp_path, path)
+
+    def metadata(_document, *, require_result_ids=False, rows_out=None):
+        if rows_out is not None:
+            rows_out.append({"symbol": "BTCUSDT", "side": "LONG", "result_id": 11, "user_rank": 1})
+        return database, ["BTCUSDT|LONG"], {"BTCUSDT|LONG": 1}, (11,)
+
+    monkeypatch.setattr(service, "_current_finalist_metadata", metadata)
+    monkeypatch.setattr(service, "_prepared_finalists_metadata_state", lambda *_args, **_kwargs: {"state": "READY", "required": 1, "ready": 1})
+    monkeypatch.setattr(PortfolioPanelService, "_finalist_history", staticmethod(lambda _database, rows: {"BTCUSDT|LONG": [{"rank": 1, "start": "2026-09-01", "end": "2026-09-21"}]}))
+
+    assert service.readiness()["finalist_history"] == {"BTCUSDT|LONG": [{"rank": 1, "start": "2026-09-01", "end": "2026-09-21"}]}
+
+    def broken(_database, _rows):
+        raise duckdb.Error("history unavailable")
+
+    monkeypatch.setattr(PortfolioPanelService, "_finalist_history", staticmethod(broken))
+    readiness = service.readiness()
+    assert readiness["finalist_history"] == {}
+    assert readiness["stage1"]["enabled"] is True

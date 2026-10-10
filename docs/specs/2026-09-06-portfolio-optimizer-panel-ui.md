@@ -1130,3 +1130,27 @@ written once at admission and only read afterwards. `_save` never serializes a
 Campaign that has a snapshot descriptor; a legacy Campaign without a
 descriptor is still persisted. Every other runtime key keeps its deep copy.
 Measured with the real 14 MB journal: 2.26 s → 0.16 s per progress update.
+
+### Pair history and selection summary amendment (2026-10-10)
+
+- Readiness adds `finalist_history`: for each current `PAIR|SIDE`, the
+  finalists in User Rank order with their history as whole UTC days
+  (`start`, `end`). The period rule is the optimizer's: the complete effective
+  range if valid, else the report range; starts round up and ends round down
+  to whole days. It reads `strategy_results` periods only. A finalist without
+  a usable period keeps its rank slot with `start`/`end` = `null`, so the
+  top-N cutoff stays exact. A history read failure returns `{}` and never
+  blocks Stage 1.
+- Each pair row shows `История: ≈ N д · dd.mm–dd.mm` for the finalists its
+  current LONG/SHORT limits would select (top-N by rank).
+- Under the pair table: `Выбрано пар · финалистов · совместная история · расчёт
+  ≈ … (оценка)`. The common history is the latest start to the earliest end over
+  all selected finalists. This is the same intersection the common pretest
+  period starts from, before its coverage rules.
+- The runtime estimate is a rough model fitted to the 2026-10-10 real runs
+  (61 pairs, 117 finalists, 21 days, 10 levels: about 16 min): `30 + 1.6·pairs
+  + 0.5·finalists·r + Σ_profiles[(K+2)·0.17·finalists·r + K·pairs·r]` seconds,
+  with `r = days/21` and `K = max_candidates`. It is guidance, not a bound.
+- Acceptance: helper behaviour via node (rank cutoff, intersection, labels,
+  estimate range, invalid limits); readiness history from DuckDB periods;
+  live check: 61 pairs, 21 days (16.09–07.10), estimate ≈ 17 min.

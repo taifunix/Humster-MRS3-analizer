@@ -501,6 +501,60 @@ const testerCollectionUiHelpers = (() => {
   return { create, endpoint };
 })();
 if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = testerCollectionUiHelpers;
+/* portfolio-selection-helpers:start */
+const portfolioSelectionHelpers = (() => {
+  const DAY_MS = 86400000;
+  const day = (value) => { const time = Date.parse(`${value}T00:00:00Z`); return Number.isFinite(time) ? time : null; };
+  const limit = (requested, available) => (Number.isSafeInteger(requested) && requested > 0 && Number.isSafeInteger(available) && available > 0 ? Math.min(requested, available) : 0);
+  // The optimizer keeps the top-N finalists by User Rank per Pair + Side.
+  const ranked = (history, key, count) => (Array.isArray(history?.[key]) ? history[key] : []).slice(0, count);
+  const selectedHistory = (row, history) => [
+    ...ranked(history, `${row.pair}|LONG`, limit(row.long, row.finalistLong)),
+    ...ranked(history, `${row.pair}|SHORT`, limit(row.short, row.finalistShort)),
+  ];
+  // Common history = latest start .. earliest end over whole UTC days, as the common pretest period.
+  const commonWindow = (items) => {
+    let start = null; let end = null;
+    for (const item of items) {
+      const first = day(item?.start); const last = day(item?.end);
+      if (first === null || last === null) continue;
+      start = start === null ? first : Math.max(start, first);
+      end = end === null ? last : Math.min(end, last);
+    }
+    if (start === null) return null;
+    return { start, end, days: Math.max(0, Math.round((end - start) / DAY_MS)) };
+  };
+  const short = (time) => { const date = new Date(time); return `${String(date.getUTCDate()).padStart(2, '0')}.${String(date.getUTCMonth() + 1).padStart(2, '0')}`; };
+  const label = (value) => (!value ? '—' : (value.end < value.start ? 'нет общего периода' : `≈ ${value.days} д · ${short(value.start)}–${short(value.end)}`));
+  // Rough runtime model fitted to the 2026-10-10 real runs (61 pairs, 117 finalists, 21 days, 10 levels: about 16 min).
+  const etaSeconds = (pairs, finalists, days, profiles) => {
+    const scale = Math.max(1, days || 21) / 21;
+    const base = 30 + 1.6 * pairs + 0.5 * finalists * scale;
+    return profiles.reduce((total, profile) => {
+      const levels = Number.isSafeInteger(Number(profile?.candidates)) ? Math.max(1, Number(profile.candidates)) : 10;
+      return total + (levels + 2) * 0.17 * finalists * scale + levels * 1.0 * pairs * scale;
+    }, base);
+  };
+  const duration = (seconds) => {
+    if (!Number.isFinite(seconds)) return '—';
+    const minutes = Math.round(seconds / 60);
+    if (minutes < 1) return '< 1 мин';
+    return minutes < 60 ? `≈ ${minutes} мин` : `≈ ${Math.floor(minutes / 60)} ч ${minutes % 60} мин`;
+  };
+  const summary = (rows, history, profiles) => {
+    let pairs = 0; let finalists = 0; const items = [];
+    for (const row of rows) {
+      const count = limit(row.long, row.finalistLong) + limit(row.short, row.finalistShort);
+      if (!count) continue;
+      pairs += 1; finalists += count; items.push(...selectedHistory(row, history));
+    }
+    const common = commonWindow(items);
+    return { pairs, finalists, window: common, etaSeconds: pairs ? etaSeconds(pairs, finalists, common?.days, profiles) : 0 };
+  };
+  return { pairWindow: (row, history) => commonWindow(selectedHistory(row, history)), summary, label, duration, etaSeconds };
+})();
+if (typeof globalThis !== 'undefined') globalThis.portfolioSelectionHelpers = portfolioSelectionHelpers;
+/* portfolio-selection-helpers:end */
   const { selectCommittedRetestTester, selectRetestTester } = window.retestRecovery;
   let shortlistGroups = [];
   let shortlistItems = [];
@@ -4639,8 +4693,9 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
           selected.addEventListener('change', () => { row.selected = selected.checked; updateControls(); });
           const name = document.createElement('span'); name.textContent = row.pair;
           const count = document.createElement('small'); count.className = 'portfolio-pair-count'; count.textContent = `FINALIST: LONG ${row.finalistLong} · SHORT ${row.finalistShort}`;
+          const historyNote = document.createElement('small'); historyNote.className = 'portfolio-pair-count portfolio-pair-history'; historyNote.dataset.portfolioHistory = row.pair;
           const pairInfo = document.createElement('div'); pairInfo.className = 'portfolio-pair-info';
-          label.append(selected, name); pairInfo.append(label, count); pairCell.append(pairInfo); tableRow.append(pairCell);
+          label.append(selected, name); pairInfo.append(label, count, historyNote); pairCell.append(pairInfo); tableRow.append(pairCell);
           for (const [side, countValue] of [['LONG', row.long], ['SHORT', row.short]]) {
             const field = document.createElement('td');
             const input = document.createElement('input'); input.type = 'number'; input.min = '0'; input.max = String(side === 'LONG' ? row.finalistLong : row.finalistShort); input.step = '1'; input.value = String(countValue); input.dataset.portfolioPair = row.pair; input.dataset.portfolioSide = side; input.setAttribute('aria-label', `${row.pair}: максимум ${side}`);
@@ -4664,6 +4719,18 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
         const preparationState = state.readiness?.preparation?.state;
         if (formStatus && !state.locked) formStatus.textContent = launch.valid ? 'Кампания готова к фиксации.' : (launch.invalidPairLimits.length ? `Лимит превышает доступное число финалистов: ${launch.invalidPairLimits.join(', ')}.` : 'Заполните обязательные поля и исправьте недопустимые лимиты.');
         if (runButton) runButton.disabled = state.locked || !launch.valid;
+        const history = state.readiness?.finalist_history || {};
+        for (const row of launch.rows) {
+          const note = query('#portfolio-pairs')?.querySelector(`[data-portfolio-history="${typeof CSS !== 'undefined' && CSS.escape ? CSS.escape(row.pair) : row.pair}"]`);
+          if (note) note.textContent = `История: ${portfolioSelectionHelpers.label(portfolioSelectionHelpers.pairWindow(row, history))}`;
+        }
+        const summaryNode = query('#portfolio-selection-summary');
+        if (summaryNode) {
+          const selection = portfolioSelectionHelpers.summary(launch.selectedPairs, history, launch.profiles);
+          summaryNode.textContent = selection.pairs
+            ? `Выбрано пар: ${selection.pairs} · финалистов: ${selection.finalists} · совместная история: ${portfolioSelectionHelpers.label(selection.window)} · расчёт ${portfolioSelectionHelpers.duration(selection.etaSeconds)} (оценка)`
+            : 'Выбрано пар: 0';
+        }
         const combinationNode = query('#portfolio-combination-count');
         if (combinationNode) {
           const combinations = launch.selectedPairs.length ? portfolioCombinationCount(launch.selectedPairs) : 0n;
