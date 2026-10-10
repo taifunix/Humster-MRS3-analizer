@@ -17,6 +17,7 @@ def render_screener_tester_config(
     end: str,
     *,
     max_parallel_runs: int | None = None,
+    exchange: str = "bybit",
 ) -> str:
     if not isinstance(symbols, tuple) or not symbols:
         raise PanelTestingError("invalid tester configuration")
@@ -28,7 +29,7 @@ def render_screener_tester_config(
         )
 
     rendered = render_tester_config(
-        template, symbols, start, end, max_parallel_runs=max_parallel_runs
+        template, symbols, start, end, max_parallel_runs=max_parallel_runs, exchange=exchange
     )
     document = json.loads(rendered)
     targets = [

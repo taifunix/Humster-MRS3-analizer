@@ -230,8 +230,9 @@ const panelRequestErrorHelpers = (() => {
     '/api/v2/strategies/fresh/',
     '/api/v2/surfaces/',
     '/api/v2/testing/screener/',
+    '/api/v2/testing/bingx/',
   ];
-  const safeStringEndpoints = new Set(['/api/v2/settings/analysis-profile']);
+  const safeStringEndpoints = new Set(['/api/v2/settings/analysis-profile', '/api/v2/testing/local/fill']);
   const allowsSafeString = (endpoint) => (
     safeStringEndpoints.has(endpoint) || safeStringPrefixes.some((prefix) => endpoint.startsWith(prefix))
   );
@@ -1009,17 +1010,50 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
     });
   }
 
+  // BingX mode (docs/specs/2026-10-10-bingx-data-downloader.md, stage 2):
+  // top up BingX data in the background, then prepare files with bingx: true.
+  async function runBingxTopUp(request, report) {
+    await requestJson('/api/v2/testing/bingx/download', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(request),
+    });
+    report('Докачка данных BingX запущена.');
+    for (;;) {
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+      const state = await requestJson('/api/v2/testing/bingx/status');
+      if (state.state === 'running') {
+        report(`Докачка BingX: обработано ${state.processed}. ${state.last_message || ''}`.trim());
+        continue;
+      }
+      if (state.state === 'done') {
+        report(`Данные BingX готовы. ${(state.summary || []).join('; ')}`);
+        return true;
+      }
+      const errors = (state.errors || []).map((item) => [item.pair, item.day, item.message].filter(Boolean).join(' ')).join('; ');
+      report(`Докачка BingX завершилась с ошибками, файлы не подготовлены: ${errors}`);
+      return false;
+    }
+  }
+
   const localFill = document.querySelector('#local-fill');
   if (localFill) localFill.addEventListener('click', async () => {
     const value = (id) => document.querySelector(id)?.value || '';
+    const bingx = document.querySelector('#local-bingx')?.checked === true;
+    const localStatus = (message) => {
+      const target = document.querySelector('#runner-local .card-status');
+      if (target) target.textContent = message;
+    };
     try {
+      const request = {
+        symbols: value('#local-pair'), side: value('#local-side'),
+        start: value('#local-start-date'), end: value('#local-end-date'),
+        delete_old_reports: document.querySelector('#local-delete-old-reports')?.checked === true,
+        bingx,
+      };
+      if (bingx && !(await runBingxTopUp(request, localStatus))) return;
       const result = await requestJson('/api/v2/testing/local/fill', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          symbols: value('#local-pair'), side: value('#local-side'),
-          start: value('#local-start-date'), end: value('#local-end-date'),
-          delete_old_reports: document.querySelector('#local-delete-old-reports')?.checked === true,
-        }),
+        body: JSON.stringify(request),
       });
       const target = document.querySelector('#runner-local .card-status');
       if (target) target.textContent = result.reports_cleared
@@ -1029,7 +1063,9 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
       const target = document.querySelector('#runner-local .card-status');
       if (target) target.textContent = error.code === 'TESTER_FILES_PREPARED'
         ? 'Файлы уже подготовлены. Если что-то изменилось, сначала нажмите Стоп.'
-        : 'Не удалось подготовить файлы. Проверьте runner и настройки тестера.';
+        : (bingx && String(error?.message || '').startsWith('BingX:')
+          ? error.message
+          : 'Не удалось подготовить файлы. Проверьте runner и настройки тестера.');
     }
   });
 
@@ -1100,13 +1136,16 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
   if (screenerFill) screenerFill.addEventListener('click', async () => {
     const value = (id) => document.querySelector(id)?.value || '';
     try {
+      const request = {
+        symbols: value('#screener-pairs'), side: value('#screener-side'),
+        start: value('#screener-start-date'), end: value('#screener-end-date'),
+        delete_old_reports: document.querySelector('#screener-delete-old-reports')?.checked === true,
+        bingx: document.querySelector('#screener-bingx')?.checked === true,
+      };
+      if (request.bingx && !(await runBingxTopUp(request, screenerStatus))) return;
       const result = await requestJson('/api/v2/testing/screener/fill', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          symbols: value('#screener-pairs'), side: value('#screener-side'),
-          start: value('#screener-start-date'), end: value('#screener-end-date'),
-          delete_old_reports: document.querySelector('#screener-delete-old-reports')?.checked === true,
-        }),
+        body: JSON.stringify(request),
       });
       const expected = document.querySelector('#screener-expected-runs');
       if (expected) expected.textContent = Number.isFinite(result.expected_runs)

@@ -39,7 +39,19 @@ class TesterRunClient(Protocol):
 
 
 _SYMBOL = re.compile(r"^[A-Z0-9]{2,32}$")
+# BingX API symbols, e.g. NCSKPANW2USD-USDT (docs/specs/2026-10-10-bingx-data-downloader.md).
+_BINGX_SYMBOL = re.compile(r"^[A-Z0-9]{2,40}-USDT$")
 _SCREENER_USDT_SUFFIX = re.compile(r"USDT$")
+EXCHANGES = ("bybit", "bingx")
+# BingX mode: tester reads data only from tester/data/bingx and uses BingX fees.
+_BINGX_TESTER_SETTINGS = {"MakerFee": 0.0002, "TakerFee": 0.0005, "UpdateData": False}
+_BINGX_STRATEGY_EXCHANGE = {"name": "BingX", "account": "bingx"}
+
+
+def _symbol_pattern(exchange: str) -> "re.Pattern[str]":
+    if exchange not in EXCHANGES:
+        raise PanelTestingError("invalid tester configuration")
+    return _BINGX_SYMBOL if exchange == "bingx" else _SYMBOL
 _TEMPLATES = {
     "LONG": ("templates/tester/mrs2/config_tester_long.json", "templates/strategies/source-v6-mrs2/long.json"),
     "SHORT": ("templates/tester/mrs2/config_tester_short.json", "templates/strategies/source-v6-mrs2/short.json"),
@@ -74,7 +86,11 @@ def _find_unique_symbol_entry(mining: list) -> dict:
 
 
 def expected_screener_runs(
-    repo_root: Path, config_template_path: str, symbols: tuple[str, ...] | list[str]
+    repo_root: Path,
+    config_template_path: str,
+    symbols: tuple[str, ...] | list[str],
+    *,
+    exchange: str = "bybit",
 ) -> int:
     """Total tester runs a screener config template would submit for `symbols`.
 
@@ -88,9 +104,10 @@ def expected_screener_runs(
     if not symbols:
         raise PanelTestingError("invalid tester configuration")
     clean_symbols = tuple(symbol.strip().upper() for symbol in symbols)
+    pattern = _symbol_pattern(exchange)
     if (
         len(set(clean_symbols)) != len(clean_symbols)
-        or any(not _SYMBOL.fullmatch(symbol) for symbol in clean_symbols)
+        or any(not pattern.fullmatch(symbol) for symbol in clean_symbols)
         or any(not _SCREENER_USDT_SUFFIX.search(symbol) for symbol in clean_symbols)
     ):
         raise PanelTestingError("invalid tester configuration")
@@ -156,13 +173,15 @@ def render_tester_config(
     end: str,
     *,
     max_parallel_runs: int | None = None,
+    exchange: str = "bybit",
 ) -> str:
     if not isinstance(template, str) or not isinstance(symbols, tuple) or not symbols:
         raise PanelTestingError("invalid tester configuration")
     if max_parallel_runs is not None and (type(max_parallel_runs) is not int or max_parallel_runs <= 0):
         raise PanelTestingError("invalid tester configuration")
+    pattern = _symbol_pattern(exchange)
     clean_symbols = tuple(symbol.strip().upper() for symbol in symbols)
-    if len(set(clean_symbols)) != len(clean_symbols) or any(not _SYMBOL.fullmatch(symbol) for symbol in clean_symbols):
+    if len(set(clean_symbols)) != len(clean_symbols) or any(not pattern.fullmatch(symbol) for symbol in clean_symbols):
         raise PanelTestingError("invalid tester configuration")
     try:
         start_date, end_date = date.fromisoformat(start), date.fromisoformat(end)
@@ -179,15 +198,19 @@ def render_tester_config(
     document["EndDate"] = f"{end_date.isoformat()}T00:00:00"
     if max_parallel_runs is not None:
         document["max_parallel_runs"] = max_parallel_runs
+    if exchange == "bingx":
+        document.update(_BINGX_TESTER_SETTINGS)
     symbol_entry["values"] = list(clean_symbols)
     return json.dumps(document, ensure_ascii=False, indent=2) + "\n"
 
 
-def render_strategy(template: str, symbol: str, side: str) -> tuple[str, dict]:
+def render_strategy(template: str, symbol: str, side: str, *, exchange: str = "bybit") -> tuple[str, dict]:
     if not isinstance(template, str) or not isinstance(symbol, str) or side not in {"LONG", "SHORT"}:
         raise PanelTestingError("invalid strategy template")
+    if exchange not in EXCHANGES:
+        raise PanelTestingError("invalid strategy template")
     symbol = symbol.strip().upper()
-    if not _SYMBOL.fullmatch(symbol):
+    if not _symbol_pattern(exchange).fullmatch(symbol):
         raise PanelTestingError("invalid strategy template")
     try:
         document = json.loads(template)
@@ -200,6 +223,11 @@ def render_strategy(template: str, symbol: str, side: str) -> tuple[str, dict]:
     basic["symbol"] = symbol
     basic["use_long"] = side == "LONG"
     basic["use_short"] = side == "SHORT"
+    if exchange == "bingx":
+        strategy_exchange = document.get("exchange")
+        if not isinstance(strategy_exchange, dict):
+            raise PanelTestingError("invalid strategy template")
+        strategy_exchange.update(_BINGX_STRATEGY_EXCHANGE)
     return f"{name}.json", document
 
 
@@ -289,6 +317,7 @@ class LocalTestingService:
         end: str,
         output_dir: Path | None = None,
         template_override: tuple[str, Callable[..., str]] | None = None,
+        exchange: str = "bybit",
     ) -> LocalTestingPreparation:
         """Stage a rendered tester config and one strategy file.
 
@@ -305,6 +334,10 @@ class LocalTestingService:
         side = side.strip().upper() if isinstance(side, str) else ""
         if side not in _TEMPLATES:
             raise PanelTestingError("invalid testing side")
+        if exchange not in EXCHANGES:
+            raise PanelTestingError("invalid testing exchange")
+        # Bybit keeps the exact pre-BingX call shape for every renderer.
+        exchange_kwargs = {"exchange": exchange} if exchange != "bybit" else {}
         selected = tuple(symbols)
         if not selected:
             raise PanelTestingError("at least one symbol is required")
@@ -325,8 +358,9 @@ class LocalTestingService:
             start,
             end,
             max_parallel_runs=self.config.max_parallel_submissions,
+            **exchange_kwargs,
         )
-        filename, strategy = render_strategy(strategy_template, selected[0], side)
+        filename, strategy = render_strategy(strategy_template, selected[0], side, **exchange_kwargs)
 
         workspace = (self.config.inbox_root / "panel-testing").resolve()
         destination = (output_dir or workspace).resolve()
@@ -369,6 +403,7 @@ class LocalTestingService:
         end: str,
         delete_old_reports: bool = False,
         template_override: tuple[str, Callable[..., str]] | None = None,
+        exchange: str = "bybit",
     ) -> dict[str, object]:
         """Install the requested single strategy and rendered tester config."""
         if not isinstance(delete_old_reports, bool):
@@ -379,6 +414,7 @@ class LocalTestingService:
             start=start,
             end=end,
             template_override=template_override,
+            exchange=exchange,
         )
         owner: TesterTargetLock | None = None
         target_quiesced = True

@@ -22,9 +22,20 @@ Stage 1 is implemented: `src/mrs3/bingx_downloader.py`, manual launch
 for 2026-08-03..05 (BABA listing day 870 rows, pre-listing day skipped) and a
 repeat run skipped all 8 valid days.
 
-Next step: stage 2 Panel BingX mode. Open precondition: one probe run
-confirming the `bot_root` tester reads `tester\data\bingx\`; no tester run has
-been made.
+Stage 2 is implemented: «BingX» checkbox on SCREENER 01 and RUNNER 01;
+«Подготовить файлы» first tops up data (`StartDate − 1` … `EndDate`) through
+`/api/v2/testing/bingx/download` + `/status`, then fills the tester with API
+symbols, BingX fees, `UpdateData: false` and a `BingX`/`bingx` strategy. The
+screener takes BingX listing dates from `launchTime` and does not write BingX
+verdicts to the Bybit registry. Verification:
+`.venv\Scripts\python.exe -m pytest -p no:cacheprovider tests/test_panel_bingx_mode.py tests/test_bingx_downloader.py tests/test_panel_testing.py tests/test_panel_static_ui.py tests/screener tests/test_panel.py`
+— all BingX tests pass; 3 failures are pre-existing and reproduce without
+these changes (`test_panel_static_ui.py`: two `WinError 206` node command-line
+length failures; `test_panel.py::test_static_panel_shell_contains_only_navigation_contract`:
+existing maintenance `previewToken` identifiers). `node --check` passed.
+
+Open: the Panel server was not restarted, and no tester run was made. One
+probe run must confirm the `bot_root` tester reads `tester\data\bingx\`.
 
 ## Panel job admission reliability (2026-10-09)
 

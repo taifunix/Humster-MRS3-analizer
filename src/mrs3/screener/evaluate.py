@@ -16,7 +16,7 @@ from mrs3.eligibility import absolute_trade_floor
 
 from .config import ScreenerConfig
 from .errors import ScreenerEvaluationError
-from .listing import resolve_listing_dates
+from .listing import is_bingx_symbol, resolve_listing_dates
 from .registry import ScreeningRow, write_screening_results
 
 _SYMBOL_COL = "settings[*].basic.symbol"
@@ -350,7 +350,11 @@ def evaluate_and_record(
         dates_path=dates_path,
         registry_path=screener_config.liquidity_registry_path,
     )
-    if screener_config.liquidity_registry_path is not None:
+    # BingX verdicts are shown/exported only; the registry is Bybit-only
+    # (docs/specs/2026-10-10-bingx-data-downloader.md, stage 2).
+    if screener_config.liquidity_registry_path is not None and not any(
+        is_bingx_symbol(verdict.symbol) for verdict in verdicts
+    ):
         rows = tuple(
             ScreeningRow(
                 symbol=verdict.symbol,

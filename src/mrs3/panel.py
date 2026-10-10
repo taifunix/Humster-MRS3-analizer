@@ -199,6 +199,14 @@ from .panel_remote_source_db import RemoteSourceDbExecutor, RemoteSourceDbError
 from .panel_source_db import LocalSourceDbService
 from .panel_source_jobs import LocalSourceDbJobRunner
 from .panel_surfaces import LocalSurfacesService
+from .bingx_downloader import (
+    BingXClient,
+    BingXDownloadError,
+    download_pairs as bingx_download_pairs,
+    load_account_keys as bingx_load_account_keys,
+    load_bingx_settings,
+    normalize_ticker as bingx_normalize_ticker,
+)
 from .panel_testing import (
     LocalTestingService,
     PanelTestingError,
@@ -1394,6 +1402,15 @@ class PanelController:
         self._portfolio_service.startup_recover()
         self._local_testing_filled = False
         self._remote_testing_filled = False
+        # BingX mode (docs/specs/2026-10-10-bingx-data-downloader.md, stage 2):
+        # one background top-up at a time; fill uses its resolved API symbols.
+        self._bingx_lock = threading.Lock()
+        self._bingx_thread: threading.Thread | None = None
+        self._bingx_state: dict[str, object] = {"state": "idle"}
+        self._bingx_client_factory: Callable[[tuple[str, str] | None], BingXClient] = (
+            lambda keys: BingXClient(credentials=keys)
+        )
+        self._bingx_now: Callable[[], datetime] = lambda: datetime.now(timezone.utc)
         self._local_testing_service_instance: LocalTestingService | None = None
         self._remote_testing_service_instance: RemoteTestingService | None = None
         self._remote_ownership_adapter = remote_ownership_adapter
@@ -2373,7 +2390,112 @@ class PanelController:
             **self._local_testing_request(payload),
             "delete_old_reports": delete_old_reports,
         }
+        if self._bingx_mode(payload):
+            fill_kwargs.update(symbols=self._bingx_symbols_for_fill(payload), exchange="bingx")
         return self._run_local_fill(fill_kwargs, redact=False)
+
+    # -- BingX mode (docs/specs/2026-10-10-bingx-data-downloader.md, stage 2):
+    # «Подготовить файлы» first tops up BingX data in a background thread, then
+    # fills the tester with the API symbols resolved by that completed top-up.
+
+    @staticmethod
+    def _bingx_mode(payload: Mapping[str, object]) -> bool:
+        value = payload.get("bingx", False)
+        if not isinstance(value, bool):
+            raise PanelTestingError("invalid testing request")
+        return value
+
+    @staticmethod
+    def _bingx_request(payload: Mapping[str, object]) -> tuple[tuple[str, ...], date, date]:
+        symbols = payload.get("symbols")
+        if isinstance(symbols, str):
+            symbols = PanelController._split_symbols_field(symbols, _SCREENER_SYMBOL_SPLIT)
+        if not isinstance(symbols, (tuple, list)) or not symbols or not all(isinstance(item, str) for item in symbols):
+            raise PanelTestingError("BingX: укажите пары")
+        try:
+            tickers = tuple(dict.fromkeys(bingx_normalize_ticker(item) for item in symbols))
+            start = date.fromisoformat(str(payload.get("start")))
+            end = date.fromisoformat(str(payload.get("end")))
+        except (BingXDownloadError, ValueError) as error:
+            raise PanelTestingError(f"BingX: {_redact_screener_error(error)}") from None
+        if start > end:
+            raise PanelTestingError("BingX: дата начала позже даты конца")
+        return tickers, start, end
+
+    def bingx_download_start(self, payload: Mapping[str, object]) -> dict[str, object]:
+        tickers, start, end = self._bingx_request(payload)
+        try:
+            settings = load_bingx_settings(self.default_config)
+        except BingXDownloadError as error:
+            raise PanelTestingError(f"BingX: {_redact_screener_error(error)}") from None
+        with self._bingx_lock:
+            if self._bingx_thread is not None and self._bingx_thread.is_alive():
+                raise PanelTestingError("BingX: докачка уже выполняется")
+            state: dict[str, object] = {
+                "state": "running", "tickers": list(tickers),
+                "start": start.isoformat(), "end": end.isoformat(),
+                "processed": 0, "last_message": "", "summary": [], "errors": [], "contracts": {},
+            }
+            self._bingx_state = state
+            self._bingx_thread = threading.Thread(
+                target=self._bingx_download_worker,
+                args=(settings.bot_root, settings.download_mode, tickers, start, end, state),
+                name="bingx-download",
+                daemon=True,
+            )
+            self._bingx_thread.start()
+        return self.bingx_download_status()
+
+    def _bingx_download_worker(
+        self, bot_root: Path, mode: str, tickers: tuple[str, ...], start: date, end: date, state: dict[str, object]
+    ) -> None:
+        def log(message: str) -> None:
+            with self._bingx_lock:
+                state["processed"] = int(state["processed"]) + 1
+                state["last_message"] = redact_local_paths(message)[:512]
+
+        try:
+            client = self._bingx_client_factory(bingx_load_account_keys(bot_root))
+            # One extra day before StartDate for the tester warm-up (WarmupDays: 1).
+            report = bingx_download_pairs(
+                bot_root=bot_root, pairs=tickers, start=start - timedelta(days=1), end=end,
+                mode=mode, client=client, now=self._bingx_now(), log=log,
+            )
+        except Exception as error:  # Background thread: surface every failure as state.
+            with self._bingx_lock:
+                state.update(state="failed", errors=[{"pair": "", "day": None, "message": _redact_screener_error(error)}])
+            return
+        errors = [
+            {"pair": item.pair, "day": item.day.isoformat() if item.day else None, "message": redact_local_paths(item.message)[:512]}
+            for item in report.errors
+        ]
+        with self._bingx_lock:
+            state.update(
+                state="failed" if errors else "done",
+                summary=[redact_local_paths(line)[:512] for line in report.summary_lines()],
+                errors=errors,
+                contracts={ticker: contract.api_symbol for ticker, contract in report.contracts.items()},
+            )
+
+    def bingx_download_status(self) -> dict[str, object]:
+        with self._bingx_lock:
+            return json.loads(json.dumps(self._bingx_state))
+
+    def _bingx_symbols_for_fill(self, payload: Mapping[str, object]) -> tuple[str, ...]:
+        tickers, start, end = self._bingx_request(payload)
+        state = self.bingx_download_status()
+        if (
+            state.get("state") != "done"
+            or state.get("tickers") != list(tickers)
+            or state.get("start") != start.isoformat()
+            or state.get("end") != end.isoformat()
+        ):
+            raise PanelTestingError("BingX: сначала докачайте данные для этих пар и дат")
+        contracts = state.get("contracts") or {}
+        try:
+            return tuple(contracts[ticker] for ticker in tickers)
+        except KeyError:
+            raise PanelTestingError("BingX: сначала докачайте данные для этих пар и дат") from None
 
     def local_testing_start(self) -> dict[str, str]:
         if not self._local_testing_filled:
@@ -2423,6 +2545,10 @@ class PanelController:
         template_path = _SCREENER_TEMPLATES.get(side)
         if template_path is None:
             raise PanelTestingError("invalid testing request")
+        exchange_kwargs: dict[str, object] = {}
+        if self._bingx_mode(payload):
+            request["symbols"] = self._bingx_symbols_for_fill(payload)
+            exchange_kwargs = {"exchange": "bingx"}
         fill_kwargs = {
             "side": side,
             "symbols": request["symbols"],
@@ -2430,12 +2556,13 @@ class PanelController:
             "end": request["end"],
             "delete_old_reports": delete_old_reports,
             "template_override": (template_path, render_screener_tester_config),
+            **exchange_kwargs,
         }
         result = self._run_local_fill(fill_kwargs, redact=True)
         try:
             service = self._local_testing_service()
             result["expected_runs"] = expected_screener_runs(
-                service.repo_root, template_path, request["symbols"]
+                service.repo_root, template_path, request["symbols"], **exchange_kwargs
             )
         except PanelTestingError:
             pass  # Files are already staged; a preview-count failure must not undo that.
@@ -9836,6 +9963,9 @@ class _PanelHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/v2/testing/screener/status":
             self._json(200, self.server.controller.local_screener_status())
             return
+        if parsed.path == "/api/v2/testing/bingx/status":
+            self._json(200, self.server.controller.bingx_download_status())
+            return
         if parsed.path == "/api/v2/testing/screener/registry-pairs":
             side = parse_qs(parsed.query).get("side", [""])[0]
             try:
@@ -10220,7 +10350,7 @@ class _PanelHandler(BaseHTTPRequestHandler):
         portfolio_submission_route = bool(re.fullmatch(r"/api/v2/portfolio/campaigns/[^/]+/tester-submissions", endpoint))
         if equity_filter_endpoint:
             pass
-        elif bulk_retest_endpoint is None and endpoint != "/api/v2/strategies/performance-v2/selection-settings" and endpoint not in {"/api/start", "/api/browse", "/api/duckdb-import/settings", "/api/duckdb-import/preflight", "/api/duckdb-import/start", "/api/duckdb-import/cancel", "/api/duckdb-import/migrate", "/api/duckdb-direct/coverage", "/api/duckdb-direct/preflight", "/api/duckdb-direct/start", "/api/duckdb-direct/cancel", "/api/analysis/library", "/api/analysis/initialize", "/api/analysis/rerun", "/api/analysis/compare", "/api/analysis/export", "/api/analysis/shortlist", "/api/analysis/filter-export", "/api/analysis/strategies", "/api/source-v6/preflight", "/api/source-v6/start", "/api/source-v6/fresh/multiscope/start", "/api/source-v6/fresh/multiscope/analysis/start", "/api/source-v6/cancel", "/api/source-v6/merge", "/api/v2/panel/restart", "/api/v2/settings/validate", "/api/v2/settings/save", "/api/v2/settings/analysis-profile", "/api/v2/jobs", "/api/v2/strategies/tester/verify-inbox", "/api/v2/strategies/tester/report-collection/clear", "/api/v2/testing/local/fill", "/api/v2/testing/local/start", "/api/v2/testing/local/stop", "/api/v2/testing/screener/fill", "/api/v2/testing/screener/start", "/api/v2/testing/screener/stop", "/api/v2/testing/screener/evaluate", "/api/v2/testing/remote/check-paths", "/api/v2/testing/remote/prepare", "/api/v2/testing/remote/fill", "/api/v2/testing/remote/start", "/api/v2/source/local/import/preflight", "/api/v2/source/local/import/start", "/api/v2/source/local/merge/preflight", "/api/v2/source/local/merge/start", "/api/v2/source/local/cancel", "/api/v2/source/remote/start", "/api/v2/source/remote/cancel", "/api/v2/surfaces/preflight", "/api/v2/surfaces/select", "/api/v2/surfaces/publish", "/api/v2/surfaces/publish/start", "/api/v2/strategies/fresh/analyze", "/api/v2/strategies/fresh/generate", "/api/v2/strategies/fresh/runs", "/api/v2/strategies/fresh/shortlist", "/api/v2/strategies/fresh/open", "/api/v2/strategies/performance-v2/windows", "/api/v2/strategies/performance-v2/selection", "/api/v2/strategies/performance-v2/selection-preview", "/api/v2/strategies/performance-v2/selection-cache-status", "/api/v2/strategies/performance-v2/recalculate", "/api/v2/strategies/performance-v2/recalculate-all", "/api/v2/strategies/performance-v2/selection-review-import", "/api/v2/strategies/performance-v2/selection-user-fields-import", "/api/v2/strategies/performance-v2/retest-tags-import", "/api/v2/strategies/performance-v2/retest/start", "/api/v2/strategies/performance-v2/retest/import"} and not portfolio_route and not performance_v2_maintenance_endpoint:
+        elif bulk_retest_endpoint is None and endpoint != "/api/v2/strategies/performance-v2/selection-settings" and endpoint not in {"/api/start", "/api/browse", "/api/duckdb-import/settings", "/api/duckdb-import/preflight", "/api/duckdb-import/start", "/api/duckdb-import/cancel", "/api/duckdb-import/migrate", "/api/duckdb-direct/coverage", "/api/duckdb-direct/preflight", "/api/duckdb-direct/start", "/api/duckdb-direct/cancel", "/api/analysis/library", "/api/analysis/initialize", "/api/analysis/rerun", "/api/analysis/compare", "/api/analysis/export", "/api/analysis/shortlist", "/api/analysis/filter-export", "/api/analysis/strategies", "/api/source-v6/preflight", "/api/source-v6/start", "/api/source-v6/fresh/multiscope/start", "/api/source-v6/fresh/multiscope/analysis/start", "/api/source-v6/cancel", "/api/source-v6/merge", "/api/v2/panel/restart", "/api/v2/settings/validate", "/api/v2/settings/save", "/api/v2/settings/analysis-profile", "/api/v2/jobs", "/api/v2/strategies/tester/verify-inbox", "/api/v2/strategies/tester/report-collection/clear", "/api/v2/testing/local/fill", "/api/v2/testing/local/start", "/api/v2/testing/local/stop", "/api/v2/testing/screener/fill", "/api/v2/testing/screener/start", "/api/v2/testing/screener/stop", "/api/v2/testing/screener/evaluate", "/api/v2/testing/bingx/download", "/api/v2/testing/remote/check-paths", "/api/v2/testing/remote/prepare", "/api/v2/testing/remote/fill", "/api/v2/testing/remote/start", "/api/v2/source/local/import/preflight", "/api/v2/source/local/import/start", "/api/v2/source/local/merge/preflight", "/api/v2/source/local/merge/start", "/api/v2/source/local/cancel", "/api/v2/source/remote/start", "/api/v2/source/remote/cancel", "/api/v2/surfaces/preflight", "/api/v2/surfaces/select", "/api/v2/surfaces/publish", "/api/v2/surfaces/publish/start", "/api/v2/strategies/fresh/analyze", "/api/v2/strategies/fresh/generate", "/api/v2/strategies/fresh/runs", "/api/v2/strategies/fresh/shortlist", "/api/v2/strategies/fresh/open", "/api/v2/strategies/performance-v2/windows", "/api/v2/strategies/performance-v2/selection", "/api/v2/strategies/performance-v2/selection-preview", "/api/v2/strategies/performance-v2/selection-cache-status", "/api/v2/strategies/performance-v2/recalculate", "/api/v2/strategies/performance-v2/recalculate-all", "/api/v2/strategies/performance-v2/selection-review-import", "/api/v2/strategies/performance-v2/selection-user-fields-import", "/api/v2/strategies/performance-v2/retest-tags-import", "/api/v2/strategies/performance-v2/retest/start", "/api/v2/strategies/performance-v2/retest/import"} and not portfolio_route and not performance_v2_maintenance_endpoint:
             self._json(404, {"error": "not found"})
             return
         if endpoint in {"/api/v2/strategies/performance-v2/selection-review-import", "/api/v2/strategies/performance-v2/selection-user-fields-import", "/api/v2/strategies/performance-v2/retest-tags-import"}:
@@ -10336,6 +10466,8 @@ class _PanelHandler(BaseHTTPRequestHandler):
                 result = self.server.controller.local_screener_stop()
             elif endpoint == "/api/v2/testing/screener/evaluate":
                 result = self.server.controller.local_screener_evaluate()
+            elif endpoint == "/api/v2/testing/bingx/download":
+                result = self.server.controller.bingx_download_start(document)
             elif endpoint == "/api/v2/testing/remote/prepare":
                 result = self.server.controller.remote_testing_prepare(document)
             elif endpoint == "/api/v2/testing/remote/check-paths":
@@ -10506,6 +10638,11 @@ class _PanelHandler(BaseHTTPRequestHandler):
         except PanelTestingError as error:
             if endpoint == "/api/v2/testing/local/fill" and str(error) == "TESTER_FILES_PREPARED":
                 self._json(409, {"error": "TESTER_FILES_PREPARED"})
+            elif str(error).startswith("BingX:") and endpoint in {
+                "/api/v2/testing/bingx/download", "/api/v2/testing/local/fill", "/api/v2/testing/screener/fill",
+            }:
+                # BingX-mode messages are actionable and already path-redacted.
+                self._json(400, {"error": str(error)})
             elif endpoint.startswith("/api/v2/testing/screener/"):
                 if str(error) == "TESTER_FILES_PREPARED":
                     self._json(409, {"error": "TESTER_FILES_PREPARED"})

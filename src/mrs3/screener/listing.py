@@ -49,6 +49,35 @@ def _throttle() -> None:
         _last_request_monotonic = now
 
 
+def is_bingx_symbol(symbol: str) -> bool:
+    """BingX API symbols contain a dash (NCSKPANW2USD-USDT); Bybit symbols never do."""
+    return "-" in symbol
+
+
+def _bingx_contracts() -> list[dict[str, object]]:
+    from mrs3.bingx_downloader import BingXClient, BingXDownloadError
+
+    try:
+        return BingXClient().contracts()
+    except BingXDownloadError as exc:
+        raise ScreenerEvaluationError(f"BingX contracts request failed: {exc}") from exc
+
+
+def _resolve_bingx_listing_dates(symbols: tuple[str, ...]) -> dict[str, pd.Timestamp]:
+    """Listing dates of BingX API symbols from BingX `launchTime`."""
+    by_symbol = {item.get("symbol"): item.get("launchTime") for item in _bingx_contracts() if isinstance(item, dict)}
+    listing: dict[str, pd.Timestamp] = {}
+    for symbol in symbols:
+        try:
+            launch_time_ms = int(by_symbol[symbol])
+        except (KeyError, TypeError, ValueError):
+            raise ScreenerEvaluationError(f"listing date not found on BingX for symbol: {symbol}") from None
+        if launch_time_ms <= 0:
+            raise ScreenerEvaluationError(f"listing date not found on BingX for symbol: {symbol}")
+        listing[symbol] = pd.Timestamp(launch_time_ms, unit="ms", tz="UTC")
+    return listing
+
+
 def resolve_listing_dates(
     symbols: tuple[str, ...],
     *,
@@ -56,6 +85,11 @@ def resolve_listing_dates(
     dates_path: Path | None,
 ) -> dict[str, pd.Timestamp]:
     symbols = tuple(symbol.strip().upper() for symbol in symbols)
+    bingx = [symbol for symbol in symbols if is_bingx_symbol(symbol)]
+    if bingx:
+        if len(bingx) != len(symbols):
+            raise ScreenerEvaluationError("reports mix BingX and Bybit symbols")
+        return _resolve_bingx_listing_dates(symbols)
     listing: dict[str, pd.Timestamp] = {}
     if registry_path is not None and registry_path.exists():
         listing.update(read_registry_listing_dates(registry_path, symbols))
