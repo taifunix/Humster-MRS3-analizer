@@ -135,6 +135,13 @@ rate. An absent rate persists as SQL `NULL`; HTML fees and PnL remain authoritat
     Windows replace denials; exhausted retries remain fail-closed. Wrapping
     Panel services preserve the machine-readable `JOB_PERSISTENCE_FAILED`
     code and HTTP 503 status.
+15. The Windows Panel launchers disable delayed expansion before handling
+    paths. `start_panel.bat` prepends its checkout's `src` directory to
+    `PYTHONPATH` without an empty path component and preserves existing entries.
+    `start_new_panel.bat` and `restart_new_panel.bat` delegate to it without
+    overriding that path or launching Python themselves. An editable install
+    pointing at another checkout must not select backend code for the current
+    checkout's configuration and database.
 
 ## Failure behavior
 
@@ -156,6 +163,9 @@ rate. An absent rate persists as SQL `NULL`; HTML fees and PnL remain authoritat
 - A transient Windows journal replace denial that clears within the bounded
   retry window saves the job and proceeds through the ordinary SINGLE_MODE
   flow.
+- Starting Panel from any supported batch launcher imports the package from
+  its checkout, even when `.venv` has an editable install for a different
+  worktree; the launcher's working copy retains CRLF line endings.
 - A journal persistence failure exposed through a service wrapper, including
   portfolio job submission, remains HTTP 503 with
   `JOB_PERSISTENCE_FAILED` rather than being reclassified as a client error.

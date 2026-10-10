@@ -252,6 +252,28 @@ complete: Panel API on port 8766 responds, the stale in-memory QUEUED job is
 gone, and no `hb_c.exe` process is running. No tester run or PerformanceDB was
 used.
 
+## Performance v2 import launcher source (2026-10-09)
+
+Import job `8dda736e70b3449e890d1a4c0f908af7` failed before reading reports.
+Diagnosis found the local venv's editable install resolving code from
+`.worktrees/heavy-db-optimization`, which accepts schema v8, while the
+configured target is schema v10. The job's public error does not expose the
+underlying DuckDB open exception, but this runtime mismatch is incompatible;
+the current checkout's `src` passes the read-only v10 schema guard. No import
+was retried; database inspections used read-only connections.
+
+The Windows Panel launchers disable delayed expansion; the shared launcher
+prepends its checkout's `src` to `PYTHONPATH` without an empty path component
+and preserves existing entries. The other launchers delegate to it. Git pins
+Windows `.bat`, `.cmd`, and `.ps1` scripts under `scripts/` to CRLF. Focused
+`tests/test_panel_launcher.py` passed cmd.exe source-resolution checks for
+direct start and both wrappers with unset and pre-populated paths, including
+`!`, `^`, `%`, and a later duplicate `src` entry while caller delayed expansion
+was enabled. Panel was restarted on port 8766 and `/` returned HTTP 200. A
+stale non-listening `start_new_panel` process tree was stopped; the active
+listener remained available. No import was retried; the next step is user
+verification.
+
 ## PerformanceDB maintenance
 
 The maintenance card is implemented in the Strategy and DD5 tab. It supports pair selection, strategy-count previews, Rejected retirement, full pair deletion, progress reporting, elapsed time, and actionable database errors. `Удалить Rejected` now physically removes per-strategy facts, window/equity caches, tags, rejection sources, and selection rows, compacts the retained result to interval/provenance identity, then atomically marks the typed identity as `DISCARDED`; only strategy settings/orders and that compact tombstone remain for deduplication. The code targets schema v10 and adds no cleanup markers, deletion timestamps, backups, or maintenance tables. Contract: [PerformanceDB maintenance](docs/specs/2026-10-06-performance-db-maintenance.md); retirement decision: [ADR-0061](docs/decisions/0061-performance-db-rejected-retirement.md).
