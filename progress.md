@@ -59,6 +59,14 @@ bootstrap child died at start-up while the parent was blocked writing to its
 pipe. It needed a Panel restart. The bootstrap pool spawn path is unchanged,
 and this remains an open reliability risk.
 
+Real-data evidence: Campaign `campaign-00b399c7100c42bf8692075d4ab9b72c` covered
+61 pairs, 5 of them with two finalists (32 compositions, exhaustive
+path), AGGRESSIVE profile, bank 1600. It SUCCEEDED in 78 min (about 2.4 min
+per composition) with 10 candidates. Candidate 1: required bank 719 USDT,
+source-proxy P30 1502 USDT/30d, historical DD 30%; candidates 2–10 differ only
+in the SOXX/SPCH/VST/XLK finalist choice (P30 1485–1502). These are
+pretest proxies, not tick-tested MRS3 results.
+
 ## Panel job admission reliability (2026-10-09)
 
 Panel job submission now persists `QUEUED` before worker dispatch, removes an
