@@ -34,8 +34,17 @@ these changes (`test_panel_static_ui.py`: two `WinError 206` node command-line
 length failures; `test_panel.py::test_static_panel_shell_contains_only_navigation_contract`:
 existing maintenance `previewToken` identifiers). `node --check` passed.
 
-Open: the Panel server was not restarted, and no tester run was made. One
-probe run must confirm the `bot_root` tester reads `tester\data\bingx\`.
+Probe run accepted by the user on 2026-10-11: a SCREENER 01 BingX run on
+TSLL (304 runs) used `NCSKTSLL2USD-USDT`, BingX fees and data from
+`tester\data\bingx\` (trades on 2026-10-07/08, after the last Bybit TSLL day).
+
+Ticker mapping now uses BingX TradFi contracts only (212 of 242 registry pairs
+resolve, 30 absent). The registry sheet «Скрининг BingX» was created with
+`scripts/build_bingx_screening_sheet.py` (212 pairs, backup kept next to the
+registry). Automatic BingX verdict writes to Excel are postponed.
+
+Next: split the Panel checkbox into «Режим BingX» and «Докачать данные BingX».
+Moving the Panel to the newer tester installation is not decided yet.
 
 ## Panel job admission reliability (2026-10-09)
 
