@@ -4774,6 +4774,7 @@ def test_weighted_summary_enriches_identity_only_members_from_payload_facts() ->
             "required_bank_usdt": Decimal("200"),
             "B_sat_settings_usdt": Decimal("400"),
             "historical_bank_usdt": Decimal("150"),
+            "own_history_dd_bank_usdt": Decimal("190"),
             "B_risk_usdt": Decimal("180"),
             "B_margin_usdt": Decimal("120"),
             "I_all_usdt": Decimal("40"),
@@ -4786,6 +4787,7 @@ def test_weighted_summary_enriches_identity_only_members_from_payload_facts() ->
     summary = PortfolioPanelService._summary(campaign, (), (), (variant,), ())
 
     assert summary["Historical bank USDT"] == Decimal("150")
+    assert summary["Own-history DD bank USDT"] == Decimal("190")
     assert summary["Stress bank P95 USDT"] == Decimal("180")
     assert summary["IM all USDT"] == Decimal("40")
     assert summary["CDaR peak80 %"] == Decimal("2.5")

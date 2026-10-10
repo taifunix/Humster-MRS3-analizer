@@ -45,6 +45,7 @@ from ..performance_v2_windows import (
     _Equity,
     _calculate,
 )
+from .own_history import own_history_unit_drawdown
 from .canonical import (
     CanonicalList,
     CanonicalEnvelope,
@@ -1574,6 +1575,9 @@ class PreparedWeightedInput:
     cycles: Mapping[str, tuple[Mapping[str, Any], ...]]
     diagnostics: Mapping[str, Any]
     preparation_key: str
+    # Per-unit drawdown of each strategy over its own full history (ADR-0069);
+    # empty means "not computed" and disables the own-history cap.
+    own_history_unit_drawdowns: tuple[Decimal, ...] = ()
 
     @property
     def period(self) -> tuple[datetime, datetime]:
@@ -2043,9 +2047,13 @@ def prepare_weighted_input(
         for cycle in values
     ):
         raise PortfolioInputError("mixed-side cycle attribution is unavailable", code="ONE_WAY_CYCLE_ATTRIBUTION_UNAVAILABLE")
+    own_drawdowns = tuple(
+        own_history_unit_drawdown(row.get("equity", row.get("equity_series", row.get("equity_path", ()))), source_cycles[_period_row_key(row)])
+        for row in ordered
+    )
     one_way_evidence = MappingProxyType({**dict(one_way_evidence), "participants": strategy_ids})
     diagnostics = _frozen({"rows": diagnostic_rows, "period": period.evidence, "one_way": one_way_evidence})
-    prepared = PreparedWeightedInput(start, end, history_step_minutes, tuple(item.isoformat().replace("+00:00", "Z") for item in timestamps), strategy_ids, tuple(tuple(row) for row in columns), tuple(tuple(row) for row in valid), tuple(tuple(row) for row in reasons), _frozen(cycles), diagnostics, key)
+    prepared = PreparedWeightedInput(start, end, history_step_minutes, tuple(item.isoformat().replace("+00:00", "Z") for item in timestamps), strategy_ids, tuple(tuple(row) for row in columns), tuple(tuple(row) for row in valid), tuple(tuple(row) for row in reasons), _frozen(cycles), diagnostics, key, own_drawdowns)
     if cache is not None:
         cache[key] = prepared
     return prepared

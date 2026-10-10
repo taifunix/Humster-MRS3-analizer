@@ -129,7 +129,7 @@ WEIGHTED_SUMMARY_HEADERS = ("Key", "Value")
 # Stage 1 workbook uses operator-facing columns; legacy sheets remain unchanged.
 WEIGHTED_VARIANT_HEADERS = (
     "№", "ID", "Профиль", "Поз.", "Состав", "Банк\nнасыщ., USDT", "Целевой\nбанк, USDT",
-    "Мин. банк DD\nистории, USDT", "Банк DD P95\nстресса, USDT", "Банк\nлимитов, USDT", "PnL 30д,\nUSDT", "MaxDD SUM,\nUSDT", "DD истории,\n%",
+    "Мин. банк DD\nистории, USDT", "Банк DD\nсобств. истории, USDT", "Банк DD P95\nстресса, USDT", "Банк\nлимитов, USDT", "PnL 30д,\nUSDT", "MaxDD SUM,\nUSDT", "DD истории,\n%",
     "CDaR 20%\nUSDT · ц/н", "CDaR 10%\nUSDT · ц/н", "IM\nUSDT · ц/н", "MM\nUSDT · ц/н", "Номинал\nпортф., USDT",
 )
 WEIGHTED_MEMBER_HEADERS = (
@@ -3487,6 +3487,7 @@ class PortfolioPanelService:
             reserve_reason = _weighted_value(metrics, "reserve_unknown_reason")
             required_bank = _weighted_value(metrics, "B_required_usdt", "required_bank_usdt", "B_required_margin_usdt")
             historical_bank = _weighted_value(metrics, "historical_bank_usdt", "bank_for_path_usdt")
+            own_history_bank = _weighted_value(metrics, "own_history_dd_bank_usdt")
             stress_bank = _weighted_value(metrics, "B_risk_usdt", "stress_p95_bank_usdt", "stress_bank_p95_usdt")
             margin_bank = _weighted_value(metrics, "B_margin_usdt")
             if stress_bank == "UNKNOWN":
@@ -3607,6 +3608,7 @@ class PortfolioPanelService:
                 "B required USDT": required_bank,
                 "Required bank USDT": required_bank,
                 "Historical bank USDT": historical_bank,
+                "Own-history DD bank USDT": own_history_bank,
                 "Stress bank P95 USDT": stress_bank,
                 "Margin-only bank USDT": margin_bank,
                 "B available USDT": available,
@@ -3769,6 +3771,7 @@ class PortfolioPanelService:
                     display(variant_summary.get("B saturation USDT")),
                     display(variant_summary.get("Target bank USDT")),
                     display(variant_summary.get("Historical bank USDT")),
+                    display(variant_summary.get("Own-history DD bank USDT")),
                     display(variant_summary.get("Stress bank P95 USDT")),
                     display(variant_summary.get("Margin-only bank USDT")),
                     display(_weighted_value(metrics, "p30_limiter_model_usdt_30d", "p30_common_usdt_30d")),
@@ -3894,6 +3897,7 @@ class PortfolioPanelService:
                 ["Профиль", val(weighted_variant, "profile") if weighted_variant is not None else None],
                 ["Целевой банк, USDT", display(weighted_summary.get("Target bank USDT")) or ("UNCAPPED" if weighted_summary.get("Target bank USDT") == "UNCAPPED" else None)],
                 [f"Минимальный банк для DD ≤ {limit_text}% на истории", display(weighted_summary.get("Historical bank USDT"))],
+                [f"Банк, при котором худшая просадка одной пары на её собственной истории ≤ {limit_text}%", display(weighted_summary.get("Own-history DD bank USDT"))],
                 [f"Банк для DD ≤ {limit_text}% в 95% стресс-сценариев", display(weighted_summary.get("Stress bank P95 USDT"))],
                 ["Банк для профильных лимитов, USDT", display(weighted_summary.get("Margin-only bank USDT"))],
                 ["PnL, USDT", display(_weighted_value(top_metrics, "p30_limiter_model_usdt_30d", "p30_common_usdt_30d"))],
@@ -4053,7 +4057,7 @@ class PortfolioPanelService:
                         enriched = self._summary(campaign, (), (), (candidate,), ())
                         for key in (
                             "weighted_result_schema",
-                            "Weighted candidate ID", "B required USDT", "Required bank USDT", "Historical bank USDT",
+                            "Weighted candidate ID", "B required USDT", "Required bank USDT", "Historical bank USDT", "Own-history DD bank USDT",
                             "Stress bank P95 USDT", "Margin-only bank USDT", "B saturation USDT", "B margin USDT",
                             "P30 common USDT/30d", "P30 limiter USDT/30d", "MaxDD %", "CDaR peak80 USDT",
                             "CDaR peak90 USDT", "IM all USDT", "MM all USDT", "Total full notional USDT", "Weighted members",
@@ -4115,6 +4119,7 @@ class PortfolioPanelService:
                 "required_bank_usdt": text(metrics.get("required_bank_usdt")),
                 "p30_usdt_30d": text(metrics.get("p30_common_usdt_30d")),
                 "historical_bank_usdt": text(metrics.get("historical_bank_usdt")),
+                "own_history_dd_bank_usdt": text(metrics.get("own_history_dd_bank_usdt")),
                 "stress_bank_usdt": format(max(stress_values), "f") if stress_values else None,
                 "margin_bank_usdt": text(metrics.get("B_margin_usdt")),
                 "cdar80_usdt": text(metrics.get("cdar_peak80_usdt")),

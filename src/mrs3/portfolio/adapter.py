@@ -591,6 +591,8 @@ class _MilpUnion:
     slot_positions: tuple[int, ...]
     strategy_of: Mapping[int, int]
     common_days: Decimal
+    # Own-history unit drawdown per column (ADR-0069); empty when not computed.
+    unit_drawdowns: tuple[Decimal, ...] = ()
 
 
 def _milp_union_inputs(
@@ -659,6 +661,7 @@ def _milp_union_inputs(
     caps: list[Decimal] = []
     margin_a_values: list[Decimal] = []
     margin_b_values: list[Decimal] = []
+    unit_drawdowns: list[Decimal] = []
     for layer_index, (prepared, margin_a, margin_b) in enumerate(layers):
         for column, strategy_id in enumerate(prepared.strategy_ids):
             if strategy_id in column_of:
@@ -668,6 +671,11 @@ def _milp_union_inputs(
             caps.append(members_by_id[strategy_id]["position_size_usdt"])
             margin_a_values.append(margin_a[column])
             margin_b_values.append(margin_b[column])
+            if prepared.own_history_unit_drawdowns:
+                unit_drawdowns.append(prepared.own_history_unit_drawdowns[column])
+    if unit_drawdowns and len(unit_drawdowns) != len(columns):
+        # Every layer comes from prepare_weighted_input; a partial cap would be silently weaker.
+        raise CampaignContractError("UNIT_DRAWDOWN_SHAPE_MISMATCH")
     delta = tuple(
         tuple(layers[layer_index][0].normalized_delta[windows[layer_index][0] + offset][column] for layer_index, column in columns)
         for offset in range(len(reference_grid) - 1)
@@ -688,6 +696,7 @@ def _milp_union_inputs(
         tuple(slot_positions),
         MappingProxyType({column: strategy_id for strategy_id, column in column_of.items()}),
         common_days,
+        tuple(unit_drawdowns),
     )
 
 
@@ -722,6 +731,7 @@ def _milp_frontier_compositions(
         levels=levels,
         time_limit=search["weighted_search"]["wall_time_seconds"],
         progress=progress,
+        unit_drawdowns=union.unit_drawdowns or None,
     )
     frontier = []
     for point in points:

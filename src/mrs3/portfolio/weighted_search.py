@@ -1248,18 +1248,53 @@ def _p30(path: Sequence[Decimal], common_days: Decimal) -> Decimal:
         return path[-1] * Decimal(30) / common_days
 
 
+def _unit_drawdowns(value: Any, count: int) -> tuple[Decimal, ...] | None:
+    """Validated own-history unit drawdowns (ADR-0069); ``None`` disables the cap."""
+    if value is None:
+        return None
+    values = tuple(_decimal(item, "unit_drawdowns", nonnegative=True) for item in value)
+    if not values:
+        return None
+    if len(values) != count:
+        raise ValueError("UNIT_DRAWDOWN_SHAPE_MISMATCH")
+    return values
+
+
+def _active_unit_drawdowns(unit_drawdowns: Sequence[Decimal] | None, x: Sequence[Decimal]) -> tuple[Decimal, ...] | None:
+    """Keep the members ``_compact_additional_inputs`` keeps (``x > 0``)."""
+    if unit_drawdowns is None:
+        return None
+    return tuple(value for value, weight in zip(unit_drawdowns, x) if weight > 0)
+
+
+def _own_history_bank(x: Sequence[Decimal], unit_drawdowns: Sequence[Decimal] | None, max_dd: Decimal) -> Decimal:
+    """Smallest bank with ``x_i * d_i <= max_dd * B`` for every member."""
+    if not unit_drawdowns:
+        return Decimal(0)
+    with localcontext() as context:
+        context.prec = _precision_for(x, unit_drawdowns, max_dd)
+        return max((value * drawdown for value, drawdown in zip(x, unit_drawdowns)), default=Decimal(0)) / max_dd
+
+
 def evaluate_weighted_path(
     normalized_delta: Sequence[Sequence[Any]],
     x: Sequence[Any],
     *,
     max_dd: Any,
     common_days: Any,
+    unit_drawdowns: Sequence[Any] | None = None,
 ) -> Mapping[str, Any]:
-    """Evaluate a chosen vector using the same exact DD geometry as the LP."""
+    """Evaluate a chosen vector using the same exact DD geometry as the LP.
+
+    ``bank_for_path`` includes the own-history bank (ADR-0069); ``path_bank``
+    is the common-path requirement alone.
+    """
     weights = tuple(_decimal(value, "x", nonnegative=True) for value in x)
     days = _decimal(common_days, "common_days", positive=True)
     path = _path(normalized_delta, weights)
-    bank = bank_for_path(path, max_dd)
+    path_bank = bank_for_path(path, max_dd)
+    own_bank = _own_history_bank(weights, _unit_drawdowns(unit_drawdowns, len(weights)), _decimal(max_dd, "max_dd"))
+    bank = max(path_bank, own_bank)
     with localcontext() as context:
         context.prec = _precision_for(path, bank)
         equity = tuple(bank + gain for gain in path)
@@ -1275,6 +1310,8 @@ def evaluate_weighted_path(
     return {
         "path": path,
         "bank_for_path": bank,
+        "path_bank": path_bank,
+        "own_history_dd_bank": own_bank,
         "p30_common": p30,
         "max_drawdown_fraction": drawdown,
         "max_drawdown_pct": drawdown_pct,
@@ -1430,6 +1467,7 @@ def _append_bank_constraints(
     max_dd: Decimal,
     one_minus: Decimal,
     margin_coefficients: tuple[tuple[Decimal, ...], tuple[Decimal, ...], Decimal] | None,
+    unit_drawdowns: Sequence[Decimal] | None = None,
 ) -> None:
     """Append the shared bank/drawdown/margin rows over ``[bank, x(n), h(t)]``."""
     bank_index = 0
@@ -1455,6 +1493,14 @@ def _append_bank_constraints(
         entries.extend((x_start + index, -float(value)) for index, value in enumerate(row))
         entries.append((h_index, float(one_minus)))
         _append_sparse_constraint(a_rows, a_columns, a_values, b_ub, entries, 0.0)
+    for index, unit_drawdown in enumerate(unit_drawdowns or ()):
+        if unit_drawdown > 0:
+            # x_i d_i <= mB: one member's own worst episode stays inside the DD limit (ADR-0069).
+            _append_sparse_constraint(
+                a_rows, a_columns, a_values, b_ub,
+                ((bank_index, -float(max_dd)), (x_start + index, float(unit_drawdown))),
+                0.0,
+            )
     if margin_coefficients is not None:
         margin_a_values, margin_b_values, mm_load = margin_coefficients
         # Discovery intentionally uses only the necessary initial IM/MM bounds;
@@ -1495,9 +1541,11 @@ def _solve_lp_unchecked(
     max_mm_load: Any | None = None,
     symbol_cap_groups: Mapping[str, Sequence[int]],
     time_limit: Any = Decimal("30"),
+    unit_drawdowns: Sequence[Any] | None = None,
 ) -> _SolveOutcome:
     t = len(normalized_delta)
     n = len(capacities)
+    own_drawdowns = _unit_drawdowns(unit_drawdowns, n)
     bank_index = 0
     x_start = 1
     h_start = 1 + n
@@ -1520,6 +1568,7 @@ def _solve_lp_unchecked(
     _append_bank_constraints(
         a_rows, a_columns, a_values, b_ub, cumulative,
         n=n, max_dd=max_dd, one_minus=one_minus, margin_coefficients=margin_coefficients,
+        unit_drawdowns=own_drawdowns,
     )
     if target is not None:
         _append_sparse_constraint(
@@ -1652,7 +1701,7 @@ def _solve_lp_unchecked(
                     **metadata,
                 )
     path = _path(normalized_delta, raw_x)
-    required = bank_for_path(path, max_dd)
+    required = max(bank_for_path(path, max_dd), _own_history_bank(raw_x, own_drawdowns, max_dd))
     authoritative_bank = max(Decimal(1), required, margin_required)
     with localcontext() as context:
         context.prec = _precision_for(required, authoritative_bank, raw_bank, coefficients, raw_x, target)
@@ -1665,7 +1714,7 @@ def _solve_lp_unchecked(
         if bank_available is not None and authoritative_bank > bank_available:
             # A binding ceiling leaves the LP exactly on the bound; float noise can
             # put the exact requirement a tolerance above it. Path and margin
-            # requirements are linear in x, so shrink x back inside the ceiling.
+            # and own-history requirements are linear in x, so shrink x back inside the ceiling.
             scale = bank_available / authoritative_bank * (Decimal(1) - Decimal("1e-12"))
             raw_x = tuple(value * scale if value else Decimal(0) for value in raw_x)
             scaled_margin = Decimal(1)
@@ -1676,7 +1725,12 @@ def _solve_lp_unchecked(
                     _sum_products(margin_a_values, raw_x) / one_minus,
                     _sum_products(margin_b_values, raw_x) / (mm_load * one_minus),
                 )
-            authoritative_bank = max(Decimal(1), bank_for_path(_path(normalized_delta, raw_x), max_dd), scaled_margin)
+            authoritative_bank = max(
+                Decimal(1),
+                bank_for_path(_path(normalized_delta, raw_x), max_dd),
+                _own_history_bank(raw_x, own_drawdowns, max_dd),
+                scaled_margin,
+            )
             if authoritative_bank > bank_available:
                 return _SolveOutcome(
                     "ERROR",
@@ -1748,6 +1802,7 @@ def _composition_model(
     margin_b: Sequence[Any] | None,
     max_mm_load: Any | None,
     time_limit: Any,
+    unit_drawdowns: Sequence[Any] | None = None,
 ) -> _CompositionModel:
     """The discovery LP over the union of slot options plus one-per-slot binaries."""
     rows = tuple(tuple(_decimal(value, "normalized_delta") for value in row) for row in normalized_delta)
@@ -1790,6 +1845,7 @@ def _composition_model(
     _append_bank_constraints(
         a_rows, a_columns, a_values, b_ub, _cumulative(rows, n),
         n=n, max_dd=drawdown, one_minus=one_minus, margin_coefficients=margin_coefficients,
+        unit_drawdowns=_unit_drawdowns(unit_drawdowns, n),
     )
     for column, z_index in binary_of.items():
         # x_i <= C_i z_i
@@ -1899,6 +1955,7 @@ def slot_composition_frontier(
     levels: int,
     time_limit: Any = Decimal("30"),
     progress: Callable[[Mapping[str, Any]], Any] | None = None,
+    unit_drawdowns: Sequence[Any] | None = None,
 ) -> tuple[FrontierPoint, ...]:
     """Return the bank-ladder frontier of one-option-per-slot compositions.
 
@@ -1917,6 +1974,7 @@ def slot_composition_frontier(
         normalized_delta, capacities, slots,
         max_dd=max_dd, common_days=common_days,
         margin_a=margin_a, margin_b=margin_b, max_mm_load=max_mm_load, time_limit=time_limit,
+        unit_drawdowns=unit_drawdowns,
     )
     total = levels + 2
     solves = 0
@@ -2062,6 +2120,7 @@ def _solve_additional_lp(
     p30_floor_coefficients: Sequence[Any] | None = None,
     symbol_cap_groups: Mapping[str, Sequence[int]],
     _cdar: bool = False,
+    unit_drawdowns: Sequence[Any] | None = None,
 ) -> _SolveOutcome:
     """Solve one fixed-bank redistribution LP without wiring search orchestration."""
     rows = tuple(tuple(_decimal(value, "normalized_delta") for value in row) for row in normalized_delta)
@@ -2089,6 +2148,13 @@ def _solve_additional_lp(
     reserve_value = _decimal(reserve, "reserve", nonnegative=True)
     if reserve_value >= Decimal(1):
         raise ValueError("reserve must be below one")
+    own_drawdowns = _unit_drawdowns(unit_drawdowns, n)
+    if own_drawdowns is not None:
+        # At a fixed bank, x_i d_i <= mB is just a tighter upper bound (ADR-0069).
+        caps = tuple(
+            min(cap, drawdown * bank / unit_drawdown) if unit_drawdown > 0 else cap
+            for cap, unit_drawdown in zip(caps, own_drawdowns)
+        )
     margin_coefficients = _validated_lp_margin_coefficients(margin_a, margin_b, max_mm_load, n)
     assert margin_coefficients is not None
     margin_a_values, margin_b_values, mm_load = margin_coefficients
@@ -2705,6 +2771,7 @@ def _candidate_for_solution(
     bank_available: Decimal | None = None,
     B_risk: Decimal | None = None,
     bootstrap_summary: Mapping[str, Any] | None = None,
+    unit_drawdowns: Sequence[Decimal] | None = None,
 ) -> PortfolioCandidate | None:
     candidates = _candidates_for_solution(
         solution,
@@ -2721,6 +2788,7 @@ def _candidate_for_solution(
         bank_available=bank_available,
         B_risk=B_risk,
         bootstrap_summary=bootstrap_summary,
+        unit_drawdowns=unit_drawdowns,
     )
     return candidates[0] if candidates else None
 
@@ -2744,6 +2812,7 @@ def _candidates_for_solution(
     allow_rescue: bool = True,
     bank_feasible_override: bool | None = None,
     failure_reason: list[str] | None = None,
+    unit_drawdowns: Sequence[Decimal] | None = None,
 ) -> tuple[PortfolioCandidate, ...]:
     try:
         _validate_symbol_cap_vector(solution.x, source_members, capacities)
@@ -2751,7 +2820,9 @@ def _candidates_for_solution(
         if failure_reason is not None:
             failure_reason.append(str(error))
         return ()
-    evaluated = evaluate_weighted_path(normalized_delta, solution.x, max_dd=max_dd, common_days=common_days)
+    evaluated = evaluate_weighted_path(
+        normalized_delta, solution.x, max_dd=max_dd, common_days=common_days, unit_drawdowns=unit_drawdowns,
+    )
     with localcontext() as context:
         context.prec = _precision_for(evaluated["bank_for_path"], solution.bank)
         if evaluated["bank_for_path"] > solution.bank + _solver_tolerance(evaluated["bank_for_path"], solution.bank):
@@ -2770,7 +2841,7 @@ def _candidates_for_solution(
     metrics = {
         "mode": WEIGHTED_V1,
         "bank_for_path_usdt": evaluated["bank_for_path"],
-        "historical_bank_usdt": evaluated["bank_for_path"],
+        "historical_bank_usdt": evaluated["path_bank"],
         "required_bank_usdt": required_bank,
         "B_risk_usdt": B_risk,
         "p30_common_usdt_30d": evaluated["p30_common"],
@@ -2783,6 +2854,8 @@ def _candidates_for_solution(
         "target_p30_usdt_30d": target,
         "limiter_L": 0,
     }
+    if unit_drawdowns is not None:
+        metrics["own_history_dd_bank_usdt"] = evaluated["own_history_dd_bank"]
     if bootstrap_summary is not None:
         metrics.update({
             "bootstrap_p95_banks_usdt": bootstrap_summary.get("p95_banks"),
@@ -2839,6 +2912,7 @@ def _candidates_for_solution(
                         B_risk=B_risk,
                         bootstrap_summary=bootstrap_summary,
                         bank_feasible_override=False,
+                        unit_drawdowns=unit_drawdowns,
                     )
                     try:
                         risk_bank = path_risk
@@ -2858,6 +2932,7 @@ def _candidates_for_solution(
                                 scaled_x,
                                 max_dd=max_dd,
                                 common_days=common_days,
+                                unit_drawdowns=unit_drawdowns,
                             )
                             reduced = _candidates_for_solution(
                                 _Solution(max(Decimal(1), scaled_path["bank_for_path"]), scaled_x),
@@ -2875,6 +2950,7 @@ def _candidates_for_solution(
                                 allow_rescue=False,
                                 B_risk=B_risk,
                                 bootstrap_summary=bootstrap_summary,
+                                unit_drawdowns=unit_drawdowns,
                             )
                             if reduced:
                                 return original + reduced
@@ -2988,6 +3064,7 @@ def _revalidate_proposed_x(
     bank_available: Decimal | None = None,
     validator: Callable[[tuple[Decimal, ...]], bool] | None = None,
     failure_reason: list[str] | None = None,
+    unit_drawdowns: Sequence[Decimal] | None = None,
 ) -> tuple[PortfolioCandidate, ...]:
     """Validate one externally proposed x exactly once; failed proposals vanish."""
     original_candidates = (original,) if isinstance(original, PortfolioCandidate) else tuple(original)
@@ -2998,7 +3075,7 @@ def _revalidate_proposed_x(
         _validate_symbol_cap_vector(x, source_members, capacities)
         if validator is not None and not validator(x):
             return original_candidates
-        evaluated = evaluate_weighted_path(normalized_delta, x, max_dd=max_dd, common_days=common_days)
+        evaluated = evaluate_weighted_path(normalized_delta, x, max_dd=max_dd, common_days=common_days, unit_drawdowns=unit_drawdowns)
         if target is not None and evaluated["p30_common"] < target - _solver_tolerance(evaluated["p30_common"], target):
             return original_candidates
         if bank_available is not None and evaluated["bank_for_path"] > bank_available + _solver_tolerance(evaluated["bank_for_path"], bank_available):
@@ -3017,6 +3094,7 @@ def _revalidate_proposed_x(
             margin_kwargs=margin_kwargs,
             bank_available=bank_available,
             allow_rescue=False,
+            unit_drawdowns=unit_drawdowns,
         )
     except ValueError as error:
         if failure_reason is not None:
@@ -3816,6 +3894,7 @@ def weighted_search(
     elif isinstance(capacities, (str, bytes)) or not isinstance(capacities, Sequence) or len(capacities) != n:
         raise ValueError("CAPACITY_SHAPE_MISMATCH")
     caps = tuple(_member_capacity(capacities, index, strategy_id, member) for index, (strategy_id, member) in enumerate(zip(prepared.strategy_ids, source_members)))
+    own_drawdowns = _unit_drawdowns(prepared.own_history_unit_drawdowns, n)
     symbol_cap_groups = _symbol_cap_groups(source_members, caps)
     coefficients = _coefficients(normalized_delta, n, days)
     if margin is not None and (margin_coefficients is not None or margin_kwargs is not None):
@@ -3887,6 +3966,7 @@ def weighted_search(
             caps,
             coefficients,
             max_dd=drawdown,
+            unit_drawdowns=own_drawdowns,
             target=target_value,
             bank_available=lp_ceiling,
             maximize=maximize,
@@ -4087,6 +4167,7 @@ def weighted_search(
                 source_members,
                 caps,
                 max_dd=drawdown,
+                unit_drawdowns=own_drawdowns,
                 common_days=days,
                 target=target_value,
                 profile_id=profile_id,
@@ -4351,6 +4432,7 @@ def weighted_search(
                         caps,
                         bank_fixed=fixed_bank,
                         max_dd=drawdown,
+                        unit_drawdowns=own_drawdowns,
                         objective_coefficients=objective,
                         L=limiter,
                         priorities=frozen_priorities,
@@ -4474,6 +4556,7 @@ def weighted_search(
                                         active_members,
                                         active_caps,
                                         max_dd=drawdown,
+                                        unit_drawdowns=_active_unit_drawdowns(own_drawdowns, proposed_solution.x),
                                         common_days=days,
                                         target=target_value,
                                         profile_id=profile_id,
@@ -4596,6 +4679,7 @@ def weighted_search(
                     caps,
                     bank_fixed=fixed_bank,
                     max_dd=drawdown,
+                    unit_drawdowns=own_drawdowns,
                     objective_coefficients=coefficients,
                     L=source_limiter,
                     priorities=frozen_priorities,
@@ -4732,6 +4816,7 @@ def weighted_search(
                     active_members,
                     active_caps,
                     max_dd=drawdown,
+                    unit_drawdowns=_active_unit_drawdowns(own_drawdowns, proposed_solution.x),
                     common_days=days,
                     target=cdar_floor,
                     profile_id=profile_id,
@@ -4788,6 +4873,7 @@ def weighted_search(
             source_members,
             caps,
             max_dd=drawdown,
+            unit_drawdowns=own_drawdowns,
             common_days=days,
             target=target,
             profile_id=profile_id,

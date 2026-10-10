@@ -44,6 +44,41 @@ ETA. Next step: restart Panel to load the code, then rerun the
 full-universe Campaign. No PerformanceDB or
 tester was used.
 
+## Portfolio own-history drawdown cap (2026-10-10)
+
+Stage 1 now caps each member by its own worst drawdown: `x_i·d_i ≤ max_dd·B`.
+Here `d_i` is the member's per-unit drawdown over its full own history, not
+only the common window, and `max_dd` is the profile DD limit. This is a
+per-member concentration cap, not a sum of DDs. The common-path DD, CDaR and
+bootstrap stay as they were. The cap is enforced in the LP/MILP, in the
+fixed-bank LPs and in the exact bank. Decision:
+[ADR-0069](docs/decisions/0069-portfolio-own-history-drawdown-cap.md);
+contract: the own-history amendment in the
+[weighted-search spec](docs/specs/2026-09-14-portfolio-optimizer-weighted-search.md).
+The Stage 1 summary, XLSX and `/results` show `own_history_dd_bank_usdt`;
+the web table column waits for the parallel `app.js` work.
+
+Why: in Stage 2 tester runs, the 9-pair candidate (bank 72) reached a 61%
+drawdown. Under the new rule its TSEM/MSTU sizes would need a bank of about
+730.
+
+Real evidence: the frozen 61-pair Campaign, rerun offline with 30 workers,
+gave PASS in 19 min.
+
+| Level | Members | Bank | P30 | Own-history bank |
+| --- | --- | --- | --- | --- |
+| top | 61 | 715 | 1641 | 390 |
+| bottom | 61 | 72 | 328 | 58 |
+
+Before the cap the same ladder went from 61 members down to 9, with P30
+1643 → 360. Lower levels now shrink the whole portfolio instead of
+concentrating it. The margin bank binds at every level.
+
+Verification: the own-history, weighted-search, adapter, optimizer and
+panel portfolio suites give 933 passed, 1 skipped. `test_portfolio_input.py`
+has 34 failures, all from the parallel v11 schema changes. Independent review
+passed after one fix round.
+
 ## Stage 2 strategy files in tester format (2026-10-10)
 
 Stage 2 strategy and tester-config JSON are now indented, with keys in the

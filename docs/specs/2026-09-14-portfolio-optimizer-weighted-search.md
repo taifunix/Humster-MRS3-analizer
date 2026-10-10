@@ -564,3 +564,59 @@ Measured on the real 61-pair snapshot and a 81-strategy synthetic composition.
   exact LPs. HiGHS keeps one process-wide scheduler, and a MILP on the default
   thread count made every later LP in the process fail with
   "HiGHS Status 0: Not Set".
+
+## Own-history drawdown cap amendment (2026-10-10)
+
+Decision: [ADR-0069](../decisions/0069-portfolio-own-history-drawdown-cap.md).
+
+- **Input.** `PreparedWeightedInput.own_history_unit_drawdowns` holds one
+  `d_i ≥ 0` per strategy, in `strategy_ids` order. It is computed by
+  `prepare_weighted_input` from each row's full equity samples and its
+  pre-admission cycles:
+  - each equity change between consecutive samples is divided by the
+    `source_basis` of the cycle active at the change's midpoint;
+  - a change with no active cycle, or with an unknown basis, contributes 0;
+  - `d_i` is the maximum peak-to-trough fall of the cumulative sum, which
+    starts at 0.
+
+  An empty tuple means "not computed" and disables the cap. This is used only
+  by direct callers that build the input by hand.
+- **Rule.** `x_i · d_i ≤ max_dd · B` for every member. `max_dd` is the
+  profile's `max_actual_equity_dd_pct / 100`.
+  - Discovery LP and composition MILP: one row `d_i x_i − max_dd·B ≤ 0` per
+    member with `d_i > 0`.
+  - Fixed-bank additional and CDaR LPs: the upper bound of `x_i` becomes
+    `min(C_i, max_dd · B / d_i)`.
+  - Exact evaluation: `evaluate_weighted_path` reports
+    `bank_for_path = max(path bank, B_own)`, with
+    `B_own = max_i x_i d_i / max_dd`. All existing bank checks, rescue scaling
+    and acceptance therefore include the cap. The path-only bank stays
+    available as `path_bank`.
+- **Metrics.**
+  - `own_history_dd_bank_usdt` = `B_own`.
+  - `historical_bank_usdt` = the path-only bank.
+  - `bank_for_path_usdt` = the combined value.
+  - `required_bank_usdt` still is the maximum of every component.
+  - When the prepared input carries drawdowns, `own_history_dd_bank_usdt`
+    is always present, including a value of 0. The Stage 1 summary, XLSX
+    («Банк DD собств. истории») and the `/results` Stage 2 rows show it.
+- **Attribution.** `d_i` uses the same rule as the prepared grid:
+  - a sample gap is split at cycle openings and closings;
+  - the change sits on the last segment;
+  - its owner is the lowest-index cycle open at that segment's midpoint, or
+    else a cycle opening exactly at its right end.
+
+  When the common window equals the whole history, `d_i` equals the
+  drawdown of the summed prepared column.
+- **Compacted revalidation.** The fixed-bank and CDaR families revalidate
+  only members with `x > 0`, so `d_i` is sliced the same way.
+- **Union MILP.** The adapter carries `d_i` per union column from the layer
+  that first admits the column.
+- **Acceptance evidence.**
+  - Unit tests show `d_i` on a synthetic history with a drawdown before the
+    common window.
+  - The LP/MILP rows bind and shrink only the capped member.
+  - The exact bank includes `B_own`.
+  - A fixed-bank LP respects the tightened bound.
+  - A real Campaign is rerun on the 61-pair snapshot and compared with the
+    previous frontier.
