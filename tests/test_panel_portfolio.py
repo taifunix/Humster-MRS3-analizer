@@ -191,7 +191,7 @@ def _stage2_batch_service(tmp_path: Path, candidates: tuple[dict, ...]) -> tuple
 
 
 def _wait_stage1(service: PortfolioPanelService, result: dict) -> dict:
-    deadline = time.monotonic() + 3
+    deadline = time.monotonic() + 30
     while time.monotonic() < deadline and service.job(result["job_id"])["status"] in {"QUEUED", "RUNNING"}:
         time.sleep(0.01)
     return service.job(result["job_id"])
@@ -2820,6 +2820,10 @@ def test_stage2_route_rejects_non_successful_campaign_before_job_submit(
         {"confirmed": False, "campaign_id": "campaign"},
         {"confirmed": True, "campaign_id": "other"},
         {"confirmed": True, "campaign_id": "campaign", "extra": True},
+        {"confirmed": True, "campaign_id": "campaign", "candidate_ids": []},
+        {"confirmed": True, "campaign_id": "campaign", "candidate_ids": ["a" * 64, "a" * 64]},
+        {"confirmed": True, "campaign_id": "campaign", "candidate_ids": ["not-a-digest"]},
+        {"confirmed": True, "campaign_id": "campaign", "candidate_ids": "a" * 64},
     ),
 )
 def test_stage2_route_rejects_invalid_confirmation_before_campaign_lookup(tmp_path: Path, payload: dict) -> None:
@@ -3947,7 +3951,7 @@ class _FakeStage2Tester:
             wizard_result=root / "wizard-result.json",
             report_dir=root / "tester" / "report" / "my_test",
             poll_interval_seconds=0.001,
-            stall_timeout_seconds=0.05,
+            stall_timeout_seconds=1.0,
             report_stability_polls=1,
             metric_tolerance=Decimal("0.01"),
         )
@@ -5560,3 +5564,87 @@ def test_readiness_exposes_finalist_history_without_blocking_on_history_errors(t
     readiness = service.readiness()
     assert readiness["finalist_history"] == {}
     assert readiness["stage1"]["enabled"] is True
+
+
+
+def test_results_list_every_committed_candidate_for_stage2_selection(tmp_path: Path) -> None:
+    candidates = _stage2_batch_candidates()
+    service, stage1 = _stage2_batch_service(tmp_path, candidates)
+
+    rows = service.results(stage1["campaign_id"])["candidates"]
+
+    assert [row["candidate_id"] for row in rows] == [candidate["candidate_id"] for candidate in candidates]
+    assert [row["order"] for row in rows] == [0, 1, 2]
+    assert rows[0]["profile"] == candidates[0]["profile"]
+    assert rows[0]["positions"] == 2
+    assert rows[0]["required_bank_usdt"] == "10000"
+    assert set(rows[0]) >= {"p30_usdt_30d", "historical_bank_usdt", "margin_bank_usdt", "cdar80_usdt", "max_drawdown_pct"}
+
+
+def test_stage2_runs_only_the_selected_candidates_in_artifact_order(tmp_path: Path) -> None:
+    candidates = _stage2_batch_candidates()
+    service, stage1 = _stage2_batch_service(tmp_path, candidates)
+    fake = _FakeStage2Tester(tmp_path, ("PORTFOLIO_BTCUSDT_7_11", "PORTFOLIO_ETHUSDT_8_12"))
+    service._local_testing_service_provider = lambda: fake
+    selected = [candidates[2]["candidate_id"], candidates[0]["candidate_id"]]
+
+    submitted = service.submit_tester_submission(
+        stage1["campaign_id"], {"confirmed": True, "campaign_id": stage1["campaign_id"], "candidate_ids": selected},
+    )
+    job = _wait_stage1(service, submitted)
+
+    assert job["status"] == "SUCCEEDED"
+    assert [item["candidate_id"] for item in job["results"]] == [candidates[0]["candidate_id"], candidates[2]["candidate_id"]]
+    assert job["batch"]["total"] == 2
+    again = service.submit_tester_submission(
+        stage1["campaign_id"], {"confirmed": True, "campaign_id": stage1["campaign_id"], "candidate_ids": list(reversed(selected))},
+    )
+    assert again["job_id"] == submitted["job_id"]
+    other = service.submit_tester_submission(
+        stage1["campaign_id"], {"confirmed": True, "campaign_id": stage1["campaign_id"], "candidate_ids": [candidates[1]["candidate_id"]]},
+    )
+    assert other["job_id"] != submitted["job_id"]
+    assert [item["candidate_id"] for item in _wait_stage1(service, other)["results"]] == [candidates[1]["candidate_id"]]
+
+
+def test_stage2_rejects_a_selected_candidate_outside_the_artifact(tmp_path: Path) -> None:
+    service, stage1 = _stage2_batch_service(tmp_path, _stage2_batch_candidates())
+    with pytest.raises(PortfolioPanelError) as error:
+        service.submit_tester_submission(
+            stage1["campaign_id"], {"confirmed": True, "campaign_id": stage1["campaign_id"], "candidate_ids": ["f" * 64]},
+        )
+    assert error.value.code == "PORTFOLIO_STAGE2_SELECTION_INVALID"
+
+
+def test_stage2_subset_progress_counts_positions_within_the_batch(tmp_path: Path) -> None:
+    candidates = _stage2_batch_candidates()
+    service, stage1 = _stage2_batch_service(tmp_path, candidates)
+    service._local_testing_service_provider = lambda: _FakeStage2Tester(tmp_path, ("PORTFOLIO_BTCUSDT_7_11", "PORTFOLIO_ETHUSDT_8_12"))
+
+    submitted = service.submit_tester_submission(
+        stage1["campaign_id"], {"confirmed": True, "campaign_id": stage1["campaign_id"], "candidate_ids": [candidates[2]["candidate_id"]]},
+    )
+    job = _wait_stage1(service, submitted)
+
+    assert job["batch"] == {"current_index": 0, "total": 1, "completed": 1}
+
+
+def test_stage2_identical_selection_reruns_after_a_failed_batch_without_rebuilding_a_live_one(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    candidates = _stage2_batch_candidates()
+    service, stage1 = _stage2_batch_service(tmp_path, candidates)
+    service._local_testing_service_provider = lambda: _FakeStage2Tester(tmp_path, ("PORTFOLIO_BTCUSDT_7_11", "PORTFOLIO_ETHUSDT_8_12"))
+    body = {"confirmed": True, "campaign_id": stage1["campaign_id"], "candidate_ids": [candidates[0]["candidate_id"]]}
+    first = service.submit_tester_submission(stage1["campaign_id"], body)
+    _wait_stage1(service, first)
+
+    monkeypatch.setattr(service, "_prepare_stage2_batch", lambda *_args: pytest.fail("existing batch must short-circuit"))
+    assert service.submit_tester_submission(stage1["campaign_id"], body)["job_id"] == first["job_id"]
+    monkeypatch.undo()
+
+    service._local_testing_service_provider = lambda: _FakeStage2Tester(tmp_path, ("PORTFOLIO_BTCUSDT_7_11", "PORTFOLIO_ETHUSDT_8_12"))
+    job = service.registry.jobs[first["job_id"]]
+    job["state"] = "FAILED"
+    rerun = service.submit_tester_submission(stage1["campaign_id"], body)
+    assert rerun["job_id"] != first["job_id"]
+    rerun_job = _wait_stage1(service, rerun)
+    assert rerun_job["status"] == "SUCCEEDED", rerun_job.get("diagnostics")

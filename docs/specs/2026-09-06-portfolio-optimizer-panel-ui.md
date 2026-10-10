@@ -1154,3 +1154,56 @@ Measured with the real 14 MB journal: 2.26 s → 0.16 s per progress update.
 - Acceptance: helper behaviour via node (rank cutoff, intersection, labels,
   estimate range, invalid limits); readiness history from DuckDB periods;
   live check: 61 pairs, 21 days (16.09–07.10), estimate ≈ 17 min.
+
+### Pair table controls and Stage 2 portfolio selection amendment (2026-10-10)
+
+**Pair table.**
+- A separate `История` column shows `≈ N д` (bold) · `dd.mm–dd.mm` without a
+  label word.
+- The action row is `Выбрать все`, `Выбрать N финалистов` [N], `Выбрать
+  максимум`, `Отменить выбор`. `Выбрать N финалистов` selects every pair and
+  sets each side to `min(N, available)`; an invalid N is flagged and nothing
+  changes.
+- A sort selector on the right of the same row offers three display orders:
+  by name A–Z; by history, shortest first, with unknown last; by available
+  finalists, most first. Ties are broken by name. Sorting changes the display
+  order only, never the launch payload.
+
+**Stage 2 selection.**
+- `GET /campaigns/{id}/results` adds `candidates`: one compact row per
+  committed artifact candidate, in artifact order. Each row has `candidate_id`,
+  `order`, `profile`, `positions`, `required_bank_usdt`, `p30_usdt_30d`,
+  `historical_bank_usdt`, `stress_bank_usdt` (max of the bootstrap P95 banks),
+  `margin_bank_usdt`, `cdar80_usdt` and `max_drawdown_pct`, as decimal strings
+  or `null`. The table omits `max_drawdown_pct`: the historical bank is defined
+  by DD = profile limit, so that value always equals the limit.
+- The Stage 2 card lists these rows with a checkbox on the left, plus a header
+  checkbox for all. Nothing is selected initially. Rows are shown only for
+  the Campaign they were loaded for. A new calculation or a different
+  displayed Campaign clears them until that Campaign's own rows arrive. The button is `Отправить на
+  тест` and is enabled only with at least one selected portfolio.
+- The submission body may add `candidate_ids`: a non-empty list of unique
+  64-hex ids. Otherwise it is malformed (`PORTFOLIO_CAMPAIGN_INVALID`, 422).
+  Ids must belong to the committed artifact
+  (`PORTFOLIO_STAGE2_SELECTION_INVALID`, 422). The batch runs the selected
+  candidates in committed artifact order; the selection only filters it.
+- Idempotency is per selection and is checked before the batch is prepared.
+  The same set of ids for the same Campaign returns its live or successful
+  job. After a `FAILED`, `CANCELLED` or `INTERRUPTED` batch it starts a new
+  attempt. A different set creates a new batch under the shared tester
+  resource lock. Batch progress (`current_index`) counts positions within the
+  selected batch. A body without `candidate_ids`
+  keeps the previous whole-Campaign behaviour, including returning any
+  existing batch of that Campaign. This amends the "new Stage 1 Campaign
+  required for another batch" rule of the 2026-10-07 amendment.
+- Real tester execution still requires the operator's explicit action.
+
+**Where Stage 2 writes on disk** (from `config.local.json` →
+`tester_runner`):
+1. Private staging copy:
+   `<inbox_root>/panel-testing/mrs3-testing-*/strategies/PORTFOLIO_<SYMBOL>_<strategy>_<result>.json`.
+2. Install into the tester: `<bot_root>/<strategy_dir>`
+   (`settings_strategy`), and the config `<bot_root>/<tester_config>`
+   (`config_tester.json`). Both are snapshotted before the fill and restored
+   by `stop()`.
+3. Reports: `<bot_root>/tester/report/<candidate_id>/`.

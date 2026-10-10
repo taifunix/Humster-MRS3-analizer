@@ -551,7 +551,25 @@ const portfolioSelectionHelpers = (() => {
     const common = commonWindow(items);
     return { pairs, finalists, window: common, etaSeconds: pairs ? etaSeconds(pairs, finalists, common?.days, profiles) : 0 };
   };
-  return { pairWindow: (row, history) => commonWindow(selectedHistory(row, history)), summary, label, duration, etaSeconds };
+  const labelParts = (value) => (!value ? null : (value.end < value.start ? { days: 'нет общего периода', range: '' } : { days: `≈ ${value.days} д`, range: `${short(value.start)}–${short(value.end)}` }));
+  const pairWindow = (row, history) => commonWindow(selectedHistory(row, history));
+  // Display order only: alpha A–Z, history shortest first (unknown last), finalists most first.
+  const sortRows = (rows, history, mode) => {
+    const byName = (left, right) => String(left.pair).localeCompare(String(right.pair));
+    const days = (row) => { const value = pairWindow(row, history); return value && value.end >= value.start ? value.days : Number.POSITIVE_INFINITY; };
+    const available = (row) => (Number(row.finalistLong) || 0) + (Number(row.finalistShort) || 0);
+    const order = mode === 'history' ? (left, right) => (days(left) - days(right)) || byName(left, right)
+      : mode === 'finalists' ? (left, right) => (available(right) - available(left)) || byName(left, right)
+        : byName;
+    return [...rows].sort(order);
+  };
+  // "Select N finalists": every pair, each side capped by its available finalists.
+  const limitRow = (row, count) => {
+    const cap = (available) => (Number.isSafeInteger(available) && available > 0 ? Math.min(count, available) : 0);
+    const long = cap(row.finalistLong); const shortSide = cap(row.finalistShort);
+    return { long, short: shortSide, selected: long > 0 || shortSide > 0 };
+  };
+  return { pairWindow, summary, label, labelParts, duration, etaSeconds, sortRows, limitRow };
 })();
 if (typeof globalThis !== 'undefined') globalThis.portfolioSelectionHelpers = portfolioSelectionHelpers;
 /* portfolio-selection-helpers:end */
@@ -4581,7 +4599,7 @@ if (typeof globalThis !== 'undefined') globalThis.portfolioSelectionHelpers = po
 
   function loadPortfolioScreen() {
     if (!loadPortfolioScreen.state) {
-      const state = { pairRows: [], readiness: null, configDigest: null, activeJobId: '', job: null, poller: 0, initialized: true, locked: false, renderedJobId: '', renderedPercent: 0, renderedSubstage: '', progressAnchor: 0, progressBaseElapsed: 0, heartbeatAnchor: 0, heartbeatBaseAge: 0, settingsChanged: false, refreshPromise: null };
+      const state = { pairRows: [], pairSort: 'alpha', stage2Candidates: [], stage2Selected: new Set(), stage2Campaign: '', stage2Version: 0, readiness: null, configDigest: null, activeJobId: '', job: null, poller: 0, initialized: true, locked: false, renderedJobId: '', renderedPercent: 0, renderedSubstage: '', progressAnchor: 0, progressBaseElapsed: 0, heartbeatAnchor: 0, heartbeatBaseAge: 0, settingsChanged: false, refreshPromise: null };
       const portfolioJobEndpoint = '/api/v2/portfolio/jobs/';
       const query = (selector) => document.querySelector(selector);
       const prepareButton = query('#portfolio-prepare-finalists');
@@ -4684,8 +4702,8 @@ if (typeof globalThis !== 'undefined') globalThis.portfolioSelectionHelpers = po
         const container = query('#portfolio-pairs');
         if (!container) return;
         container.replaceChildren();
-        if (!state.pairRows.length) { const tableRow = document.createElement('tr'); const cell = document.createElement('td'); cell.colSpan = 3; cell.textContent = 'Нет пар с финалистами LONG или SHORT.'; tableRow.append(cell); container.append(tableRow); return; }
-        for (const row of state.pairRows) {
+        if (!state.pairRows.length) { const tableRow = document.createElement('tr'); const cell = document.createElement('td'); cell.colSpan = 4; cell.textContent = 'Нет пар с финалистами LONG или SHORT.'; tableRow.append(cell); container.append(tableRow); return; }
+        for (const row of portfolioSelectionHelpers.sortRows(state.pairRows, state.readiness?.finalist_history || {}, state.pairSort || 'alpha')) {
           const tableRow = document.createElement('tr');
           const pairCell = document.createElement('th'); pairCell.scope = 'row';
           const label = document.createElement('label'); label.className = 'check';
@@ -4693,9 +4711,9 @@ if (typeof globalThis !== 'undefined') globalThis.portfolioSelectionHelpers = po
           selected.addEventListener('change', () => { row.selected = selected.checked; updateControls(); });
           const name = document.createElement('span'); name.textContent = row.pair;
           const count = document.createElement('small'); count.className = 'portfolio-pair-count'; count.textContent = `FINALIST: LONG ${row.finalistLong} · SHORT ${row.finalistShort}`;
-          const historyNote = document.createElement('small'); historyNote.className = 'portfolio-pair-count portfolio-pair-history'; historyNote.dataset.portfolioHistory = row.pair;
+          const historyCell = document.createElement('td'); historyCell.className = 'portfolio-pair-history'; historyCell.dataset.portfolioHistory = row.pair;
           const pairInfo = document.createElement('div'); pairInfo.className = 'portfolio-pair-info';
-          label.append(selected, name); pairInfo.append(label, count, historyNote); pairCell.append(pairInfo); tableRow.append(pairCell);
+          label.append(selected, name); pairInfo.append(label, count); pairCell.append(pairInfo); tableRow.append(pairCell, historyCell);
           for (const [side, countValue] of [['LONG', row.long], ['SHORT', row.short]]) {
             const field = document.createElement('td');
             const input = document.createElement('input'); input.type = 'number'; input.min = '0'; input.max = String(side === 'LONG' ? row.finalistLong : row.finalistShort); input.step = '1'; input.value = String(countValue); input.dataset.portfolioPair = row.pair; input.dataset.portfolioSide = side; input.setAttribute('aria-label', `${row.pair}: максимум ${side}`);
@@ -4722,7 +4740,11 @@ if (typeof globalThis !== 'undefined') globalThis.portfolioSelectionHelpers = po
         const history = state.readiness?.finalist_history || {};
         for (const row of launch.rows) {
           const note = query('#portfolio-pairs')?.querySelector(`[data-portfolio-history="${typeof CSS !== 'undefined' && CSS.escape ? CSS.escape(row.pair) : row.pair}"]`);
-          if (note) note.textContent = `История: ${portfolioSelectionHelpers.label(portfolioSelectionHelpers.pairWindow(row, history))}`;
+          if (note) {
+            const parts = portfolioSelectionHelpers.labelParts(portfolioSelectionHelpers.pairWindow(row, history));
+            const days = document.createElement('strong'); days.textContent = parts ? parts.days : '—';
+            note.replaceChildren(days, document.createTextNode(parts?.range ? ` · ${parts.range}` : ''));
+          }
         }
         const summaryNode = query('#portfolio-selection-summary');
         if (summaryNode) {
@@ -4740,7 +4762,8 @@ if (typeof globalThis !== 'undefined') globalThis.portfolioSelectionHelpers = po
         if (prepareButton) { prepareButton.textContent = preparationState === 'READY' ? 'Готово' : (preparationState === 'ERROR' ? 'Повторить' : 'Подготовить данные финалистов'); prepareButton.disabled = state.locked || preparationState === 'READY' || preparationState === 'PREPARING'; }
         if (newButton) newButton.disabled = preparationState === 'PREPARING' || !jobTerminal;
         if (cancelButton) cancelButton.disabled = !state.activeJobId || jobTerminal || ['CANCEL_REQUESTED', 'CANCELLING'].includes(statusOf(state.job));
-        const stage2Ready = stage2Eligible();
+        renderStage2Candidates();
+        const stage2Ready = stage2Eligible() && state.stage2Campaign === state.job?.campaign_id && state.stage2Selected.size > 0;
         if (stage2Submit) {
           stage2Submit.disabled = !stage2Ready;
           stage2Submit.setAttribute('aria-disabled', String(!stage2Ready));
@@ -4748,8 +4771,8 @@ if (typeof globalThis !== 'undefined') globalThis.portfolioSelectionHelpers = po
         }
         if (state.job?.kind !== 'TESTER_SUBMISSION') {
           if (stage2State) setBadge('#portfolio-stage2-state', stage2Ready ? 'READY' : 'DISABLED', stage2Ready ? 'ready' : 'pending');
-          if (stage2Reason) stage2Reason.textContent = stage2Ready
-            ? `Готово к тестированию: ${state.job.executables_count} портфелей.`
+          if (stage2Reason) stage2Reason.textContent = stage2Eligible()
+            ? `Выбрано портфелей для теста: ${state.stage2Selected.size} из ${state.stage2Candidates.length || state.job.executables_count}.`
             : 'Доступно после успешного расчёта и подтверждения состава портфелей.';
         }
       };
@@ -4765,6 +4788,10 @@ if (typeof globalThis !== 'undefined') globalThis.portfolioSelectionHelpers = po
         if (!job?.campaign_id || !succeeded) { if (summary) summary.textContent = 'Результаты появятся только после успешного завершения.'; if (exclusions) exclusions.replaceChildren(); return; }
         try {
           const result = await requestJson(`/api/v2/portfolio/campaigns/${encodeURIComponent(job.campaign_id)}/results`);
+          if (state.stage2Campaign !== job.campaign_id) { state.stage2Campaign = job.campaign_id; state.stage2Selected = new Set(); }
+          state.stage2Candidates = Array.isArray(result.candidates) ? result.candidates : [];
+          state.stage2Version += 1;
+          updateControls();
            const values = result.summary || result;
            const optimizerStatus = String(values?.optimizer_status || '').toUpperCase();
            if (optimizerStatus === 'PARTIAL') setBadge('#portfolio-result-state', 'PARTIAL', 'pending');
@@ -4908,6 +4935,50 @@ if (typeof globalThis !== 'undefined') globalThis.portfolioSelectionHelpers = po
             if (exclusions) { exclusions.replaceChildren(); for (const item of portfolioValues(result.exclusions || result.blockers)) { const row = document.createElement('div'); row.className = 'portfolio-exclusion'; row.textContent = portfolioReasonHelpers.humanize(typeof item === 'string' ? item : `${item.code || item.stage || 'Исключено'}: ${item.message || item.reason || ''}`); exclusions.append(row); } }
           if (portfolioXlsx && result.workbook_available === true) { portfolioXlsx.href = `/api/v2/portfolio/campaigns/${encodeURIComponent(job.campaign_id)}/stage1.xlsx`; portfolioXlsx.hidden = false; }
         } catch (error) { if (summary) summary.textContent = `Результаты недоступны: ${portfolioErrorMessage(error)}`; }
+      };
+      const renderStage2Candidates = () => {
+        const host = query('#portfolio-stage2-candidates');
+        if (!host) return;
+        // Rows belong to one Campaign; a different displayed Campaign shows nothing until its own rows load.
+        const rows = stage2Eligible() && state.stage2Campaign === state.job?.campaign_id ? state.stage2Candidates : [];
+        const token = rows.length ? `${state.stage2Campaign}:${state.stage2Version}` : '';
+        if (host.dataset.token === token) {
+          host.querySelectorAll('input[data-candidate-id]').forEach((box) => { box.checked = state.stage2Selected.has(box.dataset.candidateId); });
+          const all = host.querySelector('input[data-candidate-all]'); if (all) all.checked = rows.length > 0 && state.stage2Selected.size === rows.length;
+          return;
+        }
+        host.dataset.token = token;
+        host.replaceChildren();
+        if (!rows.length) return;
+        const number = (value, digits = 0) => (value === null || value === undefined || !Number.isFinite(Number(value)) ? '—' : Number(value).toLocaleString('ru-RU', { maximumFractionDigits: digits, minimumFractionDigits: digits }));
+        const table = document.createElement('table'); table.className = 'portfolio-stage2-table';
+        const caption = document.createElement('caption'); caption.className = 'sr-only'; caption.textContent = 'Портфели этапа 1 для теста'; table.append(caption);
+        const head = document.createElement('tr');
+        const allCell = document.createElement('th'); allCell.scope = 'col';
+        const all = document.createElement('input'); all.type = 'checkbox'; all.dataset.candidateAll = 'true'; all.setAttribute('aria-label', 'Выбрать все портфели');
+        all.addEventListener('change', () => { state.stage2Selected = new Set(all.checked ? rows.map((row) => row.candidate_id) : []); updateControls(); });
+        allCell.append(all); head.append(allCell);
+        for (const title of ['№', 'Профиль', 'Позиций', 'Банк, USDT', 'P30, USDT/30д', 'Банк DD, USDT', 'Стресс P95, USDT', 'Маржа, USDT', 'CDaR 20%, USDT']) {
+          const cell = document.createElement('th'); cell.scope = 'col'; cell.textContent = title; head.append(cell);
+        }
+        const thead = document.createElement('thead'); thead.append(head); table.append(thead);
+        const body = document.createElement('tbody');
+        rows.forEach((row, index) => {
+          const tableRow = document.createElement('tr');
+          const boxCell = document.createElement('td');
+          const box = document.createElement('input'); box.type = 'checkbox'; box.dataset.candidateId = row.candidate_id; box.checked = state.stage2Selected.has(row.candidate_id);
+          box.setAttribute('aria-label', `Выбрать портфель ${index + 1}`);
+          box.addEventListener('change', () => { if (box.checked) state.stage2Selected.add(row.candidate_id); else state.stage2Selected.delete(row.candidate_id); updateControls(); });
+          boxCell.append(box); tableRow.append(boxCell);
+          for (const value of [String(index + 1), row.profile || '—', number(row.positions), number(row.required_bank_usdt), number(row.p30_usdt_30d), number(row.historical_bank_usdt), number(row.stress_bank_usdt), number(row.margin_bank_usdt), number(row.cdar80_usdt, 2)]) {
+            const cell = document.createElement('td'); cell.textContent = value; tableRow.append(cell);
+          }
+          body.append(tableRow);
+        });
+        table.append(body);
+        const wrap = document.createElement('div'); wrap.className = 'portfolio-stage2-wrap'; wrap.append(table);
+        host.append(wrap);
+        all.checked = rows.length > 0 && state.stage2Selected.size === rows.length;
       };
       const renderStage2 = (job) => {
         if (!stage2Progress || !stage2Results || !stage2State || !stage2Reason) return;
@@ -5057,18 +5128,20 @@ if (typeof globalThis !== 'undefined') globalThis.portfolioSelectionHelpers = po
         }
       });
       stage2Submit?.addEventListener('click', async () => {
-        if (stage2Submit.disabled || !stage2Eligible()) return;
+        if (stage2Submit.disabled || !stage2Eligible() || state.stage2Campaign !== state.job?.campaign_id || !(state.stage2Selected.size > 0)) return;
         const campaignId = state.job.campaign_id;
-        const count = state.job.executables_count;
+        // Artifact order is kept; the checkboxes only choose which portfolios run.
+        const selectedIds = state.stage2Candidates.map((row) => row.candidate_id).filter((id) => state.stage2Selected.has(id));
+        const count = selectedIds.length;
         stage2Submit.disabled = true;
         stage2Submit.setAttribute('aria-disabled', 'true');
-        const confirmed = window.confirm(`Передать тестеру ${count} портфелей кампании ${campaignId}?`);
+        const confirmed = window.confirm(`Отправить на тест ${count} портфелей кампании ${campaignId}?`);
         if (!confirmed) { updateControls(); return; }
         try {
           const result = await requestJson(`/api/v2/portfolio/campaigns/${encodeURIComponent(campaignId)}/tester-submissions`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ confirmed: true, campaign_id: campaignId }),
+            body: JSON.stringify({ confirmed: true, campaign_id: campaignId, candidate_ids: selectedIds }),
           });
           if (!result.job_id) throw new Error('Не удалось создать задание передачи тестеру.');
           state.activeJobId = result.job_id;
@@ -5094,9 +5167,17 @@ if (typeof globalThis !== 'undefined') globalThis.portfolioSelectionHelpers = po
         try { const result = await requestJson(`${portfolioJobEndpoint}${encodeURIComponent(state.activeJobId)}/cancel`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }); renderJob(result.job || { ...state.job, status: result.status || 'CANCEL_REQUESTED' }); }
         catch (error) { if (formStatus) formStatus.textContent = portfolioErrorMessage(error); await pollPortfolioJob(); }
       });
-      newButton?.addEventListener('click', async () => { if (!terminal(state.job)) return; state.activeJobId = ''; state.job = null; state.settingsChanged = false; renderJob(null); setLocked(false); try { renderReadiness(await requestJson('/api/v2/portfolio/readiness')); if (formStatus) formStatus.textContent = 'Новая кампания готова.'; } catch (error) { if (formStatus) formStatus.textContent = portfolioErrorMessage(error); } });
+      newButton?.addEventListener('click', async () => { if (!terminal(state.job)) return; state.activeJobId = ''; state.job = null; state.stage2Candidates = []; state.stage2Selected = new Set(); state.stage2Campaign = ''; state.stage2Version += 1; state.settingsChanged = false; renderJob(null); setLocked(false); try { renderReadiness(await requestJson('/api/v2/portfolio/readiness')); if (formStatus) formStatus.textContent = 'Новая кампания готова.'; } catch (error) { if (formStatus) formStatus.textContent = portfolioErrorMessage(error); } });
       ['aggressive', 'balanced', 'conservative'].forEach((profile) => query(`#portfolio-profile-${profile}`)?.addEventListener('change', updateControls));
       query('#portfolio-select-all')?.addEventListener('click', () => { state.pairRows.forEach((row) => { row.selected = true; }); renderPairs(); updateControls(); });
+      query('#portfolio-select-n')?.addEventListener('click', () => {
+        const input = query('#portfolio-select-n-value'); const count = Number(input?.value);
+        if (!Number.isSafeInteger(count) || count < 1) { input?.setAttribute('aria-invalid', 'true'); input?.focus(); return; }
+        input?.removeAttribute('aria-invalid');
+        state.pairRows.forEach((row) => Object.assign(row, portfolioSelectionHelpers.limitRow(row, count)));
+        renderPairs(); updateControls();
+      });
+      query('#portfolio-pair-sort')?.addEventListener('change', (event) => { state.pairSort = event.target.value; renderPairs(); updateControls(); });
       query('#portfolio-select-maximum')?.addEventListener('click', () => { state.pairRows.forEach((row) => { row.long = Math.max(0, Number(row.finalistLong) || 0); row.short = Math.max(0, Number(row.finalistShort) || 0); row.selected = row.long > 0 || row.short > 0; }); renderPairs(); updateControls(); });
       query('#portfolio-select-none')?.addEventListener('click', () => { state.pairRows.forEach((row) => { row.selected = false; }); renderPairs(); updateControls(); });
       query('#portfolio-profiles')?.querySelectorAll('input').forEach((input) => { input.addEventListener('input', updateControls); input.addEventListener('change', updateControls); });

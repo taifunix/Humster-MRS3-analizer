@@ -2984,13 +2984,14 @@ class PortfolioPanelService:
             self.registry.transition(job_id, "RUNNING", phase=STAGE2_STAGES[0])
             self._sync_runtime(job_id, started_at=_now(), stage_index=0, completed_stages=0)
             tester = self._local_testing_service_provider()
-            for prepared in prepared_candidates:
+            for batch_position, prepared in enumerate(prepared_candidates):
                 if self._cancelled(job_id):
                     raise asyncio.CancelledError
                 candidate_index = prepared["candidate_index"]
+                # Progress counts positions within this batch, which may be a selection.
                 self._sync_runtime(
                     job_id,
-                    current_index=candidate_index,
+                    current_index=batch_position,
                     current_candidate_id=prepared["candidate_id"],
                     stage_index=0,
                     completed_stages=0,
@@ -3998,7 +3999,61 @@ class PortfolioPanelService:
                                 summary[key] = _plain(enriched[key])
                 except PortfolioPanelError:
                     pass
-        return {"campaign_id": campaign_id, "input_digest": campaign["input_digest"], "config_digest": campaign["config_digest"], "summary": summary, "blockers": summary.get("blockers", []), "workbook_available": workbook.is_file()}
+        return {
+            "campaign_id": campaign_id,
+            "input_digest": campaign["input_digest"],
+            "config_digest": campaign["config_digest"],
+            "summary": summary,
+            "blockers": summary.get("blockers", []),
+            "workbook_available": workbook.is_file(),
+            "candidates": self._stage2_candidate_rows(campaign_id, campaign, runtime),
+        }
+
+    def _stage2_candidate_rows(self, campaign_id: str, campaign: Mapping[str, Any], runtime: Mapping[str, Any]) -> list[dict[str, Any]]:
+        """Compact per-portfolio facts of the committed artifact, for Stage 2 selection."""
+        artifact_digest = runtime.get("executables_digest")
+        if not isinstance(artifact_digest, str) or re.fullmatch(r"[0-9a-f]{64}", artifact_digest) is None:
+            return []
+        try:
+            artifact = self._load_stage1_executables(campaign_id, campaign["input_digest"], campaign["config_digest"], artifact_digest)
+        except PortfolioPanelError:
+            return []
+        candidates = artifact.get("candidates") if isinstance(artifact, Mapping) else None
+        if not isinstance(candidates, list):
+            return []
+
+        def text(value: Any) -> str | None:
+            if isinstance(value, bool) or value is None:
+                return None
+            try:
+                number = Decimal(str(value))
+            except (InvalidOperation, TypeError, ValueError):
+                return None
+            return format(number, "f") if number.is_finite() else None
+
+        rows = []
+        for order, candidate in enumerate(candidates):
+            if not isinstance(candidate, Mapping) or not isinstance(candidate.get("candidate_id"), str):
+                continue
+            metrics = candidate.get("metrics") if isinstance(candidate.get("metrics"), Mapping) else {}
+            stress = metrics.get("bootstrap_p95_banks_usdt")
+            stress_values = [text(item) for item in stress] if isinstance(stress, (list, tuple)) else []
+            stress_values = [Decimal(item) for item in stress_values if item is not None]
+            payloads = candidate.get("strategy_payloads")
+            rows.append({
+                "candidate_id": candidate["candidate_id"],
+                "order": order,
+                "profile": candidate.get("profile"),
+                "positions": len(payloads) if isinstance(payloads, list) else None,
+                "required_bank_usdt": text(metrics.get("required_bank_usdt")),
+                "p30_usdt_30d": text(metrics.get("p30_common_usdt_30d")),
+                "historical_bank_usdt": text(metrics.get("historical_bank_usdt")),
+                "stress_bank_usdt": format(max(stress_values), "f") if stress_values else None,
+                "margin_bank_usdt": text(metrics.get("B_margin_usdt")),
+                "cdar80_usdt": text(metrics.get("cdar_peak80_usdt")),
+                "max_drawdown_pct": text(metrics.get("max_drawdown_pct")),
+            })
+        return rows
 
     def workbook(self, campaign_id: str) -> bytes:
         saved, runtime = self._campaign_by_id(campaign_id)
@@ -4020,16 +4075,29 @@ class PortfolioPanelService:
             raise PortfolioPanelError("PORTFOLIO_JOB_WORKBOOK_UNAVAILABLE", "workbook is not available", status=409) from None
 
     def submit_tester_submission(self, campaign_id: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+        keys = set(payload) if isinstance(payload, Mapping) else set()
+        raw_selection = payload.get("candidate_ids") if isinstance(payload, Mapping) else None
         if (
             not isinstance(campaign_id, str)
             or not campaign_id
             or not isinstance(payload, Mapping)
-            or set(payload) != {"confirmed", "campaign_id"}
+            or keys not in ({"confirmed", "campaign_id"}, {"confirmed", "campaign_id", "candidate_ids"})
             or payload.get("confirmed") is not True
             or payload.get("campaign_id") != campaign_id
+            or (
+                "candidate_ids" in keys
+                and (
+                    not isinstance(raw_selection, list)
+                    or not raw_selection
+                    or any(not isinstance(item, str) or re.fullmatch(r"[0-9a-f]{64}", item) is None for item in raw_selection)
+                    or len(set(raw_selection)) != len(raw_selection)
+                )
+            )
         ):
             raise PortfolioPanelError("PORTFOLIO_CAMPAIGN_INVALID", "campaign confirmation is invalid", status=422)
-        with self._lock, self.registry.lock:
+        selection = frozenset(raw_selection) if "candidate_ids" in keys else None
+
+        def stage2_jobs():
             for saved in self.registry.list():
                 if saved.get("kind") != "portfolio.stage2":
                     continue
@@ -4039,11 +4107,37 @@ class PortfolioPanelService:
                     raise PortfolioPanelError("PORTFOLIO_JOB_RUNTIME_UNAVAILABLE", "portfolio job runtime is unavailable", status=500) from error
                 binding = runtime.get("stage2") if isinstance(runtime.get("stage2"), Mapping) else {}
                 if binding.get("campaign_id") == campaign_id:
+                    bindings = binding.get("candidate_bindings")
+                    ids = frozenset(item[0] for item in bindings if isinstance(item, (list, tuple)) and item) if isinstance(bindings, (list, tuple)) else frozenset()
+                    yield saved, ids
+
+        with self._lock, self.registry.lock:
+            if selection is None:
+                # Legacy whole-campaign submission: any batch of this Campaign is returned as before.
+                for saved, _ids in stage2_jobs():
                     return {"campaign_id": campaign_id, "job_id": saved["job_id"], "status": self._project_state(saved)}
+            attempt = 0
+            if selection is not None:
+                # An identical selection returns its live or successful batch; after a
+                # failed, cancelled or interrupted batch it starts a fresh attempt.
+                for saved, ids in stage2_jobs():
+                    if ids != selection:
+                        continue
+                    state = self._project_state(saved)
+                    if state in {"FAILED", "CANCELLED", "INTERRUPTED"}:
+                        attempt += 1
+                        continue
+                    return {"campaign_id": campaign_id, "job_id": saved["job_id"], "status": state}
             saved_stage1, _runtime = self._campaign_by_id(campaign_id)
             if self._project_state(saved_stage1) != "SUCCEEDED":
                 raise PortfolioPanelError("PORTFOLIO_STAGE2_CAMPAIGN_NOT_READY", "stage 1 campaign is not ready", status=409)
             prepared_candidates = self._prepare_stage2_batch(campaign_id)
+            if selection is not None:
+                known = {prepared["candidate_id"] for prepared in prepared_candidates}
+                if not selection <= known:
+                    raise PortfolioPanelError("PORTFOLIO_STAGE2_SELECTION_INVALID", "selected portfolios are not in this campaign", status=422)
+                # The committed artifact order is kept; the selection only filters it.
+                prepared_candidates = tuple(prepared for prepared in prepared_candidates if prepared["candidate_id"] in selection)
             candidate_bindings = [
                 [prepared["candidate_id"], prepared["candidate_digest"]]
                 for prepared in prepared_candidates
@@ -4057,6 +4151,10 @@ class PortfolioPanelService:
                 "candidate_bindings": candidate_bindings,
             }
             submission_key = f"portfolio-stage2:{campaign_id}"
+            if selection is not None:
+                submission_key += ":" + hashlib.sha256(",".join(sorted(selection)).encode("ascii")).hexdigest()
+                if attempt:
+                    submission_key += f":attempt-{attempt}"
             created_job_id: str | None = None
             try:
                 saved = self.registry.submit("portfolio.stage2", {"campaign_id": campaign_id}, submission_key, ("portfolio_optimizer",))

@@ -407,3 +407,13 @@ textarea { width: 100%; padding: 10px; border: 1px solid #cbd7e4; border-radius:
   .selection-stage-summary { grid-column: 2; text-align: left; }
   .selection-stage-controls { grid-column: 2; justify-self: end; }
 }
+.portfolio-pair-actions { align-items: center; }
+.portfolio-select-n { display: inline-flex; align-items: center; gap: 6px; }
+.portfolio-select-n input { width: 4.5em; }
+.portfolio-pair-sort { margin-left: auto; display: inline-flex; align-items: center; gap: 6px; font-size: .8rem; color: var(--muted); }
+.portfolio-pair-history { white-space: nowrap; font-size: .8rem; color: var(--muted); }
+.portfolio-pair-history strong { color: var(--text, inherit); font-weight: 700; }
+.portfolio-stage2-wrap { overflow-x: auto; margin: 8px 0 12px; }
+.portfolio-stage2-table { border-collapse: collapse; width: 100%; font-size: .8rem; }
+.portfolio-stage2-table th, .portfolio-stage2-table td { padding: 4px 8px; border-bottom: 1px solid var(--border, #e3e7ee); text-align: right; white-space: nowrap; }
+.portfolio-stage2-table th:first-child, .portfolio-stage2-table td:first-child, .portfolio-stage2-table td:nth-child(3), .portfolio-stage2-table th:nth-child(3) { text-align: left; }

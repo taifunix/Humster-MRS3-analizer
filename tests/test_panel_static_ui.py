@@ -3105,7 +3105,7 @@ def test_portfolio_pair_selection_preserves_per_row_limits() -> None:
     assert ".filter((row) => row.pair && (row.finalistLong > 0 || row.finalistShort > 0))" in js
     assert "Нет пар с финалистами LONG или SHORT." in portfolio
     assert "copyPortfolioMaximum" not in portfolio
-    assert "pairInfo.append(label, count, historyNote); pairCell.append(pairInfo)" in portfolio
+    assert "pairInfo.append(label, count); pairCell.append(pairInfo); tableRow.append(pairCell, historyCell)" in portfolio
     assert "row.selected = selected.checked; updateControls();" in portfolio
     assert "portfolioSafeInteger(profile.candidates, 1) && Number(profile.candidates) <= 50" in portfolio
 
@@ -3207,8 +3207,8 @@ def test_portfolio_stage2_confirmation_and_batch_progress_use_server_job() -> No
     assert "job.stage?.name" in stage2
     assert "window.confirm" in submit
     assert "state.job.campaign_id" in submit
-    assert "state.job.executables_count" in submit
-    assert "JSON.stringify({ confirmed: true, campaign_id: campaignId })" in submit
+    assert "state.stage2Selected.has(id)" in submit
+    assert "JSON.stringify({ confirmed: true, campaign_id: campaignId, candidate_ids: selectedIds })" in submit
     assert "tester-submissions" in submit
     assert "if (!confirmed)" in submit
     assert submit.index("stage2Submit.disabled = true") < submit.index("window.confirm")
@@ -3920,3 +3920,77 @@ def test_portfolio_pairs_show_history_and_selection_summary() -> None:
     assert "state.readiness?.finalist_history" in controls
     assert "Выбрано пар:" in controls
     assert "совместная история" in controls
+
+
+def test_portfolio_pair_sorting_finalist_limit_and_history_label_parts(tmp_path: Path) -> None:
+    result = _run_selection_helpers("""
+const h = portfolioSelectionHelpers;
+const history = {
+  'BBBUSDT|LONG': [{rank: 1, start: '2026-09-01', end: '2026-09-30'}],
+  'AAAUSDT|LONG': [{rank: 1, start: '2026-09-20', end: '2026-09-30'}],
+  'CCCUSDT|SHORT': [{rank: 1, start: null, end: null}],
+};
+const rows = [
+  {pair: 'BBBUSDT', long: 1, short: 0, finalistLong: 3, finalistShort: 0},
+  {pair: 'CCCUSDT', long: 0, short: 1, finalistLong: 1, finalistShort: 1},
+  {pair: 'AAAUSDT', long: 1, short: 0, finalistLong: 1, finalistShort: 0},
+];
+const names = (items) => items.map((row) => row.pair);
+console.log(JSON.stringify({
+  alpha: names(h.sortRows(rows, history, 'alpha')),
+  historyOrder: names(h.sortRows(rows, history, 'history')),
+  finalists: names(h.sortRows(rows, history, 'finalists')),
+  untouched: names(rows),
+  limited: rows.map((row) => h.limitRow(row, 2)),
+  parts: h.labelParts(h.pairWindow(rows[0], history)),
+  none: h.labelParts(null),
+}));
+""", tmp_path)
+
+    assert result["alpha"] == ["AAAUSDT", "BBBUSDT", "CCCUSDT"]
+    assert result["historyOrder"] == ["AAAUSDT", "BBBUSDT", "CCCUSDT"]
+    assert result["finalists"] == ["BBBUSDT", "CCCUSDT", "AAAUSDT"]
+    assert result["untouched"] == ["BBBUSDT", "CCCUSDT", "AAAUSDT"]
+    assert result["limited"] == [
+        {"long": 2, "short": 0, "selected": True},
+        {"long": 1, "short": 1, "selected": True},
+        {"long": 1, "short": 0, "selected": True},
+    ]
+    assert result["parts"] == {"days": "≈ 29 д", "range": "01.09–30.09"}
+    assert result["none"] is None
+
+
+def test_portfolio_pair_table_has_history_column_n_finalists_and_sort_controls() -> None:
+    html = _read("index.html")
+    js = _read("app.js")
+    portfolio = js.split("function loadPortfolioScreen", 1)[1].split("function loadPortfolioSettings", 1)[0]
+
+    assert '<th scope="col">История</th>' in html
+    actions = html.split('class="portfolio-pair-actions"', 1)[1].split("</div>", 1)[0]
+    assert actions.index('id="portfolio-select-all"') < actions.index('id="portfolio-select-n"') < actions.index('id="portfolio-select-maximum"')
+    assert 'id="portfolio-select-n-value"' in actions
+    assert 'id="portfolio-pair-sort"' in html
+    for value in ('value="history"', 'value="alpha"', 'value="finalists"'):
+        assert value in html
+    assert "portfolioSelectionHelpers.sortRows(" in portfolio
+    assert "portfolioSelectionHelpers.limitRow(" in portfolio
+    assert "'История: '" not in portfolio and "`История: " not in portfolio
+    assert "document.createElement('strong')" in portfolio
+
+
+def test_portfolio_stage2_lists_candidates_with_checkboxes_and_sends_selection() -> None:
+    html = _read("index.html")
+    js = _read("app.js")
+    portfolio = js.split("function loadPortfolioScreen", 1)[1].split("function loadPortfolioSettings", 1)[0]
+
+    assert 'id="portfolio-stage2-candidates"' in html
+    assert ">Отправить на тест</button>" in html
+    assert "state.stage2Candidates = Array.isArray(result.candidates)" in portfolio
+    assert "candidate_ids: selectedIds" in portfolio
+    assert "state.stage2Selected.size > 0" in portfolio
+    # Rows render only for their own Campaign and re-render on every candidate refresh.
+    assert "state.stage2Campaign === state.job?.campaign_id ? state.stage2Candidates : []" in portfolio
+    assert "state.stage2Version += 1" in portfolio
+    assert "host.dataset.token === token" in portfolio
+    new_calculation = portfolio.split("newButton?.addEventListener('click'", 1)[1].split(chr(10), 1)[0]
+    assert "state.stage2Candidates = []" in new_calculation and "state.stage2Selected = new Set()" in new_calculation

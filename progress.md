@@ -44,6 +44,26 @@ ETA. Next step: restart Panel to load the code, then rerun the
 full-universe Campaign. No PerformanceDB or
 tester was used.
 
+## Pair table controls and Stage 2 portfolio selection (2026-10-10)
+
+The pair table gets a separate `История` column (bold `≈ N д` and the date
+range), a `Выбрать N финалистов` button with an N field, and a display sort:
+A–Z, shortest history first, or most finalists first.
+
+The Stage 2 card lists every committed Stage 1 portfolio with its main facts
+and a checkbox. `Отправить на тест` sends only the checked ones, in artifact
+order. `/results` exposes the rows, and submission accepts `candidate_ids`;
+each distinct selection is its own batch.
+
+Contract: the 2026-10-10 pair-table/Stage 2 amendment in the
+[UI spec](docs/specs/2026-09-06-portfolio-optimizer-panel-ui.md), which also
+lists where Stage 2 writes on disk. Live: `/results` for the 61-pair Campaign
+returns 10 portfolio rows. No tester run was started; the operator will start
+it from the Panel.
+
+Verification: static UI and panel portfolio suites pass, except the 2 known
+pre-existing failures. Independent review passed.
+
 ## Portfolio pair history and selection summary (2026-10-10)
 
 The Stage 1 form now shows, for every pair, the history of the finalists its
