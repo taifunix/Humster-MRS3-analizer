@@ -12,9 +12,19 @@ do not treat this file as a replacement for a feature specification.
 
 Draft contract: [BingX data downloader](docs/specs/2026-10-10-bingx-data-downloader.md).
 BingX API facts in the spec were verified with live public requests on
-2026-10-10. Next step: stage 1 downloader core with mocked-HTTP tests, then
-stage 2 Panel BingX mode. Open precondition: one probe run confirming the
-`bot_root` tester reads `tester\data\bingx\`; no tester run has been made.
+2026-10-10.
+
+Stage 1 is implemented: `src/mrs3/bingx_downloader.py`, manual launch
+`scripts\run_bingx_download.bat` (`scripts/download_bingx_data.py`, block
+`bingx` in `config.local.json`). Verification:
+`.venv\Scripts\python.exe -m pytest -p no:cacheprovider tests/test_bingx_downloader.py`
+— 17 passed. A live run into a scratch `bot_root` downloaded PANW/BABA/TSLL
+for 2026-08-03..05 (BABA listing day 870 rows, pre-listing day skipped) and a
+repeat run skipped all 8 valid days.
+
+Next step: stage 2 Panel BingX mode. Open precondition: one probe run
+confirming the `bot_root` tester reads `tester\data\bingx\`; no tester run has
+been made.
 
 ## Panel job admission reliability (2026-10-09)
 
