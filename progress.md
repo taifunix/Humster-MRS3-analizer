@@ -43,8 +43,14 @@ resolve, 30 absent). The registry sheet «Скрининг BingX» was created w
 `scripts/build_bingx_screening_sheet.py` (212 pairs, backup kept next to the
 registry). Automatic BingX verdict writes to Excel are postponed.
 
-Next: split the Panel checkbox into «Режим BingX» and «Докачать данные BingX».
-Moving the Panel to the newer tester installation is not decided yet.
+The Panel checkbox is split into «Режим BingX» and «Докачать данные BingX»
+(inactive while BingX mode is off). BingX mode without top-up prepares files
+on existing local data and refuses with the missing days. Verification:
+`.venv\Scripts\python.exe -m pytest -p no:cacheprovider tests/test_panel_bingx_mode.py tests/test_bingx_downloader.py tests/test_build_bingx_screening_sheet.py tests/test_panel_testing.py tests/screener`
+plus `node --check src/mrs3/panel_web/app.js`. The Panel needs a restart to
+show the new checkboxes.
+
+Open: moving the Panel to the newer tester installation is not decided yet.
 
 ## Panel job admission reliability (2026-10-09)
 

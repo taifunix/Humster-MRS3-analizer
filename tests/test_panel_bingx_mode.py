@@ -115,10 +115,10 @@ def test_panel_bingx_download_tops_up_from_one_day_before_start(tmp_path: Path):
     assert str(config.bot_root) not in json.dumps(status)
 
 
-def test_panel_bingx_fill_requires_completed_download_and_maps_symbols(tmp_path: Path):
+def test_panel_bingx_fill_requires_local_data_and_maps_symbols(tmp_path: Path):
     controller, config = _controller(tmp_path, FakeClient())
     payload = {"symbols": "PANW", "side": "LONG", "start": "2026-10-07", "end": "2026-10-08", "bingx": True}
-    with pytest.raises(PanelTestingError):
+    with pytest.raises(PanelTestingError, match="2026-10-06"):
         controller.local_testing_fill(payload)
     assert _download(controller, payload)["state"] == "done"
     prepared = controller.local_testing_fill(payload)
@@ -127,8 +127,23 @@ def test_panel_bingx_fill_requires_completed_download_and_maps_symbols(tmp_path:
     assert strategy["exchange"]["name"] == "BingX"
     controller.local_testing_stop()
     changed = dict(payload, end="2026-10-09")
-    with pytest.raises(PanelTestingError):
+    with pytest.raises(PanelTestingError, match="2026-10-09"):
         controller.local_testing_fill(changed)
+
+
+def test_panel_bingx_mode_without_download_uses_existing_local_data(tmp_path: Path):
+    client = FakeClient()
+    controller, config = _controller(tmp_path, client)
+    payload = {"symbols": "PANWUSDT", "side": "LONG", "start": "2026-10-07", "end": "2026-10-08", "bingx": True}
+    _download(controller, payload)
+    calls_after_download = len(client.kline_calls)
+    fresh = PanelController(tmp_path, tmp_path / "config.local.json")  # no top-up state at all
+    fresh._bingx_client_factory = lambda _keys: client
+    fresh._bingx_now = controller._bingx_now
+    prepared = fresh.local_testing_fill(payload)
+    assert prepared["symbols"] == ["NCSKPANW2USD-USDT"]
+    assert len(client.kline_calls) == calls_after_download  # no candles downloaded by fill
+    fresh.local_testing_stop()
 
 
 def test_panel_bingx_download_errors_block_fill(tmp_path: Path):
@@ -189,6 +204,11 @@ def test_panel_ui_has_bingx_checkbox_on_screener_and_local_runner_only():
     assert 'id="screener-bingx"' in screener and 'id="local-bingx"' in local
     assert "bingx" not in remote
     assert screener.index('id="screener-bingx"') < screener.index('id="screener-fill"')
+    for card, prefix in ((screener, "screener"), (local, "local")):
+        assert ">Режим BingX<" in card and ">Докачать данные BingX<" in card
+        download = card[card.index(f'id="{prefix}-bingx-download"'):]
+        assert download.split(">", 1)[0].rstrip().endswith("disabled")  # inactive until BingX mode is on
+    assert "докачать данные BingX перед подготовкой" not in html
     assert "'/api/v2/testing/bingx/download'" in js and "'/api/v2/testing/bingx/status'" in js
     # RUNNER 01 must be able to show the actionable "BingX: ..." fill error.
     assert "new Set(['/api/v2/settings/analysis-profile', '/api/v2/testing/local/fill'])" in js

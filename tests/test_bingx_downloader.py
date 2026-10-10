@@ -351,3 +351,19 @@ def test_resolve_contracts_reports_ambiguous_and_prefers_full_stock_ticker():
     resolved, errors = resolve_contracts(["DUP", "XSTOCK"], contracts)
     assert "ambiguous" in errors["DUP"]
     assert resolved["XSTOCK"].api_symbol == "NCSKXSTOCK2USD-USDT"
+
+
+def test_check_local_days_reports_missing_days_without_downloading(tmp_path: Path):
+    from mrs3.bingx_downloader import check_local_days
+
+    download_pairs(bot_root=tmp_path, pairs=["PANW"], start=date(2026, 10, 6), end=date(2026, 10, 7), client=FakeClient(), now=NOW)
+    client = FakeClient()
+    resolved, errors, missing = check_local_days(
+        bot_root=tmp_path, pairs=["PANW", "BABA", "NOPE"], start=date(2026, 10, 6), end=date(2026, 10, 12),
+        client=client, now=NOW,
+    )
+    assert client.kline_calls == []  # coverage check never downloads candles
+    assert resolved["PANW"].api_symbol == "NCSKPANW2USD-USDT"
+    assert list(errors) == ["NOPE"]
+    assert missing["PANW"] == [date(2026, 10, 8), date(2026, 10, 9)]  # 10-10.. are not available yet
+    assert missing["BABA"][0] == date(2026, 10, 6)

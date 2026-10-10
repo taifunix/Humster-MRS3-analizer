@@ -425,6 +425,35 @@ def write_day_csv(path: Path, rows: Sequence[Sequence[str]], day: date, launch_m
 # -- orchestration ----------------------------------------------------------
 
 
+def check_local_days(
+    *,
+    bot_root: Path,
+    pairs: Iterable[str],
+    start: date,
+    end: date,
+    client: BingXClient | None = None,
+    now: datetime | None = None,
+) -> tuple[dict[str, BingXContract], dict[str, str], dict[str, list[date]]]:
+    """Resolve pairs and list days missing or invalid locally, without downloading candles.
+
+    Returns ``(resolved, unresolved errors, missing days per ticker)``; days
+    before listing or not yet available are not counted as missing.
+    """
+    resolved, errors = resolve_contracts(pairs, (client or BingXClient()).contracts())
+    data_root = bingx_data_root(bot_root)
+    last_day = last_available_day(now or datetime.now(timezone.utc))
+    missing: dict[str, list[date]] = {}
+    for ticker, contract in resolved.items():
+        days = [
+            day
+            for day in planned_days(start, end, contract.launch_ms, last_day)
+            if validate_day_csv(day_csv_path(data_root, contract, day), day, contract.launch_ms) is not None
+        ]
+        if days:
+            missing[ticker] = days
+    return resolved, errors, missing
+
+
 def download_pairs(
     *,
     bot_root: Path,

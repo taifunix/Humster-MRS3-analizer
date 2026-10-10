@@ -202,6 +202,7 @@ from .panel_surfaces import LocalSurfacesService
 from .bingx_downloader import (
     BingXClient,
     BingXDownloadError,
+    check_local_days as bingx_check_local_days,
     download_pairs as bingx_download_pairs,
     load_account_keys as bingx_load_account_keys,
     load_bingx_settings,
@@ -2482,20 +2483,41 @@ class PanelController:
             return json.loads(json.dumps(self._bingx_state))
 
     def _bingx_symbols_for_fill(self, payload: Mapping[str, object]) -> tuple[str, ...]:
+        """API symbols for a BingX fill; every day of StartDate−1 … EndDate must already be local.
+
+        Works with or without a preceding top-up: data is checked on disk,
+        and only the contract list (no candles) is requested from BingX.
+        """
         tickers, start, end = self._bingx_request(payload)
-        state = self.bingx_download_status()
-        if (
-            state.get("state") != "done"
-            or state.get("tickers") != list(tickers)
-            or state.get("start") != start.isoformat()
-            or state.get("end") != end.isoformat()
-        ):
-            raise PanelTestingError("BingX: сначала докачайте данные для этих пар и дат")
-        contracts = state.get("contracts") or {}
+        if self._bingx_thread is not None and self._bingx_thread.is_alive():
+            raise PanelTestingError("BingX: дождитесь окончания докачки")
         try:
-            return tuple(contracts[ticker] for ticker in tickers)
-        except KeyError:
-            raise PanelTestingError("BingX: сначала докачайте данные для этих пар и дат") from None
+            settings = load_bingx_settings(self.default_config)
+            resolved, unresolved, missing = bingx_check_local_days(
+                bot_root=settings.bot_root, pairs=tickers, start=start - timedelta(days=1), end=end,
+                client=self._bingx_client_factory(bingx_load_account_keys(settings.bot_root)),
+                now=self._bingx_now(),
+            )
+        except BingXDownloadError as error:
+            raise PanelTestingError(f"BingX: {_redact_screener_error(error)}") from None
+        if unresolved:
+            raise PanelTestingError(
+                "BingX: пары не определены на BingX: "
+                + "; ".join(f"{ticker} ({redact_local_paths(message)[:200]})" for ticker, message in sorted(unresolved.items()))
+            )
+        if missing:
+            details = "; ".join(
+                f"{ticker}: " + ", ".join(day.isoformat() for day in days[:5]) + (f" и ещё {len(days) - 5}" if len(days) > 5 else "")
+                for ticker, days in missing.items()
+            )
+            raise PanelTestingError(f"BingX: нет данных за дни — {details}. Включите «Докачать данные BingX».")
+        # resolve_contracts normalizes each ticker again (AUSDTUSDT -> AUSDT -> A).
+        try:
+            symbols = [resolved[bingx_normalize_ticker(ticker)].api_symbol for ticker in tickers]
+        except (KeyError, BingXDownloadError):
+            raise PanelTestingError("BingX: пары не определены на BingX: " + ", ".join(tickers)) from None
+        # Two inputs for one contract (AMD, AMDSTOCK) must not duplicate the tester symbol.
+        return tuple(dict.fromkeys(symbols))
 
     def local_testing_start(self) -> dict[str, str]:
         if not self._local_testing_filled:

@@ -1011,7 +1011,22 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
   }
 
   // BingX mode (docs/specs/2026-10-10-bingx-data-downloader.md, stage 2):
-  // top up BingX data in the background, then prepare files with bingx: true.
+  // «Режим BingX» prepares files with bingx: true; «Докачать данные BingX»
+  // (active only in BingX mode) first tops up data in the background.
+  for (const prefix of ['screener', 'local']) {
+    const mode = document.querySelector(`#${prefix}-bingx`);
+    const download = document.querySelector(`#${prefix}-bingx-download`);
+    if (!mode || !download) continue;
+    const sync = () => {
+      download.disabled = !mode.checked;
+      if (!mode.checked) download.checked = false;
+    };
+    mode.addEventListener('change', sync);
+    sync();
+  }
+  const bingxDownloadChecked = (prefix) => document.querySelector(`#${prefix}-bingx`)?.checked === true
+    && document.querySelector(`#${prefix}-bingx-download`)?.checked === true;
+
   async function runBingxTopUp(request, report) {
     await requestJson('/api/v2/testing/bingx/download', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -1050,7 +1065,7 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
         delete_old_reports: document.querySelector('#local-delete-old-reports')?.checked === true,
         bingx,
       };
-      if (bingx && !(await runBingxTopUp(request, localStatus))) return;
+      if (bingxDownloadChecked('local') && !(await runBingxTopUp(request, localStatus))) return;
       const result = await requestJson('/api/v2/testing/local/fill', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(request),
@@ -1142,7 +1157,7 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
         delete_old_reports: document.querySelector('#screener-delete-old-reports')?.checked === true,
         bingx: document.querySelector('#screener-bingx')?.checked === true,
       };
-      if (request.bingx && !(await runBingxTopUp(request, screenerStatus))) return;
+      if (bingxDownloadChecked('screener') && !(await runBingxTopUp(request, screenerStatus))) return;
       const result = await requestJson('/api/v2/testing/screener/fill', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(request),
