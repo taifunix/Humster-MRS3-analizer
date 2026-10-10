@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import hashlib
+import itertools
 import json
 from http.client import HTTPConnection
 import os
@@ -22,6 +23,7 @@ import duckdb
 
 import mrs3.panel as panel_module
 from mrs3.panel import PanelController, create_panel_server
+import mrs3.panel_portfolio as pp
 from mrs3.panel_portfolio import (
     PORTFOLIO_SNAPSHOT_UNSERIALIZABLE,
     PortfolioPanelError,
@@ -3610,8 +3612,10 @@ def test_stage2_baseline_preparation_uses_first_persisted_candidate_and_exact_pa
     assert prepared["tester_config_json"].endswith("\n")
     for payload in payloads:
         name = payload["strategy"]["name"]
-        expected = json.dumps(payload["strategy"], ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n"
+        # Tester rendering: template key order, two-space indent, tester rounding.
+        expected = pp._tester_strategy_json(payload["strategy"], pp._load_weighted_template()[0])
         assert prepared["strategy_jsons"][name] == expected
+        assert json.loads(expected) == json.loads(json.dumps(payload["strategy"]))
     assert prepared["receipt"]["candidate_order"] == 0
     assert prepared["receipt"]["profile"] == "BALANCED"
     assert prepared["receipt"]["member_identities"] == [
@@ -3920,6 +3924,9 @@ def test_stage2_baseline_preparation_loads_restart_without_stage1_recomputation(
     assert prepared["candidate_id"] == "f" * 64
 
 
+_FAKE_TESTER_RUNS = itertools.count(1)
+
+
 class _FakeStage2Tester:
     def __init__(
         self,
@@ -4039,7 +4046,11 @@ class _FakeStage2Tester:
                     if self.report_as_directory:
                         report.mkdir()
                     else:
-                        report.write_text("<html>fresh report</html>", encoding="utf-8")
+                        # Unique per start like a real run; the coarse Windows file clock can stamp
+                        # an immediate write before the precise start time, so stamp it explicitly.
+                        report.write_text(f"<html>fresh report {next(_FAKE_TESTER_RUNS)}</html>", encoding="utf-8")
+                        stamp = time.time_ns() + 1_000_000
+                        os.utime(report, ns=(stamp, stamp))
                     if self.extra_report:
                         (report.parent / "second.html").write_text("<html>second</html>", encoding="utf-8")
                 if self.delayed_report:
@@ -4049,7 +4060,7 @@ class _FakeStage2Tester:
                 else:
                     write_report()
             self.config.wizard_result.write_text(json.dumps([{
-                "runId": f"portfolio-run-{self.current_candidate_id[0]}",
+                "runId": f"portfolio-run-{self.current_candidate_id[0]}-{next(_FAKE_TESTER_RUNS)}",
                 "strategies": list(self.result_names if self.result_names is not None else self.current_names),
                 "stats": self.result_stats,
                 "chartUrl": f"/tester-report/{self.current_candidate_id}/portfolio.html",
@@ -5648,3 +5659,67 @@ def test_stage2_identical_selection_reruns_after_a_failed_batch_without_rebuildi
     assert rerun["job_id"] != first["job_id"]
     rerun_job = _wait_stage1(service, rerun)
     assert rerun_job["status"] == "SUCCEEDED", rerun_job.get("diagnostics")
+
+
+def _tester_strategy_candidate(lots_long: tuple, *, balance: str = "55.333888888888886", exchange: str = "Bybit") -> dict:
+    first = _stage2_payload("BTCUSDT", "LONG", name="PORTFOLIO_BTCUSDT_7_11")
+    second = _stage2_payload("ETHUSDT", "SHORT", name="PORTFOLIO_ETHUSDT_8_12")
+    for payload in (first, second):
+        strategy = payload["strategy"]
+        strategy["basic"]["balance_percentage_long"] = float(balance) if payload is first else 0
+        strategy["basic"]["balance_percentage_short"] = 0 if payload is first else 12.0000001
+        strategy.setdefault("exchange", {})["name"] = exchange
+        strategy["mrs3"] = {
+            "ma_long": [{"value": None, "lot_x": lot, "id": index + 1, "side": "buy"} for index, lot in enumerate(lots_long)],
+            "notification": True,
+            "allow_close_by_market_order": False,
+        }
+    return _weighted_executable_candidate((first, second), candidate_id="c" * 64, identity="c" * 64)
+
+
+def test_stage2_strategy_json_is_indented_in_template_key_order() -> None:
+    material = _stage2_material(_tester_strategy_candidate((0.5, 0.5)))
+    raw = material["strategy_jsons"]["PORTFOLIO_BTCUSDT_7_11"]
+    template, _digest = pp._load_weighted_template()
+
+    assert raw.startswith("{\n  \"") and raw.endswith("}\n")
+    strategy = json.loads(raw)
+    template_keys = [key for key in template if key in strategy]
+    assert list(strategy)[:len(template_keys)] == template_keys
+    assert list(strategy["basic"]) == [key for key in template["basic"] if key in strategy["basic"]] + [
+        key for key in strategy["basic"] if key not in template["basic"]
+    ]
+    assert list(strategy["mrs3"])[:2] == ["allow_close_by_market_order", "ma_long"]
+    assert list(strategy["mrs3"]["ma_long"][0]) == ["id", "side", "lot_x", "value"]
+    tester = material["tester_config_json"]
+    assert tester.startswith("{\n  \"") and list(json.loads(tester))[:3] == ["name_comment", "use_runs", "single_mode"]
+
+
+def test_stage2_strategy_rounds_balance_up_and_lot_x_to_cents_with_remainder_on_last_order() -> None:
+    material = _stage2_material(_tester_strategy_candidate((0.333, 0.333, 0.334)))
+    long_strategy = json.loads(material["strategy_jsons"]["PORTFOLIO_BTCUSDT_7_11"])
+    short_strategy = json.loads(material["strategy_jsons"]["PORTFOLIO_ETHUSDT_8_12"])
+
+    assert long_strategy["basic"]["balance_percentage_long"] == 56
+    assert long_strategy["basic"]["balance_percentage_short"] == 0
+    assert short_strategy["basic"]["balance_percentage_short"] == 13
+    assert [order["lot_x"] for order in long_strategy["mrs3"]["ma_long"]] == [0.33, 0.33, 0.34]
+
+    skewed = json.loads(_stage2_material(_tester_strategy_candidate((0.125, 0.125, 0.756)))["strategy_jsons"]["PORTFOLIO_BTCUSDT_7_11"])
+    lots = [order["lot_x"] for order in skewed["mrs3"]["ma_long"]]
+    assert lots[:2] == [0.13, 0.13]
+    assert round(sum(lots), 2) == 1.01 and lots[-1] == 0.75
+
+
+def test_stage2_strategy_lot_x_rounding_refuses_a_non_positive_last_order() -> None:
+    for lots in ((0.015, 0.015, 0.001), (0.015, 0.015, 0.0)):
+        with pytest.raises(ValueError, match="lot_x"):
+            _stage2_material(_tester_strategy_candidate(lots))
+
+
+def test_stage2_tester_maker_fee_is_zero_for_bybit_only() -> None:
+    bybit = json.loads(_stage2_material(_tester_strategy_candidate((0.5, 0.5)))["tester_config_json"])
+    other = json.loads(_stage2_material(_tester_strategy_candidate((0.5, 0.5), exchange="Binance"))["tester_config_json"])
+
+    assert bybit["MakerFee"] == 0
+    assert other["MakerFee"] == json.loads(pp.mrs3_tester_config_template().read_text(encoding="utf-8"))["MakerFee"]

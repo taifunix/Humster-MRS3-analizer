@@ -44,6 +44,26 @@ ETA. Next step: restart Panel to load the code, then rerun the
 full-universe Campaign. No PerformanceDB or
 tester was used.
 
+## Stage 2 strategy files in tester format (2026-10-10)
+
+Stage 2 strategy and tester-config JSON are now indented, with keys in the
+template order. `balance_percentage_*` round up to a whole percent (0 stays
+0). `lot_x` rounds to 0.01, with the remainder on the last order; a
+non-positive last order fails closed. `MakerFee` is 0 for Bybit-only
+batches. Contract: the 2026-10-10 tester-rendering amendment in the
+[UI spec](docs/specs/2026-09-06-portfolio-optimizer-panel-ui.md).
+
+Open decision: rounding percentages up enlarges positions (small `q` the
+most) and can exceed the liquidity cap C. The spec records the consequence.
+
+Evidence: portfolios 01 (61 strategies, bank 716) and 10 (9 strategies,
+bank 72) of `campaign-df84e07d885f4fb8a7b5d9c97a05b5d2` were re-exported
+locally. All 70 files were checked. No tester run was started; the Panel
+backend needs a restart to use the new rendering.
+
+Verification: `tests/test_panel_portfolio.py` 297 passed, 1 skipped.
+Independent review passed.
+
 ## Pair table controls and Stage 2 portfolio selection (2026-10-10)
 
 The pair table gets a separate `История` column (bold `≈ N д` and the date

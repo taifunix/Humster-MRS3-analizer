@@ -1207,3 +1207,32 @@ Measured with the real 14 MB journal: 2.26 s → 0.16 s per progress update.
    (`config_tester.json`). Both are snapshotted before the fill and restored
    by `stop()`.
 3. Reports: `<bot_root>/tester/report/<candidate_id>/`.
+
+### Tester strategy rendering amendment (2026-10-10)
+
+This supersedes "canonical deterministic UTF-8 JSON" for the Stage 2 strategy
+and tester-config files. They are now rendered for the tester as follows:
+
+- **Format.** UTF-8 JSON with a two-space indent and a trailing newline. Keys
+  follow the order of `templates/strategies/portfolio-weighted-mrs/base.json`,
+  recursively; list items follow the template's first item. Keys absent from
+  the template keep their order after the template keys. The tester config
+  keeps the MRS3 tester template's key order.
+- **`basic.balance_percentage_long/short`** round up to a whole percent; a
+  zero stays zero.
+- **`mrs3.ma_long` / `mrs3.ma_short`.** Each order's `lot_x` rounds half-up
+  to 0.01. The last order takes the remainder, so the list total equals the
+  original total rounded to 0.01. If the last order would become negative, or a
+  positive last order would become 0, rendering fails closed (`ValueError`, the candidate is not prepared).
+- **`MakerFee`** is `0` in the tester config when every strategy's exchange
+  is Bybit; otherwise the template value stays.
+- Sizing receipts (`facts` B/C/q/x, `max_balance`) remain the exact artifact
+  values. Only the rendered files carry the rounding, and the
+  receipts/manifests hash those rendered bytes.
+- Known consequence (open operator decision): rounding a percentage up
+  enlarges every position of that strategy by `ceil(100q)/(100q)` and lets its
+  cap `max_balance·p/100` exceed the liquidity cap C. Small `q` are hit
+  hardest (q = 0.3% → ×3.3). Stage 2 therefore tests a somewhat larger
+  portfolio than the one Stage 1 sized.
+- Evidence: the 70 strategies of the two exported portfolios were checked for
+  template order, whole percentages, cent `lot_x` and preserved totals.

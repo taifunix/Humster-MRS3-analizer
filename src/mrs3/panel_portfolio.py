@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_HALF_UP
 import asyncio
 import base64
 import copy
@@ -370,6 +370,66 @@ def _candidate_required_bank(candidate: Mapping[str, Any]) -> Decimal:
     return bank
 
 
+_LOT_X_STEP = Decimal("0.01")
+
+
+def _template_ordered(value: Any, template: Any) -> Any:
+    """Order mapping keys as in the template; keys absent there keep their order at the end."""
+    if isinstance(value, Mapping):
+        shape = template if isinstance(template, Mapping) else {}
+        ordered = {key: _template_ordered(value[key], shape[key]) for key in shape if key in value}
+        for key, item in value.items():
+            if key not in ordered:
+                ordered[key] = _template_ordered(item, None)
+        return ordered
+    if isinstance(value, (list, tuple)):
+        item_shape = template[0] if isinstance(template, (list, tuple)) and template else None
+        return [_template_ordered(item, item_shape) for item in value]
+    return value
+
+
+def _tester_number(value: Decimal, like: Any) -> int | float:
+    return float(value) if isinstance(like, float) else (int(value) if value == value.to_integral_value() else float(value))
+
+
+def _tester_strategy_json(strategy: Mapping[str, Any], template: Mapping[str, Any]) -> str:
+    """Render one strategy for the tester: template key order, indented, tester rounding.
+
+    balance_percentage_* round up to whole percent (zero stays zero); every
+    mrs3 entry-order list rounds lot_x to cents and puts the rounding residual
+    of the list total on its last order.
+    """
+    rendered = json.loads(json.dumps(_plain(strategy), ensure_ascii=False, allow_nan=False))
+    basic = rendered.get("basic")
+    if isinstance(basic, dict):
+        for key in ("balance_percentage_long", "balance_percentage_short"):
+            value = basic.get(key)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue
+            number = Decimal(str(value))
+            if number > 0:
+                basic[key] = _tester_number(number.to_integral_value(rounding=ROUND_CEILING), 1)
+    mrs3 = rendered.get("mrs3")
+    if isinstance(mrs3, dict):
+        for key in ("ma_long", "ma_short"):
+            orders = mrs3.get(key)
+            if not isinstance(orders, list) or not orders or any(
+                not isinstance(order, dict) or isinstance(order.get("lot_x"), bool) or not isinstance(order.get("lot_x"), (int, float))
+                for order in orders
+            ):
+                continue
+            lots = [Decimal(str(order["lot_x"])) for order in orders]
+            total = sum(lots, Decimal(0)).quantize(_LOT_X_STEP, rounding=ROUND_HALF_UP)
+            rounded = [lot.quantize(_LOT_X_STEP, rounding=ROUND_HALF_UP) for lot in lots[:-1]]
+            rounded.append(total - sum(rounded, Decimal(0)))
+            if rounded[-1] < 0 or (lots[-1] > 0 and rounded[-1] <= 0):
+                raise ValueError("candidate lot_x rounding leaves a non-positive last order")
+            for order, lot in zip(orders, rounded):
+                order["lot_x"] = float(lot)
+    ordered = _template_ordered(rendered, template)
+    return json.dumps(ordered, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
+
+
 def _stage2_material(candidate: Mapping[str, Any]) -> dict[str, Any]:
     """Render the exact tester inputs and receipt from one committed candidate."""
     candidate_id = candidate.get("candidate_id")
@@ -386,6 +446,8 @@ def _stage2_material(candidate: Mapping[str, Any]) -> dict[str, Any]:
     strategy_jsons: dict[str, str] = {}
     sizing_by_name: dict[str, dict[str, Any]] = {}
     max_balance_by_name: dict[str, Any] = {}
+    exchanges: set[str] = set()
+    strategy_template, _template_digest = _load_weighted_template()
     for payload in payloads:
         if not isinstance(payload, Mapping):
             raise ValueError("candidate strategy wrapper is invalid")
@@ -419,7 +481,9 @@ def _stage2_material(candidate: Mapping[str, Any]) -> dict[str, Any]:
             raise ValueError("candidate max_balance is invalid") from error
         if not max_balance.is_finite() or max_balance <= 0:
             raise ValueError("candidate max_balance is invalid")
-        strategy_jsons[name] = _json(strategy) + "\n"
+        strategy_jsons[name] = _tester_strategy_json(strategy, strategy_template)
+        exchange = strategy.get("exchange")
+        exchanges.add(str(exchange.get("name", "")) if isinstance(exchange, Mapping) else "")
         sizing_by_name[name] = {key: facts[key] for key in ("B", "C", "q", "x")}
         max_balance_by_name[name] = basic["max_balance"]
     if len(strategy_jsons) < 2:
@@ -455,7 +519,10 @@ def _stage2_material(candidate: Mapping[str, Any]) -> dict[str, Any]:
         "single_mode": False,
         "UpdateData": False,
     })
-    tester_config_json = _json(template) + "\n"
+    if exchanges == {"Bybit"}:
+        # Operator rule for Stage 2 tester runs: Bybit-only batches use MakerFee 0.
+        template["MakerFee"] = 0.0
+    tester_config_json = json.dumps(template, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
     members = candidate.get("members")
     if isinstance(members, (str, bytes)) or not isinstance(members, Sequence) or any(
         not isinstance(member, Mapping) for member in members
