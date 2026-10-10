@@ -27,6 +27,8 @@ CONTRACTS_PATH = "/openApi/swap/v2/quote/contracts"
 KLINES_PATH = "/openApi/swap/v3/quote/klines"
 CSV_HEADER = ("timestamp", "open", "high", "low", "close", "volume", "buy_volume", "sell_volume", "trades")
 DOWNLOAD_MODES = ("incremental", "overwrite")
+# BingX TradFi contracts: stocks/ETFs, indices, commodities (forex NCFX is excluded).
+TRADFI_SYMBOL_PREFIXES = ("NCSK", "NCSI", "NCCO")
 MINUTE_MS = 60_000
 DAY_MS = 86_400_000
 # Daily data appears ~6 h after 00:00 UTC; 3 h margin on top (spec: «Доступность дневных данных»).
@@ -254,10 +256,28 @@ def normalize_ticker(value: str) -> str:
     return ticker
 
 
+def _tradfi_matches(base: str, contracts: Sequence[Mapping[str, object]]) -> list[Mapping[str, object]]:
+    names = {f"{base}-USDT", f"{base}US-USDT"}  # BingX adds "US" where a crypto coin owns the name
+    matches: dict[str, Mapping[str, object]] = {}
+    for item in contracts:
+        symbol = item.get("symbol")
+        if not isinstance(symbol, str) or not symbol.startswith(TRADFI_SYMBOL_PREFIXES):
+            continue
+        display = str(item.get("displayName") or "").replace(" ", "")
+        if display in names or symbol == f"NCSK{base}2USD-USDT":
+            matches[symbol] = item
+    return list(matches.values())
+
+
 def resolve_contracts(
     pairs: Iterable[str], contracts: Sequence[Mapping[str, object]]
 ) -> tuple[dict[str, BingXContract], dict[str, str]]:
-    """Map user tickers to BingX contracts by ``displayName == <TICKER>-USDT``."""
+    """Map user tickers to BingX TradFi contracts (spec: «Определение внутренних API-тикеров»).
+
+    Only stock/index/commodity contracts are considered, so a ticker never
+    resolves to a crypto coin of the same name; ``<T>-USDT`` and ``<T>US-USDT``
+    display names match, and a Bybit ``…STOCK`` suffix is dropped.
+    """
     resolved: dict[str, BingXContract] = {}
     errors: dict[str, str] = {}
     for raw in pairs:
@@ -268,21 +288,23 @@ def resolve_contracts(
             continue
         if ticker in resolved or ticker in errors:
             continue
-        display = f"{ticker}-USDT"
-        matches = [item for item in contracts if item.get("displayName") == display]
+        bases = [ticker]
+        if ticker.endswith("STOCK") and len(ticker) > len("STOCK"):
+            bases.append(ticker[: -len("STOCK")])
+        for base in bases:
+            matches = _tradfi_matches(base, contracts)
+            if matches:
+                break
         if len(matches) != 1:
-            errors[ticker] = f"ticker not found on BingX: {display}"
+            reason = "is ambiguous" if matches else "not found"
+            errors[ticker] = f"ticker {reason} on BingX: {ticker}"
             continue
         match = matches[0]
         try:
             launch_ms = int(match.get("launchTime") or 0)
         except (TypeError, ValueError):
             launch_ms = 0
-        symbol = match.get("symbol")
-        if not isinstance(symbol, str) or not symbol:
-            errors[ticker] = f"ticker not found on BingX: {display}"
-            continue
-        resolved[ticker] = BingXContract(ticker, symbol, display.replace("-", ""), launch_ms)
+        resolved[ticker] = BingXContract(ticker, str(match["symbol"]), f"{base}USDT", launch_ms)
     return resolved, errors
 
 

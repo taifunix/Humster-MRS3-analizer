@@ -315,3 +315,39 @@ def test_unexpected_day_error_is_recorded_and_other_pairs_continue(tmp_path: Pat
     )
     assert report.downloaded == 1
     assert [(error.pair, error.message) for error in report.errors] == [("PANW", "socket reset")]
+
+
+TRADFI_COLLISIONS = [
+    {"symbol": "ON-USDT", "displayName": "ON-USDT", "launchTime": 1},
+    {"symbol": "NCSKON2USD-USDT", "displayName": "ON-USDT", "launchTime": 2},
+    {"symbol": "NCSKAMD2USD-USDT", "displayName": "AMDUS-USDT", "launchTime": 3},
+    {"symbol": "NCSKNETFLIX2USD-USDT", "displayName": "NFLX-USDT", "launchTime": 4},
+    {"symbol": "NCSKGME2USD-USDT", "displayName": "GME-USDT", "launchTime": 5},
+    {"symbol": "NCFXEUR2USD-USDT", "displayName": "EURUSD-USDT", "launchTime": 6},
+    {"symbol": "RAMSES-USDT", "displayName": "RAM-USDT", "launchTime": 7},
+]
+
+
+def test_resolve_contracts_uses_only_tradfi_contracts_and_bingx_name_variants():
+    resolved, errors = resolve_contracts(
+        ["ON", "AMDUSDT", "AMDSTOCKUSDT", "NFLX", "GMESTOCKUSDT", "EURUSD", "RAM"], TRADFI_COLLISIONS
+    )
+    assert resolved["ON"].api_symbol == "NCSKON2USD-USDT"  # not the ON crypto coin
+    assert resolved["AMD"].api_symbol == "NCSKAMD2USD-USDT"  # BingX name AMDUS-USDT
+    assert resolved["AMDSTOCK"].api_symbol == "NCSKAMD2USD-USDT"  # Bybit STOCK suffix
+    assert resolved["AMDSTOCK"].file_ticker == "AMDUSDT"
+    assert resolved["NFLX"].api_symbol == "NCSKNETFLIX2USD-USDT"
+    assert resolved["GMESTOCK"].file_ticker == "GMEUSDT"
+    assert set(errors) == {"EURUSD", "RAM"}  # forex and crypto are not TradFi stocks
+
+
+def test_resolve_contracts_reports_ambiguous_and_prefers_full_stock_ticker():
+    contracts = [
+        {"symbol": "NCSKDUP2USD-USDT", "displayName": "DUP-USDT", "launchTime": 1},
+        {"symbol": "NCSIDUP2USD-USDT", "displayName": "DUP-USDT", "launchTime": 1},
+        {"symbol": "NCSKXSTOCK2USD-USDT", "displayName": "XSTOCK-USDT", "launchTime": 1},
+        {"symbol": "NCSKX2USD-USDT", "displayName": "X-USDT", "launchTime": 1},
+    ]
+    resolved, errors = resolve_contracts(["DUP", "XSTOCK"], contracts)
+    assert "ambiguous" in errors["DUP"]
+    assert resolved["XSTOCK"].api_symbol == "NCSKXSTOCK2USD-USDT"
