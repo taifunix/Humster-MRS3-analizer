@@ -27,6 +27,7 @@ from mrs3.performance_v2_finalist_retest import (
     FinalistRetestError,
     import_combined_control_workbook,
     finalist_retest_config_digest,
+    current_effective_finalist_members,
     _control_reason,
 )
 from mrs3.performance_v2_store import initialize_performance_v2
@@ -40,6 +41,24 @@ from mrs3.panel_strategy_batch import validate_strategy_manifest
 
 
 PORTFOLIO_ARITHMETIC_FIXTURE = Path(__file__).parent / "fixtures" / "portfolio" / "source_sizing_arithmetic.json"
+
+
+@pytest.mark.parametrize("version", [10, 11])
+def test_current_effective_finalist_control_reader_accepts_v10_and_v11(version: int) -> None:
+    from tests.test_performance_v2_store import _prepare_v10_migration_fixture
+    from mrs3.performance_v2_store import _require_v10_catalog
+
+    with duckdb.connect(":memory:") as connection:
+        if version == 10:
+            _prepare_v10_migration_fixture(connection)
+            _require_v10_catalog(connection)
+            assert connection.execute(
+                "select count(*) from information_schema.tables where table_schema = 'main' "
+                "and table_name in ('selection_publications', 'selection_publication_runs', 'selection_aggregate_imports')"
+            ).fetchone() == (0,)
+        else:
+            initialize_performance_v2(connection)
+        assert current_effective_finalist_members(connection) == ()
 
 
 def test_selection_reason_aliases_are_shared_and_reversible() -> None:
@@ -250,7 +269,8 @@ def test_freeze_uses_effective_user_status_and_listing_warmup_without_writes() -
         )
         connection.execute(
             """insert into selection_review_imports
-            values ('review-2', 'run-2', ?, ?, 1)""",
+               (review_import_id, selection_run_id, workbook_sha256, imported_at_utc, row_count)
+               values ('review-2', 'run-2', ?, ?, 1)""",
             ["d" * 64, now],
         )
         connection.execute(
@@ -258,6 +278,7 @@ def test_freeze_uses_effective_user_status_and_listing_warmup_without_writes() -
         )
         connection.execute(
             """insert into selection_review_imports
+               (review_import_id, selection_run_id, workbook_sha256, imported_at_utc, row_count)
                values ('review-1', 'run-1', ?, ?, 1)""",
             ["e" * 64, now],
         )
@@ -317,6 +338,7 @@ def test_manifest_has_one_common_period_and_native_strategy_provenance(tmp_path)
         )
         connection.execute(
             """insert into selection_review_imports
+               (review_import_id, selection_run_id, workbook_sha256, imported_at_utc, row_count)
                values ('review-1', 'selection-1', ?, ?, 1)""",
             ["d" * 64, now],
         )
@@ -487,7 +509,9 @@ def test_combined_control_import_is_atomic_and_idempotent() -> None:
         previous_imported = datetime(2025, 12, 31, tzinfo=UTC)
         cleared_imported = datetime(2026, 1, 1, 12, tzinfo=UTC)
         connection.execute(
-            "insert into selection_review_imports values ('review-old', 'sel', ?, ?, 2)",
+            "insert into selection_review_imports "
+            "(review_import_id, selection_run_id, workbook_sha256, imported_at_utc, row_count) "
+            "values ('review-old', 'sel', ?, ?, 2)",
             ["d" * 64, previous_imported],
         )
         connection.execute(
@@ -502,7 +526,9 @@ def test_combined_control_import_is_atomic_and_idempotent() -> None:
             "insert into selection_review_rows values ('review-old', 3, 'FINALIST', 9, null, 'wrong direction')"
         )
         connection.execute(
-            "insert into selection_review_imports values ('review-clear', 'sel', ?, ?, 1)",
+            "insert into selection_review_imports "
+            "(review_import_id, selection_run_id, workbook_sha256, imported_at_utc, row_count) "
+            "values ('review-clear', 'sel', ?, ?, 1)",
             ["e" * 64, cleared_imported],
         )
         connection.execute(
@@ -513,7 +539,9 @@ def test_combined_control_import_is_atomic_and_idempotent() -> None:
             ["f" * 64, "g" * 64, "h" * 64, previous_imported],
         )
         connection.execute(
-            "insert into selection_review_imports values ('review-short', 'sel-short', ?, ?, 1)",
+            "insert into selection_review_imports "
+            "(review_import_id, selection_run_id, workbook_sha256, imported_at_utc, row_count) "
+            "values ('review-short', 'sel-short', ?, ?, 1)",
             ["i" * 64, previous_imported],
         )
         connection.execute(
@@ -632,7 +660,9 @@ def test_server_issued_control_accepts_user_edits_and_failure_only_group(reason:
                 values ('sel', 1, 11, 'FINALIST', 5.5, 1, ?, null, null, false, '{}')""", [reason]
         )
         connection.execute(
-            "insert into selection_review_imports values ('review-prior', 'sel', ?, ?, 1)",
+                "insert into selection_review_imports "
+                "(review_import_id, selection_run_id, workbook_sha256, imported_at_utc, row_count) "
+                "values ('review-prior', 'sel', ?, ?, 1)",
             ["p" * 64, datetime(2025, 12, 31, tzinfo=UTC)],
         )
         connection.execute(
@@ -643,7 +673,7 @@ def test_server_issued_control_accepts_user_edits_and_failure_only_group(reason:
         headers = {cell.value: cell.column for cell in workbook["Candidates"][1]}
         rendered_reason = workbook["Candidates"].cell(2, headers["Причина"]).value
         expected_reason = (
-            "1. PARETO_PL_PTS_PER_ORDER" if reason == "PARETO_PLATEAU_POINTS_PER_ORDER"
+            "2. PARETO_PLATEAU_POINTS_PER_ORDER" if reason == "PARETO_PLATEAU_POINTS_PER_ORDER"
             else reason
         )
         assert rendered_reason == expected_reason

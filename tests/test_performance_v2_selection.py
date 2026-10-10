@@ -37,6 +37,7 @@ from mrs3.performance_v2_selection import (
     selection_cache_missing_strategy_ids,
     selection_cache_status,
     selection_equity_facts_token,
+    selection_row_fill,
     write_selection_workbook,
     retest_cohort_request,
 )
@@ -604,6 +605,45 @@ def test_finalists_only_request_is_strict_boolean_and_preserves_legacy_hash() ->
     for invalid in ("true", "on", 1, None, ""):
         with pytest.raises(PerformanceV2SelectionError, match="INVALID_REQUEST"):
             parse_selection_request({**base, "finalists_only": invalid})
+
+
+def test_process_all_pairs_is_an_operation_flag_outside_the_canonical_request() -> None:
+    from mrs3.performance_v2_selection_review import canonical_contract
+
+    parse_operation = getattr(selection_module, "parse_selection_operation", None)
+    assert callable(parse_operation), "operation-only request parser is missing"
+    base = {"symbol": "BTCUSDT", "side": "LONG", "stages": []}
+
+    legacy_request, legacy_all_pairs = parse_operation(base)
+    false_request, false_all_pairs = parse_operation({**base, "process_all_pairs": False})
+    true_request, true_all_pairs = parse_operation({**base, "process_all_pairs": True})
+
+    assert not legacy_all_pairs and not false_all_pairs and true_all_pairs
+    assert canonical_contract(legacy_request, SelectionConfig()) == canonical_contract(false_request, SelectionConfig())
+    assert canonical_contract(legacy_request, SelectionConfig()) == canonical_contract(true_request, SelectionConfig())
+    with pytest.raises(PerformanceV2SelectionError, match="INVALID_REQUEST"):
+        parse_operation({**base, "unexpected": True})
+    with pytest.raises(PerformanceV2SelectionError, match="INVALID_REQUEST"):
+        parse_operation({**base, "process_all_pairs": "true"})
+    with pytest.raises(PerformanceV2SelectionError, match="INVALID_REQUEST"):
+        parse_selection_request({**base, "process_all_pairs": False})
+
+
+@pytest.mark.parametrize("status", ["FINALIST", "RESERVE"])
+def test_selection_cohort_requires_raw_manual_finalist_or_reserve(status: str) -> None:
+    admits = getattr(selection_module, "selection_cohort_admits", None)
+    assert callable(admits), "pure raw-manual cohort predicate is missing"
+
+    assert admits(finalists_only=True, raw_user_status=status, raw_user_status_origin="MANUAL")
+    assert not admits(finalists_only=True, raw_user_status=status, raw_user_status_origin="AUTOMATIC")
+    assert not admits(finalists_only=True, raw_user_status=status, raw_user_status_origin="EFFECTIVE")
+
+
+@pytest.mark.parametrize("status", [None, "", " ", "ANALOG", "FILTERED", "REJECTED", "UNKNOWN"])
+def test_selection_cohort_off_admits_every_stored_raw_status(status: str | None) -> None:
+    admits = getattr(selection_module, "selection_cohort_admits", None)
+    assert callable(admits), "pure raw-manual cohort predicate is missing"
+    assert admits(finalists_only=False, raw_user_status=status, raw_user_status_origin=None)
 
 
 def test_legacy_robust_request_json_stays_byte_identical() -> None:
@@ -1213,8 +1253,14 @@ def _candidate_db(tmp_path: Path) -> duckdb.DuckDBPyConnection:
     return connection
 
 
-def test_selection_equity_token_reads_v7_equity_cache(tmp_path: Path) -> None:
+@pytest.mark.parametrize("schema_version", [None, 10], ids=["v11", "v10"])
+def test_selection_equity_token_reads_cache_for_v10_and_v11(
+    tmp_path: Path, schema_version: int | None,
+) -> None:
     connection = _candidate_db(tmp_path)
+    assert connection.execute(
+        "select value from schema_info where key = 'schema_version'"
+    ).fetchone() == ("11",)
     request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
     queries: list[str] = []
 
@@ -1224,11 +1270,14 @@ def test_selection_equity_token_reads_v7_equity_cache(tmp_path: Path) -> None:
             return connection.execute(sql) if parameters is None else connection.execute(sql, parameters)
 
     try:
-        selection_equity_facts_token(CountingConnection(), request)
+        token = selection_equity_facts_token(
+            CountingConnection(), request, schema_version=schema_version,
+        )
     finally:
         connection.close()
 
     assert any("from equity_quality_metrics" in sql for sql in queries)
+    assert token[-1][2] is None
 
 
 def _clone_current_candidate(connection: duckdb.DuckDBPyConnection, name: str) -> tuple[int, int]:
@@ -4264,13 +4313,14 @@ def test_equity_regime_workbook_displays_rank_only_when_regime_is_enabled(tmp_pa
         {"id": "filter_equity_regime", "enabled": True, "scope": "pair_side"},
     ]})
     result = run_selection(pd.DataFrame([_selection_row("stalled", _equity_state="STALLED")]), request)
+    assert result.loc[0, "equity_regime_rank"] == "RESERVED"
     sheet = load_workbook(
         write_selection_workbook(result, tmp_path / "regime-rank.xlsx", request), data_only=True,
     )["All candidates"]
     headers = [cell.value for cell in sheet[1]]
 
     assert "Regime rank" in headers
-    assert sheet.cell(2, headers.index("Regime rank") + 1).value == "RESERVED"
+    assert sheet.cell(2, headers.index("Regime rank") + 1).value == "STALLED"
     assert not any(header in headers for header in (
         "Equity state", "Equity basis", "Equity DD, %", "Equity smoothness",
     ))
@@ -4633,7 +4683,7 @@ def test_workbook_prefixes_applied_filter_reason_and_fills_rows(tmp_path: Path) 
     headers = [cell.value for cell in book["All candidates"][1]]
 
     assert book["All candidates"].cell(2, headers.index("Причина") + 1).value == "3. PARETO_DD5_CAPITAL"
-    assert book["All candidates"].cell(2, 1).fill.fgColor.rgb == "00F6DFDF"
+    assert book["All candidates"].cell(2, 1).fill.fgColor.rgb == "00D9EAD3"
     assert book["All candidates"].cell(3, 1).fill.fgColor.rgb == "00D9EAD3"
     assert book["Finalists"].cell(2, 1).fill.fgColor.rgb == "00D9EAD3"
 
@@ -5074,3 +5124,50 @@ def test_loader_uses_closed_cycles_for_b_gate_and_ignores_zero_and_commission(tm
     assert row["completed_profitable_cycle_count"] == 21
     assert row["completed_cycle_net_pnl"] == Decimal("26")
     assert row["top5_pnl"] == Decimal("14")
+
+
+def test_selection_row_fill_uses_exact_provenance_and_precedence() -> None:
+    enabled = (
+        "filter_equity_regime", "filter_min_shift", "pair_side_pnl_upper_half",
+        "structural_stage_1", "structural_stage_2", "pair_side_stage_3",
+    )
+    row = {
+        "prior_rejected": False,
+        "equity_regime_state": "STALLED",
+        "eliminated_by_filter_equity_regime": True,
+        "eliminated_by_filter_min_shift": True,
+        "eliminated_by_pair_side_pnl_upper_half": True,
+        "eliminated_by_structural_stage_1": False,
+        "eliminated_by_structural_stage_2": False,
+        "eliminated_by_pair_side_stage_3": False,
+    }
+    assert selection_row_fill(row, enabled_stage_ids=enabled) == "B7B7B7"
+    assert selection_row_fill({**row, "prior_rejected": True}, enabled_stage_ids=enabled) == "F4CCCC"
+    assert selection_row_fill(
+        {**row, "equity_regime_state": "GROWING", "eliminated_by_filter_equity_regime": False},
+        enabled_stage_ids=enabled,
+    ) == "CFE2F3"
+    assert selection_row_fill(
+        {**row, "equity_regime_state": "GROWING", "eliminated_by_filter_equity_regime": False,
+         "eliminated_by_filter_min_shift": False},
+        enabled_stage_ids=enabled,
+    ) == "FFF2CC"
+
+
+def test_selection_row_fill_requires_trace_for_non_rejected_colors() -> None:
+    assert selection_row_fill(
+        {"elimination_reason": "FILTER_MIN_SHIFT", "auto_status": "RESERVE"},
+        enabled_stage_ids=("filter_min_shift",),
+    ) == "D9EAD3"
+    outside_top_n = {
+        "eliminated_by_rank_robust_top_n": True,
+        "auto_status": "RESERVE", "final_rank": 3,
+        "elimination_reason": "RANK_ROBUST_TOP_N", "auto_analog_of_strategy_id": None,
+        "prior_rejected": False,
+    }
+    assert selection_row_fill(
+        outside_top_n, enabled_stage_ids=("rank_robust_top_n",), top_n=2,
+    ) == "EAF4E5"
+    assert selection_row_fill(
+        outside_top_n, enabled_stage_ids=("rank_robust_top_n",), top_n=None,
+    ) == "D9EAD3"

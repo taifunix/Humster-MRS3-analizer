@@ -14,7 +14,8 @@ import duckdb
 from .config import PanelPathSettings, load_duckdb_import_settings, load_panel_path_settings
 
 
-_SCHEMA_VERSION = "10"
+_SCHEMA_VERSION = "11"
+_V10_SCHEMA_VERSION = "10"
 _V9_SCHEMA_VERSION = "9"
 _V8_SCHEMA_VERSION = "8"
 _V7_SCHEMA_VERSION = "7"
@@ -489,6 +490,50 @@ _SELECTION_SCHEMA_V10 = _SELECTION_SCHEMA.replace(
     "user_status VARCHAR CHECK (user_status IN ('FINALIST', 'RESERVE', 'ANALOG', 'FILTERED', 'REJECTED'))",
 )
 
+_SELECTION_PUBLICATIONS_SCHEMA = """CREATE TABLE selection_publications (
+    publication_id VARCHAR PRIMARY KEY,
+    publication_kind VARCHAR NOT NULL,
+    operation_key VARCHAR NOT NULL UNIQUE,
+    operation_digest VARCHAR NOT NULL,
+    manifest_contract_version VARCHAR NOT NULL,
+    decision_group_id VARCHAR NOT NULL,
+    database_instance_id VARCHAR NOT NULL,
+    source_revision VARCHAR NOT NULL,
+    controls_json VARCHAR NOT NULL,
+    controls_sha256 VARCHAR NOT NULL,
+    render_model_json VARCHAR NOT NULL,
+    render_model_sha256 VARCHAR NOT NULL,
+    evaluated_rowset_sha256 VARCHAR NOT NULL,
+    export_workbook_sha256 VARCHAR,
+    created_at_utc TIMESTAMPTZ NOT NULL,
+    retired_at_utc TIMESTAMPTZ
+)"""
+_SELECTION_PUBLICATION_RUNS_SCHEMA = """CREATE TABLE selection_publication_runs (
+    publication_id VARCHAR NOT NULL REFERENCES selection_publications(publication_id),
+    pair VARCHAR NOT NULL,
+    side VARCHAR NOT NULL CHECK (side IN ('LONG', 'SHORT')),
+    role VARCHAR NOT NULL CHECK (role IN ('SOURCE', 'OVERLAY')),
+    selection_run_id VARCHAR NOT NULL REFERENCES selection_runs(selection_run_id),
+    PRIMARY KEY (publication_id, pair, side, role),
+    UNIQUE (publication_id, selection_run_id)
+)"""
+_SELECTION_AGGREGATE_IMPORTS_SCHEMA = """CREATE TABLE selection_aggregate_imports (
+    aggregate_import_id VARCHAR PRIMARY KEY,
+    publication_id VARCHAR NOT NULL REFERENCES selection_publications(publication_id),
+    operation_key VARCHAR NOT NULL,
+    operation_digest VARCHAR NOT NULL,
+    manifest_contract_version VARCHAR NOT NULL,
+    source_revision VARCHAR NOT NULL,
+    partition_rowsets_json VARCHAR NOT NULL,
+    candidate_identities_json VARCHAR NOT NULL,
+    uploaded_workbook_sha256 VARCHAR NOT NULL,
+    lifecycle_status VARCHAR NOT NULL CHECK (
+        lifecycle_status IN ('ACTIVE', 'PARTIALLY_RETIRED', 'RETIRED')
+    ),
+    imported_at_utc TIMESTAMPTZ NOT NULL,
+    retired_at_utc TIMESTAMPTZ
+)"""
+
 _V2_TABLE_NAMES = {
     "schema_info",
     "strategies",
@@ -515,6 +560,11 @@ _V4_EXPECTED_TABLES = frozenset(
 _V5_EXPECTED_TABLES = frozenset({("main", "optimizer_prepared_inputs")}) | _V4_EXPECTED_TABLES
 _V8_EXPECTED_TABLES = _V5_EXPECTED_TABLES | {("main", "equity_quality_metrics")}
 _V9_EXPECTED_TABLES = _V8_EXPECTED_TABLES | {("main", "strategy_rejection_sources")}
+_V11_EXPECTED_TABLES = _V9_EXPECTED_TABLES | {
+    ("main", "selection_publications"),
+    ("main", "selection_publication_runs"),
+    ("main", "selection_aggregate_imports"),
+}
 # Kept as the v8 catalog for legacy fixture builders and migration validators.
 _EXPECTED_TABLES = _V8_EXPECTED_TABLES
 _V2_EXPECTED_TABLES = frozenset(("main", name) for name in _V2_TABLE_NAMES)
@@ -569,6 +619,9 @@ _PREPARED_COLUMNS = frozenset(
         "unavailable_reason", "prepared_json", "prepared_at_utc",
     }
 )
+_V11_EXPECTED_INDEXES = _EXPECTED_INDEXES | {
+    ("main", "selection_review_imports_aggregate_run_uq"),
+}
 _EQUITY_QUALITY_COLUMNS = (
     ("result_id", "BIGINT", "NO"),
     ("source_revision", "VARCHAR", "NO"),
@@ -577,6 +630,81 @@ _EQUITY_QUALITY_COLUMNS = (
     ("facts_sha256", "VARCHAR", "NO"),
     ("calculated_at_utc", "TIMESTAMP WITH TIME ZONE", "NO"),
 )
+_V10_SELECTION_HISTORY_COLUMNS = {
+    "selection_runs": (
+        ("selection_run_id", "VARCHAR", "NO"),
+        ("database_instance_id", "VARCHAR", "NO"),
+        ("symbol", "VARCHAR", "NO"),
+        ("side", "VARCHAR", "NO"),
+        ("selection_contract_version", "VARCHAR", "NO"),
+        ("request_json", "VARCHAR", "NO"),
+        ("request_sha256", "VARCHAR", "NO"),
+        ("config_json", "VARCHAR", "NO"),
+        ("config_sha256", "VARCHAR", "NO"),
+        ("candidate_count", "INTEGER", "NO"),
+        ("representative_count", "INTEGER", "NO"),
+        ("auto_finalist_count", "INTEGER", "NO"),
+        ("top_n", "INTEGER", "NO"),
+        ("workbook_sha256", "VARCHAR", "NO"),
+        ("created_at_utc", "TIMESTAMP WITH TIME ZONE", "NO"),
+    ),
+    "selection_review_imports": (
+        ("review_import_id", "VARCHAR", "NO"),
+        ("selection_run_id", "VARCHAR", "NO"),
+        ("workbook_sha256", "VARCHAR", "NO"),
+        ("imported_at_utc", "TIMESTAMP WITH TIME ZONE", "NO"),
+        ("row_count", "INTEGER", "NO"),
+    ),
+    "selection_review_rows": (
+        ("review_import_id", "VARCHAR", "NO"),
+        ("strategy_id", "BIGINT", "NO"),
+        ("user_status", "VARCHAR", "YES"),
+        ("user_rank", "INTEGER", "YES"),
+        ("user_analog_of_strategy_id", "BIGINT", "YES"),
+        ("comment", "VARCHAR", "YES"),
+    ),
+}
+_V11_NEW_TABLE_COLUMNS = {
+    "selection_publications": (
+        ("publication_id", "VARCHAR", "NO"),
+        ("publication_kind", "VARCHAR", "NO"),
+        ("operation_key", "VARCHAR", "NO"),
+        ("operation_digest", "VARCHAR", "NO"),
+        ("manifest_contract_version", "VARCHAR", "NO"),
+        ("decision_group_id", "VARCHAR", "NO"),
+        ("database_instance_id", "VARCHAR", "NO"),
+        ("source_revision", "VARCHAR", "NO"),
+        ("controls_json", "VARCHAR", "NO"),
+        ("controls_sha256", "VARCHAR", "NO"),
+        ("render_model_json", "VARCHAR", "NO"),
+        ("render_model_sha256", "VARCHAR", "NO"),
+        ("evaluated_rowset_sha256", "VARCHAR", "NO"),
+        ("export_workbook_sha256", "VARCHAR", "YES"),
+        ("created_at_utc", "TIMESTAMP WITH TIME ZONE", "NO"),
+        ("retired_at_utc", "TIMESTAMP WITH TIME ZONE", "YES"),
+    ),
+    "selection_publication_runs": (
+        ("publication_id", "VARCHAR", "NO"),
+        ("pair", "VARCHAR", "NO"),
+        ("side", "VARCHAR", "NO"),
+        ("role", "VARCHAR", "NO"),
+        ("selection_run_id", "VARCHAR", "NO"),
+    ),
+    "selection_aggregate_imports": (
+        ("aggregate_import_id", "VARCHAR", "NO"),
+        ("publication_id", "VARCHAR", "NO"),
+        ("operation_key", "VARCHAR", "NO"),
+        ("operation_digest", "VARCHAR", "NO"),
+        ("manifest_contract_version", "VARCHAR", "NO"),
+        ("source_revision", "VARCHAR", "NO"),
+        ("partition_rowsets_json", "VARCHAR", "NO"),
+        ("candidate_identities_json", "VARCHAR", "NO"),
+        ("uploaded_workbook_sha256", "VARCHAR", "NO"),
+        ("lifecycle_status", "VARCHAR", "NO"),
+        ("imported_at_utc", "TIMESTAMP WITH TIME ZONE", "NO"),
+        ("retired_at_utc", "TIMESTAMP WITH TIME ZONE", "YES"),
+    ),
+}
 def _schema_version(connection: duckdb.DuckDBPyConnection) -> str | None:
     exists = connection.execute(
         "select count(*) from information_schema.tables where table_name = 'schema_info'"
@@ -680,6 +808,7 @@ def _require_v5_catalog(connection: duckdb.DuckDBPyConnection) -> None:
 def _require_equity_catalog(
     connection: duckdb.DuckDBPyConnection, *, schema_version: str, commission_nullable: str,
     expected_tables: frozenset[tuple[str, str]] = _V8_EXPECTED_TABLES,
+    expected_indexes: frozenset[tuple[str, str]] = _EXPECTED_INDEXES,
 ) -> None:
     _require_v4_markers(connection)
     tables, sequences, indexes = _catalog_objects(connection)
@@ -714,7 +843,7 @@ def _require_equity_catalog(
         _schema_version(connection) != schema_version
         or tables != expected_tables
         or sequences != _EXPECTED_SEQUENCES
-        or indexes != _EXPECTED_INDEXES
+        or indexes != expected_indexes
         or _table_columns(connection, "strategy_actions") != _V5_ACTION_COLUMNS
         or _table_columns(connection, "strategy_results") != _V5_RESULT_COLUMNS
         or _table_columns(connection, "optimizer_prepared_inputs") != _PREPARED_COLUMNS
@@ -741,12 +870,15 @@ def _require_v8_catalog(connection: duckdb.DuckDBPyConnection) -> None:
 
 def _require_v9_catalog(
     connection: duckdb.DuckDBPyConnection, *, schema_version: str = _V9_SCHEMA_VERSION,
+    expected_tables: frozenset[tuple[str, str]] = _V9_EXPECTED_TABLES,
+    expected_indexes: frozenset[tuple[str, str]] = _EXPECTED_INDEXES,
 ) -> None:
     _require_equity_catalog(
         connection,
         schema_version=schema_version,
         commission_nullable="YES",
-        expected_tables=_V9_EXPECTED_TABLES,
+        expected_tables=expected_tables,
+        expected_indexes=expected_indexes,
     )
     selection_columns = tuple(
         connection.execute(
@@ -821,24 +953,97 @@ def _require_v9_catalog(
 
 
 def _require_v10_catalog(connection: duckdb.DuckDBPyConnection) -> None:
-    _require_v9_catalog(connection, schema_version=_SCHEMA_VERSION)
+    _require_v9_catalog(connection, schema_version=_V10_SCHEMA_VERSION)
+    _require_v10_selection_history(connection)
+
+
+def _column_shapes(
+    connection: duckdb.DuckDBPyConnection, table_name: str,
+) -> tuple[tuple[str, str, str], ...]:
+    return tuple(
+        connection.execute(
+            """select column_name, data_type, is_nullable
+                 from information_schema.columns
+                where table_schema = 'main' and table_name = ?
+                order by ordinal_position""",
+            [table_name],
+        ).fetchall()
+    )
+
+
+def _require_v10_selection_history(
+    connection: duckdb.DuckDBPyConnection, *, v11: bool = False,
+) -> None:
+    for table_name, expected_columns in _V10_SELECTION_HISTORY_COLUMNS.items():
+        if table_name == "selection_review_imports" and v11:
+            expected_columns = expected_columns + (("aggregate_import_id", "VARCHAR", "YES"),)
+        if _column_shapes(connection, table_name) != expected_columns:
+            raise PerformanceV2StoreError("Performance database has an unexpected catalog")
+    review_constraints = {
+        (kind, tuple(columns))
+        for kind, columns in connection.execute(
+            """select constraint_type, constraint_column_names from duckdb_constraints()
+                 where schema_name = 'main' and table_name = 'selection_review_imports'"""
+        ).fetchall()
+    }
+    if ("UNIQUE", ("workbook_sha256",)) not in review_constraints:
+        raise PerformanceV2StoreError("Performance database has an unexpected catalog")
+
+
+def _require_v11_catalog(
+    connection: duckdb.DuckDBPyConnection, *, schema_version: str = _SCHEMA_VERSION,
+) -> None:
+    _require_v9_catalog(
+        connection,
+        schema_version=schema_version,
+        expected_tables=_V11_EXPECTED_TABLES,
+        expected_indexes=_V11_EXPECTED_INDEXES,
+    )
     status_column = connection.execute(
         "select data_type, is_nullable from information_schema.columns "
         "where table_schema = 'main' and table_name = 'selection_review_rows' and column_name = 'user_status'"
     ).fetchone()
-    if status_column != ("VARCHAR", "YES"):
+    aggregate_column = connection.execute(
+        "select data_type, is_nullable from information_schema.columns "
+        "where table_schema = 'main' and table_name = 'selection_review_imports' "
+        "and column_name = 'aggregate_import_id'"
+    ).fetchone()
+    if status_column != ("VARCHAR", "YES") or aggregate_column != ("VARCHAR", "YES"):
         raise PerformanceV2StoreError("Performance database has an unexpected catalog")
+    aggregate_index = connection.execute(
+        "select table_name, is_unique, is_primary, expressions from duckdb_indexes() "
+        "where schema_name = 'main' and index_name = 'selection_review_imports_aggregate_run_uq'"
+    ).fetchone()
+    lifecycle_checks = connection.execute(
+        "select expression from duckdb_constraints() "
+        "where schema_name = 'main' and table_name = 'selection_aggregate_imports' "
+        "and constraint_type = 'CHECK' and constraint_column_names = ['lifecycle_status']"
+    ).fetchall()
+    if (
+        aggregate_index != (
+            "selection_review_imports", True, False,
+            "[aggregate_import_id, selection_run_id]",
+        )
+        or lifecycle_checks != [
+            ("(lifecycle_status IN ('ACTIVE', 'PARTIALLY_RETIRED', 'RETIRED'))",)
+        ]
+    ):
+        raise PerformanceV2StoreError("Performance database has an unexpected catalog")
+    _require_v10_selection_history(connection, v11=True)
+    for table_name, expected_columns in _V11_NEW_TABLE_COLUMNS.items():
+        if _column_shapes(connection, table_name) != expected_columns:
+            raise PerformanceV2StoreError("Performance database has an unexpected catalog")
 
 
 def require_performance_v2(connection: duckdb.DuckDBPyConnection) -> None:
     """Fail closed unless the connection already contains the v2 schema."""
     if _schema_version(connection) != _SCHEMA_VERSION:
-        raise PerformanceV2StoreError("Performance database does not have schema version 10")
-    _require_v10_catalog(connection)
+        raise PerformanceV2StoreError("Performance database does not have schema version 11")
+    _require_v11_catalog(connection)
 
 
 def require_performance_v2_readable(connection: duckdb.DuckDBPyConnection) -> int:
-    """Accept exact read-only v5/v6/v7/v8/v9/v10 catalogs without migrating or repairing."""
+    """Accept exact read-only v5 through v11 catalogs without migrating or repairing."""
     version = _schema_version(connection)
     if version == _V5_SCHEMA_VERSION:
         _require_v5_catalog(connection)
@@ -855,9 +1060,12 @@ def require_performance_v2_readable(connection: duckdb.DuckDBPyConnection) -> in
     if version == _V9_SCHEMA_VERSION:
         _require_v9_catalog(connection)
         return 9
-    if version == _SCHEMA_VERSION:
+    if version == _V10_SCHEMA_VERSION:
         _require_v10_catalog(connection)
         return 10
+    if version == _SCHEMA_VERSION:
+        _require_v11_catalog(connection)
+        return 11
     raise PerformanceV2StoreError("Performance database schema version requires upgrade")
 
 
@@ -1179,6 +1387,41 @@ def _migrate_schema_v9_to_v10(connection: duckdb.DuckDBPyConnection) -> None:
     _require_v10_catalog(connection)
 
 
+def _migrate_schema_v10_to_v11(connection: duckdb.DuckDBPyConnection) -> None:
+    _require_v10_catalog(connection)
+    transaction_started = False
+    try:
+        connection.execute("begin transaction")
+        transaction_started = True
+        connection.execute(_SELECTION_PUBLICATIONS_SCHEMA)
+        connection.execute(_SELECTION_PUBLICATION_RUNS_SCHEMA)
+        connection.execute(_SELECTION_AGGREGATE_IMPORTS_SCHEMA)
+        connection.execute(
+            "alter table selection_review_imports add column aggregate_import_id varchar"
+        )
+        connection.execute(
+            """create unique index selection_review_imports_aggregate_run_uq
+                 on selection_review_imports(aggregate_import_id, selection_run_id)"""
+        )
+        if connection.execute(
+            "select count(*) from selection_review_imports where aggregate_import_id is not null"
+        ).fetchone()[0] != 0:
+            raise PerformanceV2StoreError(
+                "Performance v10->v11 migration found pre-existing aggregate import references"
+            )
+        _require_v11_catalog(connection, schema_version=_V10_SCHEMA_VERSION)
+        connection.execute("update schema_info set value = '11' where key = 'schema_version'")
+        _require_v11_catalog(connection)
+        connection.execute("commit")
+    except Exception as error:
+        if transaction_started:
+            _rollback_quietly(connection)
+        raise PerformanceV2StoreError(
+            f"Performance database schema migration failed (v10->v11 additive publication schema): {error}"
+        ) from error
+    _require_v11_catalog(connection)
+
+
 def _alter_v6_commission_with_children(connection: duckdb.DuckDBPyConnection) -> None:
     snapshots = {
         table_name: f"__performance_v2_v7_{table_name}"
@@ -1299,11 +1542,11 @@ def initialize_performance_v2(
     *,
     create_if_missing: bool = True,
 ) -> None:
-    """Initialize or migrate the isolated Performance v2 schema to v10."""
+    """Initialize or migrate the isolated Performance v2 schema to v11."""
     version = _schema_version(connection)
     if version is not None and version not in {
         "2", "3", "4", _V5_SCHEMA_VERSION, _V6_SCHEMA_VERSION, _V7_SCHEMA_VERSION,
-        _V8_SCHEMA_VERSION, _V9_SCHEMA_VERSION, _SCHEMA_VERSION,
+        _V8_SCHEMA_VERSION, _V9_SCHEMA_VERSION, _V10_SCHEMA_VERSION, _SCHEMA_VERSION,
     }:
         raise PerformanceV2StoreError("Performance database has an unsupported schema version")
     if version == "2":
@@ -1327,6 +1570,7 @@ def initialize_performance_v2(
         _migrate_schema_v7_to_v8(connection)
         _migrate_schema_v8_to_v9(connection)
         _migrate_schema_v9_to_v10(connection)
+        _migrate_schema_v10_to_v11(connection)
         require_performance_v2(connection)
         return
     if version == _V6_SCHEMA_VERSION:
@@ -1334,24 +1578,30 @@ def initialize_performance_v2(
         _migrate_schema_v7_to_v8(connection)
         _migrate_schema_v8_to_v9(connection)
         _migrate_schema_v9_to_v10(connection)
+        _migrate_schema_v10_to_v11(connection)
         require_performance_v2(connection)
         return
     if version == _V7_SCHEMA_VERSION:
         _migrate_schema_v7_to_v8(connection)
         _migrate_schema_v8_to_v9(connection)
         _migrate_schema_v9_to_v10(connection)
+        _migrate_schema_v10_to_v11(connection)
         require_performance_v2(connection)
         return
     if version == _V8_SCHEMA_VERSION:
         _migrate_schema_v8_to_v9(connection)
         _migrate_schema_v9_to_v10(connection)
+        _migrate_schema_v10_to_v11(connection)
         require_performance_v2(connection)
         return
     if version == _V9_SCHEMA_VERSION:
         _migrate_schema_v9_to_v10(connection)
+        version = _V10_SCHEMA_VERSION
+    if version == _V10_SCHEMA_VERSION:
+        _migrate_schema_v10_to_v11(connection)
         version = _SCHEMA_VERSION
     if version == _SCHEMA_VERSION:
-        _require_v10_catalog(connection)
+        _require_v11_catalog(connection)
         try:
             connection.execute("begin transaction")
             _add_window_columns(connection)
@@ -1370,6 +1620,7 @@ def initialize_performance_v2(
         _migrate_schema_v7_to_v8(connection)
         _migrate_schema_v8_to_v9(connection)
         _migrate_schema_v9_to_v10(connection)
+        _migrate_schema_v10_to_v11(connection)
         require_performance_v2(connection)
         return
     if version == "4":
@@ -1379,6 +1630,7 @@ def initialize_performance_v2(
         _migrate_schema_v7_to_v8(connection)
         _migrate_schema_v8_to_v9(connection)
         _migrate_schema_v9_to_v10(connection)
+        _migrate_schema_v10_to_v11(connection)
         require_performance_v2(connection)
         return
     if version == _V5_SCHEMA_VERSION:
@@ -1387,6 +1639,7 @@ def initialize_performance_v2(
         _migrate_schema_v7_to_v8(connection)
         _migrate_schema_v8_to_v9(connection)
         _migrate_schema_v9_to_v10(connection)
+        _migrate_schema_v10_to_v11(connection)
         require_performance_v2(connection)
         return
     if not create_if_missing:
@@ -1403,7 +1656,7 @@ def initialize_performance_v2(
         connection.executemany(
             "insert into schema_info (key, value) values (?, ?)",
             [
-                ("schema_version", _SCHEMA_VERSION),
+                ("schema_version", _V10_SCHEMA_VERSION),
                 ("database_kind", "unified_performance_v2"),
                 ("database_instance_id", str(uuid4())),
             ],
@@ -1412,4 +1665,5 @@ def initialize_performance_v2(
     except Exception as error:
         _rollback_quietly(connection)
         raise PerformanceV2StoreError("Performance database initialization failed") from error
+    _migrate_schema_v10_to_v11(connection)
     require_performance_v2(connection)

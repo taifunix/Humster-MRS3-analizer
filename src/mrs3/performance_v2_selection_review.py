@@ -2,17 +2,19 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
 from hashlib import sha256
 from io import BytesIO
 import json
+from pathlib import Path
 from typing import Mapping, Sequence
 from uuid import uuid4
 import zipfile
 
 import duckdb
+import numpy as np
 from openpyxl import load_workbook
 import pandas as pd
 
@@ -29,7 +31,8 @@ from .performance_v2_equity_regime_cache import (
     encode_equity_regime_facts,
 )
 from .performance_v2_selection import (
-    SelectionConfig, SelectionRequest, effective_selection_stages, parse_selection_request,
+    SelectionConfig, SelectionRequest, SelectionWorkbookError, effective_selection_stages, parse_selection_request,
+    validate_combined_selection_workbook,
 )
 
 
@@ -58,6 +61,44 @@ class SelectionReviewError(ValueError):
         self.code = code
         self.details = details
         super().__init__(message or code)
+
+
+@dataclass(frozen=True, slots=True)
+class DirectRejectionTransition:
+    user_status: str | None
+    user_rank: int | None
+    analog_of_strategy_id: int | None
+    comment: str | None
+    no_op: bool
+
+
+def direct_rejection_transition(
+    *,
+    effective_rejected: bool,
+    prior_user_status: str | None,
+    prior_user_rank: int | None,
+    prior_analog_of_strategy_id: int | None,
+    prior_comment: str | None,
+) -> DirectRejectionTransition:
+    """Return the user-field decision for a direct hard-filter rejection."""
+    if effective_rejected:
+        return DirectRejectionTransition(
+            prior_user_status, prior_user_rank, prior_analog_of_strategy_id, prior_comment, True,
+        )
+
+    marker = None
+    if prior_user_status not in (None, ""):
+        if prior_user_status == "FINALIST":
+            marker = "Degraded Finalist"
+        elif prior_user_status == "RESERVE":
+            marker = "Degraded Reserved"
+        else:
+            marker = f'Degraded "{prior_user_status}"'
+
+    comment = prior_comment
+    if marker is not None:
+        comment = marker if not prior_comment else f"{prior_comment}\n{marker}"
+    return DirectRejectionTransition("REJECTED", None, None, comment, False)
 
 
 def _rollback_quietly(connection: duckdb.DuckDBPyConnection) -> None:
@@ -110,9 +151,9 @@ def _legacy_effective_stage_order(request: SelectionRequest, lot_enabled: bool) 
 
 def database_instance_id(connection: duckdb.DuckDBPyConnection) -> str:
     row = connection.execute("select value from schema_info where key = 'database_instance_id'").fetchone()
-    if not row:
+    if not row or not isinstance(row[0], str) or not row[0].strip():
         raise SelectionReviewError("SELECTION_REVIEW_DATABASE_MISMATCH")
-    return str(row[0])
+    return row[0]
 
 
 def _equity_quality_rank_enabled(request: SelectionRequest | None) -> bool:
@@ -439,6 +480,11 @@ def _selection_rows(result: pd.DataFrame) -> list[dict[str, object]]:
     return rows.to_dict(orient="records")
 
 
+def _exact_boolean(value: object) -> bool | None:
+    """Normalize only Python and NumPy boolean scalars; other values are not evidence."""
+    return bool(value) if isinstance(value, (bool, np.bool_)) else None
+
+
 _AUTOMATIC_REJECTION_FILTERS = (
     ("filter_lot_variant_redundancy", "eliminated_by_filter_lot_variant_redundancy", "SELECTION_LOT_VARIANT"),
     ("filter_hard_cutoffs", "eliminated_by_filter_hard_cutoffs", "SELECTION_HARD_CUTOFF"),
@@ -453,13 +499,13 @@ def automatic_filter_rejected_ids(
         stage.id for stage in effective_selection_stages(request, config) if stage.enabled
     }
     rows = _selection_rows(result)
-    # The stage-specific trace flag is the exclusion evidence. Auto status and
-    # reason are presentation fields and may be normalized after the stages run.
+    # Non-boolean/missing trace values are conservative non-matches. The
+    # stage-specific trace is evidence; Auto Status and reason are presentation.
     rejected_by_source = {
         source: {
             int(row["strategy_id"])
             for row in rows
-            if bool(row.get(column))
+            if _exact_boolean(row.get(column)) is True
         }
         for stage_id, column, source in _AUTOMATIC_REJECTION_FILTERS
         if stage_id in enabled and column in result
@@ -471,6 +517,42 @@ def automatic_filter_rejected_ids(
                 raise SelectionReviewError("SELECTION_REVIEW_INVALID_SELECTION")
             owner_by_strategy[strategy_id] = source
     return rejected_by_source
+
+
+def outside_top_n_eligible(
+    *,
+    enabled_stage_ids: Sequence[str],
+    stage_trace: Mapping[str, object],
+    top_n: int | None,
+    auto_status: str | None,
+    auto_rank: int | None,
+    auto_reason: str | None,
+    auto_analog_of_strategy_id: int | None,
+    prior_rejected: bool,
+) -> bool:
+    """Classify a stored same-run rank exclusion without recalculating ranks."""
+    stages = tuple(enabled_stage_ids)
+    rank_stage = "rank_robust_top_n"
+    if (
+        not isinstance(top_n, int) or isinstance(top_n, bool) or top_n < 1
+        or not stages or stages[-1] != rank_stage or len(set(stages)) != len(stages)
+        or set(stage_trace) != set(stages)
+    ):
+        return False
+    trace_values = {stage_id: _exact_boolean(stage_trace[stage_id]) for stage_id in stages}
+    if any(value is None for value in trace_values.values()):
+        return False
+    return (
+        trace_values[rank_stage] is True
+        and not any(trace_values[stage_id] is True for stage_id in stages[:-1])
+        and auto_status == "RESERVE"
+        and isinstance(auto_rank, int)
+        and not isinstance(auto_rank, bool)
+        and auto_rank > top_n
+        and auto_reason == "RANK_ROBUST_TOP_N"
+        and auto_analog_of_strategy_id is None
+        and _exact_boolean(prior_rejected) is False
+    )
 
 
 def automatic_filter_rejected_strategy_ids(
@@ -1653,3 +1735,499 @@ def latest_effective_finalists(connection: duckdb.DuckDBPyConnection, symbol: st
     has_runs = connection.execute("select 1 from selection_runs where symbol = ? limit 1", [symbol]).fetchone() is not None
     decisions = effective_selection_decisions(connection, symbol=symbol)
     return has_runs, {strategy_id for strategy_id, decision in decisions.items() if decision[0] == "FINALIST"}
+
+
+def _canonical_aggregate_argument(value: object) -> str:
+    if not isinstance(value, str) or not value.strip() or "\0" in value:
+        raise SelectionReviewError("INVALID_ARGUMENT")
+    return value.strip().lower()
+
+
+def _manifest_scope_id(value: object) -> str:
+    if not isinstance(value, str) or not value or value != value.strip() or "\0" in value:
+        raise SelectionReviewError("INVALID_ARGUMENT")
+    return value.lower()
+
+
+def import_combined_selection_workbook(
+    connection: duckdb.DuckDBPyConnection,
+    database_root: Path,
+    data: bytes,
+    *,
+    aggregate_import_id: str,
+    operation_key: str,
+) -> dict[str, object]:
+    """Validate and atomically import one aggregate review workbook.
+
+    The workbook is the artifact boundary.  Its manifest fixes each source
+    row and user tuple; only rows whose submitted tuple differs are sent to
+    the common v11 publication writer.
+    """
+    aggregate_import_id = _canonical_aggregate_argument(aggregate_import_id)
+    operation_key = _canonical_aggregate_argument(operation_key)
+    try:
+        parsed = validate_combined_selection_workbook(data)
+    except ValueError as error:
+        if isinstance(error, SelectionReviewError):
+            raise
+        if isinstance(error, SelectionWorkbookError):
+            raise SelectionReviewError(str(error)) from error
+        raise SelectionReviewError("SELECTION_REVIEW_INVALID_FILE") from error
+    manifest = parsed["manifest"]
+    if not isinstance(manifest, Mapping):
+        raise SelectionReviewError("SELECTION_REVIEW_SCHEMA_MISMATCH")
+    publication_id = _manifest_scope_id(manifest.get("publication_id"))
+    decision_group_id = _manifest_scope_id(manifest.get("decision_group_id"))
+    expected_aggregate_id = manifest.get("aggregate_import_id")
+    if expected_aggregate_id is not None:
+        if _manifest_scope_id(expected_aggregate_id) != aggregate_import_id:
+            raise SelectionReviewError("INVALID_ARGUMENT")
+    instance_id = database_instance_id(connection)
+    instance_key = instance_id.strip().lower()
+    manifest_instance_id = manifest.get("database_instance_id")
+    if (
+        not isinstance(manifest_instance_id, str)
+        or not manifest_instance_id.strip()
+        or manifest_instance_id.strip().lower() != instance_key
+    ):
+        raise SelectionReviewError("SELECTION_REVIEW_DATABASE_MISMATCH")
+    authorized = connection.execute(
+        """select decision_group_id, database_instance_id, retired_at_utc
+             from selection_publications
+             where lower(trim(publication_id)) = ?""",
+        [publication_id],
+    ).fetchone()
+    if authorized is None or authorized[2] is not None:
+        raise SelectionReviewError("NOT_FOUND")
+    if str(authorized[1]).strip().lower() != instance_key:
+        raise SelectionReviewError("SELECTION_REVIEW_DATABASE_MISMATCH")
+    if _manifest_scope_id(authorized[0]) != decision_group_id:
+        raise SelectionReviewError("INVALID_ARGUMENT")
+    existing = connection.execute(
+        """select publications.publication_id, publications.publication_kind,
+                  imports.aggregate_import_id, imports.uploaded_workbook_sha256,
+                   imports.lifecycle_status, publications.controls_json,
+                   publications.retired_at_utc
+             from selection_publications publications
+             left join selection_aggregate_imports imports using (publication_id)
+            where lower(trim(publications.operation_key)) = ?
+              and lower(trim(publications.database_instance_id)) = ?
+            order by case when upper(trim(coalesce(imports.lifecycle_status, ''))) = 'ACTIVE' then 0 else 1 end,
+                     imports.imported_at_utc desc nulls last, publications.publication_id asc
+            limit 1""",
+        [operation_key, instance_key],
+    ).fetchone()
+    if existing is not None:
+        if existing[1] != "AGGREGATE_REVIEW":
+            raise SelectionReviewError("OPERATION_KEY_CONFLICT")
+        if existing[2] is None:
+            raise SelectionReviewError("AGGREGATE_NOT_FOUND")
+        if str(existing[2]).strip().lower() != aggregate_import_id:
+            raise SelectionReviewError("AGGREGATE_ID_CONFLICT")
+        try:
+            existing_controls = json.loads(str(existing[5]))
+        except (TypeError, ValueError):
+            existing_controls = None
+        if (
+            not isinstance(existing_controls, Mapping)
+            or not isinstance(existing_controls.get("publication_id"), str)
+            or existing_controls["publication_id"].strip().lower() != publication_id
+        ):
+            raise SelectionReviewError("OPERATION_KEY_CONFLICT")
+        if existing[6] is not None:
+            raise SelectionReviewError("AGGREGATE_NOT_FOUND")
+        if str(existing[4]).strip().upper() != "ACTIVE":
+            raise SelectionReviewError("AGGREGATE_NOT_FOUND")
+        if str(existing[3]).strip().lower() != str(parsed["workbook_sha256"]).strip().lower():
+            raise SelectionReviewError("UPLOAD_DIGEST_CONFLICT")
+        # Replay is deliberately write-free and deterministic: callers get the
+        # canonical request id plus frozen row counts, regardless of DB casing.
+        return {
+            "publication_id": _canonical_aggregate_argument(existing[0]),
+            "aggregate_import_id": aggregate_import_id,
+            "review_import_ids": (), "changed_count": 0,
+            "unchanged_count": len(parsed["rows"]), "code": "ALREADY_IMPORTED",
+        }
+    existing_aggregate = connection.execute(
+        """select imports.publication_id, imports.uploaded_workbook_sha256,
+                  imports.lifecycle_status, imports.operation_key,
+                  publications.controls_json, publications.retired_at_utc
+             from selection_aggregate_imports imports
+             join selection_publications publications using (publication_id)
+            where lower(trim(imports.aggregate_import_id)) = ?
+              and lower(trim(publications.database_instance_id)) = ?
+            order by case when upper(trim(coalesce(imports.lifecycle_status, ''))) = 'ACTIVE' then 0 else 1 end,
+                     imports.imported_at_utc desc, imports.publication_id asc
+            limit 1""",
+        [aggregate_import_id, instance_key],
+    ).fetchone()
+    if existing_aggregate is not None:
+        try:
+            existing_controls = json.loads(str(existing_aggregate[4]))
+        except (TypeError, ValueError):
+            existing_controls = None
+        if (
+            not isinstance(existing_controls, Mapping)
+            or not isinstance(existing_controls.get("publication_id"), str)
+            or existing_controls["publication_id"].strip().lower() != publication_id
+        ):
+            raise SelectionReviewError("OPERATION_KEY_CONFLICT")
+        if str(existing_aggregate[3]).strip().lower() != operation_key:
+            raise SelectionReviewError("OPERATION_KEY_CONFLICT")
+        if existing_aggregate[5] is not None:
+            raise SelectionReviewError("AGGREGATE_NOT_FOUND")
+        if str(existing_aggregate[2]).strip().upper() != "ACTIVE":
+            raise SelectionReviewError("AGGREGATE_NOT_FOUND")
+        if str(existing_aggregate[1]).strip().lower() != str(parsed["workbook_sha256"]).strip().lower():
+            raise SelectionReviewError("UPLOAD_DIGEST_CONFLICT")
+        # Same stable, write-free replay payload as the operation-key path.
+        return {
+            "publication_id": _canonical_aggregate_argument(existing_aggregate[0]),
+            "aggregate_import_id": aggregate_import_id,
+            "review_import_ids": (), "changed_count": 0,
+            "unchanged_count": len(parsed["rows"]), "code": "ALREADY_IMPORTED",
+        }
+    partitions = manifest.get("partitions")
+    rows = tuple(parsed["rows"])
+    if not isinstance(partitions, list) or not partitions:
+        raise SelectionReviewError("SELECTION_REVIEW_ROWSET_MISMATCH")
+    partition_map: dict[tuple[str, str], Mapping[str, object]] = {}
+    for partition in partitions:
+        if not isinstance(partition, Mapping):
+            raise SelectionReviewError("SELECTION_REVIEW_ROWSET_MISMATCH")
+        pair, side = partition.get("pair"), partition.get("side")
+        if not isinstance(pair, str) or not isinstance(side, str) or (pair, side) in partition_map:
+            raise SelectionReviewError("SELECTION_REVIEW_ROWSET_MISMATCH")
+        partition_map[(pair, side)] = partition
+    partition_runs: dict[tuple[str, str], tuple[object, ...]] = {}
+    for pair, side in sorted(partition_map):
+        source_run_id = partition_map[(pair, side)].get("selection_run_id")
+        if not isinstance(source_run_id, str) or not source_run_id.strip() or source_run_id != source_run_id.strip():
+            raise SelectionReviewError("SELECTION_REVIEW_SCHEMA_MISMATCH")
+        run = connection.execute(
+            """select database_instance_id, symbol, side, selection_contract_version
+                 from selection_runs where selection_run_id = ?""",
+            [source_run_id],
+        ).fetchone()
+        if run is None:
+            raise SelectionReviewError("SOURCE_RUN_NOT_FOUND")
+        if str(run[0]).strip().lower() != instance_key:
+            raise SelectionReviewError("SELECTION_REVIEW_DATABASE_MISMATCH")
+        if (str(run[1]), str(run[2])) != (pair, side):
+            raise SelectionReviewError("SOURCE_RUN_PARTITION_MISMATCH")
+        partition_runs[(pair, side)] = run
+    for pair, side in sorted(partition_map):
+        source_run_id = str(partition_map[(pair, side)]["selection_run_id"])
+        expected_identities = [
+            (int(result[0]), int(result[1]))
+            for result in connection.execute(
+                "select strategy_id, result_id_at_selection from selection_results where selection_run_id = ? order by strategy_id",
+                [source_run_id],
+            ).fetchall()
+        ]
+        submitted_identities = sorted(
+            (int(row["ID"]), int(row["Result ID"]))
+            for row in parsed["rows"]
+            if (str(row["Pair"]), str(row["Side"])) == (pair, side)
+        )
+        if expected_identities != submitted_identities:
+            raise SelectionReviewError("SELECTION_REVIEW_CANDIDATE_MISMATCH")
+    row_partitions = {(str(row["Pair"]), str(row["Side"])) for row in rows}
+    if not row_partitions.issubset(set(partition_map)):
+        raise SelectionReviewError("SELECTION_REVIEW_ROWSET_MISMATCH")
+    strategy_ids = [int(row["ID"]) for row in rows]
+    if len(strategy_ids) != len(set(strategy_ids)):
+        raise SelectionReviewError("DUPLICATE_STRATEGY_ID")
+    frozen_fields = manifest.get("frozen_user_fields")
+    if not isinstance(frozen_fields, Mapping):
+        raise SelectionReviewError("SELECTION_REVIEW_ROWSET_MISMATCH")
+    presentation_fields = manifest.get("frozen_user_fields_presentation", frozen_fields)
+    if not isinstance(presentation_fields, Mapping):
+        raise SelectionReviewError("SELECTION_REVIEW_ROWSET_MISMATCH")
+    row_keys = [row.get("Row Key") for row in rows]
+    if (
+        any(not isinstance(key, str) or not key for key in row_keys)
+        or len(row_keys) != len(set(row_keys))
+        or set(row_keys) != set(frozen_fields)
+        or set(row_keys) != set(presentation_fields)
+    ):
+        raise SelectionReviewError("SELECTION_REVIEW_ROWSET_MISMATCH")
+
+    from .performance_v2_publication import (
+        PublicationAggregate, PublicationPackage, PublicationPartition,
+        PublicationReview, operation_digest, publish_publication,
+    )
+
+    reviews_by_partition: dict[tuple[str, str], list[PublicationReview]] = {
+        key: [] for key in partition_map
+    }
+    source_ids = [
+        str(partition_map[key]["selection_run_id"])
+        for key in sorted(partition_map)
+    ]
+    changed_count = 0
+    latest_reviews = latest_user_reviews_by_strategy(connection, strategy_ids)
+    changed_rank_by_partition: dict[tuple[str, str], set[int]] = {key: set() for key in partition_map}
+    rows_by_partition: dict[tuple[str, str], list[Mapping[str, object]]] = {key: [] for key in partition_map}
+    for row in rows:
+        rows_by_partition[(str(row["Pair"]), str(row["Side"]))].append(row)
+
+    # Freeze/stale checks must precede rank allocation.  Otherwise a stale
+    # row appearing after a newly conflicting row would report INVALID_RANK
+    # instead of the artifact's required stale-head error.
+    for row in rows:
+        pair, side = str(row["Pair"]), str(row["Side"])
+        source_run_id = str(partition_map[(pair, side)]["selection_run_id"])
+        selected = connection.execute(
+            """select result_id_at_selection
+                 from selection_results
+                where selection_run_id = ? and strategy_id = ?""",
+            [source_run_id, int(row["ID"])],
+        ).fetchone()
+        if selected is None or int(selected[0]) != int(row["Result ID"]):
+            raise SelectionReviewError("SELECTION_REVIEW_ROWSET_MISMATCH")
+        current_result = connection.execute(
+            "select current_result_id from strategies where strategy_id = ?",
+            [int(row["ID"])],
+        ).fetchone()
+        if current_result is None or current_result[0] != selected[0]:
+            raise SelectionReviewError("SELECTION_REVIEW_STALE")
+        frozen = frozen_fields.get(str(row["Row Key"]))
+        if not isinstance(frozen, list) or len(frozen) != 5:
+            raise SelectionReviewError("SELECTION_REVIEW_ROWSET_MISMATCH")
+        current = latest_reviews.get(int(row["ID"]), {})
+        current_tuple = [
+            current.get("user_status") or None, current.get("user_rank"),
+            current.get("user_analog_of_strategy_id"),
+            None if current.get("comment") in (None, "") else str(current.get("comment")),
+        ]
+        if current_tuple != frozen[:4]:
+            raise SelectionReviewError("SELECTION_REVIEW_STALE")
+
+    partition_strategy_ids = {
+        key: {int(row["ID"]) for row in partition_rows}
+        for key, partition_rows in rows_by_partition.items()
+    }
+
+    # Validate immutable automatic/provenance fields and analog scope before
+    # rank allocation, so a tampered artifact cannot mask its typed integrity
+    # error behind a rank collision.
+    for row in rows:
+        pair, side = str(row["Pair"]), str(row["Side"])
+        source_run_id = str(partition_map[(pair, side)]["selection_run_id"])
+        selected = connection.execute(
+            """select result_id_at_selection, auto_status, auto_rank,
+                      auto_analog_of_strategy_id, auto_reason
+                 from selection_results
+                where selection_run_id = ? and strategy_id = ?""",
+            [source_run_id, int(row["ID"])],
+        ).fetchone()
+        if selected is None or int(selected[0]) != int(row["Result ID"]):
+            raise SelectionReviewError("SELECTION_REVIEW_ROWSET_MISMATCH")
+        automatic = (
+            row.get("Auto Status"), row.get("Auto Rank") or None,
+            row.get("Auto Analog Of ID") or None, row.get("Auto Reason") or None,
+        )
+        expected_automatic = (
+            selected[1], selected[2] if selected[2] is not None else None,
+            selected[3] if selected[3] is not None else None,
+            selected[4] if selected[4] is not None else None,
+        )
+        if automatic != expected_automatic:
+            raise SelectionReviewError("SELECTION_REVIEW_AUTOMATIC_FIELDS_CHANGED")
+        frozen = frozen_fields.get(str(row["Row Key"]))
+        presentation = presentation_fields.get(str(row["Row Key"]))
+        if not isinstance(frozen, list) or len(frozen) != 5:
+            raise SelectionReviewError("SELECTION_REVIEW_ROWSET_MISMATCH")
+        if not isinstance(presentation, list) or len(presentation) != 5:
+            raise SelectionReviewError("SELECTION_REVIEW_ROWSET_MISMATCH")
+        submitted = [
+            row.get("User Status") or None, row.get("User Rank") or None,
+            row.get("Analog Of ID") or None, row.get("Comment") or None,
+        ]
+        if submitted == presentation[:4]:
+            continue
+        analog = _whole_number(
+            submitted[2], "SELECTION_REVIEW_INVALID_ANALOG", optional=True,
+        )
+        if submitted[0] == "ANALOG" and (
+            analog is None
+            or analog == int(row["ID"])
+            or analog not in partition_strategy_ids[(pair, side)]
+        ):
+            raise SelectionReviewError("SELECTION_REVIEW_INVALID_ANALOG")
+        if submitted[0] != "ANALOG" and analog is not None:
+            raise SelectionReviewError("SELECTION_REVIEW_INVALID_ANALOG")
+
+    for key, partition_rows in rows_by_partition.items():
+        changed_ranks = changed_rank_by_partition[key]
+        pair, side = key
+        partition_strategy_ids_in_db = {
+            int(result[0]) for result in connection.execute(
+                "select strategy_id from strategies where symbol = ? and side = ?",
+                [pair, side],
+            ).fetchall()
+        }
+        changed_rows: list[tuple[Mapping[str, object], list[object], list[object]]] = []
+        rank_changed_ids: set[int] = set()
+        for row in partition_rows:
+            frozen = frozen_fields.get(str(row["Row Key"]))
+            if not isinstance(frozen, list) or len(frozen) != 5:
+                raise SelectionReviewError("SELECTION_REVIEW_ROWSET_MISMATCH")
+            presentation = presentation_fields.get(str(row["Row Key"]))
+            if not isinstance(presentation, list) or len(presentation) != 5:
+                raise SelectionReviewError("SELECTION_REVIEW_ROWSET_MISMATCH")
+            submitted = [
+                row.get("User Status") or None, row.get("User Rank") or None,
+                row.get("Analog Of ID") or None, row.get("Comment") or None,
+            ]
+            if submitted == presentation[:4]:
+                continue
+            changed_rows.append((row, submitted, presentation))
+            if submitted[:2] != presentation[:2]:
+                rank_changed_ids.add(int(row["ID"]))
+        effective = effective_selection_decisions(connection, symbol=pair)
+        effective_ranks: dict[int, set[int]] = {}
+        for strategy_id in sorted(partition_strategy_ids_in_db.difference(rank_changed_ids)):
+            effective_status, effective_rank, _ = effective.get(strategy_id, (None, None, None))
+            if effective_status in {"FINALIST", "RESERVE"}:
+                try:
+                    parsed_rank = _whole_number(
+                        effective_rank, "SELECTION_REVIEW_INVALID_RANK", optional=False,
+                    )
+                except SelectionReviewError:
+                    continue
+                effective_ranks.setdefault(parsed_rank, set()).add(strategy_id)
+        for row, submitted, presentation in changed_rows:
+            if submitted[:2] == presentation[:2]:
+                continue
+            status = submitted[0]
+            if status in {"FINALIST", "RESERVE"}:
+                parsed_rank = _whole_number(
+                    submitted[1], "SELECTION_REVIEW_INVALID_RANK", optional=False,
+                )
+                if parsed_rank in changed_ranks or any(
+                    holder != int(row["ID"])
+                    for holder in effective_ranks.get(parsed_rank, set())
+                ):
+                    raise SelectionReviewError("SELECTION_REVIEW_INVALID_RANK")
+                changed_ranks.add(parsed_rank)
+    for row in rows:
+        pair, side = str(row["Pair"]), str(row["Side"])
+        partition = partition_map[(pair, side)]
+        source_run_id = str(partition["selection_run_id"])
+        run = partition_runs[(pair, side)]
+        selected = connection.execute(
+            """select result_id_at_selection, auto_status, auto_rank,
+                      auto_analog_of_strategy_id, auto_reason
+                 from selection_results
+                where selection_run_id = ? and strategy_id = ?""",
+            [source_run_id, int(row["ID"])],
+        ).fetchone()
+        if selected is None or int(selected[0]) != int(row["Result ID"]):
+            raise SelectionReviewError("SELECTION_REVIEW_ROWSET_MISMATCH")
+        current_result = connection.execute(
+            "select current_result_id from strategies where strategy_id = ?",
+            [int(row["ID"])],
+        ).fetchone()
+        if current_result is None or current_result[0] != selected[0]:
+            raise SelectionReviewError("SELECTION_REVIEW_STALE")
+        automatic = (
+            row.get("Auto Status"), row.get("Auto Rank") or None,
+            row.get("Auto Analog Of ID") or None, row.get("Auto Reason") or None,
+        )
+        expected_automatic = (
+            selected[1], selected[2] if selected[2] is not None else None,
+            selected[3] if selected[3] is not None else None,
+            selected[4] if selected[4] is not None else None,
+        )
+        if automatic != expected_automatic:
+            raise SelectionReviewError("SELECTION_REVIEW_AUTOMATIC_FIELDS_CHANGED")
+        row_key = str(row["Row Key"])
+        frozen = frozen_fields.get(row_key)
+        if not isinstance(frozen, list) or len(frozen) != 5:
+            raise SelectionReviewError("SELECTION_REVIEW_ROWSET_MISMATCH")
+        presentation = presentation_fields.get(row_key)
+        if not isinstance(presentation, list) or len(presentation) != 5:
+            raise SelectionReviewError("SELECTION_REVIEW_ROWSET_MISMATCH")
+        current = latest_reviews.get(int(row["ID"]), {})
+        current_tuple = [
+            current.get("user_status") or None, current.get("user_rank"),
+            current.get("user_analog_of_strategy_id"),
+            None if current.get("comment") in (None, "") else str(current.get("comment")),
+        ]
+        if current_tuple != frozen[:4]:
+            raise SelectionReviewError("SELECTION_REVIEW_STALE")
+        submitted = [
+            row.get("User Status") or None, row.get("User Rank") or None,
+            row.get("Analog Of ID") or None, row.get("Comment") or None,
+        ]
+        if submitted == presentation[:4]:
+            continue
+        status = submitted[0]
+        rank = None
+        if status in {"FINALIST", "RESERVE"}:
+            rank = _whole_number(submitted[1], "SELECTION_REVIEW_INVALID_RANK", optional=False)
+        elif submitted[1] is not None:
+            raise SelectionReviewError("SELECTION_REVIEW_INVALID_RANK")
+        analog = _whole_number(submitted[2], "SELECTION_REVIEW_INVALID_ANALOG", optional=True)
+        if status == "ANALOG" and (
+            analog is None
+            or analog == int(row["ID"])
+            or analog not in partition_strategy_ids[(pair, side)]
+        ):
+            raise SelectionReviewError("SELECTION_REVIEW_INVALID_ANALOG")
+        if status != "ANALOG" and analog is not None:
+            raise SelectionReviewError("SELECTION_REVIEW_INVALID_ANALOG")
+        review_comment = current_tuple[3] if submitted[3] == presentation[3] else submitted[3]
+        reviews_by_partition[(pair, side)].append(
+            PublicationReview(int(row["ID"]), status, rank, analog, review_comment)
+        )
+        changed_count += 1
+
+    source_revision = sha256("\0".join(source_ids).encode("utf-8")).hexdigest()
+    controls_json = json.dumps({
+        "aggregate_import_id": aggregate_import_id,
+        "publication_id": publication_id,
+        "decision_group_id": decision_group_id,
+    }, sort_keys=True, separators=(",", ":"))
+    controls_hash = sha256(controls_json.encode("utf-8")).hexdigest()
+    operation_hash = operation_digest({
+        "aggregate_import_id": aggregate_import_id,
+        "operation_key": operation_key,
+        "uploaded_workbook_sha256": parsed["workbook_sha256"],
+    })
+    package = PublicationPackage(
+        publication_id=f"publication-aggregate-{aggregate_import_id}",
+        publication_kind="AGGREGATE_REVIEW", operation_key=operation_key,
+        operation_digest=operation_hash,
+        manifest_contract_version=manifest["manifest_contract_version"],
+        decision_group_id=decision_group_id,
+        database_instance_id=instance_key, source_revision=source_revision,
+        controls_json=controls_json, controls_sha256=controls_hash,
+        render_model_json="{}", render_model_sha256=sha256(b"{}").hexdigest(),
+        evaluated_rowset_sha256=manifest["rowset_sha256"],
+        partitions=tuple(
+            PublicationPartition(pair, side, partition.get("selection_run_id"), None,
+                                 tuple(reviews_by_partition[(pair, side)]))
+            for pair, side in partition_map
+        ),
+        aggregate=PublicationAggregate(
+            aggregate_import_id=aggregate_import_id,
+            uploaded_workbook_sha256=parsed["workbook_sha256"],
+            partition_rowsets_json=json.dumps(partitions, sort_keys=True, separators=(",", ":")),
+            candidate_identities_json=json.dumps(manifest["candidate_identities"], sort_keys=True, separators=(",", ":")),
+            operation_digest=operation_hash,
+            manifest_contract_version=manifest["manifest_contract_version"],
+            source_revision=source_revision,
+        ),
+    )
+    result = publish_publication(connection, Path(database_root), package)
+    return {
+        "publication_id": result.publication_id,
+        "aggregate_import_id": result.aggregate_import_id or aggregate_import_id,
+        "review_import_ids": result.review_import_ids,
+        "changed_count": changed_count,
+        "unchanged_count": len(rows) - changed_count,
+        "code": result.code,
+    }

@@ -455,6 +455,31 @@ adds the exact product and configured limit. The adapter count/limit regression
 and persisted Panel status regression pass (3 focused tests). Reload Panel
 before the next run; the failed status will show `COMBINATIONS=N; LIMIT=M`.
 
+## Performance v2 P5.2 all-pairs filtering and direct rejection (2026-10-10)
+
+P5.2 is implemented and independently reviewed. The root-verified evidence
+ledger is: additive v11 migration tests/review `PASS`; selection suite `253
+passed`; aggregate-import suite `12 passed`; publication suite `65 passed`;
+all-pairs suite `17 passed`; Panel suite `205 passed, 4 skipped`; and static UI
+suite `172 passed`. Task6 styling/STALLED-boundary work and Task7
+filters-11-27/performance work are now root-verified, each with independent
+`CODE_REVIEW_PASS`.
+
+The current v11 contract-suite accounting is `469 passed` with `20 warnings`
+total. The initial full rerun recorded `455 passed` plus `14` compact failures,
+all solely from the `C:\Temp` capacity guard. A sanctioned capacity mock reran
+the compact module with `30 passed`, so all `469` logical tests pass. No real
+full-corpus compaction rehearsal is claimed; the guard itself was tested by the
+mock.
+
+The bounded PARETO/filter measurement conclusion is that the existing
+`PARETO_PLATEAU_POINTS_PER_ORDER` reason/alias expectation is unchanged;
+disabled legacy filter stage bodies are skipped, but candidate preparation is
+unconditional. Legacy filters are thus collapsed presentation-only; no risky
+loader optimization or safe-disable branch landed. This is not a production
+performance claim. The final holistic independent review returned
+`CODE_REVIEW_PASS`; no live-database, tick-test, or DD5-retest claim is made.
+
 ## Bybit base-lot history repair (2026-10-10)
 
 The partially initialized Actual-sheet history was rebuilt for 2026-10-01 through

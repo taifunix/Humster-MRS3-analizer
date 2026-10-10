@@ -13,6 +13,7 @@ from .performance_v2_store import (
     PerformanceV2WriterLock,
     performance_v2_database_path,
     require_performance_v2,
+    require_performance_v2_readable,
 )
 
 
@@ -68,7 +69,11 @@ def _open_read_only(target: Path) -> duckdb.DuckDBPyConnection:
     except duckdb.Error as error:
         raise PerformanceV2PruneError("Performance v2 database could not be opened") from error
     try:
-        require_performance_v2(connection)
+        schema_version = require_performance_v2_readable(connection)
+        if schema_version not in {10, 11}:
+            raise PerformanceV2StoreError(
+                f"Performance v2 prune requires schema v10 or v11; found {schema_version}"
+            )
     except PerformanceV2StoreError as error:
         connection.close()
         raise PerformanceV2PruneError("Performance v2 database has invalid schema") from error

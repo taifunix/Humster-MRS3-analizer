@@ -1337,7 +1337,9 @@ def current_effective_finalist_members(
     dates: those are inputs to a new retest freeze, while this export represents
     the already effective selection decision.
     """
-    require_performance_v2(connection)
+    schema_version = require_performance_v2_readable(connection)
+    if schema_version not in {10, 11}:
+        raise PerformanceV2StoreError("Performance database does not have schema version 10 or 11")
     if type(include_reserve) is not bool:
         raise FinalistRetestError("INVALID_REQUEST", "include_reserve must be a boolean")
     decisions = effective_selection_decisions(connection)

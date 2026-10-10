@@ -793,7 +793,7 @@ def test_v2_panel_first_import_bootstrap_initializes_empty_and_preserves_foreign
         with duckdb.connect(str(target), read_only=True) as connection:
             assert connection.execute(
                 "select value from schema_info where key = 'schema_version'"
-            ).fetchone() == ("10",)
+            ).fetchone() == ("11",)
     else:
         assert target.read_bytes() == existing
 
@@ -1901,17 +1901,65 @@ def _controller_for_windows(tmp_path: Path) -> tuple[PanelController, Path, int]
     return PanelController(tmp_path, config), tmp_path / "data" / "strategy_performance.duckdb", result_id
 
 
+def _remove_v11_catalog_additions(connection: duckdb.DuckDBPyConnection) -> None:
+    connection.execute("drop index selection_review_imports_aggregate_run_uq")
+    connection.execute("drop index selection_review_imports_run_imported_idx")
+    connection.execute("drop table selection_aggregate_imports")
+    connection.execute("drop table selection_publication_runs")
+    connection.execute("drop table selection_publications")
+    connection.execute(
+        "create temp table __selection_review_rows_before_v11 as "
+        "select * from selection_review_rows"
+    )
+    connection.execute("drop table selection_review_rows")
+    connection.execute("alter table selection_review_imports drop column aggregate_import_id")
+    connection.execute(
+        """create table selection_review_rows (
+            review_import_id VARCHAR NOT NULL REFERENCES selection_review_imports(review_import_id),
+            strategy_id BIGINT NOT NULL,
+            user_status VARCHAR NOT NULL CHECK (
+                user_status IN ('FINALIST', 'RESERVE', 'ANALOG', 'FILTERED', 'REJECTED')
+            ),
+            user_rank INTEGER CHECK (user_rank IS NULL OR user_rank > 0),
+            user_analog_of_strategy_id BIGINT,
+            comment VARCHAR,
+            PRIMARY KEY (review_import_id, strategy_id)
+        )"""
+    )
+    connection.execute(
+        """insert into selection_review_rows (
+            review_import_id, strategy_id, user_status, user_rank,
+            user_analog_of_strategy_id, comment
+        ) select review_import_id, strategy_id, user_status, user_rank,
+            user_analog_of_strategy_id, comment
+        from __selection_review_rows_before_v11"""
+    )
+    connection.execute("drop table __selection_review_rows_before_v11")
+    connection.execute(
+        "create index selection_review_imports_run_imported_idx "
+        "on selection_review_imports(selection_run_id, imported_at_utc)"
+    )
+
+
 def _make_v5_catalog(connection: duckdb.DuckDBPyConnection) -> None:
+    from mrs3.performance_v2_store import _require_v5_catalog
+
+    _remove_v11_catalog_additions(connection)
     connection.execute("drop table strategy_rejection_sources")
     connection.execute("alter table selection_results drop column equity_regime_json")
     connection.execute("drop table equity_quality_metrics")
     connection.execute("update schema_info set value = '5' where key = 'schema_version'")
+    _require_v5_catalog(connection)
 
 
 def _make_v8_catalog(connection: duckdb.DuckDBPyConnection) -> None:
+    from mrs3.performance_v2_store import _require_v8_catalog
+
+    _remove_v11_catalog_additions(connection)
     connection.execute("drop table strategy_rejection_sources")
     connection.execute("alter table selection_results drop column equity_regime_json")
     connection.execute("update schema_info set value = '8' where key = 'schema_version'")
+    _require_v8_catalog(connection)
 
 
 def _http_server(controller: PanelController):
@@ -4387,26 +4435,61 @@ def test_panel_schema_preflight_initializes_an_empty_new_database(tmp_path: Path
     with duckdb.connect(str(database), read_only=True) as connection:
         assert connection.execute(
             "select value from schema_info where key = 'schema_version'"
-        ).fetchone() == ("10",)
+        ).fetchone() == ("11",)
         assert connection.execute(
             "select count(*) from information_schema.tables where table_name = 'strategy_rejection_sources'"
         ).fetchone() == (1,)
 
 
-def test_panel_schema_preflight_migrates_v9_to_v10(tmp_path: Path) -> None:
+def test_panel_schema_preflight_migrates_v9_to_v11(tmp_path: Path) -> None:
     controller, database, _ = _controller_for_windows(tmp_path)
+    from tests.test_performance_v2_store import _initialize_v9_fixture
+
+    database.unlink()
     with duckdb.connect(str(database)) as connection:
-        connection.execute("alter table selection_review_rows alter column user_status set not null")
-        connection.execute("update schema_info set value = '9' where key = 'schema_version'")
+        _initialize_v9_fixture(connection)
 
     controller._ensure_performance_v2_schema(database)
 
     with duckdb.connect(str(database), read_only=True) as connection:
-        assert connection.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("10",)
+        assert connection.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("11",)
         assert connection.execute(
             "select is_nullable from information_schema.columns "
             "where table_name = 'selection_review_rows' and column_name = 'user_status'"
         ).fetchone() == ("YES",)
+
+
+def test_panel_schema_preflight_migrates_exact_v10_catalog_to_v11(tmp_path: Path) -> None:
+    controller, database, _ = _controller_for_windows(tmp_path)
+    from tests.test_performance_v2_store import _prepare_v10_migration_fixture
+
+    database.unlink()
+    with duckdb.connect(str(database)) as connection:
+        _prepare_v10_migration_fixture(connection)
+
+    controller._ensure_performance_v2_schema(database)
+
+    with duckdb.connect(str(database), read_only=True) as connection:
+        assert connection.execute(
+            "select value from schema_info where key = 'schema_version'"
+        ).fetchone() == ("11",)
+
+
+def test_panel_read_only_catalog_opens_exact_v10_without_migrating(tmp_path: Path) -> None:
+    controller, database, _ = _controller_for_windows(tmp_path)
+    from tests.test_performance_v2_store import _prepare_v10_migration_fixture
+    from mrs3.performance_v2_store import _require_v10_catalog
+
+    database.unlink()
+    with duckdb.connect(str(database)) as connection:
+        _prepare_v10_migration_fixture(connection)
+
+    catalog = controller.performance_v2_catalog()
+
+    assert catalog["strategies"] == []
+    assert catalog["selection_pairs_with_runs"] == []
+    with duckdb.connect(str(database), read_only=True) as connection:
+        _require_v10_catalog(connection)
 
 
 def test_panel_schema_preflight_maps_corrupt_database_to_schema_invalid(tmp_path: Path) -> None:
@@ -4960,20 +5043,27 @@ def test_selection_recalculate_passes_only_missing_strategy_ids(tmp_path: Path, 
     assert calls and calls[0][0][-1] == (17, 23) and calls[0][1] == {"include_equity_regime": True}
 
 
-def test_valid_v10_schema_check_does_not_open_writer_with_reader_present(tmp_path: Path) -> None:
+def test_valid_v11_schema_check_does_not_open_writer_with_reader_present(tmp_path: Path, monkeypatch) -> None:
     controller, database, _ = _controller_for_windows(tmp_path)
+    original_connect = duckdb.connect
+
+    def reject_writer(*args, **kwargs):
+        if not kwargs.get("read_only", False):
+            raise AssertionError("v11 schema preflight attempted a writer open")
+        return original_connect(*args, **kwargs)
 
     with duckdb.connect(str(database), read_only=True) as reader:
-        assert reader.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("10",)
+        assert reader.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("11",)
+        monkeypatch.setattr(panel_module.duckdb, "connect", reject_writer)
         controller._ensure_performance_v2_schema(database)
 
 
-def test_cached_v10_schema_check_skips_reopen_with_reader_present(tmp_path: Path, monkeypatch) -> None:
+def test_cached_v11_schema_check_skips_reopen_with_reader_present(tmp_path: Path, monkeypatch) -> None:
     controller, database, _ = _controller_for_windows(tmp_path)
     controller._ensure_performance_v2_schema(database)
 
     with duckdb.connect(str(database), read_only=True) as reader:
-        assert reader.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("10",)
+        assert reader.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("11",)
 
         def unexpected_reopen(*_args, **_kwargs):
             raise AssertionError("schema cache hit reopened the database")
@@ -4982,7 +5072,7 @@ def test_cached_v10_schema_check_skips_reopen_with_reader_present(tmp_path: Path
         controller._ensure_performance_v2_schema(database)
 
 
-def test_v10_schema_check_rejects_malformed_catalog(tmp_path: Path) -> None:
+def test_v11_schema_check_rejects_malformed_catalog(tmp_path: Path) -> None:
     controller, database, _ = _controller_for_windows(tmp_path)
     with duckdb.connect(str(database)) as connection:
         connection.execute("drop table strategy_rejection_sources")
@@ -4994,7 +5084,7 @@ def test_v10_schema_check_rejects_malformed_catalog(tmp_path: Path) -> None:
     assert raised.value.status == 500
 
 
-def test_v10_schema_check_repairs_missing_window_column(tmp_path: Path) -> None:
+def test_v11_schema_check_repairs_missing_window_column(tmp_path: Path) -> None:
     controller, database, _ = _controller_for_windows(tmp_path)
     with duckdb.connect(str(database)) as connection:
         connection.execute("alter table window_metrics drop column holding_seconds")

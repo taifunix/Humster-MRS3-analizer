@@ -81,6 +81,13 @@ def test_researched_filters_have_fixed_order_and_editable_settings() -> None:
     assert 'id="performance-v2-selection-settings"' in html
     assert '/api/v2/strategies/performance-v2/selection-settings' in js
     assert "'pair_side_stage_3'" in js
+    legacy = html.split('id="performance-v2-selection-legacy-filters"', 1)[1].split('</details>', 1)[0]
+    assert "Legacy filters 11" in legacy
+    assert legacy.count('data-selection-stage=') == 17
+    assert '.selection-stage-legacy-details' in css
+    assert 'const stages = orderedSelectionStages();' in js
+    assert 'target.parentElement !== stage.parentElement' in js
+    assert 'target.parentElement.insertBefore(stage' in js
     defaults = js.split("const defaultEnabledSelectionStages = new Set([", 1)[1].split("]);", 1)[0]
     enabled = set(re.findall(r"'([^']+)'", defaults))
     stage_bodies = re.findall(r'<li class="selection-stage[^>]*" data-selection-stage="([^"]+)">(.*?)</li>', html, re.S)
@@ -743,8 +750,8 @@ def test_performance_v2_maintenance_card_starts_with_catalog_and_requires_previe
     assert 'id="performance-v2-maintenance-full"' in card
     assert 'id="performance-v2-maintenance-confirm"' in card
     assert 'id="performance-v2-maintenance-rejected-warning"' in card
-    assert "Тот же отчёт будет пропущен дедупликацией" in card
-    assert "отчёт с более узким периодом" in card
+    assert "компактная запись остаётся только для дедупликации" in card
+    assert "Равный, более узкий и более широкий отчёт с тем же типизированным ключом будет пропущен" in card
     assert 'id="performance-v2-maintenance-progress" class="progress-block"' in card
     assert 'id="performance-v2-maintenance-status" class="card-status" role="status"' in card
     assert "grid-template-columns: repeat(4, minmax(0, 1fr))" in css
@@ -755,7 +762,7 @@ def test_performance_v2_maintenance_card_starts_with_catalog_and_requires_previe
     assert "body: JSON.stringify({ operation, symbols })" in js
     assert "body: JSON.stringify({ token: previewToken })" in js
     assert "Удалено стратегий ${maintenanceCount(deletedStrategies)} из ${maintenanceCount(strategyTotal)}" in js
-    assert "Обработано стратегий ${maintenanceCount(strategyTotal)} из ${maintenanceCount(strategyTotal)}" in js
+    assert "Архивировано стратегий ${maintenanceCount(strategyTotal)} из ${maintenanceCount(strategyTotal)}" in js
     assert "удалено ${maintenanceCount(deleted)} из ${maintenanceCount(total)} строк выбранных пар" in js
     assert "`${strategyProgress}; удалено ${maintenanceCount(deleted)} из ${maintenanceCount(total)} строк выбранных пар`" in js
     assert "job.global_journal_counts || {}" in js
@@ -1253,7 +1260,9 @@ def test_fixed_five_stage_prefix_has_equity_off_and_no_scope_or_move_controls() 
         re.S,
     )
     assert "fixedSelectionPrefix.has(target.dataset.selectionStage)" in js
-    assert "fixedSelectionPrefix.has(stage.previousElementSibling?.dataset.selectionStage)" in js
+    assert "selectionPreviewOrder.querySelectorAll('[data-selection-stage]')" in js
+    assert "const sameParent = (candidate) => candidate?.parentElement === stage.parentElement;" in js
+    assert "target.parentElement !== stage.parentElement" in js
 
     fixed = re.search(r"const fixedSelectionPrefix = new Set\(\[(.*?)\]\);", js, re.S)
     default = re.search(r"const defaultSelectionStageOrder = \[(.*?)\];", js, re.S)
@@ -3652,7 +3661,7 @@ const checks = {
 };
 if (Object.values(checks).some((value) => !value)) process.exit(1);
 """
-    completed = subprocess.run(("node", "-e", script), capture_output=True, text=True)
+    completed = subprocess.run(("node", "-"), input=script, capture_output=True, text=True, encoding="utf-8")
     assert completed.returncode == 0, completed.stderr or completed.stdout
 
 

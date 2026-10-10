@@ -6,10 +6,12 @@ from io import BytesIO
 from pathlib import Path
 
 import duckdb
+import numpy as np
 from openpyxl import load_workbook
 from openpyxl.workbook.workbook import Workbook
 import pandas as pd
 import pytest
+import mrs3.performance_v2_selection_review as selection_review_module
 
 from mrs3.performance_v2_selection import (
     SelectionConfig, load_selection_candidates, parse_selection_request, retest_cohort_request,
@@ -218,6 +220,178 @@ def test_automatic_rejection_rejects_ambiguous_multiple_stage_flags() -> None:
 
     with pytest.raises(SelectionReviewError, match="SELECTION_REVIEW_INVALID_SELECTION"):
         automatic_filter_rejected_strategy_ids(result, request, SelectionConfig())
+
+
+def test_automatic_rejection_uses_only_the_three_enabled_exact_trace_flags() -> None:
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "filter_lot_variant_redundancy", "enabled": True, "scope": "pair_side_timeframe"},
+        {"id": "filter_equity_regime", "enabled": True, "scope": "pair_side"},
+        {"id": "filter_hard_cutoffs", "enabled": True, "scope": "pair_side"},
+        {"id": "ab_deterioration", "enabled": True, "scope": "pair_side"},
+    ]})
+    result = pd.DataFrame([
+        {"strategy_id": 1, "eliminated_by_filter_lot_variant_redundancy": np.bool_(True),
+         "eliminated_by_filter_hard_cutoffs": False, "eliminated_by_ab_deterioration": False,
+         "eliminated_by_filter_equity_regime": True, "auto_status": "FINALIST", "elimination_reason": "other"},
+        {"strategy_id": 2, "eliminated_by_filter_lot_variant_redundancy": False,
+         "eliminated_by_filter_hard_cutoffs": True, "eliminated_by_ab_deterioration": False,
+         "eliminated_by_filter_equity_regime": False, "auto_status": "RESERVE", "elimination_reason": "other"},
+        {"strategy_id": 3, "eliminated_by_filter_lot_variant_redundancy": False,
+         "eliminated_by_filter_hard_cutoffs": False, "eliminated_by_ab_deterioration": True,
+         "eliminated_by_filter_equity_regime": False, "auto_status": "ANALOG", "elimination_reason": "other"},
+        {"strategy_id": 4, "eliminated_by_filter_lot_variant_redundancy": False,
+         "eliminated_by_filter_hard_cutoffs": False, "eliminated_by_ab_deterioration": False,
+         "eliminated_by_filter_equity_regime": True, "auto_status": "FILTERED", "elimination_reason": "hard cutoff"},
+        {"strategy_id": 5, "eliminated_by_filter_lot_variant_redundancy": False,
+         "eliminated_by_filter_hard_cutoffs": False, "eliminated_by_ab_deterioration": False,
+         "eliminated_by_filter_equity_regime": True, "auto_status": "RESERVE",
+         "elimination_reason": "EQUITY_REGIME_STALLED_RESERVE"},
+    ])
+
+    assert selection_review_module.automatic_filter_rejected_ids(result, request, SelectionConfig()) == {
+        "SELECTION_LOT_VARIANT": {1},
+        "SELECTION_HARD_CUTOFF": {2},
+        "SELECTION_AB_DETERIORATION": {3},
+    }
+
+
+def test_automatic_rejection_ignores_non_boolean_trace_values() -> None:
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "filter_lot_variant_redundancy", "enabled": True, "scope": "pair_side_timeframe"},
+        {"id": "filter_hard_cutoffs", "enabled": True, "scope": "pair_side"},
+        {"id": "ab_deterioration", "enabled": True, "scope": "pair_side"},
+    ]})
+    result = pd.DataFrame([{
+        "strategy_id": 1,
+        "eliminated_by_filter_lot_variant_redundancy": "false",
+        "eliminated_by_filter_hard_cutoffs": float("nan"),
+        "eliminated_by_ab_deterioration": 1,
+        "extra_untrusted_trace": pd.NA,
+    }])
+
+    assert selection_review_module.automatic_filter_rejected_ids(result, request, SelectionConfig()) == {
+        "SELECTION_LOT_VARIANT": set(),
+        "SELECTION_HARD_CUTOFF": set(),
+        "SELECTION_AB_DETERIORATION": set(),
+    }
+
+
+def test_direct_rejection_transition_preserves_comment_and_marks_prior_status() -> None:
+    transition = getattr(selection_review_module, "direct_rejection_transition", None)
+    assert callable(transition), "pure direct-rejection transition is missing"
+
+    result = transition(
+        effective_rejected=False,
+        prior_user_status="FINALIST",
+        prior_user_rank=4,
+        prior_analog_of_strategy_id=25,
+        prior_comment="keep this note",
+    )
+
+    assert (result.user_status, result.user_rank, result.analog_of_strategy_id, result.comment) == (
+        "REJECTED", None, None, "keep this note\nDegraded Finalist",
+    )
+    assert not result.no_op
+
+
+@pytest.mark.parametrize(
+    ("status", "comment", "expected_comment"),
+    [
+        (None, "keep", "keep"),
+        ("", "keep", "keep"),
+        ("RESERVE", "keep", "keep\nDegraded Reserved"),
+        ("ANALOG", "", 'Degraded "ANALOG"'),
+        (" legacy ", None, 'Degraded " legacy "'),
+    ],
+)
+def test_direct_rejection_transition_comment_markers(status, comment, expected_comment) -> None:
+    transition = getattr(selection_review_module, "direct_rejection_transition", None)
+    assert callable(transition), "pure direct-rejection transition is missing"
+
+    result = transition(
+        effective_rejected=False,
+        prior_user_status=status,
+        prior_user_rank=7,
+        prior_analog_of_strategy_id=9,
+        prior_comment=comment,
+    )
+
+    assert result.user_status == "REJECTED"
+    assert result.user_rank is None and result.analog_of_strategy_id is None
+    assert result.comment == expected_comment
+
+
+def test_effectively_rejected_transition_is_a_universal_noop() -> None:
+    transition = getattr(selection_review_module, "direct_rejection_transition", None)
+    assert callable(transition), "pure direct-rejection transition is missing"
+    prior = ("RESERVE", 8, 42, "untouched")
+
+    result = transition(
+        effective_rejected=True,
+        prior_user_status=prior[0],
+        prior_user_rank=prior[1],
+        prior_analog_of_strategy_id=prior[2],
+        prior_comment=prior[3],
+    )
+
+    assert (result.user_status, result.user_rank, result.analog_of_strategy_id, result.comment) == prior
+    assert result.no_op
+
+
+def test_direct_rejection_preserves_and_appends_to_a_long_existing_comment() -> None:
+    transition = getattr(selection_review_module, "direct_rejection_transition", None)
+    assert callable(transition), "pure direct-rejection transition is missing"
+    existing = "x" * 1000
+
+    result = transition(
+        effective_rejected=False,
+        prior_user_status="FINALIST",
+        prior_user_rank=1,
+        prior_analog_of_strategy_id=None,
+        prior_comment=existing,
+    )
+
+    assert result.comment == f"{existing}\nDegraded Finalist"
+
+
+def test_outside_top_n_requires_same_run_enabled_stage_and_exact_rank_trace() -> None:
+    eligible = getattr(selection_review_module, "outside_top_n_eligible", None)
+    assert callable(eligible), "pure exact-trace Top N predicate is missing"
+    stages = ("filter_hard_cutoffs", "rank_robust_top_n")
+    trace = {"filter_hard_cutoffs": False, "rank_robust_top_n": True}
+    row = {
+        "enabled_stage_ids": stages,
+        "stage_trace": trace,
+        "top_n": 3,
+        "auto_status": "RESERVE",
+        "auto_rank": 4,
+        "auto_reason": "RANK_ROBUST_TOP_N",
+        "auto_analog_of_strategy_id": None,
+        "prior_rejected": False,
+    }
+
+    assert eligible(**row)
+    assert not eligible(**{**row, "enabled_stage_ids": ("filter_hard_cutoffs",)})
+    assert not eligible(**{**row, "stage_trace": {"filter_hard_cutoffs": False}})
+    assert not eligible(**{**row, "stage_trace": {"filter_hard_cutoffs": True, "rank_robust_top_n": True}})
+    assert not eligible(**{**row, "stage_trace": {"filter_hard_cutoffs": False, "rank_robust_top_n": False}})
+    assert not eligible(**{**row, "stage_trace": {
+        "filter_hard_cutoffs": False, "rank_robust_top_n": True, "disabled_extra": False,
+    }})
+    assert not eligible(**{**row, "auto_reason": "ANALOG"})
+    assert not eligible(**{**row, "auto_analog_of_strategy_id": 1})
+    assert not eligible(**{**row, "auto_status": "FILTERED"})
+    assert not eligible(**{**row, "prior_rejected": True})
+    assert not eligible(**{**row, "auto_rank": 3})
+    assert not eligible(**{**row, "top_n": None})
+    assert eligible(**{
+        **row,
+        "stage_trace": {
+            "filter_hard_cutoffs": np.bool_(False),
+            "rank_robust_top_n": np.bool_(True),
+        },
+        "prior_rejected": np.bool_(False),
+    })
 
 
 def test_panel_xlsx_does_not_override_equity_reserve_user_status(tmp_path: Path, monkeypatch) -> None:
@@ -658,7 +832,7 @@ def test_effective_selection_decisions_bulk_replay_preserves_resets_overlays_tie
         '{"ranking_scope":"CURRENT_EFFECTIVE"}', result_rows=((1, False), (2, False)),
     )
     connection.execute(
-        "insert into selection_review_imports values ('review-empty', 'run-empty-review', 'hash-empty', ?, 0)",
+        "insert into selection_review_imports (review_import_id, selection_run_id, workbook_sha256, imported_at_utc, row_count) values ('review-empty', 'run-empty-review', 'hash-empty', ?, 0)",
         [start + timedelta(seconds=5)],
     )
     _insert_decision_run(
@@ -667,14 +841,14 @@ def test_effective_selection_decisions_bulk_replay_preserves_resets_overlays_tie
     )
     tie_time = start + timedelta(seconds=7)
     connection.execute(
-        "insert into selection_review_imports values ('review-active-a', 'run-reviewed', 'hash-a', ?, 1)",
+        "insert into selection_review_imports (review_import_id, selection_run_id, workbook_sha256, imported_at_utc, row_count) values ('review-active-a', 'run-reviewed', 'hash-a', ?, 1)",
         [tie_time],
     )
     connection.execute(
         "insert into selection_review_rows values ('review-active-a', 1, 'FINALIST', 3, null, null)",
     )
     connection.execute(
-        "insert into selection_review_imports values ('review-active-z', 'run-reviewed', 'hash-z', ?, 2)",
+        "insert into selection_review_imports (review_import_id, selection_run_id, workbook_sha256, imported_at_utc, row_count) values ('review-active-z', 'run-reviewed', 'hash-z', ?, 2)",
         [tie_time],
     )
     connection.execute(
@@ -744,7 +918,7 @@ def test_effective_selection_decisions_102_run_mixed_ordered_digest(tmp_path: Pa
             _insert_decision_run(connection, run_id, start + timedelta(seconds=index), "{}")
     review_time = start + timedelta(seconds=102)
     connection.execute(
-        "insert into selection_review_imports values ('mixed-review', 'mixed-run-101', 'mixed-hash', ?, 2)",
+        "insert into selection_review_imports (review_import_id, selection_run_id, workbook_sha256, imported_at_utc, row_count) values ('mixed-review', 'mixed-run-101', 'mixed-hash', ?, 2)",
         [review_time],
     )
     connection.execute(
@@ -796,7 +970,7 @@ def test_effective_selection_decisions_scoped_symbol_keeps_global_latest_review_
         result_rows=((11, False), (20, False), (21, False)),
     )
     connection.execute(
-        "insert into selection_review_imports values ('btc-review', 'btc-reviewed', 'btc-hash', ?, 1)",
+        "insert into selection_review_imports (review_import_id, selection_run_id, workbook_sha256, imported_at_utc, row_count) values ('btc-review', 'btc-reviewed', 'btc-hash', ?, 1)",
         [start + timedelta(seconds=50)],
     )
     connection.execute(
@@ -808,7 +982,7 @@ def test_effective_selection_decisions_scoped_symbol_keeps_global_latest_review_
         result_rows=((2, False), (11, False), (20, False), (21, False)),
     )
     connection.execute(
-        "insert into selection_review_imports values ('btc-sibling-review', 'btc-sibling-reviewed', 'btc-sibling-hash', ?, 1)",
+        "insert into selection_review_imports (review_import_id, selection_run_id, workbook_sha256, imported_at_utc, row_count) values ('btc-sibling-review', 'btc-sibling-reviewed', 'btc-sibling-hash', ?, 1)",
         [start + timedelta(seconds=70)],
     )
     connection.execute(
@@ -819,7 +993,7 @@ def test_effective_selection_decisions_scoped_symbol_keeps_global_latest_review_
         [start + timedelta(seconds=70)],
     )
     connection.execute(
-        "insert into selection_review_imports values ('eth-review', 'eth-reviewed', 'eth-hash', ?, 2)",
+        "insert into selection_review_imports (review_import_id, selection_run_id, workbook_sha256, imported_at_utc, row_count) values ('eth-review', 'eth-reviewed', 'eth-hash', ?, 2)",
         [start + timedelta(seconds=60)],
     )
     connection.execute(
@@ -924,7 +1098,7 @@ def test_effective_selection_decisions_streams_results_across_fetchmany_boundary
         '{"ranking_scope":"RETEST_COHORT"}', result_rows=((1025, False),),
     )
     connection.execute(
-        "insert into selection_review_imports values ('wide-review', 'wide-overlay', 'wide-hash', ?, 1)",
+        "insert into selection_review_imports (review_import_id, selection_run_id, workbook_sha256, imported_at_utc, row_count) values ('wide-review', 'wide-overlay', 'wide-hash', ?, 1)",
         [start + timedelta(seconds=2)],
     )
     connection.execute(
@@ -2200,7 +2374,7 @@ def test_partial_selection_import_reserves_absent_prior_finalists_and_clears_rej
     prior_review_id = "prior-partial-review"
     prior_imported_at = datetime(2026, 9, 3, tzinfo=UTC)
     connection.execute(
-        "insert into selection_review_imports values (?, ?, ?, ?, 2)",
+        "insert into selection_review_imports (review_import_id, selection_run_id, workbook_sha256, imported_at_utc, row_count) values (?, ?, ?, ?, 2)",
         [prior_review_id, metadata["selection_run_id"], "d" * 64, prior_imported_at],
     )
     connection.executemany(
@@ -2262,7 +2436,7 @@ def test_partial_selection_reconciles_prior_finalist_absent_from_current_run(tmp
         [old_run_id],
     )
     connection.execute(
-        "insert into selection_review_imports values ('older-finalist-review', ?, ?, ?, 1)",
+        "insert into selection_review_imports (review_import_id, selection_run_id, workbook_sha256, imported_at_utc, row_count) values ('older-finalist-review', ?, ?, ?, 1)",
         [old_run_id, "e" * 64, now],
     )
     connection.execute(
@@ -2331,7 +2505,7 @@ def test_partial_selection_reconciliation_does_not_touch_other_pair_or_side(tmp_
         )
         review_id = f"prior-import-{strategy_id}"
         connection.execute(
-            "insert into selection_review_imports values (?, ?, ?, ?, 1)",
+            "insert into selection_review_imports (review_import_id, selection_run_id, workbook_sha256, imported_at_utc, row_count) values (?, ?, ?, ?, 1)",
             [review_id, run_id, f"{strategy_id:064d}", now],
         )
         connection.execute(

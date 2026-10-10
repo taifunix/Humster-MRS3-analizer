@@ -83,7 +83,9 @@ def _add_review(
         [run_id, strategy_id, result_id],
     )
     connection.execute(
-        "insert into selection_review_imports values (?, ?, ?, ?, 1)",
+        "insert into selection_review_imports "
+        "(review_import_id, selection_run_id, workbook_sha256, imported_at_utc, row_count) "
+        "values (?, ?, ?, ?, 1)",
         [review_id, run_id, f"review-hash-{review_id}", selection_time],
     )
     connection.execute(

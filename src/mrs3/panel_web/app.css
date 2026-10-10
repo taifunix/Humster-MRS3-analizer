@@ -257,6 +257,13 @@ tbody th { font-weight: 750; }
 .selection-finalists-only { gap: 7px; margin-bottom: 10px; line-height: 1.2; }
 .selection-finalists-only input[type="checkbox"] { width: 1.2em; min-width: 1.2em; height: 1.2em; min-height: 1.2em; }
 .selection-stage-list { display: grid; gap: 7px; margin: 0; padding: 0; list-style: none; }
+.legacy-filter-group { list-style: none; }
+.selection-stage-legacy-details { margin-top: 7px; border: 1px solid var(--line); border-radius: 8px; background: #f7f9fc; }
+.selection-stage-legacy-details > summary { padding: 9px 11px; color: var(--ink); }
+.selection-stage-legacy-details > summary > span:first-child { display: grid; gap: 2px; }
+.selection-stage-legacy-details > summary b { font-size: .76rem; }
+.selection-stage-legacy-details > summary small { margin: 0; font-size: .68rem; }
+.selection-stage-legacy-details[open] > .selection-stage-legacy-list { padding: 0 9px 9px; }
 .selection-stage { display: grid; grid-template-columns: 28px 24px minmax(0, 1fr) 112px 78px 175px minmax(80px, 105px) 66px; gap: 16px; align-items: center; padding: 8px 9px; border: 1px solid var(--line); border-radius: 8px; background: #fff; }
 .selection-stage-position { color: var(--muted); font-size: .7rem; font-weight: 800; text-align: center; }
 .selection-stage .check { display: grid; grid-column: 2 / 4; grid-template-columns: 16px minmax(0, 1fr); width: auto; min-width: 0; align-items: flex-start; }

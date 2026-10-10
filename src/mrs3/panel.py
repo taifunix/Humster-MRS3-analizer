@@ -273,6 +273,10 @@ from .performance_v2_selection import (
     selection_cache_status,
     selection_equity_facts_token,
     write_selection_workbook,
+    AllPairsPartition,
+    coordinate_all_pairs,
+    build_combined_selection_workbook,
+    validate_combined_selection_workbook,
     retest_cohort_request,
 )
 from .performance_v2_equity_regime import (
@@ -287,6 +291,7 @@ from .performance_v2_selection_review import (
     _current_equity_revisions,
     import_retest_tags,
     import_selection_review,
+    import_combined_selection_workbook,
     import_selection_user_fields,
     latest_effective_finalists,
     latest_user_reviews_by_strategy,
@@ -294,6 +299,7 @@ from .performance_v2_selection_review import (
     persist_selection_snapshot,
     persist_selection_snapshots,
 )
+from .performance_v2_publication import publish_publication
 from .performance_v2_retest import build_retest_manifest, retest_status
 from .performance_v2_finalist_retest import (
     FinalistRetestError,
@@ -4636,7 +4642,7 @@ class PanelController:
                                 "PERFORMANCE_V2_MIGRATION_REQUIRED", status=409,
                                 message="Existing Performance v2 database requires an explicit offline migration",
                             )
-                        if version in {"9", "10"}:
+                        if version in {"9", "10", "11"}:
                             require_performance_v2_readable(connection)
                             repairable_columns = {
                                 ("window_metrics", "holding_seconds"),
@@ -4659,7 +4665,7 @@ class PanelController:
                                       and table_name in ('window_metrics', 'strategy_results')"""
                             ).fetchall())
                             schema_repair_required = not repairable_columns.issubset(existing_columns)
-                if version != "10" or schema_repair_required:
+                if version != "11" or schema_repair_required:
                     with self._performance_v2_writer_guard(target):
                         with duckdb.connect(str(target)) as connection:
                             initialize_performance_v2(connection)
@@ -6926,6 +6932,31 @@ class PanelController:
         except SelectionReviewError as error:
             status = 409 if error.code in {
                 "SELECTION_REVIEW_NOT_LATEST_RUN", "SELECTION_REVIEW_STALE_RESULTS", "SELECTION_REVIEW_ALREADY_IMPORTED"
+            } else 400
+            details = f": {error.details}" if error.details else ""
+            raise PerformanceV2ApiError(error.code, status=status, message=f"{error}{details}") from error
+        except PerformanceV2StoreError as error:
+            raise PerformanceV2ApiError("PERFORMANCE_V2_SCHEMA_INVALID", status=500, message=str(error)) from error
+        except duckdb.Error as error:
+            raise PerformanceV2ApiError("PERFORMANCE_V2_LOCKED", status=409, message="Performance v2 database is locked") from error
+
+    def strategies_performance_v2_selection_aggregate_import(
+        self, data: bytes, *, aggregate_import_id: str, operation_key: str,
+    ) -> dict[str, object]:
+        target = performance_v2_database_path(self._performance_v2_config())
+        if not target.is_file():
+            raise PerformanceV2ApiError("PERFORMANCE_V2_NOT_FOUND", status=404)
+        self._ensure_performance_v2_schema(target)
+        try:
+            with self._performance_v2_writer_guard(target), duckdb.connect(str(target)) as connection:
+                return import_combined_selection_workbook(
+                    connection, target.parent, data,
+                    aggregate_import_id=aggregate_import_id, operation_key=operation_key,
+                )
+        except SelectionReviewError as error:
+            status = 409 if error.code in {
+                "SELECTION_REVIEW_STALE", "SELECTION_REVIEW_ALREADY_IMPORTED",
+                "STALE_RESULTS", "OPERATION_KEY_CONFLICT",
             } else 400
             details = f": {error.details}" if error.details else ""
             raise PerformanceV2ApiError(error.code, status=status, message=f"{error}{details}") from error
@@ -9629,6 +9660,139 @@ class _PanelServer(ThreadingHTTPServer):
         return {"restarting": True}
 
 
+    @staticmethod
+    def _selection_process_all_pairs(payload: Mapping[str, object]) -> bool:
+        value = payload.get("process_all_pairs", False)
+        if type(value) is not bool:
+            raise ValueError("process_all_pairs must be a boolean")
+        return value
+
+    def _selection_operation_key(self, payload: Mapping[str, object]) -> str:
+        value = payload.get("operation_key")
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("operation_key is required")
+        if "\0" in value or value != value.strip():
+            raise ValueError("operation_key is invalid")
+        return value.strip().lower()
+
+    def strategies_performance_v2_selection_aggregate_preview(
+        self, payload: Mapping[str, object],
+    ) -> dict[str, object]:
+        """Validate operation controls without evaluating or writing anything."""
+        if not isinstance(payload, Mapping):
+            raise ValueError("selection payload must be an object")
+        process_all_pairs = self._selection_process_all_pairs(payload)
+        request_payload = dict(payload)
+        request_payload.pop("process_all_pairs", None)
+        request_payload.pop("operation_key", None)
+        request_payload.pop("action", None)
+        request = parse_selection_request(request_payload)
+        return {
+            "process_all_pairs": process_all_pairs,
+            "pair": request.symbol,
+            "side": request.side,
+            "finalists_only": request.finalists_only,
+            "requires_confirmation": True,
+            "action": "EXPORT" if payload.get("action", "EXPORT") == "EXPORT" else "WRITE_REJECTED",
+        }
+
+    def _selection_aggregate_operation(
+        self, payload: Mapping[str, object], *, write_rejected: bool,
+    ) -> tuple[str, bytes | None, object]:
+        """Run one explicit all-pairs action through the Task3/4 coordinator.
+
+        The coordinator remains the only mutation writer.  Workbook bytes are
+        assembled from its frozen partition result and are never written to a
+        path by this controller.
+        """
+        if not isinstance(payload, Mapping):
+            raise ValueError("selection payload must be an object")
+        process_all_pairs = self._selection_process_all_pairs(payload)
+        operation_key = ""
+        if process_all_pairs or "operation_key" in payload:
+            operation_key = self._selection_operation_key(payload)
+        request_payload = dict(payload)
+        request_payload.pop("process_all_pairs", None)
+        request_payload.pop("operation_key", None)
+        request_payload.pop("action", None)
+        request = parse_selection_request(request_payload)
+        if not process_all_pairs:
+            # Keep the established single-pair behavior byte-for-byte and do
+            # not add operation-only fields to its canonical request/hash.
+            filename, data = self.strategies_performance_v2_selection(request_payload)
+            return filename, data, {"process_all_pairs": False, "operation_key": operation_key}
+        config = load_selection_config(self.default_config.with_name("config.performance.json"))
+        performance_config = self._performance_v2_config()
+        target = performance_v2_database_path(performance_config)
+        if not target.is_file():
+            raise PerformanceV2ApiError("PERFORMANCE_V2_NOT_FOUND", status=404)
+        with duckdb.connect(str(target)) as connection:
+            evaluated = coordinate_all_pairs(
+                connection, target.parent, request, config=config,
+                operation_key=operation_key, publish=False,
+            )
+            package = evaluated.package
+            if package is None:
+                raise PerformanceV2ApiError("PERFORMANCE_V2_PUBLICATION_INVALID", status=500)
+            partitions = tuple(
+                AllPairsPartition(item.pair, item.side, item.source_run_id, item.result)
+                for item in evaluated.partitions
+            )
+            strategy_ids = [
+                int(value)
+                for item in partitions
+                for value in item.result.get("strategy_id", pd.Series(dtype=int)).tolist()
+            ]
+            user_review_rows = latest_user_reviews_by_strategy(connection, strategy_ids)
+            data = build_combined_selection_workbook(
+                partitions,
+                database_instance_id=package.database_instance_id,
+                publication_id=package.publication_id,
+                decision_group_id=package.decision_group_id,
+                controls_sha256=package.controls_sha256,
+                render_model_sha256=package.render_model_sha256,
+                user_review_rows=user_review_rows,
+            )
+            validate_combined_selection_workbook(data)
+            publication = publish_publication(
+                connection, target.parent,
+                replace(
+                    package,
+                    export_workbook_sha256=(sha256(data).hexdigest() if not write_rejected else None),
+                ),
+            )
+            return (
+                "performance-v2-selection-all-pairs.xlsx" if data is not None else "",
+                None if write_rejected else data,
+                {
+                    "process_all_pairs": True,
+                    "operation_key": operation_key,
+                    "publication_id": publication.publication_id,
+                    "decision_group_id": package.decision_group_id,
+                    "partitions": len(partitions),
+                },
+            )
+
+    def strategies_performance_v2_selection_export_action(
+        self, payload: Mapping[str, object],
+    ) -> tuple[str, bytes]:
+        filename, data, _metadata = self._selection_aggregate_operation(payload, write_rejected=False)
+        if data is None:
+            raise ValueError("selection export did not produce workbook bytes")
+        return filename, data
+
+    def strategies_performance_v2_selection_write_rejected(
+        self, payload: Mapping[str, object],
+    ) -> dict[str, object]:
+        _filename, _data, metadata = self._selection_aggregate_operation(payload, write_rejected=True)
+        return {"status": "COMMITTED", **dict(metadata)}
+
+    def strategies_performance_v2_selection_aggregate_validate(
+        self, data: bytes,
+    ) -> dict[str, object]:
+        return validate_combined_selection_workbook(data)
+
+
 class _PanelHandler(BaseHTTPRequestHandler):
     server: _PanelServer
     _PERFORMANCE_V2_EXPORT = "/api/v2/strategies/performance-v2/export"
@@ -10209,6 +10373,7 @@ class _PanelHandler(BaseHTTPRequestHandler):
         fresh_generation = endpoint == "/api/v2/strategies/fresh/generate"
         performance_v2_windows_endpoint = endpoint == "/api/v2/strategies/performance-v2/windows"
         performance_v2_selection_endpoint = endpoint == "/api/v2/strategies/performance-v2/selection"
+        performance_v2_selection_aggregate_import_endpoint = endpoint == "/api/v2/strategies/performance-v2/selection/aggregate-import"
         performance_v2_maintenance_apply_endpoint = endpoint == "/api/v2/strategies/performance-v2/maintenance/apply"
         performance_v2_maintenance_endpoint = endpoint in {
             "/api/v2/strategies/performance-v2/maintenance/preview",
@@ -10220,10 +10385,10 @@ class _PanelHandler(BaseHTTPRequestHandler):
         portfolio_submission_route = bool(re.fullmatch(r"/api/v2/portfolio/campaigns/[^/]+/tester-submissions", endpoint))
         if equity_filter_endpoint:
             pass
-        elif bulk_retest_endpoint is None and endpoint != "/api/v2/strategies/performance-v2/selection-settings" and endpoint not in {"/api/start", "/api/browse", "/api/duckdb-import/settings", "/api/duckdb-import/preflight", "/api/duckdb-import/start", "/api/duckdb-import/cancel", "/api/duckdb-import/migrate", "/api/duckdb-direct/coverage", "/api/duckdb-direct/preflight", "/api/duckdb-direct/start", "/api/duckdb-direct/cancel", "/api/analysis/library", "/api/analysis/initialize", "/api/analysis/rerun", "/api/analysis/compare", "/api/analysis/export", "/api/analysis/shortlist", "/api/analysis/filter-export", "/api/analysis/strategies", "/api/source-v6/preflight", "/api/source-v6/start", "/api/source-v6/fresh/multiscope/start", "/api/source-v6/fresh/multiscope/analysis/start", "/api/source-v6/cancel", "/api/source-v6/merge", "/api/v2/panel/restart", "/api/v2/settings/validate", "/api/v2/settings/save", "/api/v2/settings/analysis-profile", "/api/v2/jobs", "/api/v2/strategies/tester/verify-inbox", "/api/v2/strategies/tester/report-collection/clear", "/api/v2/testing/local/fill", "/api/v2/testing/local/start", "/api/v2/testing/local/stop", "/api/v2/testing/screener/fill", "/api/v2/testing/screener/start", "/api/v2/testing/screener/stop", "/api/v2/testing/screener/evaluate", "/api/v2/testing/remote/check-paths", "/api/v2/testing/remote/prepare", "/api/v2/testing/remote/fill", "/api/v2/testing/remote/start", "/api/v2/source/local/import/preflight", "/api/v2/source/local/import/start", "/api/v2/source/local/merge/preflight", "/api/v2/source/local/merge/start", "/api/v2/source/local/cancel", "/api/v2/source/remote/start", "/api/v2/source/remote/cancel", "/api/v2/surfaces/preflight", "/api/v2/surfaces/select", "/api/v2/surfaces/publish", "/api/v2/surfaces/publish/start", "/api/v2/strategies/fresh/analyze", "/api/v2/strategies/fresh/generate", "/api/v2/strategies/fresh/runs", "/api/v2/strategies/fresh/shortlist", "/api/v2/strategies/fresh/open", "/api/v2/strategies/performance-v2/windows", "/api/v2/strategies/performance-v2/selection", "/api/v2/strategies/performance-v2/selection-preview", "/api/v2/strategies/performance-v2/selection-cache-status", "/api/v2/strategies/performance-v2/recalculate", "/api/v2/strategies/performance-v2/recalculate-all", "/api/v2/strategies/performance-v2/selection-review-import", "/api/v2/strategies/performance-v2/selection-user-fields-import", "/api/v2/strategies/performance-v2/retest-tags-import", "/api/v2/strategies/performance-v2/retest/start", "/api/v2/strategies/performance-v2/retest/import"} and not portfolio_route and not performance_v2_maintenance_endpoint:
+        elif bulk_retest_endpoint is None and endpoint != "/api/v2/strategies/performance-v2/selection-settings" and endpoint not in {"/api/start", "/api/browse", "/api/duckdb-import/settings", "/api/duckdb-import/preflight", "/api/duckdb-import/start", "/api/duckdb-import/cancel", "/api/duckdb-import/migrate", "/api/duckdb-direct/coverage", "/api/duckdb-direct/preflight", "/api/duckdb-direct/start", "/api/duckdb-direct/cancel", "/api/analysis/library", "/api/analysis/initialize", "/api/analysis/rerun", "/api/analysis/compare", "/api/analysis/export", "/api/analysis/shortlist", "/api/analysis/filter-export", "/api/analysis/strategies", "/api/source-v6/preflight", "/api/source-v6/start", "/api/source-v6/fresh/multiscope/start", "/api/source-v6/fresh/multiscope/analysis/start", "/api/source-v6/cancel", "/api/source-v6/merge", "/api/v2/panel/restart", "/api/v2/settings/validate", "/api/v2/settings/save", "/api/v2/settings/analysis-profile", "/api/v2/jobs", "/api/v2/strategies/tester/verify-inbox", "/api/v2/strategies/tester/report-collection/clear", "/api/v2/testing/local/fill", "/api/v2/testing/local/start", "/api/v2/testing/local/stop", "/api/v2/testing/screener/fill", "/api/v2/testing/screener/start", "/api/v2/testing/screener/stop", "/api/v2/testing/screener/evaluate", "/api/v2/testing/remote/check-paths", "/api/v2/testing/remote/prepare", "/api/v2/testing/remote/fill", "/api/v2/testing/remote/start", "/api/v2/source/local/import/preflight", "/api/v2/source/local/import/start", "/api/v2/source/local/merge/preflight", "/api/v2/source/local/merge/start", "/api/v2/source/local/cancel", "/api/v2/source/remote/start", "/api/v2/source/remote/cancel", "/api/v2/surfaces/preflight", "/api/v2/surfaces/select", "/api/v2/surfaces/publish", "/api/v2/surfaces/publish/start", "/api/v2/strategies/fresh/analyze", "/api/v2/strategies/fresh/generate", "/api/v2/strategies/fresh/runs", "/api/v2/strategies/fresh/shortlist", "/api/v2/strategies/fresh/open", "/api/v2/strategies/performance-v2/windows", "/api/v2/strategies/performance-v2/selection", "/api/v2/strategies/performance-v2/selection-preview", "/api/v2/strategies/performance-v2/selection-cache-status", "/api/v2/strategies/performance-v2/recalculate", "/api/v2/strategies/performance-v2/recalculate-all", "/api/v2/strategies/performance-v2/selection-review-import", "/api/v2/strategies/performance-v2/selection-user-fields-import", "/api/v2/strategies/performance-v2/retest-tags-import", "/api/v2/strategies/performance-v2/selection/aggregate-import", "/api/v2/strategies/performance-v2/retest/start", "/api/v2/strategies/performance-v2/retest/import"} and not portfolio_route and not performance_v2_maintenance_endpoint:
             self._json(404, {"error": "not found"})
             return
-        if endpoint in {"/api/v2/strategies/performance-v2/selection-review-import", "/api/v2/strategies/performance-v2/selection-user-fields-import", "/api/v2/strategies/performance-v2/retest-tags-import"}:
+        if endpoint in {"/api/v2/strategies/performance-v2/selection-review-import", "/api/v2/strategies/performance-v2/selection-user-fields-import", "/api/v2/strategies/performance-v2/retest-tags-import", "/api/v2/strategies/performance-v2/selection/aggregate-import"}:
             error_code = "RETEST_TAG_IMPORT_INVALID_FILE" if endpoint.endswith("retest-tags-import") else "SELECTION_REVIEW_INVALID_FILE"
             if self.headers.get("Content-Type", "").partition(";")[0].strip().casefold() != "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet":
                 self._json(415, {"error": {"code": error_code, "message": "XLSX Content-Type required"}})
@@ -10242,6 +10407,13 @@ class _PanelHandler(BaseHTTPRequestHandler):
                     result = self.server.controller.strategies_performance_v2_selection_user_fields_import(self.rfile.read(length))
                 elif endpoint.endswith("retest-tags-import"):
                     result = self.server.controller.strategies_performance_v2_retest_tags_import(self.rfile.read(length))
+                elif performance_v2_selection_aggregate_import_endpoint:
+                    query = parse_qs(urlparse(self.path).query)
+                    result = self.server.controller.strategies_performance_v2_selection_aggregate_import(
+                        self.rfile.read(length),
+                        aggregate_import_id=query.get("aggregate_import_id", [""])[0],
+                        operation_key=query.get("operation_key", [""])[0],
+                    )
                 else:
                     result = self.server.controller.strategies_performance_v2_selection_review_import(self.rfile.read(length))
             except PerformanceV2ApiError as error:
@@ -10386,6 +10558,12 @@ class _PanelHandler(BaseHTTPRequestHandler):
                 result = self.server.controller.strategies_performance_v2_maintenance_apply(document)
             elif endpoint == "/api/v2/strategies/performance-v2/selection":
                 result = self.server.controller.strategies_performance_v2_selection(document)
+            elif endpoint == "/api/v2/strategies/performance-v2/selection/preview":
+                result = self.server.controller.strategies_performance_v2_selection_aggregate_preview(document)
+            elif endpoint == "/api/v2/strategies/performance-v2/selection/export":
+                result = self.server.controller.strategies_performance_v2_selection_export_action(document)
+            elif endpoint == "/api/v2/strategies/performance-v2/selection/write-rejected":
+                result = self.server.controller.strategies_performance_v2_selection_write_rejected(document)
             elif endpoint == "/api/v2/strategies/performance-v2/selection-settings":
                 result = self.server.controller.performance_v2_selection_settings(document)
             elif endpoint == "/api/v2/strategies/performance-v2/selection-preview":
@@ -10561,7 +10739,7 @@ class _PanelHandler(BaseHTTPRequestHandler):
                 self._json(500, {"error": {"code": "INTERNAL", "message": "Performance v2 calculation failed"}})
                 return
             raise
-        if performance_v2_selection_endpoint:
+        if performance_v2_selection_endpoint or endpoint == "/api/v2/strategies/performance-v2/selection/export":
             filename, data = result
             self.send_response(200)
             self.send_header("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
@@ -10592,6 +10770,17 @@ class _PanelHandler(BaseHTTPRequestHandler):
             self._export_method_not_allowed()
             return
         self._json(404, {"error": "not found"})
+
+# The aggregate action helpers are defined beside the HTTP handler helpers in
+# this module.  Bind them to the controller as well so routes and direct tests
+# use the same implementation without duplicating the operation contract.
+PanelController._selection_process_all_pairs = staticmethod(_PanelServer._selection_process_all_pairs)
+PanelController._selection_operation_key = _PanelServer._selection_operation_key
+PanelController.strategies_performance_v2_selection_aggregate_preview = _PanelServer.strategies_performance_v2_selection_aggregate_preview
+PanelController._selection_aggregate_operation = _PanelServer._selection_aggregate_operation
+PanelController.strategies_performance_v2_selection_export_action = _PanelServer.strategies_performance_v2_selection_export_action
+PanelController.strategies_performance_v2_selection_write_rejected = _PanelServer.strategies_performance_v2_selection_write_rejected
+PanelController.strategies_performance_v2_selection_aggregate_validate = _PanelServer.strategies_performance_v2_selection_aggregate_validate
 
 
 def create_panel_server(

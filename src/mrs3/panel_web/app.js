@@ -3607,7 +3607,11 @@ if (typeof globalThis !== 'undefined') globalThis.portfolioSelectionHelpers = po
     const byId = Object.fromEntries([...selectionPreviewOrder.querySelectorAll('[data-selection-stage]')]
       .map((stage) => [stage.dataset.selectionStage, stage]));
     [...defaultSelectionStageOrder].reverse().forEach((id) => {
-      if (byId[id]) selectionPreviewOrder.insertBefore(byId[id], selectionPreviewOrder.firstChild);
+      const stage = byId[id];
+      if (!stage) return;
+      const parent = stage.parentElement;
+      const firstStage = [...parent.children].find((child) => child.matches('[data-selection-stage]'));
+      if (firstStage && firstStage !== stage) parent.insertBefore(stage, firstStage);
     });
     Object.values(byId).forEach((stage) => {
       stage.querySelector('input[type="checkbox"]').checked = defaultEnabledSelectionStages.has(stage.dataset.selectionStage);
@@ -3624,14 +3628,18 @@ if (typeof globalThis !== 'undefined') globalThis.portfolioSelectionHelpers = po
 
   const renderSelectionPreviewOrder = () => {
     if (!selectionPreviewOrder) return;
-    [...selectionPreviewOrder.querySelectorAll('[data-selection-stage]')].forEach((stage, index, stages) => {
+    const stages = orderedSelectionStages();
+    stages.forEach((stage, index) => {
       const position = stage.querySelector('[data-selection-position]');
       const up = stage.querySelector('[data-selection-move="up"]');
       const down = stage.querySelector('[data-selection-move="down"]');
       const fixed = fixedSelectionPrefix.has(stage.dataset.selectionStage);
+      const previous = stages[index - 1];
+      const next = stages[index + 1];
+      const sameParent = (candidate) => candidate?.parentElement === stage.parentElement;
       if (position) position.textContent = String(index + 1);
-      if (up) up.disabled = fixed || fixedSelectionPrefix.has(stage.previousElementSibling?.dataset.selectionStage) || index === 0;
-      if (down) down.disabled = fixed || fixedSelectionPrefix.has(stage.nextElementSibling?.dataset.selectionStage) || index === stages.length - 1;
+      if (up) up.disabled = fixed || !sameParent(previous) || fixedSelectionPrefix.has(previous?.dataset.selectionStage) || index === 0;
+      if (down) down.disabled = fixed || !sameParent(next) || fixedSelectionPrefix.has(next?.dataset.selectionStage) || index === stages.length - 1;
     });
   };
 
@@ -3738,14 +3746,14 @@ if (typeof globalThis !== 'undefined') globalThis.portfolioSelectionHelpers = po
     const button = event.target.closest('[data-selection-move]');
     const stage = button?.closest('[data-selection-stage]');
     if (!button || !stage) return;
-    const target = button.dataset.selectionMove === 'up'
-      ? stage.previousElementSibling
-      : stage.nextElementSibling;
-    if (!target?.matches('[data-selection-stage]')
+    const stages = orderedSelectionStages();
+    const oldIndex = stages.indexOf(stage);
+    const movingUp = button.dataset.selectionMove === 'up';
+    const target = stages[oldIndex + (movingUp ? -1 : 1)];
+    if (!target || target.parentElement !== stage.parentElement
       || fixedSelectionPrefix.has(stage.dataset.selectionStage)
       || fixedSelectionPrefix.has(target.dataset.selectionStage)) return;
-    const oldIndex = orderedSelectionStages().indexOf(stage);
-    selectionPreviewOrder.insertBefore(stage, button.dataset.selectionMove === 'up' ? target : target.nextElementSibling);
+    target.parentElement.insertBefore(stage, movingUp ? target : target.nextElementSibling);
     renderSelectionPreviewOrder();
     markSelectionPreviewDirty(Math.min(oldIndex, orderedSelectionStages().indexOf(stage)));
   });
@@ -4056,6 +4064,59 @@ if (typeof globalThis !== 'undefined') globalThis.portfolioSelectionHelpers = po
     }
   });
   renderSelectionPreviewOrder();
+
+  // Aggregate selection actions intentionally share one frozen operation key
+  // across preview, confirmation, and retries.  The server owns filtering and
+  // publication; the browser only carries the existing selection controls.
+  const aggregateProcessAllPairs = document.getElementById('performance-v2-selection-process-all-pairs');
+  const aggregateExport = document.getElementById('performance-v2-selection-export');
+  const aggregateWriteRejected = document.getElementById('performance-v2-selection-write-rejected');
+  const aggregateStatus = document.getElementById('performance-v2-selection-aggregate-status');
+  const selectionOrder = document.getElementById('performance-v2-selection-order');
+  if (selectionOrder?.parentElement && aggregateProcessAllPairs?.parentElement) {
+    selectionOrder.parentElement.insertBefore(aggregateProcessAllPairs.parentElement, selectionOrder);
+  }
+  let aggregateOperationKey = '';
+  const aggregatePayload = (action) => {
+    if (!aggregateOperationKey) aggregateOperationKey = (globalThis.crypto?.randomUUID?.() || `selection-${Date.now()}`);
+    return {
+      ...selectionPayload(),
+      action,
+      operation_key: aggregateOperationKey,
+      process_all_pairs: aggregateProcessAllPairs?.checked === true,
+    };
+  };
+  const setAggregateStatus = (value) => { if (aggregateStatus) aggregateStatus.textContent = value; };
+  const resetAggregateOperation = () => { aggregateOperationKey = ''; };
+  const runAggregateAction = async (action) => {
+    const payload = aggregatePayload(action);
+    if (!window.confirm(action === 'EXPORT' ? 'Export the frozen selection workbook?' : 'Write rejected decisions for the frozen selection?')) return;
+    const endpoint = action === 'EXPORT'
+      ? '/api/v2/strategies/performance-v2/selection/export'
+      : '/api/v2/strategies/performance-v2/selection/write-rejected';
+    const button = action === 'EXPORT' ? aggregateExport : aggregateWriteRejected;
+    if (button) button.disabled = true;
+    setAggregateStatus('Preparing selection action...');
+    try {
+      const response = await fetch(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+      if (action === 'EXPORT') {
+        if (!response.ok) { const error = await response.json().catch(() => ({})); throw new Error(error?.error?.message || error?.error || 'Selection export failed'); }
+        const blob = await response.blob();
+        const href = URL.createObjectURL(blob); const link = document.createElement('a'); link.href = href; link.download = 'performance-v2-selection-all-pairs.xlsx'; link.click(); URL.revokeObjectURL(href);
+        setAggregateStatus('Selection workbook exported.');
+      } else {
+        const result = await response.json(); if (!response.ok) throw new Error(result?.error?.message || result?.error || 'Write Rejected failed');
+        setAggregateStatus(`Rejected decisions recorded: ${result?.status || 'COMMITTED'}.`);
+      }
+    } catch (error) { setAggregateStatus(error?.message || 'Selection action failed.'); }
+    finally { if (button) button.disabled = false; }
+  };
+  aggregateProcessAllPairs?.addEventListener('change', () => { resetAggregateOperation(); setAggregateStatus(''); });
+  document.querySelector('#performance-v2-selection-card')?.querySelectorAll('input, select')?.forEach((control) => {
+    if (control !== aggregateProcessAllPairs) { control.addEventListener('change', resetAggregateOperation); control.addEventListener('input', resetAggregateOperation); }
+  });
+  aggregateExport?.addEventListener('click', () => runAggregateAction('EXPORT'));
+  aggregateWriteRejected?.addEventListener('click', () => runAggregateAction('WRITE_REJECTED'));
 
   const performanceV2ExportButton = document.querySelector('#performance-v2-export-button');
   const performanceV2ExportStatus = document.querySelector('#performance-v2-export-status');

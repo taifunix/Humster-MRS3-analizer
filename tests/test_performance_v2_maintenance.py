@@ -183,7 +183,7 @@ def _seed_fixture(connection: duckdb.DuckDBPyConnection) -> None:
                     ('sel-sol-new', 3, 303, 'FILTERED', false, '[]')"""
     )
     connection.execute(
-        """insert into selection_review_imports values ('review-btc', 'sel-btc', 'review-hash', ?, 1)""",
+        """insert into selection_review_imports values ('review-btc', 'sel-btc', 'review-hash', ?, 1, null)""",
         [now],
     )
     connection.execute(
@@ -251,8 +251,12 @@ def test_rejected_retirement_covers_every_strategy_or_result_table(maintenance_d
         *maintenance._PAIR_TABLES,
         *maintenance._GLOBAL_JOURNAL_TABLES,
         *maintenance._PRESERVED_METADATA_TABLES,
+        *maintenance._SCHEMA_TABLE_CLASSES["publication-lineage"],
     }
     assert all_tables == expected_tables
+
+    with duckdb.connect(str(maintenance_db), read_only=True) as connection:
+        maintenance._require_schema_v11(connection)
 
 
 def test_catalog_fails_closed_when_action_symbol_disagrees_with_strategy(maintenance_db: Path) -> None:
@@ -263,12 +267,24 @@ def test_catalog_fails_closed_when_action_symbol_disagrees_with_strategy(mainten
             catalog(connection)
 
 
-def test_catalog_fails_closed_on_unclassified_schema_v10_table(maintenance_db: Path) -> None:
+def test_catalog_fails_closed_on_unclassified_schema_v11_table(maintenance_db: Path) -> None:
     with _writable_fixture(maintenance_db, maintenance_db.parent) as connection:
         connection.execute("create table unexpected_table (value varchar)")
     with duckdb.connect(str(maintenance_db), read_only=True) as connection:
         with pytest.raises(ValueError, match="unclassified.*unexpected_table"):
             catalog(connection)
+
+
+def test_maintenance_mutation_gate_rejects_exact_v10_until_migrated() -> None:
+    from tests.test_performance_v2_store import _prepare_v10_migration_fixture
+
+    with duckdb.connect(":memory:") as connection:
+        _prepare_v10_migration_fixture(connection)
+        with pytest.raises(
+            maintenance.PerformanceV2MaintenanceSchemaError,
+            match="requires PerformanceDB schema v11; found 10",
+        ):
+            maintenance._require_schema_v11(connection)
 
 
 def test_catalog_rejects_null_symbols(maintenance_db: Path) -> None:
@@ -306,7 +322,7 @@ def test_schema_classification_ignores_noncurrent_tables(
             connection.execute(f"attach '{attached_path.as_posix()}' as secondary")
 
         with pytest.raises(maintenance.PerformanceV2MaintenanceSchemaError, match="missing classified.*optimizer_prepared_inputs"):
-            maintenance._classify_schema_v10_tables(connection)
+            maintenance._classify_schema_v11_tables(connection)
 
 
 def test_maintenance_schema_ownership_columns_match_delete_model(maintenance_db: Path) -> None:
@@ -458,7 +474,7 @@ def test_schema_table_classifier_rejects_duplicate_declarations(
     )
     with duckdb.connect(str(maintenance_db), read_only=True) as connection:
         with pytest.raises(maintenance.PerformanceV2MaintenanceSchemaError, match="classified more than once: strategies"):
-            maintenance._classify_schema_v10_tables(connection)
+            maintenance._classify_schema_v11_tables(connection)
 
 
 def test_catalog_preview_and_apply_reject_cross_symbol_selection_ownership(
@@ -837,7 +853,9 @@ def test_rejected_apply_rejects_changed_effective_strategy_set_with_empty_facts(
         connection.execute("delete from optimizer_prepared_inputs where result_id in (101, 202)")
         connection.execute("delete from strategy_rejection_sources where strategy_id = 2")
         connection.execute(
-            """insert into selection_review_imports values (
+            """insert into selection_review_imports (
+                   review_import_id, selection_run_id, workbook_sha256, imported_at_utc, row_count
+               ) values (
                    'review-eth', 'sel-eth', 'review-eth-hash', ?, 1
                )""",
             [datetime(2026, 10, 6, tzinfo=timezone.utc)],
@@ -1115,7 +1133,7 @@ def test_full_delete_recovers_from_legacy_migrated_strategy_results_reference(ma
             "select count(*) from strategies where symbol = 'BTCUSDT'"
         ).fetchone() == (0,)
         assert result["table_counts"]["strategies"] == 1
-        assert connection.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("10",)
+        assert connection.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("11",)
         assert connection.execute(
             "select count(*) from information_schema.tables "
             "where table_schema = 'main' and table_name = '__performance_v2_v7_strategy_results'"
@@ -1134,7 +1152,7 @@ def test_legacy_recovery_rolls_back_compatibility_table_when_strategy_retry_fail
             "select count(*) from information_schema.tables "
             "where table_schema = 'main' and table_name = '__performance_v2_v7_strategy_results'"
         ).fetchone() == (0,)
-        assert connection.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("10",)
+        assert connection.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("11",)
 
 
 @pytest.mark.parametrize(

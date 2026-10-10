@@ -31,6 +31,7 @@ TABLES = (
     "import_files", "selection_runs", "selection_results",
     "selection_review_imports", "selection_review_rows", "strategy_tags",
     "optimizer_prepared_inputs", "equity_quality_metrics", "strategy_rejection_sources",
+    "selection_publications", "selection_publication_runs", "selection_aggregate_imports",
 )
 TABLE_LEADING_KEY = {
     "strategies": "strategy_id",
@@ -46,6 +47,9 @@ TABLE_LEADING_KEY = {
     "selection_results": "selection_run_id",
     "selection_review_imports": "review_import_id",
     "selection_review_rows": "review_import_id",
+    "selection_publications": "publication_id",
+    "selection_publication_runs": "publication_id",
+    "selection_aggregate_imports": "aggregate_import_id",
     "strategy_tags": "strategy_id",
     "optimizer_prepared_inputs": "result_id",
     "equity_quality_metrics": "result_id",
@@ -67,6 +71,9 @@ TABLE_PRIMARY_KEY = {
     "selection_results": ("selection_run_id", "strategy_id"),
     "selection_review_imports": ("review_import_id",),
     "selection_review_rows": ("review_import_id", "strategy_id"),
+    "selection_publications": ("publication_id",),
+    "selection_publication_runs": ("publication_id", "pair", "side", "role"),
+    "selection_aggregate_imports": ("aggregate_import_id",),
     "strategy_tags": ("strategy_id", "tag"),
     "optimizer_prepared_inputs": ("result_id",),
     "equity_quality_metrics": ("result_id", "algo_version"),
@@ -418,11 +425,17 @@ def _copy_table(
         table == "selection_results"
         and target_columns == (*columns, "equity_regime_json")
     )
-    if columns != target_columns and not legacy_selection_results:
+    legacy_aggregate_imports = (
+        table == "selection_review_imports"
+        and target_columns == (*columns, "aggregate_import_id")
+    )
+    if columns != target_columns and not (legacy_selection_results or legacy_aggregate_imports):
         raise ValueError(f"source/target column schema mismatch for {table}")
     selected = ", ".join(_ident(column) for column in target_columns)
     source_selected = ", ".join(_ident(column) for column in columns)
     if legacy_selection_results:
+        source_selected += ", NULL"
+    if legacy_aggregate_imports:
         source_selected += ", NULL"
     lead = _ident(TABLE_LEADING_KEY[table])
     copied = 0
@@ -513,7 +526,11 @@ def _verify_table(
         table == "selection_results"
         and target_columns == (*columns, "equity_regime_json")
     )
-    if columns != target_columns and not legacy_selection_results:
+    legacy_aggregate_imports = (
+        table == "selection_review_imports"
+        and target_columns == (*columns, "aggregate_import_id")
+    )
+    if columns != target_columns and not (legacy_selection_results or legacy_aggregate_imports):
         raise ValueError(f"source/target column schema mismatch for {table}")
     payload_index = columns.index("prepared_json") if table == PREPARED else -1
     typed_columns = tuple(column for index, column in enumerate(columns) if index != payload_index)
@@ -567,6 +584,10 @@ def _verify_table(
         "select count(*) from main.selection_results where equity_regime_json is not null"
     ).fetchone()[0]:
         raise ValueError("legacy selection snapshots were backfilled during v9 migration")
+    if legacy_aggregate_imports and connection.execute(
+        "select count(*) from main.selection_review_imports where aggregate_import_id is not null"
+    ).fetchone()[0]:
+        raise ValueError("legacy review imports were assigned aggregate lineage during v11 migration")
     _progress(callback, {"phase": "verify", "table": table, "rows": checked})
     return checked
 
@@ -761,8 +782,8 @@ def verify_existing_candidate(
 
         with duckdb.connect(str(source), read_only=True) as source_connection:
             source_version = require_performance_v2_readable(source_connection)
-            if source_version not in {8, 9, 10}:
-                raise ValueError("source schema version must be 8, 9 or 10")
+            if source_version not in {8, 9, 10, 11}:
+                raise ValueError("source schema version must be 8, 9, 10 or 11")
             _unknown_catalog_objects(source_connection)
             source_markers = _markers(source_connection)
             source_tables = _table_names(source_connection)
@@ -771,8 +792,8 @@ def verify_existing_candidate(
         with duckdb.connect(str(candidate), read_only=True) as connection:
             _configure_connection(connection, workers, spill)
             target_version = require_performance_v2_readable(connection)
-            if target_version not in {8, 9, 10} or target_version < source_version:
-                raise ValueError("candidate schema version must be 8, 9 or 10 and no older than source")
+            if target_version != 11:
+                raise ValueError("candidate schema version must be 11")
             _unknown_catalog_objects(connection)
             target_markers = _markers(connection)
             target_tables = _table_names(connection)
@@ -781,10 +802,15 @@ def verify_existing_candidate(
                 raise ValueError("source/candidate sequence state differs")
             if target_version == source_version and target_signature != source_signature:
                 raise ValueError("source/candidate catalog signatures differ")
+            expected_tables = set(source_tables)
             if target_version >= 9 and source_version == 8:
-                if target_tables != source_tables | {"strategy_rejection_sources"}:
-                    raise ValueError("source/candidate catalog tables differ")
-            elif target_tables != source_tables:
+                expected_tables.add("strategy_rejection_sources")
+            if target_version >= 11 and source_version < 11:
+                expected_tables.update({
+                    "selection_publications", "selection_publication_runs",
+                    "selection_aggregate_imports",
+                })
+            if target_tables != frozenset(expected_tables):
                 raise ValueError("source/candidate catalog tables differ")
             if target_markers != {**source_markers, "schema_version": str(target_version)}:
                 raise ValueError("database markers or instance identity differ")
@@ -969,10 +995,10 @@ def compact_performance_v2(
         if _commission_nullable(target) != ("NO" if source_version in {5, 6} else "YES"):
             raise ValueError("native schema copy changed commission_rate nullability")
         initialize_performance_v2(target, create_if_missing=False)
-        if require_performance_v2_readable(target) != 10:
-            raise ValueError("target did not reach schema version 10")
+        if require_performance_v2_readable(target) != 11:
+            raise ValueError("target did not reach schema version 11")
         if _commission_nullable(target) != "YES":
-            raise ValueError("target commission_rate is not nullable in schema version 10")
+            raise ValueError("target commission_rate is not nullable in schema version 11")
         target_signature = _catalog_signature(target)
         if any(int(target.execute(f"select count(*) from main.{_ident(table)}").fetchone()[0]) for table in TABLES):
             raise ValueError("target was not empty before migration")
@@ -991,11 +1017,11 @@ def compact_performance_v2(
 
         with duckdb.connect(str(stage), read_only=True) as check:
             _configure_connection(check, workers, spill)
-            if require_performance_v2_readable(check) != 10:
-                raise ValueError("candidate is not a readable v10 database")
+            if require_performance_v2_readable(check) != 11:
+                raise ValueError("candidate is not a readable v11 database")
             if _commission_nullable(check) != "YES":
-                raise ValueError("candidate commission_rate is not nullable in schema version 10")
-            if _markers(check) != {**source_markers, "schema_version": "10"}:
+                raise ValueError("candidate commission_rate is not nullable in schema version 11")
+            if _markers(check) != {**source_markers, "schema_version": "11"}:
                 raise ValueError("database markers were not preserved")
             if _catalog_signature(check) != target_signature:
                 raise ValueError("database catalog changed during compaction")
@@ -1048,7 +1074,7 @@ def compact_performance_v2(
             "source": {"path": str(source), **source_before, "sha256": source_hash_before, "wal": source_wal_before},
             "source_after": {**source_after, "sha256": source_hash_after, "wal": source_wal_after},
             "source_schema_version": source_version,
-            "target": {"path": str(output), **stage_stat, "sha256": target_hash, "schema_version": 10},
+            "target": {"path": str(output), **stage_stat, "sha256": target_hash, "schema_version": 11},
             "table_counts": counts,
             "verified_table_counts": verified_counts,
             "prepared": payload_stats,

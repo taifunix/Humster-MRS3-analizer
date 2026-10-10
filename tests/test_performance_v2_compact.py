@@ -23,7 +23,7 @@ def test_compact_refuses_existing_target(tmp_path: Path) -> None:
     assert target.read_bytes() == b"keep"
 
 
-def test_compact_copies_complete_small_v10_fixture(tmp_path: Path) -> None:
+def test_compact_copies_complete_small_v11_fixture(tmp_path: Path) -> None:
     from tests.test_performance_v2_selection import _candidate_db
 
     (tmp_path / "source").mkdir()
@@ -32,7 +32,7 @@ def test_compact_copies_complete_small_v10_fixture(tmp_path: Path) -> None:
     strategy_id, result_id = connection.execute(
         "select strategy_id, result_id from strategy_results"
     ).fetchone()
-    selection_run_id = "compact-v10-run"
+    selection_run_id = "compact-v11-run"
     instance_id = connection.execute(
         "select value from schema_info where key = 'database_instance_id'"
     ).fetchone()[0]
@@ -82,6 +82,7 @@ def test_compact_copies_complete_small_v10_fixture(tmp_path: Path) -> None:
             "import_files", "selection_runs", "selection_results",
             "selection_review_imports", "selection_review_rows", "strategy_tags",
             "optimizer_prepared_inputs", "equity_quality_metrics", "strategy_rejection_sources",
+            "selection_publications", "selection_publication_runs", "selection_aggregate_imports",
         )
     }
     connection.close()
@@ -91,8 +92,8 @@ def test_compact_copies_complete_small_v10_fixture(tmp_path: Path) -> None:
     report = compact_performance_v2(source, target, workers=2)
 
     assert report["source_stat_unchanged"] is True
-    assert report["source_schema_version"] == 10
-    assert report["target"]["schema_version"] == 10
+    assert report["source_schema_version"] == 11
+    assert report["target"]["schema_version"] == 11
     assert report["memory_limit"] == "16GB"
     assert report["table_counts"] == {name: int(count) for name, count in before.items()}
     assert report["verified_table_counts"] == report["table_counts"]
@@ -167,7 +168,7 @@ def test_compact_preserves_semantically_invalid_legacy_payload(tmp_path: Path) -
     assert decode_prepared_storage(target_payload) == legacy_payload
 
 
-def test_compact_migrates_empty_v6_schema_to_v10(tmp_path: Path) -> None:
+def test_compact_migrates_empty_v6_schema_to_v11(tmp_path: Path) -> None:
     from tests.test_performance_v2_store import _initialize_v6_fixture
 
     source = tmp_path / "source.duckdb"
@@ -178,7 +179,61 @@ def test_compact_migrates_empty_v6_schema_to_v10(tmp_path: Path) -> None:
     report = compact_performance_v2(source, target, workers=1)
 
     assert report["source_schema_version"] == 6
-    assert report["target"]["schema_version"] == 10
+    assert report["target"]["schema_version"] == 11
+
+
+def test_compact_migrates_v10_source_and_keeps_legacy_review_unlinked(tmp_path: Path) -> None:
+    from tests.test_performance_v2_store import (
+        _insert_migration_selection_run,
+        _prepare_v10_migration_fixture,
+    )
+    from mrs3.performance_v2_store import require_performance_v2_readable
+
+    source = tmp_path / "source-v10.duckdb"
+    with duckdb.connect(str(source)) as connection:
+        _prepare_v10_migration_fixture(connection)
+        _insert_migration_selection_run(connection, "compact-v10-run")
+        connection.execute(
+            "insert into selection_review_imports values ('compact-v10-review', 'compact-v10-run', 'compact-hash', now(), 1)"
+        )
+        assert require_performance_v2_readable(connection) == 10
+    target = tmp_path / "target-v11.duckdb"
+
+    report = compact_performance_v2(source, target, workers=1)
+
+    assert report["source_schema_version"] == 10
+    assert report["target"]["schema_version"] == 11
+    with duckdb.connect(str(source), read_only=True) as original:
+        assert require_performance_v2_readable(original) == 10
+    with duckdb.connect(str(target), read_only=True) as compacted:
+        assert require_performance_v2_readable(compacted) == 11
+        assert compacted.execute(
+            "select aggregate_import_id from selection_review_imports where review_import_id = 'compact-v10-review'"
+        ).fetchone() == (None,)
+        assert compacted.execute("select count(*) from selection_publications").fetchone() == (0,)
+
+    verified_output = tmp_path / "verified-v10-to-v11.duckdb"
+    verified = compact_module.verify_existing_candidate(
+        source, target, verified_output, workers=1,
+    )
+    assert verified["source_schema_version"] == 10
+    assert verified["candidate_schema_version"] == 11
+    assert verified["verified_table_counts"]["selection_review_imports"] == 1
+
+
+def test_verify_candidate_requires_v11_target_for_v10_source(tmp_path: Path) -> None:
+    from tests.test_performance_v2_store import _prepare_v10_migration_fixture
+
+    source = tmp_path / "source-v10.duckdb"
+    with duckdb.connect(str(source)) as connection:
+        _prepare_v10_migration_fixture(connection)
+    candidate = tmp_path / "candidate-v10.duckdb"
+    shutil.copyfile(source, candidate)
+
+    with pytest.raises(ValueError, match="candidate schema version must be 11"):
+        compact_module.verify_existing_candidate(
+            source, candidate, workers=1, spill_parent=tmp_path, smoke_ranges=1,
+        )
 
 
 def test_compact_accepts_v5_commission_rate_not_nullability(tmp_path: Path) -> None:
@@ -195,11 +250,11 @@ def test_compact_accepts_v5_commission_rate_not_nullability(tmp_path: Path) -> N
             "where table_name = 'strategy_results' and column_name = 'commission_rate'"
         ).fetchone() == ("NO",)
 
-    target = tmp_path / "target-v10.duckdb"
+    target = tmp_path / "target-v11.duckdb"
     report = compact_performance_v2(source, target, workers=1)
 
     assert report["source_schema_version"] == 5
-    assert report["target"]["schema_version"] == 10
+    assert report["target"]["schema_version"] == 11
     with duckdb.connect(str(source), read_only=True) as connection:
         assert require_performance_v2_readable(connection) == 5
         assert connection.execute(
@@ -259,17 +314,17 @@ def test_compact_migrates_v8_selection_rows_without_backfill(tmp_path: Path) -> 
         metrics_before = connection.execute("select * from equity_quality_metrics").fetchall()
         assert len(selection_before) == 1
 
-    target = tmp_path / "target-v10.duckdb"
+    target = tmp_path / "target-v11.duckdb"
     report = compact_performance_v2(source, target, workers=1)
 
     assert report["source_schema_version"] == 8
-    assert report["target"]["schema_version"] == 10
+    assert report["target"]["schema_version"] == 11
     assert report["table_counts"]["selection_results"] == 1
     assert report["verified_table_counts"]["selection_results"] == 1
     assert report["table_counts"]["strategy_rejection_sources"] == 0
     assert report["verified_table_counts"]["strategy_rejection_sources"] == 0
     with duckdb.connect(str(target), read_only=True) as connection:
-        assert require_performance_v2_readable(connection) == 10
+        assert require_performance_v2_readable(connection) == 11
         assert connection.execute("select * from selection_results").fetchall() == [
             (*selection_before[0], None)
         ]

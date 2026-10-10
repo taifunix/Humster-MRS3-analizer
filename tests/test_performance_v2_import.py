@@ -936,7 +936,10 @@ def test_replace_preserves_user_finalist_status_rank_and_comment(tmp_path: Path)
             [now],
         )
         connection.execute(
-            "insert into selection_review_imports values ('review-1', 'selection-1', 'd', ?, 1)", [now]
+            "insert into selection_review_imports "
+            "(review_import_id, selection_run_id, workbook_sha256, imported_at_utc, row_count) "
+            "values ('review-1', 'selection-1', 'd', ?, 1)",
+            [now],
         )
         connection.execute(
             "insert into selection_review_rows values ('review-1', ?, 'FINALIST', 1, null, 'keep this')",
@@ -2210,9 +2213,12 @@ def test_import_migrates_existing_v4_target_before_current_schema_gate(tmp_path:
 
     assert result.status == "COMMITTED"
     with duckdb.connect(str(target), read_only=True) as connection:
+        from mrs3.performance_v2_store import require_performance_v2_readable
+
+        assert require_performance_v2_readable(connection) == 11
         assert connection.execute(
             "select value from schema_info where key = 'schema_version'"
-        ).fetchone() == ("9",)
+        ).fetchone() == ("11",)
 
 
 def test_bare_duckdb_target_is_not_initialized_by_import(tmp_path: Path) -> None:
