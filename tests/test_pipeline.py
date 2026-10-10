@@ -364,6 +364,38 @@ def test_pipeline_monthly_event_count_sums_points_without_deduplicating_ids() ->
     ).hexdigest()
 
 
+def test_pipeline_exact_monthly_rates_floor_the_plateau_sum_not_each_point() -> None:
+    points = pd.DataFrame([
+        {"point_id": "A", "event_mode": "real_independent_events", "_event_ids": ("a",), "events_last_30d": Decimal("9.6")},
+        {"point_id": "B", "event_mode": "real_independent_events", "_event_ids": ("b",), "events_last_30d": Decimal("10.5")},
+    ])
+    plateaus = pd.DataFrame([{
+        "plateau_id": "P1", "all_point_ids": ("A", "B"), "status": "MRS3_USABLE", "ready": True,
+    }])
+
+    result = _apply_package_event_unions(points, plateaus)
+
+    # 9.6 + 10.5 = 20.1 -> 20; flooring each point first would give 19.
+    assert result.loc[0, "plateau_event_count"] == 20
+    assert bool(result.loc[0, "ready"])
+
+
+@pytest.mark.parametrize("bad", [Decimal("-0.5"), Decimal("NaN"), Decimal("Infinity"), 2.5])
+def test_pipeline_rejects_invalid_or_inexact_monthly_rates(bad: object) -> None:
+    points = pd.DataFrame([
+        {"point_id": "A", "event_mode": "real_independent_events", "_event_ids": ("a",), "events_last_30d": bad},
+    ])
+    plateaus = pd.DataFrame([{
+        "plateau_id": "P1", "all_point_ids": ("A",), "status": "MRS3_USABLE", "ready": True,
+    }])
+
+    result = _apply_package_event_unions(points, plateaus)
+
+    assert pd.isna(result.loc[0, "plateau_event_count"])
+    assert result.loc[0, "status"] == "INSUFFICIENT_INDEPENDENT_EVENTS"
+    assert not bool(result.loc[0, "ready"])
+
+
 def test_pipeline_monthly_event_scalar_invalidates_only_its_plateau() -> None:
     points = pd.DataFrame([
         {

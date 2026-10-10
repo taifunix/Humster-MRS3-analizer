@@ -4,6 +4,7 @@ from dataclasses import asdict, dataclass, fields, is_dataclass
 from decimal import Decimal
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import shutil
@@ -483,10 +484,16 @@ def _apply_package_event_unions(
         zip(points["point_id"].astype(str), points["_event_ids"], strict=True)
     )
     has_monthly_counts = "events_last_30d" in points
-    recent_events: dict[str, int] = {}
+    recent_events: dict[str, int | Decimal] = {}
     if has_monthly_counts:
         for row in points.itertuples(index=False):
             value = row.events_last_30d
+            # CSV Direct has no trade timestamps, only an exact Decimal rate
+            # per 30 days; the plateau sum is floored once, never per point.
+            if isinstance(value, Decimal):
+                if value.is_finite() and value >= 0:
+                    recent_events[str(row.point_id)] = value
+                continue
             if (
                 isinstance(value, bool)
                 or not isinstance(value, Real)
@@ -515,7 +522,7 @@ def _apply_package_event_unions(
             plateau_counts.append(
                 None
                 if invalid
-                else sum(recent_events[point_id] for point_id in member_ids)
+                else math.floor(sum(recent_events[point_id] for point_id in member_ids))
             )
         output["plateau_event_count"] = plateau_counts
         output.loc[invalid_plateaus, "status"] = "INSUFFICIENT_INDEPENDENT_EVENTS"
