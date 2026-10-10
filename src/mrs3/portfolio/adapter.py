@@ -64,7 +64,7 @@ PORTFOLIO_INPUT_GEOMETRY_INVALID = "PORTFOLIO_INPUT_GEOMETRY_INVALID"
 _WEIGHTED_SEARCH_CONFIG_INVALID = "WEIGHTED_SEARCH_CONFIG_INVALID"
 _LEGACY_PROFILE_FIELD_UNSUPPORTED = "LEGACY_PROFILE_FIELD_UNSUPPORTED"
 COMPOSITION_SELECTION_UNAVAILABLE = "COMPOSITION_SELECTION_UNAVAILABLE"
-COMPOSITION_SELECTION_MILP = "COMPOSITION_SELECTION_MILP"
+COMPOSITION_SELECTION_FRONTIER = "COMPOSITION_SELECTION_FRONTIER"
 
 
 class CampaignContractError(ValueError):
@@ -691,45 +691,47 @@ def _milp_union_inputs(
     )
 
 
-def _milp_ranked_compositions(
+def _milp_frontier_compositions(
     slots: Sequence[tuple[str, str, Sequence[Mapping[str, Any]]]],
     union: _MilpUnion,
     campaign: Mapping[str, Any],
     profile: Mapping[str, Any],
     *,
-    limit: int,
+    levels: int,
     progress: Callable[[Mapping[str, Any]], Any] | None = None,
-) -> tuple[tuple[Mapping[str, Any], ...], ...]:
-    """Rank one profile's finalist compositions by the union MILP.
+) -> tuple[tuple[tuple[Mapping[str, Any], ...], Decimal], ...]:
+    """Return one profile's bank-ladder frontier as (composition rows, bank level).
 
-    The ranking is a selector only: every returned composition is still
-    evaluated by the exact single-composition path.
+    The frontier is a selector only: every returned composition is evaluated by
+    the exact single-composition path with its own bank level as the ceiling.
     """
     weighted_search_module = importlib.import_module(".weighted_search", __package__)
     policy = _frozen_profile_risk(campaign, str(profile["profile_id"]))
     search = campaign["config_document"]["search"]
-    ranked = weighted_search_module.rank_slot_compositions(
+    raw_bank = profile.get("bank_available_usdt")
+    points = weighted_search_module.slot_composition_frontier(
         union.delta,
         union.caps,
         union.slots,
         max_dd=policy["max_actual_equity_dd_pct"] / Decimal("100"),
         common_days=union.common_days,
-        bank_available=profile.get("bank_available_usdt"),
+        bank_available=None if raw_bank is None else _weighted_decimal(raw_bank),
         margin_a=union.margin_a,
         margin_b=union.margin_b,
         max_mm_load=policy["max_calculated_account_mm_load_pct"] / Decimal("100"),
-        limit=limit,
+        levels=levels,
         time_limit=search["weighted_search"]["wall_time_seconds"],
         progress=progress,
     )
-    compositions = []
-    for item in ranked:
-        chosen = {position: union.strategy_of[column] for position, column in zip(union.slot_positions, item.choice)}
-        compositions.append(tuple(
+    frontier = []
+    for point in points:
+        chosen = {position: union.strategy_of[column] for position, column in zip(union.slot_positions, point.choice)}
+        composition = tuple(
             next(row for row in rows if row["strategy_id"] == chosen[position]) if position in chosen else rows[0]
             for position, (_symbol, _side, rows) in enumerate(slots)
-        ))
-    return tuple(compositions)
+        )
+        frontier.append((composition, point.bank_limit))
+    return tuple(frontier)
 
 
 def _weighted_geometry_int(value: Any, *, minimum: int) -> int:
@@ -1126,6 +1128,11 @@ def _run_weighted_search(
         }
         if "max_candidates" in launch_profile:
             kwargs["max_candidates"] = launch_profile["max_candidates"]
+        if launch_profile.get("frontier_bank_usdt") is not None:
+            frontier_bank = _weighted_decimal(launch_profile["frontier_bank_usdt"])
+            if frontier_bank <= 0:
+                raise CampaignContractError(_WEIGHTED_SEARCH_CONFIG_INVALID)
+            kwargs["lp_bank_limit"] = frontier_bank
         if progress_callback is not None:
             kwargs["progress_callback"] = progress_callback
     except CampaignContractError:
@@ -2291,7 +2298,9 @@ def build_portfolio_candidates(
     add_excluded(spread_excluded)
     warnings: list[str] = []
     failures: dict[tuple[str, str], int] = {}
-    allowed_failures = {"NO_POSITIVE_TARGET", "LP_INFEASIBLE", "FRONTIER_INFEASIBLE", "TARGET_INFEASIBLE"}
+    # A frontier level whose exact stress/margin bank exceeds the profile ceiling
+    # is skipped like an infeasible level, not a Campaign failure.
+    allowed_failures = {"NO_POSITIVE_TARGET", "LP_INFEASIBLE", "FRONTIER_INFEASIBLE", "TARGET_INFEASIBLE", "BANK_UNAVAILABLE"}
 
     def metric_for(item: Mapping[str, Any], *names: str) -> Decimal:
         metrics = item.get("metrics")
@@ -2310,62 +2319,61 @@ def build_portfolio_candidates(
         raise CampaignContractError(WEIGHTED_CANDIDATE_SHAPE_INVALID)
 
     work: list[tuple[Mapping[str, Any], tuple[Mapping[str, Any], ...]]] = []
-    if combination_count <= max_combinations:
-        work.extend((campaign, tuple(choices)) for choices in product(*(rows for _symbol, _side, rows in slots)))
-    else:
-        def selection_failure(error: Exception) -> AdapterResult:
-            if isinstance(error, CampaignContractError):
-                code = error.code
-            elif isinstance(error, ValueError) and str(error).replace("_", "").isalnum() and str(error).isupper():
-                code = str(error)
-            else:
-                code = type(error).__name__
-            return AdapterResult(
-                "FAIL",
-                excluded=tuple(excluded),
-                blockers=(f"{COMPOSITION_SELECTION_UNAVAILABLE}:{code}",),
-                diagnostics={"combination_count": combination_count, "combination_limit": max_combinations},
-            )
+
+    def selection_failure(error: Exception) -> AdapterResult:
+        if isinstance(error, CampaignContractError):
+            code = error.code
+        elif isinstance(error, ValueError) and str(error).replace("_", "").isalnum() and str(error).isupper():
+            code = str(error)
+        else:
+            code = type(error).__name__
+        return AdapterResult(
+            "FAIL",
+            excluded=tuple(excluded),
+            blockers=(f"{COMPOSITION_SELECTION_UNAVAILABLE}:{code}",),
+            diagnostics={"combination_count": combination_count, "combination_limit": max_combinations},
+        )
+
+    try:
+        union = _milp_union_inputs(
+            slots,
+            campaign,
+            capacities=capacities,
+            reference=reference,
+            mark_prices=mark_prices,
+            now_ms=now_ms,
+            margin_coefficients=margin_coefficients,
+        )
+    except Exception as error:
+        return selection_failure(error)
+    selection_progress = _progress_sink(progress_callback)
+    for profile_id, profile in profiles_by_id.items():
+
+        def solve_progress(event: Mapping[str, Any], profile_id: str = profile_id) -> None:
+            if selection_progress is not None:
+                selection_progress({
+                    "substage": "COMPOSITION_SELECTION",
+                    "unit": "composition",
+                    "completed": event["completed"],
+                    "total": event["total"],
+                    "detail": f"profile {profile_id} MILP solve {event['completed']}",
+                })
 
         try:
-            union = _milp_union_inputs(
+            frontier = _milp_frontier_compositions(
                 slots,
+                union,
                 campaign,
-                capacities=capacities,
-                reference=reference,
-                mark_prices=mark_prices,
-                now_ms=now_ms,
-                margin_coefficients=margin_coefficients,
+                profile,
+                levels=profile["max_candidates"],
+                progress=solve_progress,
             )
         except Exception as error:
             return selection_failure(error)
-        selection_progress = _progress_sink(progress_callback)
-        for profile_id, profile in profiles_by_id.items():
-            profile_campaign = {**campaign, "launch": {**launch, "profiles": (profile,)}}
-
-            def solve_progress(event: Mapping[str, Any], profile_id: str = profile_id) -> None:
-                if selection_progress is not None:
-                    selection_progress({
-                        "substage": "COMPOSITION_SELECTION",
-                        "unit": "composition",
-                        "completed": event["completed"],
-                        "total": event["total"],
-                        "detail": f"profile {profile_id} MILP solve {event['completed']}",
-                    })
-
-            try:
-                ranked = _milp_ranked_compositions(
-                    slots,
-                    union,
-                    profile_campaign,
-                    profile,
-                    limit=min(combination_count, 2 * profile["max_candidates"]),
-                    progress=solve_progress,
-                )
-            except Exception as error:
-                return selection_failure(error)
-            work.extend((profile_campaign, composition) for composition in ranked)
-        warnings.append(f"{COMPOSITION_SELECTION_MILP}:COMBINATIONS={combination_count};EVALUATED={len(work)}")
+        for composition, bank_limit in frontier:
+            level_profile = {**profile, "frontier_bank_usdt": bank_limit}
+            work.append(({**campaign, "launch": {**launch, "profiles": (level_profile,)}}, composition))
+    warnings.append(f"{COMPOSITION_SELECTION_FRONTIER}:COMBINATIONS={combination_count};LEVELS={len(work)}")
 
     for ordinal, (work_campaign, composition) in enumerate(work):
         composition_identity = tuple(
@@ -2414,7 +2422,23 @@ def build_portfolio_candidates(
                 failures[(profile_id, reason)] = failures.get((profile_id, reason), 0) + 1
             if not result.variants:
                 continue
+        # One portfolio per frontier level: its best variant only, so variants
+        # of the top levels cannot crowd the lower levels out of max_candidates.
+        level_best: dict[str, Mapping[str, Any]] = {}
         for variant in result.variants:
+            profile_key = str(variant.get("profile_id", ""))
+            current = level_best.get(profile_key)
+            if current is None or (
+                -metric_for(variant, "p30_common_usdt_30d", "p30_common"),
+                metric_for(variant, "cdar_peak80_usdt", "cdar_peak80"),
+                str(variant.get("identity", "")),
+            ) < (
+                -metric_for(current, "p30_common_usdt_30d", "p30_common"),
+                metric_for(current, "cdar_peak80_usdt", "cdar_peak80"),
+                str(current.get("identity", "")),
+            ):
+                level_best[profile_key] = variant
+        for variant in level_best.values():
             profile_id = str(variant.get("profile_id", ""))
             item = dict(variant)
             item["composition_ordinal"] = ordinal

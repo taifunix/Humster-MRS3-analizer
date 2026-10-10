@@ -44,6 +44,38 @@ ETA. Next step: restart Panel to load the code, then rerun the
 full-universe Campaign. No PerformanceDB or
 tester was used.
 
+## Portfolio bank-ladder frontier (2026-10-10)
+
+Stage 1 now returns, per profile, up to `max_candidates` genuinely different
+portfolios. Each is the MILP-optimal choice of finalists and weights for one
+bank level across all compositions, then exactly evaluated. This replaces
+both the exhaustive enumeration and the top-K MILP ranking, which produced
+near-copies. Decision: [ADR-0067](docs/decisions/0067-portfolio-bank-ladder-frontier.md);
+contract: the 2026-10-10 frontier amendment in the
+[UI spec](docs/specs/2026-09-06-portfolio-optimizer-panel-ui.md).
+
+The same change fixes three issues found on real data:
+- binding bank ceilings failed exact LPs with `BANK_UNAVAILABLE`;
+- a MILP on the default HiGHS thread count broke every later LP in the
+  process with "Status 0: Not Set";
+- scaled zero weights (`0E-90`) failed payloads.
+
+Real evidence: the full universe (61 pairs, 117 finalists, 4·10^14
+compositions, AGGRESSIVE, bank 1600) SUCCEEDED in 16 min with 10 monotone
+candidates. Margin bank went 715 → 71, P30 1643 → 360, members 61 → 9.
+
+Walk-forward check (14 days in-sample, 7 out): returns hold out of sample. In
+this data the margin constraint binds rather than drawdown, so lower levels
+concentrate. Their out-of-sample P30/maxDD (57 → 12) is worse than
+proportionally scaling the full portfolio (60). The ladder is therefore
+"maximum P30 per margin budget", not a minimum-risk frontier. A
+min-CDaR-at-target-P30 mode was prototyped and kept diversification, with
+out-of-sample P30/maxDD 38–61. It is recorded as a future option in the
+optimizer spec (Phase 4).
+
+Verification: portfolio suites 593 passed; independent review and re-review
+passed.
+
 ## Portfolio Stage 1 throughput and hang fix (2026-10-10)
 
 Three reviewed infrastructure changes. Contracts: the 2026-10-10 amendments in

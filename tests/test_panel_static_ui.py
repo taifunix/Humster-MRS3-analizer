@@ -3798,8 +3798,7 @@ def test_portfolio_form_shows_live_combination_count_and_selection_mode() -> Non
     assert "portfolioCombinationCount(launch.selectedPairs)" in controls
     assert "Number.isSafeInteger(value) && value > 0" in portfolio
     assert "portfolioCombinationFactor(row.long, row.finalistLong)" in portfolio
-    assert "state.readiness?.combination_limit" in controls
-    assert "MILP" in controls
+    assert "MILP-фронтир по уровням банка" in controls
     assert "#portfolio-combination-count" in controls
 
 

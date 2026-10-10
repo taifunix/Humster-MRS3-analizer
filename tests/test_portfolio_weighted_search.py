@@ -4886,3 +4886,110 @@ def test_weighted_search_marks_same_x_neighbor_variants_as_limiter_and_is_repeat
     assert first.manifest["shortlist"]["selected_identities"] == second.manifest["shortlist"]["selected_identities"]
     assert first.manifest["shortlist"]["selected_origins"] == second.manifest["shortlist"]["selected_origins"]
     assert first.manifest["shortlist"]["selected_origins"] == ("scale", "limiter", "limiter")
+
+
+def test_maximize_with_a_binding_bank_ceiling_scales_float_excess_back_inside_the_ceiling() -> None:
+    import random as _random
+
+    rng = _random.Random(3)
+    drift = [rng.uniform(0.00002, 0.0004) for _ in range(4)]
+    rows = tuple(tuple(Decimal(str(round(rng.gauss(drift[c], 0.004), 8))) for c in range(4)) for _ in range(576))
+    caps = (Decimal(200), Decimal(220), Decimal(120), Decimal(160))
+    coefficients = tuple(sum((row[c] for row in rows), Decimal(0)) * Decimal(30) / Decimal(2) for c in range(4))
+    bank = Decimal("38.71")
+
+    outcome = _solve_lp(
+        rows, caps, coefficients, max_dd=Decimal("0.2"), target=None, bank_available=bank,
+        maximize=True, symbol_cap_groups={},
+    )
+
+    assert outcome.status == "PASS", outcome.reason
+    assert outcome.solution.bank <= bank
+    path = tuple(sum(row[c] * outcome.solution.x[c] for c in range(4)) for row in rows)
+    cumulative = []
+    total = Decimal(0)
+    for value in path:
+        total += value
+        cumulative.append(total)
+    assert bank_for_path(cumulative, Decimal("0.2")) <= bank
+
+
+@pytest.mark.parametrize(
+    ("bank_available", "lp_bank_limit", "expected_lp_bank"),
+    ((Decimal("100"), Decimal("10"), Decimal("10")), (None, Decimal("10"), Decimal("10")), (Decimal("5"), Decimal("10"), Decimal("5"))),
+)
+def test_lp_bank_limit_bounds_only_the_discovery_lp(monkeypatch, bank_available, lp_bank_limit, expected_lp_bank) -> None:
+    module = importlib.import_module("mrs3.portfolio.weighted_search")
+    observed = []
+    real_solve = module._solve_lp
+
+    def capture(*args, **kwargs):
+        observed.append((kwargs["bank_available"], kwargs["maximize"], kwargs["target"]))
+        return real_solve(*args, **kwargs)
+
+    monkeypatch.setattr(module, "_solve_lp", capture)
+    rows = tuple(("0.01", "0.02") if index % 3 else ("-0.01", "0.01") for index in range(10))
+    weighted_search(
+        _prepared(rows), {1: Decimal("100"), 2: Decimal("100")},
+        members=({"strategy_id": 1, "symbol": "A", "side": "LONG"}, {"strategy_id": 2, "symbol": "B", "side": "LONG"}),
+        max_dd=Decimal("0.2"), bank_available=bank_available, lp_bank_limit=lp_bank_limit,
+        bootstrap_scenarios=4, screening_scenarios=2, max_candidates=1,
+    )
+
+    assert observed[0] == (expected_lp_bank, True, None)
+
+
+def test_lp_bank_limit_must_be_positive() -> None:
+    with pytest.raises(ValueError):
+        weighted_search(
+            _prepared((("0.01", "0.02"),) * 4), {1: Decimal("1"), 2: Decimal("1")},
+            members=({"strategy_id": 1, "symbol": "A", "side": "LONG"}, {"strategy_id": 2, "symbol": "B", "side": "LONG"}),
+            lp_bank_limit=Decimal("0"),
+        )
+
+
+def test_binding_bank_scaling_keeps_zero_weights_as_plain_zero() -> None:
+    import random as _random
+
+    rng = _random.Random(3)
+    drift = [rng.uniform(0.00002, 0.0004) for _ in range(4)] + [-0.01]
+    rows = tuple(tuple(Decimal(str(round(rng.gauss(drift[c], 0.004), 8))) for c in range(5)) for _ in range(576))
+    caps = (Decimal(200), Decimal(220), Decimal(120), Decimal(160), Decimal(100))
+    coefficients = tuple(sum((row[c] for row in rows), Decimal(0)) * Decimal(30) / Decimal(2) for c in range(5))
+
+    outcome = _solve_lp(
+        rows, caps, coefficients, max_dd=Decimal("0.2"), target=None, bank_available=Decimal("38.71"),
+        maximize=True, symbol_cap_groups={},
+    )
+
+    assert outcome.status == "PASS", outcome.reason
+    assert outcome.solution.x[4] == 0
+    # Persisted money values are bounded to |adjusted| <= 38; a scaled zero must not become 0E-90.
+    assert all(value.is_zero() and value.as_tuple().exponent == 0 or abs(value.adjusted()) <= 38 for value in outcome.solution.x)
+
+
+def test_lp_bank_limit_bounds_the_limiter_post_variant_bank(monkeypatch) -> None:
+    # The CDaR branch budgets at its source candidate's own full bank (here equal to the level).
+    module = importlib.import_module("mrs3.portfolio.weighted_search")
+    prepared, members, coefficients = _additional_search_fixture()
+    banks: list[Decimal] = []
+    monkeypatch.setattr(module, "_solve_lp", lambda *args, **kwargs: module._SolveOutcome(
+        "PASS", _Solution(Decimal("10"), (Decimal("1"), Decimal("1")))
+    ))
+
+    def additional(*args, **kwargs):
+        banks.append(kwargs["bank_fixed"])
+        return module._SolveOutcome("PASS", _Solution(kwargs["bank_fixed"], (Decimal("2"), Decimal("0"))))
+
+    monkeypatch.setattr(module, "_solve_additional_lp", additional)
+    monkeypatch.setattr(module, "_solve_cdar80_lp", additional)
+
+    weighted_search(
+        prepared, (Decimal("100"), Decimal("100")), members=members, common_days=Decimal("1"),
+        bank_available=Decimal("100"), lp_bank_limit=Decimal("10"),
+        margin_coefficients=coefficients,
+        margin_kwargs={"L": 0, "limiter_release_status": "UNKNOWN", "priorities": (5, 1)},
+        bootstrap_scenarios=1, screening_scenarios=1, max_candidates=4,
+    )
+
+    assert banks and all(bank <= Decimal("10") for bank in banks), banks

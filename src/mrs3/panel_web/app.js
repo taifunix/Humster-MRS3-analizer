@@ -4667,9 +4667,7 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
         const combinationNode = query('#portfolio-combination-count');
         if (combinationNode) {
           const combinations = launch.selectedPairs.length ? portfolioCombinationCount(launch.selectedPairs) : 0n;
-          const limit = state.readiness?.combination_limit;
-          const mode = !Number.isSafeInteger(limit) || combinations === 0n ? '' : (combinations <= BigInt(limit) ? ' · точный перебор всех составов' : ' · больше лимита: MILP-отбор лучших составов (до 2 × «Максимум кандидатов» на профиль), затем их точный расчёт');
-          combinationNode.textContent = combinations === 0n ? '' : `Комбинаций: ${combinations.toLocaleString('ru-RU')}${Number.isSafeInteger(limit) ? ` · лимит точного перебора: ${limit.toLocaleString('ru-RU')}` : ''}${mode}`;
+          combinationNode.textContent = combinations === 0n ? '' : `Комбинаций финалистов: ${combinations.toLocaleString('ru-RU')} · отбор: MILP-фронтир по уровням банка — до «Максимум кандидатов» разных портфелей на профиль, каждый с точным расчётом`;
         }
         const jobTerminal = terminal(state.job);
         if (prepareButton) { prepareButton.textContent = preparationState === 'READY' ? 'Готово' : (preparationState === 'ERROR' ? 'Повторить' : 'Подготовить данные финалистов'); prepareButton.disabled = state.locked || preparationState === 'READY' || preparationState === 'PREPARING'; }

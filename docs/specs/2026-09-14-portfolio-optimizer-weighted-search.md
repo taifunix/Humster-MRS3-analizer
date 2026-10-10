@@ -549,3 +549,18 @@ Measured on the real 61-pair snapshot and a 81-strategy synthetic composition.
   pool, still `duckdb_import.workers` wide, for every bootstrap of the
   Campaign. This matches §9 "one compute pool". Measured: one composition
   takes 49 s → 17 s with the file context, and about 12 s with the shared pool.
+- **Binding bank ceiling.** In maximize mode a binding `bank_available` leaves
+  the LP on the bound. Float noise could then put the exact Decimal requirement
+  a tolerance above it and fail with `BANK_UNAVAILABLE`. Path and margin
+  requirements are linear in `x`, so `x` is scaled back inside the ceiling
+  (factor ≤ 1, with a 1e-12 margin). Larger excesses still fail. Zero weights
+  stay a plain `0`: a scaled `0E-90` exceeded the ±38 money exponent bound and
+  failed the payload with `WEIGHTED_PAYLOAD_INVALID`.
+- **Frontier level budget.** `lp_bank_limit` bounds the discovery LP and
+  the limiter post-variant `bank_fixed`. CDaR post-variants keep the source
+  candidate's own full bank. Acceptance still uses `bank_available` and the
+  full historical/stress/margin bank.
+- **HiGHS threads.** The composition MILP runs with `threads=1`, like the
+  exact LPs. HiGHS keeps one process-wide scheduler, and a MILP on the default
+  thread count made every later LP in the process fail with
+  "HiGHS Status 0: Not Set".

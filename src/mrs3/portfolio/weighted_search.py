@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, fields
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation, localcontext
+from decimal import ROUND_CEILING, Decimal, InvalidOperation, localcontext
 from fractions import Fraction
 import hashlib
 import json
@@ -1663,11 +1663,26 @@ def _solve_lp_unchecked(
                 **metadata,
             )
         if bank_available is not None and authoritative_bank > bank_available:
-            return _SolveOutcome(
-                "ERROR",
-                reason="BANK_UNAVAILABLE",
-                **metadata,
-            )
+            # A binding ceiling leaves the LP exactly on the bound; float noise can
+            # put the exact requirement a tolerance above it. Path and margin
+            # requirements are linear in x, so shrink x back inside the ceiling.
+            scale = bank_available / authoritative_bank * (Decimal(1) - Decimal("1e-12"))
+            raw_x = tuple(value * scale if value else Decimal(0) for value in raw_x)
+            scaled_margin = Decimal(1)
+            if margin_coefficients is not None:
+                margin_a_values, margin_b_values, mm_load = margin_coefficients
+                scaled_margin = max(
+                    Decimal(1),
+                    _sum_products(margin_a_values, raw_x) / one_minus,
+                    _sum_products(margin_b_values, raw_x) / (mm_load * one_minus),
+                )
+            authoritative_bank = max(Decimal(1), bank_for_path(_path(normalized_delta, raw_x), max_dd), scaled_margin)
+            if authoritative_bank > bank_available:
+                return _SolveOutcome(
+                    "ERROR",
+                    reason="BANK_UNAVAILABLE",
+                    **metadata,
+                )
         p30 = _sum_products(coefficients, raw_x)
         if target is not None and p30 < target - _solver_tolerance(p30, target):
             return _SolveOutcome(
@@ -1691,42 +1706,50 @@ def _solve_lp(*args: Any, **kwargs: Any) -> _SolveOutcome:
 
 
 @dataclass(frozen=True, slots=True)
-class RankedComposition:
-    """One slot choice from the composition MILP, best LP objective first."""
+class FrontierPoint:
+    """One bank level of the composition frontier, highest bank first."""
 
     choice: tuple[int, ...]
     p30: Decimal
+    bank_limit: Decimal
     active: tuple[int, ...] = ()
     proven_optimal: bool = True
 
 
-def rank_slot_compositions(
+@dataclass(slots=True)
+class _CompositionModel:
+    rows: list[int]
+    columns: list[int]
+    values: list[float]
+    upper: list[float]
+    lower: list[float]
+    objective: np.ndarray
+    lb: np.ndarray
+    ub: np.ndarray
+    integrality: np.ndarray
+    size: int
+    x_start: int
+    n: int
+    coefficients: tuple[Decimal, ...]
+    caps: tuple[Decimal, ...]
+    slots: tuple[tuple[int, ...], ...]
+    binary_of: Mapping[int, int]
+    time_limit: float
+
+
+def _composition_model(
     normalized_delta: Sequence[Sequence[Any]],
     capacities: Sequence[Any],
     slots: Sequence[Sequence[int]],
     *,
     max_dd: Any,
     common_days: Any,
-    bank_available: Any | None = None,
-    margin_a: Sequence[Any] | None = None,
-    margin_b: Sequence[Any] | None = None,
-    max_mm_load: Any | None = None,
-    limit: int,
-    time_limit: Any = Decimal("30"),
-    progress: Callable[[Mapping[str, Any]], Any] | None = None,
-) -> tuple[RankedComposition, ...]:
-    """Rank one-option-per-slot compositions by the discovery LP objective.
-
-    The model is the maximizing discovery LP of ``_solve_lp_unchecked`` over the
-    union of all slot options, plus one binary per option of a multi-option
-    slot: exactly one option is chosen per slot and an unchosen option has zero
-    weight. Each solution's positive-weight multi-option choices are excluded
-    by a no-good cut, so successive solves return the next best distinct
-    portfolio (not a zero-weight relabelling) until ``limit`` or exhaustion.
-    A time-limited solve keeps its feasible incumbent (``proven_optimal`` is
-    false) and ends the ranking; no solution at all raises
-    ``COMPOSITION_SELECTION_NO_SOLUTION``.
-    """
+    margin_a: Sequence[Any] | None,
+    margin_b: Sequence[Any] | None,
+    max_mm_load: Any | None,
+    time_limit: Any,
+) -> _CompositionModel:
+    """The discovery LP over the union of slot options plus one-per-slot binaries."""
     rows = tuple(tuple(_decimal(value, "normalized_delta") for value in row) for row in normalized_delta)
     caps = tuple(_decimal(value, "capacity", nonnegative=True) for value in capacities)
     n = len(caps)
@@ -1741,13 +1764,10 @@ def rank_slot_compositions(
         or sorted(flat) != list(range(n))
     ):
         raise ValueError("COMPOSITION_SLOTS_INVALID")
-    if type(limit) is not int or limit <= 0:
-        raise ValueError("COMPOSITION_LIMIT_INVALID")
     drawdown = _decimal(max_dd, "max_dd")
     if not Decimal(0) < drawdown < Decimal(1):
         raise ValueError("max_dd must be between zero and one")
     days = _decimal(common_days, "common_days", positive=True)
-    available = None if bank_available is None else _decimal(bank_available, "bank_available", positive=True)
     margin_coefficients = _validated_lp_margin_coefficients(margin_a, margin_b, max_mm_load, n)
     solver_time_limit = float(_decimal(time_limit, "time_limit", positive=True))
     coefficients = _coefficients(rows, n, days)
@@ -1788,57 +1808,172 @@ def rank_slot_compositions(
             a_values.extend([1.0] * len(slot))
             b_ub.append(1.0)
             lower.append(1.0)
-    c = np.zeros(size)
-    c[x_start:x_start + n] = [-float(value) for value in coefficients]
+    objective = np.zeros(size)
+    objective[x_start:x_start + n] = [-float(value) for value in coefficients]
     lb = np.zeros(size)
     ub = np.full(size, np.inf)
     lb[0] = 1.0
-    if available is not None:
-        ub[0] = float(available)
     ub[x_start:x_start + n] = [float(value) for value in caps]
     ub[z_start:] = 1.0
     integrality = np.zeros(size)
     integrality[z_start:] = 1
-    ranked: list[RankedComposition] = []
-    while len(ranked) < limit:
-        matrix = coo_matrix((a_values, (a_rows, a_columns)), shape=(len(b_ub), size), dtype=float).tocsr()
-        result = milp(
-            c,
-            constraints=LinearConstraint(matrix, np.asarray(lower), np.asarray(b_ub)),
-            bounds=Bounds(lb, ub),
-            integrality=integrality,
-            options={"time_limit": solver_time_limit, "mip_rel_gap": 1e-9},
+    return _CompositionModel(
+        a_rows, a_columns, a_values, b_ub, lower, objective, lb, ub, integrality, size,
+        x_start, n, coefficients, caps, slot_options, binary_of, solver_time_limit,
+    )
+
+
+def _solve_composition_model(
+    model: _CompositionModel,
+    *,
+    bank_limit: Decimal | None,
+    minimum_p30: Decimal | None = None,
+) -> Any:
+    """Maximize P30 under ``bank_limit``, or minimize the bank keeping ``minimum_p30``."""
+    rows, columns, values = list(model.rows), list(model.columns), list(model.values)
+    upper, lower = list(model.upper), list(model.lower)
+    objective = model.objective
+    if minimum_p30 is not None:
+        row_index = len(upper)
+        for index, coefficient in enumerate(model.coefficients):
+            rows.append(row_index)
+            columns.append(model.x_start + index)
+            values.append(float(coefficient))
+        lower.append(float(minimum_p30))
+        upper.append(np.inf)
+        objective = np.zeros(model.size)
+        objective[0] = 1.0
+    ub = model.ub.copy()
+    if bank_limit is not None:
+        ub[0] = float(bank_limit)
+    matrix = coo_matrix((values, (rows, columns)), shape=(len(upper), model.size), dtype=float).tocsr()
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=RuntimeWarning, message=r"Unrecognized options detected:.*threads")
+        # HiGHS keeps one process-wide thread scheduler. The exact LPs run with
+        # threads=1; a MILP on the default count would make every later LP in
+        # this process fail with "HiGHS Status 0: Not Set".
+        return milp(
+            objective,
+            constraints=LinearConstraint(matrix, np.asarray(lower), np.asarray(upper)),
+            bounds=Bounds(model.lb, ub),
+            integrality=model.integrality,
+            options={"time_limit": model.time_limit, "mip_rel_gap": 1e-9, "threads": 1},
         )
+
+
+def _composition_point(model: _CompositionModel, result: Any, bank_limit: Decimal) -> FrontierPoint:
+    values = result.x
+    choice = tuple(
+        slot[0] if len(slot) == 1 else max(slot, key=lambda column: (values[model.binary_of[column]], -column))
+        for slot in model.slots
+    )
+    x = tuple(
+        min(model.caps[column], max(Decimal(0), Decimal(str(values[model.x_start + column]))))
+        for column in range(model.n)
+    )
+    with localcontext() as context:
+        context.prec = _precision_for(model.coefficients, x)
+        p30 = _sum_products(model.coefficients, x)
+    active = tuple(
+        column for slot, column in zip(model.slots, choice)
+        if values[model.x_start + column] > 1e-7 * max(1.0, float(model.caps[column]))
+    )
+    return FrontierPoint(choice, p30, bank_limit, active, getattr(result, "status", None) == 0)
+
+
+def _frontier_weights(model: _CompositionModel, result: Any) -> np.ndarray:
+    return np.clip(np.asarray(result.x[model.x_start:model.x_start + model.n], dtype=float), 0.0, None)
+
+
+def slot_composition_frontier(
+    normalized_delta: Sequence[Sequence[Any]],
+    capacities: Sequence[Any],
+    slots: Sequence[Sequence[int]],
+    *,
+    max_dd: Any,
+    common_days: Any,
+    bank_available: Any | None = None,
+    margin_a: Sequence[Any] | None = None,
+    margin_b: Sequence[Any] | None = None,
+    max_mm_load: Any | None = None,
+    levels: int,
+    time_limit: Any = Decimal("30"),
+    progress: Callable[[Mapping[str, Any]], Any] | None = None,
+) -> tuple[FrontierPoint, ...]:
+    """Return the bank-ladder frontier of one-option-per-slot compositions.
+
+    A first MILP maximizes P30 under ``bank_available``; a second finds the
+    smallest bank keeping that P30 (``B_sat``). Each of ``levels`` banks
+    ``B_sat * k / levels`` then gets its own P30-maximizing MILP over every
+    composition, so lower levels drop or shrink members as the bank binds.
+    Points are returned highest bank first; a level with no solution is
+    skipped, and points within 1% (relative L1) of a kept point with the same
+    choice are dropped.
+    """
+    if type(levels) is not int or levels <= 0:
+        raise ValueError("FRONTIER_LEVELS_INVALID")
+    available = None if bank_available is None else _decimal(bank_available, "bank_available", positive=True)
+    model = _composition_model(
+        normalized_delta, capacities, slots,
+        max_dd=max_dd, common_days=common_days,
+        margin_a=margin_a, margin_b=margin_b, max_mm_load=max_mm_load, time_limit=time_limit,
+    )
+    total = levels + 2
+    solves = 0
+
+    def solved(result: Any) -> bool:
+        nonlocal solves
+        solves += 1
         status = getattr(result, "status", None)
         if progress is not None:
-            progress({"completed": len(ranked) + 1, "total": limit, "status": status})
-        if status not in (0, 1) or result.x is None:
-            break
-        values = result.x
-        choice = tuple(
-            slot[0] if len(slot) == 1 else max(slot, key=lambda column: (values[binary_of[column]], -column))
-            for slot in slot_options
-        )
-        x = tuple(min(caps[column], max(Decimal(0), Decimal(str(values[x_start + column])))) for column in range(n))
-        with localcontext() as context:
-            context.prec = _precision_for(coefficients, x)
-            p30 = _sum_products(coefficients, x)
-        chosen = [
-            column for slot, column in zip(slot_options, choice)
-            if len(slot) > 1 and values[x_start + column] > 1e-7 * max(1.0, float(caps[column]))
-        ]
-        ranked.append(RankedComposition(choice, p30, tuple(chosen), status == 0))
-        if not chosen or status != 0:
-            break
-        row_index = len(b_ub)
-        a_rows.extend([row_index] * len(chosen))
-        a_columns.extend(binary_of[column] for column in chosen)
-        a_values.extend([1.0] * len(chosen))
-        b_ub.append(float(len(chosen) - 1))
-        lower.append(-np.inf)
-    if not ranked:
+            progress({"completed": solves, "total": total, "status": status})
+        return status in (0, 1) and getattr(result, "x", None) is not None
+
+    top = _solve_composition_model(model, bank_limit=available)
+    if not solved(top):
         raise ValueError("COMPOSITION_SELECTION_NO_SOLUTION")
-    return tuple(ranked)
+    top_p30 = _composition_point(model, top, available or Decimal(1)).p30
+    if top_p30 <= 0:
+        raise ValueError("NO_POSITIVE_TARGET")
+    with localcontext() as context:
+        context.prec = _precision_for(top_p30)
+        keep = top_p30 * (Decimal(1) - Decimal("1e-7"))
+    saturation = _solve_composition_model(model, bank_limit=available, minimum_p30=keep)
+    if solved(saturation):
+        saturation_bank = Decimal(str(float(saturation.x[0])))
+    else:
+        saturation_bank = available if available is not None else Decimal(str(float(top.x[0])))
+    if available is not None:
+        saturation_bank = min(saturation_bank, available)
+    points: list[FrontierPoint] = []
+    kept_weights: list[tuple[tuple[int, ...], np.ndarray]] = []
+    for level in range(levels, 0, -1):
+        with localcontext() as context:
+            context.prec = _precision_for(saturation_bank)
+            bank_limit = (saturation_bank * Decimal(level) / Decimal(levels)).quantize(Decimal("0.01"), rounding=ROUND_CEILING)
+        if available is not None:
+            bank_limit = min(bank_limit, available)
+        if bank_limit < Decimal(1):
+            continue
+        result = _solve_composition_model(model, bank_limit=bank_limit)
+        if not solved(result):
+            continue
+        point = _composition_point(model, result, bank_limit)
+        if point.p30 <= 0:
+            continue
+        weights = _frontier_weights(model, result)
+        duplicate = any(
+            choice == point.choice
+            and float(np.abs(weights - previous).sum()) <= 0.01 * max(float(previous.sum()), 1e-12)
+            for choice, previous in kept_weights
+        )
+        if duplicate:
+            continue
+        kept_weights.append((point.choice, weights))
+        points.append(point)
+    if not points:
+        raise ValueError("COMPOSITION_SELECTION_NO_SOLUTION")
+    return tuple(points)
 
 
 def _cdar_money(drawdowns: Sequence[Any], tail_fraction: Any) -> Decimal:
@@ -3585,6 +3720,7 @@ def weighted_search(
     common_days: Any | None = None,
     target_p30: Any | None = None,
     bank_available: Any | None = None,
+    lp_bank_limit: Any | None = None,
     max_targets: int = 8,
     profile_id: str = "WEIGHTED",
     scenario_id: str = "WEIGHTED_V1",
@@ -3709,6 +3845,12 @@ def weighted_search(
             return _result(FAIL, "MARGIN_BOUND_UNAVAILABLE")
     target = None if target_p30 is None else _decimal(target_p30, "target_p30", positive=True)
     available = None if bank_available is None else _decimal(bank_available, "bank_available", positive=True)
+    # A frontier bank level bounds only the discovery LP; candidates are still
+    # accepted against ``available`` with their full (stress/margin) bank.
+    lp_ceiling = available
+    if lp_bank_limit is not None:
+        lp_limit = _decimal(lp_bank_limit, "lp_bank_limit", positive=True)
+        lp_ceiling = lp_limit if available is None else min(lp_limit, available)
     upper_target = sum(
         (capacity * max(coefficient, Decimal(0)) for capacity, coefficient in zip(caps, coefficients)),
         Decimal(0),
@@ -3746,7 +3888,7 @@ def weighted_search(
             coefficients,
             max_dd=drawdown,
             target=target_value,
-            bank_available=available,
+            bank_available=lp_ceiling,
             maximize=maximize,
             margin_a=margin_a,
             margin_b=margin_b,
@@ -3778,14 +3920,14 @@ def weighted_search(
                 substage="SOLVER",
                 unit="solver_call",
                 completed=calls,
-                total=1 if target is not None or available is not None else None,
+                total=1 if target is not None or lp_ceiling is not None else None,
                 detail=f"solver call {calls}",
             )
         return True
 
     if target is not None:
         run_target(target)
-    elif available is not None:
+    elif lp_ceiling is not None:
         run_target(None, maximize=True)
     else:
         attempted: set[Decimal] = set()
@@ -4143,7 +4285,8 @@ def weighted_search(
             if limiter_status not in {UNKNOWN, "CONFIRMED"}:
                 limiter_status = UNKNOWN
             try:
-                fixed_bank = available if available is not None else max(
+                # On a frontier level the post-variants share the level's bank budget.
+                fixed_bank = lp_ceiling if lp_ceiling is not None else max(
                     _decimal(metrics.get("required_bank_usdt", seed_solution.bank), "bank_fixed", positive=True),
                     _decimal(seed_solution.bank, "bank_fixed", positive=True),
                 )
@@ -4755,5 +4898,5 @@ __all__ = [
     "WEIGHTED_V1", "LimiterReplayResult", "derive_priorities", "priority_details",
     "replay_limiter", "bank_for_path", "evaluate_weighted_path", "weighted_search",
     "nearest_rank", "stationary_bootstrap_indices", "bootstrap_banks",
-    "RankedComposition", "rank_slot_compositions",
+    "FrontierPoint", "slot_composition_frontier",
 ]

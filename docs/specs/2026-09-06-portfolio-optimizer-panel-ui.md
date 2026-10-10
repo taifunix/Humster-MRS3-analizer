@@ -1088,6 +1088,36 @@ change every real lot-model Campaign failed post-search with
 serializable. Acceptance: a regression test binds the Decimal V25/A15 values,
 and a real 61-pair Campaign passes the identity stage.
 
+### Bank-ladder frontier amendment (2026-10-10)
+
+Decision: [ADR-0067](../decisions/0067-portfolio-bank-ladder-frontier.md). It
+supersedes the candidate selection of the MILP amendment above; the union
+assembly, failure codes and progress events stay.
+
+- Goal: `max_candidates` genuinely different portfolios per profile, not
+  near-copies of the saturated one.
+- Per profile, two MILP solves find the best P30 under the profile ceiling and
+  the smallest bank `B_sat` keeping it. Then `K = max_candidates` levels
+  `b_k = B_sat × k / K` (rounded up to 0.01 USDT, capped by the ceiling, and
+  skipped below 1 USDT) each get a P30-maximizing MILP over all finalist
+  compositions.
+- Each level's composition is evaluated by the exact path. `b_k` is passed as
+  `frontier_bank_usdt` / `lp_bank_limit` and bounds only the discovery LP;
+  acceptance keeps the profile ceiling and the full stress/margin bank. Each
+  level contributes only its best variant. A level with `BANK_UNAVAILABLE` is
+  skipped and counted in the warnings. Duplicates (same finalists, weights
+  within 1% relative L1) are kept once. The warning is
+  `COMPOSITION_SELECTION_FRONTIER:COMBINATIONS=N;LEVELS=<count>`.
+- The Panel shows `Комбинаций финалистов: N · отбор: MILP-фронтир по уровням
+  банка …`. `search.max_enumerated_combinations` and readiness
+  `combination_limit` remain for schema compatibility but no longer select a
+  mode.
+- Acceptance: each frontier level equals the exhaustive best LP composition at
+  that bank, with and without margin bounds. Levels have strictly decreasing
+  bank and P30. Binding banks pick other finalists. The adapter evaluates every
+  point at its own bank. A real full-universe Campaign (61 pairs, 117
+  finalists) completes.
+
 ### Job-journal persistence cost amendment (2026-10-10)
 
 A running Stage 1 job keeps its frozen Campaign (tens of MB) in
