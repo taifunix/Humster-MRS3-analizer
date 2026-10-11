@@ -63,7 +63,7 @@ def _frozen_cell(sheet) -> str | None:
 
 def _copy_form(source, target) -> None:
     """Carry over what copy_worksheet does not: filter, freeze, validations, conditional formats."""
-    target.auto_filter.ref = source.auto_filter.ref
+    target.auto_filter.ref = source.auto_filter.ref  # filter range only, no source criteria
     target.freeze_panes = _frozen_cell(source)
     for validation in source.data_validations.dataValidation:
         target.add_data_validation(copy(validation))
@@ -78,6 +78,9 @@ def _new_target(workbook, source):
     for row in target.iter_rows(min_row=2):
         for cell in row:
             cell.value = None
+    # copy_worksheet keeps rows hidden by the source filter but not the filter itself.
+    for dimension in target.row_dimensions.values():
+        dimension.hidden = False
     _copy_form(source, target)
     active = workbook.active
     workbook.move_sheet(target, offset=workbook.sheetnames.index(SOURCE_SHEET) + 1 - workbook.sheetnames.index(TARGET_SHEET))

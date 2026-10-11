@@ -37,6 +37,9 @@ def _registry(path: Path) -> None:
     sheet["A1"].fill = PatternFill("solid", fgColor="FFFF00")
     sheet.column_dimensions["A"].width = 21
     sheet.auto_filter.ref = "A1:P5"
+    sheet.auto_filter.add_filter_column(11, ["MRS3-READY"])  # active source filter hides other rows
+    sheet.row_dimensions[3].hidden = True
+    sheet.row_dimensions[4].hidden = True
     sheet.freeze_panes = "A2"
     sheet.sheet_view.pane.topLeftCell = "A165"  # bottom pane scrolled down, as in the real registry
     validation = DataValidation(type="list", formula1='"СКРИН,АНАЛИЗ"')
@@ -67,6 +70,8 @@ def test_builds_bingx_sheet_with_same_form_and_bingx_tickers(tmp_path: Path):
     assert sheet["A1"].fill.fgColor.rgb.endswith("FFFF00")
     assert sheet.column_dimensions["A"].width == 21
     assert sheet.auto_filter.ref == "A1:P5" and sheet.freeze_panes == "A2"
+    assert not sheet.auto_filter.filterColumn
+    assert not any(dimension.hidden for dimension in sheet.row_dimensions.values())
     assert [str(item.sqref) for item in sheet.data_validations.dataValidation] == ["E2:E5"]
     assert [str(item.sqref) for item in sheet.conditional_formatting] == ["F2:F5"]
     assert workbook[SOURCE_SHEET]["A2"].value == "PANWUSDT" and workbook[SOURCE_SHEET]["F2"].value == "GO"
