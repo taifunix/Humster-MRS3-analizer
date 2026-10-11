@@ -62,8 +62,10 @@ top-up and before fill, never cached. Live check for 2026-07-24..27: 8 days
 saved, 8 no-trade days, fill check reports nothing missing.
 
 Open: moving the Panel to the newer tester installation is not decided yet.
-Open: one probe run on a pair with no-trade weekends (e.g. XLP) must confirm
-the tester accepts missing day files; otherwise switch to header-only files.
+Probe run 2026-10-11 confirmed the tester accepts missing day files: a
+SCREENER 01 BingX run on XLP (2026-07-22..10-10, 70 day files, 12 weekend days
+without files) produced 304 BingX reports with trades in every month and no
+tester log errors.
 
 ## Panel job admission reliability (2026-10-09)
 
