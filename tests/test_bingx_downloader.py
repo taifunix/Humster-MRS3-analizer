@@ -55,10 +55,11 @@ def _candles(start_ms: int, end_ms: int, *, skip: int | None = None) -> list[dic
 
 
 class FakeClient:
-    def __init__(self, *, contracts=CONTRACTS, broken_symbols=(), short_days=()):
+    def __init__(self, *, contracts=CONTRACTS, broken_symbols=(), short_days=(), empty_days=()):
         self._contracts = contracts
         self.broken_symbols = set(broken_symbols)
         self.short_days = set(short_days)
+        self.empty_days = set(empty_days)  # days without a single trade (e.g. weekends)
         self.kline_calls: list[tuple[str, int, int]] = []
 
     def contracts(self):
@@ -71,6 +72,8 @@ class FakeClient:
         launch = next(int(item["launchTime"]) for item in self._contracts if item["symbol"] == symbol)
         first = max(start_ms, -(-launch // 60_000) * 60_000)
         day = datetime.fromtimestamp(start_ms / 1000, timezone.utc).date()
+        if day in self.empty_days:
+            return []
         return _candles(first, end_ms, skip=5 if day in self.short_days else None)
 
 
@@ -173,17 +176,26 @@ def test_duplicate_candles_leave_no_csv(tmp_path: Path):
     assert [(error.pair, error.day) for error in report.errors] == [("PANW", date(2026, 10, 8))]
 
 
-def test_empty_day_answer_is_an_error_and_leaves_no_csv(tmp_path: Path):
-    class Empty(FakeClient):
-        def klines(self, symbol, start_ms, end_ms):
-            self.kline_calls.append((symbol, start_ms, end_ms))
-            return []
+def test_day_without_trades_creates_no_file_and_is_rechecked_next_run(tmp_path: Path):
+    weekend = {date(2026, 10, 3), date(2026, 10, 4)}
+    days = dict(start=date(2026, 10, 2), end=date(2026, 10, 5))
+    report = download_pairs(bot_root=tmp_path, pairs=["PANW"], client=FakeClient(empty_days=weekend), now=NOW, **days)
+    assert (report.downloaded, report.no_trades, report.errors) == (2, 2, [])
+    assert any("без сделок" in line and "2" in line for line in report.summary_lines())
+    for day in weekend:
+        assert not day_csv_path(bingx_data_root(tmp_path), _contract(), day).exists()
 
-    report = download_pairs(
-        bot_root=tmp_path, pairs=["PANW"], start=date(2026, 10, 8), end=date(2026, 10, 8), client=Empty(), now=NOW,
-    )
-    assert report.downloaded == 0 and [error.day for error in report.errors] == [date(2026, 10, 8)]
-    assert not day_csv_path(bingx_data_root(tmp_path), _contract(), date(2026, 10, 8)).exists()
+    client = FakeClient()  # trades appeared on a re-check: the day is downloaded now
+    again = download_pairs(bot_root=tmp_path, pairs=["PANW"], client=client, now=NOW, **days)
+    assert (again.downloaded, again.skipped_valid, again.no_trades) == (2, 2, 0)
+    assert sorted(call[1] for call in client.kline_calls) == sorted(_day_ms(day) for day in weekend)
+
+
+def test_header_only_file_is_never_valid(tmp_path: Path):
+    path = day_csv_path(bingx_data_root(tmp_path), _contract(), date(2026, 10, 8))
+    path.parent.mkdir(parents=True)
+    path.write_text(",".join(CSV_HEADER) + "\n", encoding="utf-8-sig")
+    assert validate_day_csv(path, date(2026, 10, 8), PANW_LAUNCH_MS) is not None
 
 
 def test_validate_rejects_misaligned_or_out_of_day_timestamps(tmp_path: Path):
@@ -405,8 +417,43 @@ def test_check_local_days_reports_missing_days_without_downloading(tmp_path: Pat
         bot_root=tmp_path, pairs=["PANW", "BABA", "NOPE"], start=date(2026, 10, 6), end=date(2026, 10, 12),
         client=client, now=NOW,
     )
-    assert client.kline_calls == []  # coverage check never downloads candles
+    # Only days without a local file are re-checked at BingX (to tell "no trades" from "not downloaded").
+    checked = {(symbol, start) for symbol, start, _ in client.kline_calls}
+    assert ("NCSKPANW2USD-USDT", _day_ms(date(2026, 10, 6))) not in checked
+    assert ("NCSKPANW2USD-USDT", _day_ms(date(2026, 10, 8))) in checked
     assert resolved["PANW"].api_symbol == "NCSKPANW2USD-USDT"
     assert list(errors) == ["NOPE"]
     assert missing["PANW"] == [date(2026, 10, 8), date(2026, 10, 9)]  # 10-10.. are not available yet
     assert missing["BABA"][0] == date(2026, 10, 6)
+
+
+def test_check_local_days_accepts_confirmed_days_without_trades(tmp_path: Path):
+    from mrs3.bingx_downloader import check_local_days
+
+    weekend = {date(2026, 10, 3), date(2026, 10, 4)}
+    download_pairs(bot_root=tmp_path, pairs=["PANW"], start=date(2026, 10, 2), end=date(2026, 10, 5),
+                   client=FakeClient(empty_days=weekend), now=NOW)
+    client = FakeClient(empty_days=weekend)
+    _, _, missing = check_local_days(bot_root=tmp_path, pairs=["PANW"], start=date(2026, 10, 2), end=date(2026, 10, 5),
+                                     client=client, now=NOW)
+    assert missing == {}
+    assert sorted(call[1] for call in client.kline_calls) == sorted(_day_ms(day) for day in weekend)  # only absent days
+
+    _, _, missing = check_local_days(bot_root=tmp_path, pairs=["PANW"], start=date(2026, 10, 2), end=date(2026, 10, 5),
+                                     client=FakeClient(), now=NOW)  # trades exist now -> data is missing locally
+    assert missing == {"PANW": sorted(weekend)}
+
+
+def test_damaged_file_on_a_no_trade_day_is_removed(tmp_path: Path):
+    from mrs3.bingx_downloader import check_local_days
+
+    saturday = date(2026, 10, 3)
+    path = day_csv_path(bingx_data_root(tmp_path), _contract(), saturday)
+    path.parent.mkdir(parents=True)
+    path.write_text(",".join(CSV_HEADER) + "\n", encoding="utf-8-sig")  # broken: header only
+    report = download_pairs(bot_root=tmp_path, pairs=["PANW"], start=saturday, end=saturday,
+                            client=FakeClient(empty_days={saturday}), now=NOW)
+    assert report.no_trades == 1 and report.errors == [] and not path.exists()
+    _, _, missing = check_local_days(bot_root=tmp_path, pairs=["PANW"], start=saturday, end=saturday,
+                                     client=FakeClient(empty_days={saturday}), now=NOW)
+    assert missing == {}

@@ -2485,8 +2485,9 @@ class PanelController:
     def _bingx_symbols_for_fill(self, payload: Mapping[str, object]) -> tuple[str, ...]:
         """API symbols for a BingX fill; every day of StartDate−1 … EndDate must already be local.
 
-        Works with or without a preceding top-up: data is checked on disk,
-        and only the contract list (no candles) is requested from BingX.
+        Works with or without a preceding top-up: data is checked on disk;
+        BingX gets the contract list plus one klines request per absent day
+        file (to confirm a day without trades).
         """
         tickers, start, end = self._bingx_request(payload)
         if self._bingx_thread is not None and self._bingx_thread.is_alive():

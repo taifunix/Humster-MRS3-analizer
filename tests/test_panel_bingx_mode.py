@@ -212,3 +212,15 @@ def test_panel_ui_has_bingx_checkbox_on_screener_and_local_runner_only():
     assert "'/api/v2/testing/bingx/download'" in js and "'/api/v2/testing/bingx/status'" in js
     # RUNNER 01 must be able to show the actionable "BingX: ..." fill error.
     assert "new Set(['/api/v2/settings/analysis-profile', '/api/v2/testing/local/fill'])" in js
+
+
+def test_panel_bingx_fill_accepts_days_without_trades(tmp_path: Path):
+    weekend = {date(2026, 10, 3), date(2026, 10, 4)}
+    controller, config = _controller(tmp_path, FakeClient(empty_days=weekend))
+    payload = {"symbols": "PANW", "side": "LONG", "start": "2026-10-03", "end": "2026-10-06", "bingx": True}
+    status = _download(controller, payload)
+    assert status["state"] == "done" and status["errors"] == []
+    assert any("без сделок" in line for line in status["summary"])
+    prepared = controller.local_testing_fill(payload)
+    assert prepared["symbols"] == ["NCSKPANW2USD-USDT"]
+    controller.local_testing_stop()

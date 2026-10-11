@@ -55,7 +55,15 @@ are omitted by BingX on illiquid pairs; gaps are kept as in Bybit files, no
 rows are invented). A live top-up of ALAB/CSCO/TTWO/BSP for 2026-07-03..06
 saved all 16 days (e.g. CSCO 2026-07-04: 1171 rows).
 
+Some BingX stock contracts trade only in US market hours (XLP, BAC, SKUU,
+SPCH: 391 candles on weekdays, 0 on weekends). A day with no candles now
+creates no file and is not an error; it is re-checked at BingX on every
+top-up and before fill, never cached. Live check for 2026-07-24..27: 8 days
+saved, 8 no-trade days, fill check reports nothing missing.
+
 Open: moving the Panel to the newer tester installation is not decided yet.
+Open: one probe run on a pair with no-trade weekends (e.g. XLP) must confirm
+the tester accepts missing day files; otherwise switch to header-only files.
 
 ## Panel job admission reliability (2026-10-09)
 

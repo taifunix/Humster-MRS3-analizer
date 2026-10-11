@@ -72,6 +72,7 @@ class DownloadReport:
     downloaded: int = 0
     skipped_valid: int = 0
     redownloaded: int = 0
+    no_trades: int = 0
     errors: list[DownloadError] = field(default_factory=list)
     contracts: dict[str, BingXContract] = field(default_factory=dict)
 
@@ -80,6 +81,7 @@ class DownloadReport:
             f"скачано новых дней: {self.downloaded}",
             f"пропущено уже валидных дней: {self.skipped_valid}",
             f"перекачано повреждённых дней: {self.redownloaded}",
+            f"дней без сделок (файл не создаётся): {self.no_trades}",
             f"ошибки по дням/парам: {len(self.errors)}",
         ]
         for error in self.errors:
@@ -440,21 +442,30 @@ def check_local_days(
     client: BingXClient | None = None,
     now: datetime | None = None,
 ) -> tuple[dict[str, BingXContract], dict[str, str], dict[str, list[date]]]:
-    """Resolve pairs and list days missing or invalid locally, without downloading candles.
+    """Resolve pairs and list days missing or invalid locally, without writing files.
+
+    A day without a local file is re-checked with one klines request: it is
+    fine only if BingX confirms there were no trades that day.
 
     Returns ``(resolved, unresolved errors, missing days per ticker)``; days
     before listing or not yet available are not counted as missing.
     """
-    resolved, errors = resolve_contracts(pairs, (client or BingXClient()).contracts())
+    resolved, errors = resolve_contracts(pairs, (client := client or BingXClient()).contracts())
     data_root = bingx_data_root(bot_root)
     last_day = last_available_day(now or datetime.now(timezone.utc))
     missing: dict[str, list[date]] = {}
     for ticker, contract in resolved.items():
-        days = [
-            day
-            for day in planned_days(start, end, contract.launch_ms, last_day)
-            if validate_day_csv(day_csv_path(data_root, contract, day), day, contract.launch_ms) is not None
-        ]
+        days = []
+        for day in planned_days(start, end, contract.launch_ms, last_day):
+            path = day_csv_path(data_root, contract, day)
+            if path.exists():
+                if validate_day_csv(path, day, contract.launch_ms) is not None:
+                    days.append(day)
+                continue
+            # No file: fine only if BingX confirms the day had no trades (never cached).
+            day_start = _day_start_ms(day)
+            if _rows_from_klines(client.klines(contract.api_symbol, day_start, day_start + DAY_MS - 1), day):
+                days.append(day)
         if days:
             missing[ticker] = days
     return resolved, errors, missing
@@ -500,8 +511,16 @@ def download_pairs(
                 continue
             try:
                 day_start = _day_start_ms(day)
-                klines = client.klines(contract.api_symbol, day_start, day_start + DAY_MS - 1)
-                write_day_csv(path, _rows_from_klines(klines, day), day, contract.launch_ms)
+                rows = _rows_from_klines(client.klines(contract.api_symbol, day_start, day_start + DAY_MS - 1), day)
+                if not rows:
+                    # No trades that day (some stock contracts are closed on weekends): no file,
+                    # not an error; the day is re-checked on every run, never cached as empty.
+                    if damaged:
+                        path.unlink(missing_ok=True)  # a broken file must not stand in for "no trades"
+                    report.no_trades += 1
+                    log(f"{ticker} {day.isoformat()}: no trades")
+                    continue
+                write_day_csv(path, rows, day, contract.launch_ms)
             except Exception as error:  # One failing day must never stop the remaining pairs/days.
                 report.errors.append(DownloadError(ticker, day, str(error) or type(error).__name__))
                 log(f"{ticker} {day.isoformat()}: {error}")
