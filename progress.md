@@ -50,6 +50,11 @@ on existing local data and refuses with the missing days. Verification:
 plus `node --check src/mrs3/panel_web/app.js`. The Panel needs a restart to
 show the new checkboxes.
 
+Day validation now accepts minutes without BingX candles (no-trade minutes
+are omitted by BingX on illiquid pairs; gaps are kept as in Bybit files, no
+rows are invented). A live top-up of ALAB/CSCO/TTWO/BSP for 2026-07-03..06
+saved all 16 days (e.g. CSCO 2026-07-04: 1171 rows).
+
 Open: moving the Panel to the newer tester installation is not decided yet.
 
 ## Panel job admission reliability (2026-10-09)

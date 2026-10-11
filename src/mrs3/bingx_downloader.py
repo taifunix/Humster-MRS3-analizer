@@ -317,7 +317,7 @@ def _day_start_ms(day: date) -> int:
 
 
 def _first_minute_ms(day: date, launch_ms: int) -> int:
-    launch_minute = -(-launch_ms // MINUTE_MS) * MINUTE_MS
+    launch_minute = launch_ms // MINUTE_MS * MINUTE_MS  # the minute containing the listing moment
     return max(_day_start_ms(day), launch_minute)
 
 
@@ -344,12 +344,17 @@ def _number(text: str) -> Decimal:
 
 
 def _validate_rows(rows: Sequence[Sequence[str]], day: date, launch_ms: int) -> str | None:
+    """Minutes without trades have no BingX candle; like Bybit files, the gap stays (no invented rows)."""
     first = _first_minute_ms(day, launch_ms)
-    expected = (_day_start_ms(day) + DAY_MS - first) // MINUTE_MS
+    day_end = _day_start_ms(day) + DAY_MS
+    expected = (day_end - first) // MINUTE_MS
     if expected <= 0:
         return "day is before listing"
-    if len(rows) != expected:
-        return f"expected {expected} rows, got {len(rows)}"
+    if not rows:  # never cache an empty answer as a valid day; it stays a visible error
+        return "no candles for the day"
+    if len(rows) > expected:
+        return f"at most {expected} rows expected, got {len(rows)}"
+    previous = first - MINUTE_MS
     for index, row in enumerate(rows):
         if len(row) != len(CSV_HEADER):
             return f"row {index + 1} has {len(row)} columns"
@@ -358,8 +363,9 @@ def _validate_rows(rows: Sequence[Sequence[str]], day: date, launch_ms: int) -> 
             opened, high, low, close, volume = (_number(value) for value in row[1:6])
         except (ValueError, InvalidOperation):
             return f"row {index + 1} has an empty or invalid value"
-        if str(stamp) != row[0] or stamp != first + index * MINUTE_MS:
-            return f"row {index + 1} timestamp is not the expected minute"
+        if str(stamp) != row[0] or stamp % MINUTE_MS or stamp <= previous or stamp >= day_end:
+            return f"row {index + 1} timestamp is not an increasing minute of this day after listing"
+        previous = stamp
         if high < max(opened, close, low) or low > min(opened, close) or volume < 0:
             return f"row {index + 1} has inconsistent OHLCV"
         if row[6:] != ["0", "0", "0"]:

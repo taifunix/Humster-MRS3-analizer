@@ -143,10 +143,29 @@ def test_listing_day_is_complete_from_listing_minute(tmp_path: Path):
     assert validate_day_csv(path, date(2026, 6, 11), PANW_LAUNCH_MS) is None
 
 
-def test_incomplete_download_leaves_no_csv(tmp_path: Path):
+def test_minutes_without_trades_are_kept_as_gaps_like_bybit(tmp_path: Path):
+    # BingX omits a candle for a minute without trades; the CSV keeps the gap (no invented rows).
     report = download_pairs(
         bot_root=tmp_path, pairs=["PANW"], start=date(2026, 10, 8), end=date(2026, 10, 8),
         client=FakeClient(short_days={date(2026, 10, 8)}), now=NOW,
+    )
+    assert report.downloaded == 1 and report.errors == []
+    path = day_csv_path(bingx_data_root(tmp_path), _contract(), date(2026, 10, 8))
+    stamps = [int(line.split(",")[0]) for line in path.read_text(encoding="utf-8-sig").splitlines()[1:]]
+    assert len(stamps) == 1439
+    assert _day_ms(date(2026, 10, 8)) + 5 * 60_000 not in stamps
+    assert validate_day_csv(path, date(2026, 10, 8), PANW_LAUNCH_MS) is None
+
+
+def test_duplicate_candles_leave_no_csv(tmp_path: Path):
+    class Broken(FakeClient):
+        def klines(self, symbol, start_ms, end_ms):
+            candles = super().klines(symbol, start_ms, end_ms)
+            return candles + [dict(candles[0])]  # duplicate minute
+
+    report = download_pairs(
+        bot_root=tmp_path, pairs=["PANW"], start=date(2026, 10, 8), end=date(2026, 10, 8),
+        client=Broken(), now=NOW,
     )
     folder = bingx_data_root(tmp_path) / "NCSKPANW2USD-USDT"
     assert not folder.exists() or list(folder.iterdir()) == []
@@ -154,11 +173,35 @@ def test_incomplete_download_leaves_no_csv(tmp_path: Path):
     assert [(error.pair, error.day) for error in report.errors] == [("PANW", date(2026, 10, 8))]
 
 
+def test_empty_day_answer_is_an_error_and_leaves_no_csv(tmp_path: Path):
+    class Empty(FakeClient):
+        def klines(self, symbol, start_ms, end_ms):
+            self.kline_calls.append((symbol, start_ms, end_ms))
+            return []
+
+    report = download_pairs(
+        bot_root=tmp_path, pairs=["PANW"], start=date(2026, 10, 8), end=date(2026, 10, 8), client=Empty(), now=NOW,
+    )
+    assert report.downloaded == 0 and [error.day for error in report.errors] == [date(2026, 10, 8)]
+    assert not day_csv_path(bingx_data_root(tmp_path), _contract(), date(2026, 10, 8)).exists()
+
+
+def test_validate_rejects_misaligned_or_out_of_day_timestamps(tmp_path: Path):
+    download_pairs(bot_root=tmp_path, pairs=["PANW"], start=date(2026, 10, 8), end=date(2026, 10, 8), client=FakeClient(), now=NOW)
+    path = day_csv_path(bingx_data_root(tmp_path), _contract(), date(2026, 10, 8))
+    text = path.read_text(encoding="utf-8-sig")
+    first = str(_day_ms(date(2026, 10, 8)))
+    path.write_text(text.replace(first, str(int(first) + 1), 1), encoding="utf-8-sig")  # not on a minute
+    assert validate_day_csv(path, date(2026, 10, 8), PANW_LAUNCH_MS) is not None
+    path.write_text(text.replace(first, str(int(first) - 60_000), 1), encoding="utf-8-sig")  # previous day
+    assert validate_day_csv(path, date(2026, 10, 8), PANW_LAUNCH_MS) is not None
+
+
 def test_incremental_skips_valid_and_redownloads_damaged_days(tmp_path: Path):
     days = dict(start=date(2026, 10, 6), end=date(2026, 10, 8))
     download_pairs(bot_root=tmp_path, pairs=["PANW"], client=FakeClient(), now=NOW, **days)
     damaged = day_csv_path(bingx_data_root(tmp_path), _contract(), date(2026, 10, 7))
-    damaged.write_text(damaged.read_text(encoding="utf-8-sig").rsplit("\n", 3)[0] + "\n", encoding="utf-8-sig")
+    damaged.write_text(damaged.read_text(encoding="utf-8-sig").replace(",419.51,", ",,", 1), encoding="utf-8-sig")
     assert validate_day_csv(damaged, date(2026, 10, 7), PANW_LAUNCH_MS) is not None
 
     client = FakeClient()
