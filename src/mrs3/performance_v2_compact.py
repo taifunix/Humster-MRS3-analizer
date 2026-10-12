@@ -84,6 +84,7 @@ RANGE_VALUES = 128
 FETCH_BATCH = 4096
 PREPARED_FETCH_BATCH = 16
 MAX_FAST_VERIFY_RANGE_ROWS = 20_000_000
+FAST_VERIFY_TARGET_RANGE_ROWS = 10_000_000
 CAPACITY_RESERVE = 10 * 1024**3
 MEMORY_LIMIT = "16GB"
 FAST_VERIFY_TABLES = {"strategy_actions", "strategy_equity"}
@@ -439,11 +440,18 @@ def _copy_table(
         source_selected += ", NULL"
     lead = _ident(TABLE_LEADING_KEY[table])
     copied = 0
-    ranges = (
-        result_ranges
-        if TABLE_LEADING_KEY[table] == "result_id" and result_ranges is not None
-        else _ranges(connection, table)
-    )
+    if table in FAST_VERIFY_TABLES:
+        # Each filtered insert scans the unclustered source; size ranges by rows.
+        target_catalog = str(connection.execute("select current_database()").fetchone()[0])
+        ranges = _fast_verify_ranges(
+            connection, table, "origin", target_catalog, target_rows=FAST_VERIFY_TARGET_RANGE_ROWS,
+        )
+    else:
+        ranges = (
+            result_ranges
+            if TABLE_LEADING_KEY[table] == "result_id" and result_ranges is not None
+            else _ranges(connection, table)
+        )
     for low, high in ranges:
         _capacity(spill_root, output_parent)
         if table == PREPARED:
@@ -659,6 +667,48 @@ def _fast_except_count(
     ).fetchone()[0])
 
 
+def _fast_verify_ranges(
+    connection: duckdb.DuckDBPyConnection,
+    table: str,
+    source_catalog: str,
+    target_catalog: str,
+    *,
+    target_rows: int,
+) -> tuple[tuple[int, int], ...]:
+    """Contiguous result_id ranges of about `target_rows` source rows.
+
+    Each range costs a full scan of an unclustered source table, so ranges are
+    sized by rows, not by a fixed number of result IDs. The first and last
+    bounds extend to both catalogs' extremes so candidate-only IDs are covered.
+    """
+    lead = _ident("result_id")
+    counts = connection.execute(
+        f"select {lead}, count(*) from {_ident(source_catalog)}.main.{_ident(table)} "
+        f"group by {lead} order by {lead}"
+    ).fetchall()
+    bounds = connection.execute(
+        f"select min(r), max(r) from ("
+        f"select {lead} as r from {_ident(source_catalog)}.main.{_ident(table)} union all "
+        f"select {lead} from {_ident(target_catalog)}.main.{_ident(table)})"
+    ).fetchone()
+    if bounds[0] is None:
+        return ()
+    low, high = int(bounds[0]), int(bounds[1])
+    ranges: list[tuple[int, int]] = []
+    start, rows, last = low, 0, None
+    for result_id, count in counts:
+        if result_id is None:
+            raise ValueError(f"NULL result_id rows cannot be ranged in {table}")
+        result_id, count = int(result_id), int(count)
+        if rows and rows + count > target_rows:
+            ranges.append((start, last))
+            start, rows = last + 1, 0
+        rows += count
+        last = result_id
+    ranges.append((start, high))
+    return tuple(ranges)
+
+
 def _verify_fast_table(
     connection: duckdb.DuckDBPyConnection,
     table: str,
@@ -668,6 +718,7 @@ def _verify_fast_table(
     callback: Callable[[dict[str, object]], object] | None,
     *,
     max_ranges: int | None = None,
+    range_counts: dict[str, int] | None = None,
 ) -> int:
     source_schema = _fast_column_signature(connection, source_catalog, table)
     target_schema = _fast_column_signature(connection, target_catalog, table)
@@ -690,7 +741,16 @@ def _verify_fast_table(
             raise ValueError(f"NULL result_id rows cannot be ranged in {table}")
         if source_count != target_count:
             raise ValueError(f"row count mismatch in {table}")
-    ranges = result_ranges[:max_ranges] if max_ranges is not None else result_ranges
+    # result_ranges (128 IDs each) are kept for the typed comparator; the SQL
+    # path re-slices by rows so the unclustered source is scanned far less often.
+    del result_ranges
+    all_ranges = _fast_verify_ranges(
+        connection, table, source_catalog, target_catalog,
+        target_rows=FAST_VERIFY_TARGET_RANGE_ROWS,
+    )
+    ranges = all_ranges[:max_ranges] if max_ranges is not None else all_ranges
+    if range_counts is not None:
+        range_counts[table] = len(ranges)
 
     checked = 0
     range_count = len(ranges)
@@ -834,10 +894,10 @@ def verify_existing_candidate(
                             verified_counts[table] = _verify_fast_table(
                                 connection, table, source_catalog, target_catalog,
                                 result_ranges, progress_callback, max_ranges=smoke_ranges,
+                                range_counts=verified_ranges,
                             )
                         except _FastVerifyUnsupported as exc:
                             raise ValueError(f"smoke mode cannot verify SQL columns in {table}") from exc
-                        verified_ranges[table] = min(smoke_ranges, len(result_ranges))
                     continue
                 if table in FAST_VERIFY_TABLES:
                     try:

@@ -8,6 +8,41 @@ Use [PRD.md](PRD.md) for the feature registry and [docs/README.md](docs/README.m
 for the documentation map. Read the linked contract only for the active task;
 do not treat this file as a replacement for a feature specification.
 
+## PerformanceDB compaction and faster verification (2026-10-12)
+
+The live PerformanceDB was compacted from 31.14 GiB to 15.76 GiB and is now
+schema v11. Cause of the old size: DuckDB never shrinks the file on DELETE.
+About half of the physical rows in `strategy_equity` (238 M vs 122 M live) and
+`strategy_actions` were deleted tuples, plus 8.4 GiB of free blocks. Rejected
+retirement itself had removed all heavy facts correctly.
+
+The candidate was built with `scripts/compact_performance_v2.py` and verified
+with `scripts/verify_performance_v2_candidate.py`. All 20 tables matched
+row-for-row, and the source SHA-256 was unchanged before and after. It was
+swapped in on D:; the old file is kept as
+`data/performance-v2/strategy_performance.pre-compact-20261012.duckdb` until
+the user confirms the Panel works.
+
+The verifier compared large tables in 128-result-id ranges, so each range
+rescanned the unclustered source: about 90 s per range and 384 ranges for
+`strategy_equity`, roughly 9 h. Large tables are now copied and verified in
+row-sized ranges of about 10 M rows. The exact `EXCEPT ALL` comparison in both
+directions is unchanged. Contract: the 2026-10-12 amendment in
+[lossless compaction](docs/specs/2026-09-30-performance-db-lossless-compaction.md).
+
+On the real DB, verification took 3 h 47 min in total. That includes source and
+candidate hashing, `strategy_actions` (2 ranges), `strategy_equity` (13 ranges,
+about 1 h 45 min) and about 2 h for the single-threaded typed comparison of
+`window_metrics`, `selection_results` and `optimizer_prepared_inputs`. Copying
+the candidate to D: and hash-checking it took 132 s.
+
+Verification: `tests/test_performance_v2_compact.py` 37 passed. Independent
+review passed after one fix round.
+
+Next step: speed up the typed comparison of medium tables and the prepared
+payloads (SQL `EXCEPT ALL` where types allow, parallel payload decoding).
+Delete the pre-compact backup only after user confirmation.
+
 ## MRS3 evaluation protocol v2 (2026-10-12)
 
 Approved; P1 implemented, P2–P6 pending. Evaluation tests of MRS3 move to a
