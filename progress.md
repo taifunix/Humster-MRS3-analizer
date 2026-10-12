@@ -20,6 +20,14 @@ and T−42).
   and relative smoothness within the pair; less consistently by the latest
   weekly loss and DECLINE (DECLINE measured only on the T−14/T−7 cuts).
 - **Filter 7 shows no measurable effect** (approximate replay).
+- **Self-computed risk analytics** (`rolling_risk.py`, no look-ahead, also
+  measured on the new drawdown after the cut): the mean daily worst floating
+  loss is the strongest predictor of the new drawdown after the cut on all three
+  cuts, ahead of CVaR, Ulcer and smoothness; against the all-time high-water
+  mark it is comparable to Ulcer (report §2a). It is proposed to replace smoothness in the in-pair
+  risk flag. Depth below the high-water mark mostly describes the current state:
+  on the clean outcome it predicts future drawdown only weakly. Preliminary,
+  pending the protocol-v2 recheck.
 - **Caveat: survivorship bias.** The sample contains only strategies still in
   the database. Rejection filters partly looked at the outcome windows (A/B
   deterioration uses the last 14 days), so the conclusions are preliminary
@@ -36,7 +44,7 @@ script, its input and how to run it. Metrics of the new tester report worth
 recording for the next analysis:
 [tester metrics to record](docs/reports/2026-10-12-tester-report-metrics-to-record.md).
 
-Next step: walk-forward of self-computable risk analytics (Ulcer, time under water, recovery time, CVaR, MAE, monthly consistency) and a small spec for fee-efficiency columns. Repeat the rolling-origin study on the protocol-v2
+Next step: a small spec for fee-efficiency columns. Repeat the rolling-origin study on the protocol-v2
 database once longer tests exist.
 
 ## PerformanceDB compaction and faster verification (2026-10-12)
