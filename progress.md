@@ -8,6 +8,22 @@ Use [PRD.md](PRD.md) for the feature registry and [docs/README.md](docs/README.m
 for the documentation map. Read the linked contract only for the active task;
 do not treat this file as a replacement for a feature specification.
 
+## MRS2 point settings: out-of-sample check (2026-10-12)
+
+A read-only study compared point facts in an earlier analysis with the same
+point's B tail in a later analysis of the same pair (14 analysis pairs, 20
+symbol links). Within pairs only the current DD ≤ 12 cap predicts later
+results; PnL > 5, PnL/DD ≥ 3 and WR ≥ 68 do not, and tighter PF, WR, PnL/DD or
+plateau size rules do not separate points either. A DD cap of 10% is not
+supported by the data (no direction at 10–11%, a weak unproven lean at 8–9%);
+it is only an optional risk policy in the user's Panel settings. The current
+PRETEST A/B rule removes points that later lose less often (14.2% vs 23.9%),
+so CSV Direct needs no A/B replacement on this evidence. A first attempt via PerformanceDB is withdrawn:
+its MRS3 use source `open`, the MRS2 points `ohlc4`. Gap rules, READY and
+plateau settings need the protocol-v2 (`ohlc4`) MRS3 database. Report and
+deferred list: [MRS2 point settings OOS](docs/reports/2026-10-12-mrs2-point-settings-oos.md);
+scripts: `scripts/mrs2_research/`.
+
 ## Fee efficiency columns in the selection XLSX (2026-10-12)
 
 The selection workbooks now show `Fees share, %` (fees as a share of the gross
