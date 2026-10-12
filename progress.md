@@ -27,7 +27,7 @@ and T−42).
 
 Evidence:
 [walk-forward report](docs/reports/2026-10-12-equity-evaluation-walk-forward.md).
-Proposed contract, pending user confirmation of D1/D15:
+Proposed contract; the user decided D1 (pause is a finalist) and D15 (unheld breakout ≤5% is a pause) on 2026-10-12, other items are still open:
 [equity risk evaluation](docs/specs/2026-10-12-equity-risk-evaluation.md).
 The recommended filter set keeps filters 2–6 and 8–10 and turns off filter 7.
 
@@ -36,7 +36,7 @@ script, its input and how to run it. Metrics of the new tester report worth
 recording for the next analysis:
 [tester metrics to record](docs/reports/2026-10-12-tester-report-metrics-to-record.md).
 
-Next step: confirm D1/D15. Repeat the rolling-origin study on the protocol-v2
+Next step: walk-forward of self-computable risk analytics (Ulcer, time under water, recovery time, CVaR, MAE, monthly consistency) and a small spec for fee-efficiency columns. Repeat the rolling-origin study on the protocol-v2
 database once longer tests exist.
 
 ## PerformanceDB compaction and faster verification (2026-10-12)
