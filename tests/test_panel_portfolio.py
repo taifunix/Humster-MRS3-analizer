@@ -3603,13 +3603,17 @@ def test_stage2_baseline_preparation_uses_first_persisted_candidate_and_exact_pa
     assert prepared["pretest_period"] == {"start_utc": "2026-01-01T00:00:00Z", "end_utc": "2026-01-15T00:00:00Z"}
 
     config = json.loads(prepared["tester_config_json"])
-    template = json.loads((Path(__file__).parents[1] / "templates/tester/mrs3/config_tester.json").read_text(encoding="utf-8"))
+    template = json.loads((Path(__file__).parents[1] / "templates/tester/portfolio-stage2/config_tester.json").read_text(encoding="utf-8"))
     expected_config = {**template, "name_comment": "a" * 64, "StartDate": "2026-01-01", "EndDate": "2026-01-14", "InitialBalance": 10000, "single_mode": False, "UpdateData": True}
     assert config == expected_config
     assert type(config["InitialBalance"]) is int
     assert config["use_runs"] is False
     assert config["parameter_mining"] == []
     assert prepared["tester_config_json"].endswith("\n")
+    # Pinned bytes: MRS3 evaluation-template changes must never reach Stage 2 (ADR-0070).
+    assert hashlib.sha256(prepared["tester_config_json"].encode("utf-8")).hexdigest() == (
+        "22274250c5b752c78ea6b2c25f67f5230b5ef19424b80bc4e0f3b7491170d5fa"
+    )
     for payload in payloads:
         name = payload["strategy"]["name"]
         # Tester rendering: template key order, two-space indent, tester rounding.
@@ -5724,7 +5728,28 @@ def test_stage2_tester_maker_fee_is_zero_for_bybit_only() -> None:
     other = json.loads(_stage2_material(_tester_strategy_candidate((0.5, 0.5), exchange="Binance"))["tester_config_json"])
 
     assert bybit["MakerFee"] == 0
-    assert other["MakerFee"] == json.loads(pp.mrs3_tester_config_template().read_text(encoding="utf-8"))["MakerFee"]
+    assert other["MakerFee"] == json.loads(pp.portfolio_stage2_tester_config_template().read_text(encoding="utf-8"))["MakerFee"]
+
+
+def test_stage2_tester_config_comes_only_from_its_own_template(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from mrs3.panel_testing import mrs3_tester_config_template, portfolio_stage2_tester_config_template
+
+    stage2_path = portfolio_stage2_tester_config_template()
+    assert stage2_path != mrs3_tester_config_template()
+    assert stage2_path.parent.name == "portfolio-stage2"
+    assert not hasattr(pp, "mrs3_tester_config_template")
+    # Stage 2 keeps the liquidity-aware fill model of the trading test (ADR-0070).
+    assert json.loads(stage2_path.read_text(encoding="utf-8"))["LimitOrderVolumeCheck"] is True
+
+    sentinel = json.loads(stage2_path.read_text(encoding="utf-8"))
+    sentinel["SlippagePercent"] = 0.123
+    custom = tmp_path / "config_tester.json"
+    custom.write_text(json.dumps(sentinel), encoding="utf-8")
+    monkeypatch.setattr(pp, "portfolio_stage2_tester_config_template", lambda *_args, **_kwargs: custom)
+
+    config = json.loads(_stage2_material(_tester_strategy_candidate((0.5, 0.5)))["tester_config_json"])
+
+    assert config["SlippagePercent"] == 0.123
 
 
 def test_stage2_tester_config_updates_data_and_keeps_report_settings_only_in_report() -> None:

@@ -34,7 +34,7 @@ import pandas as pd
 
 from .audit import normalize_xlsx_workbook, write_audit_workbook
 from .panel_jobs import PanelJobError, PanelJobRegistry
-from .panel_testing import mrs3_tester_config_template
+from .panel_testing import portfolio_stage2_tester_config_template
 from .runner.files import file_fingerprint, read_stable_file
 from .runner.results import CORE_METRICS, ResultParseError, WizardResult, load_wizard_results
 from .portfolio.config import (
@@ -495,7 +495,7 @@ def _stage2_material(candidate: Mapping[str, Any]) -> dict[str, Any]:
     end = datetime.fromisoformat(period["end_utc"].replace("Z", "+00:00")).astimezone(timezone.utc) - timedelta(days=1)
     if start.date() > end.date():
         raise ValueError("tester period is invalid")
-    template = json.loads(mrs3_tester_config_template().read_text(encoding="utf-8"))
+    template = json.loads(portfolio_stage2_tester_config_template().read_text(encoding="utf-8"))
     if (
         not isinstance(template, dict)
         or type(template.get("use_runs")) is not bool
