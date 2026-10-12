@@ -5213,3 +5213,80 @@ def test_workbook_shows_fee_efficiency_after_top5_share(tmp_path: Path) -> None:
 
     assert headers[top5 + 1: top5 + 3] == ["Fees share, %", "Fees/30, %"]
     assert "Fees share, %" in selection_module.SELECTION_LEGACY_HEADERS
+
+
+def test_rejection_reasons_use_the_earliest_rejecting_source(tmp_path: Path) -> None:
+    from mrs3.performance_v2_selection_review import rejection_reasons_by_strategy
+
+    connection = _candidate_db(tmp_path)
+    strategy_id, result_id = connection.execute("select strategy_id, current_result_id from strategies").fetchone()
+    connection.execute(
+        "insert into strategy_tags values (?, 'REJECTED', 'SELECTION_AB_DETERIORATION', 'run-2', ?)",
+        [strategy_id, datetime(2026, 10, 12, tzinfo=UTC)],
+    )
+    assert rejection_reasons_by_strategy(connection, [strategy_id]) == {strategy_id: "AB_DETERIORATION;REJECTED"}
+
+    connection.execute(
+        "insert into strategy_rejection_sources values (?, 'EQUITY_REGIME_FILTER', 'W28_DOWN', ?, 'run-1', 'v1', 'r', 'f', ?)",
+        [strategy_id, result_id, datetime(2026, 10, 9, tzinfo=UTC)],
+    )
+    assert rejection_reasons_by_strategy(connection, [strategy_id]) == {
+        strategy_id: "FILTER_EQUITY_REGIME;W28_DOWN;REJECTED"
+    }
+    assert rejection_reasons_by_strategy(connection, []) == {}
+
+
+def test_workbook_shows_rejecting_filter_for_rejected_rows(tmp_path: Path) -> None:
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "pareto_plateau_points_per_order", "enabled": True, "scope": "pair_side"},
+        {"id": "pareto_dd5_capital", "enabled": True, "scope": "pair_side"},
+    ]})
+    result = pd.DataFrame([
+        _selection_row("winner"), _selection_row("loser"), {**_selection_row("loser"), "strategy_id": 3, "strategy_name": "detailed"},
+    ])
+    result["finalist"] = [False, False, False]
+    result["elimination_reason"] = [
+        "EQUITY_REGIME_STALLED_RESERVE", "PARETO_DD5_CAPITAL", "AB_DETERIORATION;B_PNL30_FLOOR(b=-1)",
+    ]
+    reviews = {
+        1: {"user_status": "REJECTED", "rejection_reason": "AB_DETERIORATION;REJECTED"},
+        3: {"user_status": "REJECTED", "rejection_reason": "AB_DETERIORATION;REJECTED"},
+    }
+
+    book = load_workbook(write_selection_workbook(
+        result, tmp_path / "finalists.xlsx", request, {"workbook_schema_version": "2"}, reviews,
+    ), data_only=True)
+    sheet = book["All candidates"]
+    headers = [cell.value for cell in sheet[1]]
+    reasons = {
+        sheet.cell(row, headers.index("ID") + 1).value: sheet.cell(row, headers.index("Причина") + 1).value
+        for row in range(2, sheet.max_row + 1)
+    }
+
+    assert reasons[1] == "AB_DETERIORATION;REJECTED"
+    assert reasons[2].endswith("PARETO_DD5_CAPITAL")
+    assert reasons[3] == "AB_DETERIORATION;B_PNL30_FLOOR(b=-1)"
+
+
+def test_attach_rejection_reasons_prefers_stored_source_then_this_run(tmp_path: Path) -> None:
+    from mrs3.performance_v2_selection_review import attach_rejection_reasons, rejection_reason_label
+
+    connection = _candidate_db(tmp_path)
+    strategy_id = connection.execute("select strategy_id from strategies").fetchone()[0]
+    connection.execute(
+        "insert into strategy_tags values (?, 'REJECTED', 'SELECTION_LOT_VARIANT', 'run-1', ?)",
+        [strategy_id, datetime(2026, 10, 12, tzinfo=UTC)],
+    )
+    reviews = {
+        strategy_id: {"user_status": "REJECTED"},
+        9001: {"user_status": "REJECTED"},
+        9002: {"user_status": "RESERVE"},
+    }
+    attach_rejection_reasons(connection, reviews, {strategy_id: "AB_DETERIORATION;REJECTED",
+                                                   9001: rejection_reason_label("SELECTION_HARD_CUTOFF"),
+                                                   9002: "AB_DETERIORATION;REJECTED"})
+
+    assert reviews[strategy_id]["rejection_reason"] == "FILTER_LOT_VARIANT_REDUNDANCY;REJECTED"
+    assert reviews[9001]["rejection_reason"] == "FILTER_HARD_CUTOFFS;REJECTED"
+    assert rejection_reason_label("SELECTION_AUTOMATIC_REJECTION") == "AUTOMATIC_FILTER;REJECTED"
+    assert "rejection_reason" not in reviews[9002]

@@ -287,7 +287,8 @@ from .performance_v2_selection_review import (
     SelectionReviewError,
     _selection_rows,
     apply_prior_rejected,
-    automatic_filter_rejected_strategy_ids,
+    attach_rejection_reasons,
+    automatic_filter_rejected_ids,
     _current_equity_revisions,
     import_retest_tags,
     import_selection_review,
@@ -298,6 +299,7 @@ from .performance_v2_selection_review import (
     new_run_metadata,
     persist_selection_snapshot,
     persist_selection_snapshots,
+    rejection_reason_label,
 )
 from .performance_v2_publication import publish_publication
 from .performance_v2_retest import build_retest_manifest, retest_status
@@ -6895,15 +6897,21 @@ class PanelController:
                     user_review_rows = latest_user_reviews_by_strategy(
                         connection, [int(strategy_id) for strategy_id in result["strategy_id"]]
                     )
-                    pending_rejected = automatic_filter_rejected_strategy_ids(
+                    pending_by_source = automatic_filter_rejected_ids(
                         result, request, selection_config,
                     )
+                    pending_reasons = {
+                        strategy_id: rejection_reason_label(source)
+                        for source, strategy_ids in pending_by_source.items()
+                        for strategy_id in strategy_ids
+                    }
                     for row in _selection_rows(result):
                         strategy_id = int(row["strategy_id"])
                         if row.get("prior_rejected") is True:
                             user_review_rows.setdefault(strategy_id, {})["user_status"] = "REJECTED"
-                        if strategy_id in pending_rejected:
+                        if strategy_id in pending_reasons:
                             user_review_rows.setdefault(strategy_id, {})["user_status"] = "REJECTED"
+                    attach_rejection_reasons(connection, user_review_rows, pending_reasons)
                 workbook = write_selection_workbook(
                     result, Path(directory) / "finalists.xlsx", request, metadata, user_review_rows
                 )
@@ -9744,6 +9752,7 @@ class _PanelServer(ThreadingHTTPServer):
                 for value in item.result.get("strategy_id", pd.Series(dtype=int)).tolist()
             ]
             user_review_rows = latest_user_reviews_by_strategy(connection, strategy_ids)
+            attach_rejection_reasons(connection, user_review_rows)
             data = build_combined_selection_workbook(
                 partitions,
                 database_instance_id=package.database_instance_id,

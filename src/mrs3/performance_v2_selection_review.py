@@ -464,6 +464,66 @@ def _rejected_strategy_ids(
     return {int(row[0]) for row in rows}
 
 
+_REJECTION_SOURCE_REASONS = {
+    "SELECTION_LOT_VARIANT": "FILTER_LOT_VARIANT_REDUNDANCY",
+    "SELECTION_HARD_CUTOFF": "FILTER_HARD_CUTOFFS",
+    "SELECTION_AB_DETERIORATION": "AB_DETERIORATION",
+    "SELECTION_REVIEW": "USER_REVIEW",
+    "SELECTION_AUTOMATIC_REJECTION": "AUTOMATIC_FILTER",
+}
+
+
+def rejection_reason_label(source: str, reason_code: str | None = None) -> str:
+    """Workbook reason naming the filter or review that set REJECTED."""
+    if source == "EQUITY_REGIME_FILTER":
+        parts = ["FILTER_EQUITY_REGIME", *([reason_code] if reason_code else [])]
+    else:
+        parts = [_REJECTION_SOURCE_REASONS.get(source, source)]
+    return ";".join([*parts, "REJECTED"])
+
+
+def rejection_reasons_by_strategy(
+    connection: duckdb.DuckDBPyConnection, strategy_ids: Sequence[int],
+) -> dict[int, str]:
+    """Return the earliest stored REJECTED source of each strategy as a workbook reason."""
+    ids = [int(value) for value in strategy_ids]
+    if not ids:
+        return {}
+    sources = connection.execute(
+        """select strategy_id, source, null, updated_at_utc from strategy_tags
+            where tag = 'REJECTED' and strategy_id in (select unnest(?::bigint[]))""",
+        [ids],
+    ).fetchall()
+    try:
+        sources += connection.execute(
+            """select strategy_id, source_kind, reason_code, created_at_utc from strategy_rejection_sources
+                where strategy_id in (select unnest(?::bigint[]))""",
+            [ids],
+        ).fetchall()
+    except duckdb.CatalogException:
+        pass
+    reasons: dict[int, str] = {}
+    for strategy_id, source, reason_code, _ in sorted(
+        sources, key=lambda row: (int(row[0]), row[3], str(row[1]), str(row[2] or "")),
+    ):
+        reasons.setdefault(int(strategy_id), rejection_reason_label(str(source), reason_code))
+    return reasons
+
+
+def attach_rejection_reasons(
+    connection: duckdb.DuckDBPyConnection,
+    reviews: dict[int, dict[str, object]],
+    pending_reasons: Mapping[int, str] | None = None,
+) -> None:
+    """Add `rejection_reason` to REJECTED review rows: stored source first, then this run's filter."""
+    rejected = [strategy_id for strategy_id, review in reviews.items() if review.get("user_status") == "REJECTED"]
+    stored = rejection_reasons_by_strategy(connection, rejected)
+    for strategy_id in rejected:
+        reason = stored.get(strategy_id) or (pending_reasons or {}).get(strategy_id)
+        if reason:
+            reviews[strategy_id]["rejection_reason"] = reason
+
+
 def apply_prior_rejected(connection: duckdb.DuckDBPyConnection, candidates: pd.DataFrame) -> pd.DataFrame:
     output = candidates.copy()
     rejected = _rejected_strategy_ids(connection)

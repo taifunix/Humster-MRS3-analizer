@@ -98,6 +98,28 @@ candidate metric table, so the columns appear only in the XLSX.
   validator accepts the previous header tuple, each checked against its own
   `headers_sha256`. A previous header tuple with the current hash is rejected.
 
+## Reason of REJECTED rows (amended 2026-10-12)
+
+For a row shown with status `REJECTED`, `Причина` (aggregate: `Elimination
+Reason`) names the filter or review that set `REJECTED`, not the first stage
+that fired in the current run. The source is the earliest of the rejections
+currently stored for the strategy: its `strategy_tags` tag `REJECTED` (one row
+per strategy; the latest writer replaces its source) and its
+`strategy_rejection_sources` rows. Without a stored source, the automatic
+filter that rejects it in this run is shown. Known limits: review imports and
+finalist retest replace `REJECTED` tags with source `SELECTION_REVIEW`, so a
+strategy first rejected by an automatic filter shows `USER_REVIEW;REJECTED`
+after such a write; the all-pairs automatic-rejection publication stores
+`SELECTION_AUTOMATIC_REJECTION` without the filter name and shows
+`AUTOMATIC_FILTER;REJECTED`. Applies to the pair selection workbook and the
+all-pairs workbook. Finalist control/retest candidate workbooks are excluded:
+their `Причина` column is the importer's protected `Auto Reason`. Labels:
+`FILTER_LOT_VARIANT_REDUNDANCY;REJECTED`, `FILTER_HARD_CUTOFFS;REJECTED`,
+`AB_DETERIORATION;REJECTED`, `USER_REVIEW;REJECTED`, `AUTOMATIC_FILTER;REJECTED` and
+`FILTER_EQUITY_REGIME;<reason code>;REJECTED`. If the current reason already
+starts with the same filter, its detailed text stays. Display only: persisted
+`selection_results.auto_reason` and stage traces are unchanged.
+
 ## Compatibility and acceptance
 
 - Review imports continue to use their existing protected headers and ignore

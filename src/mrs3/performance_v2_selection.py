@@ -1944,6 +1944,18 @@ def _present(value: object) -> bool:
     return value is not None and not pd.isna(value)
 
 
+def _rejected_row_reason(reason: object, review: Mapping[str, object] | None) -> object:
+    """For a REJECTED row show the filter that set REJECTED, not the first stage that fired."""
+    if not isinstance(review, Mapping) or review.get("user_status") != "REJECTED":
+        return reason
+    label = review.get("rejection_reason")
+    if not isinstance(label, str) or not label:
+        return reason
+    if isinstance(reason, str) and reason.split(";", 1)[0] == label.split(";", 1)[0]:
+        return reason
+    return label
+
+
 def _analog_group_keys(survivors: pd.DataFrame) -> pd.Series:
     """Partition exact plateau structures into non-transitive adjacent Close-MA groups."""
     groups: dict[tuple[object, ...], list[tuple[int, int, object]]] = {}
@@ -3737,6 +3749,11 @@ def write_selection_workbook(
             top_n=top_n,
             user_review=(user_review_rows or {}).get(strategy_id) if strategy_id is not None else None,
         ))
+    if "elimination_reason" in display and "strategy_id" in display and user_review_rows:
+        display["elimination_reason"] = [
+            _rejected_row_reason(reason, user_review_rows.get(int(strategy_id)) if _present(strategy_id) else None)
+            for reason, strategy_id in zip(display["elimination_reason"], display["strategy_id"], strict=True)
+        ]
     reason_positions = {stage_id.upper(): index for index, stage_id in enumerate(enabled_stage_ids, start=1)}
     if "elimination_reason" in display:
         display["elimination_reason"] = display["elimination_reason"].map(
@@ -4252,7 +4269,10 @@ def _aggregate_row(
         elif source == "equity_regime_rank":
             value = _aggregate_regime_rank(raw)
         if source == "elimination_reason":
-            value = raw.get("elimination_reason", raw.get("auto_reason"))
+            value = _rejected_row_reason(
+                raw.get("elimination_reason", raw.get("auto_reason")),
+                {"user_status": status, "rejection_reason": review.get("rejection_reason")},
+            )
         rendered[header] = _aggregate_json(value)
     for header in SELECTION_WORKBOOK_HEADERS:
         rendered.setdefault(header, None)

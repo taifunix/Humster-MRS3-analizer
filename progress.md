@@ -8,6 +8,18 @@ Use [PRD.md](PRD.md) for the feature registry and [docs/README.md](docs/README.m
 for the documentation map. Read the linked contract only for the active task;
 do not treat this file as a replacement for a feature specification.
 
+## Reason of REJECTED rows in selection workbooks (2026-10-12)
+
+In the pair selection and all-pairs workbooks, a row shown as `REJECTED` now
+names the filter or review that set `REJECTED` (for example
+`AB_DETERIORATION;REJECTED`) instead of the first stage that fired in the
+current run. Display only; persisted selection results are unchanged. Finalist
+control/retest workbooks are excluded because their `Причина` is a protected
+import field. Known limit: review imports and finalist retest rewrite
+`REJECTED` tags as `SELECTION_REVIEW`. Contract: the amendment in the
+[XLSX column contract](docs/specs/2026-10-07-performance-v2-xlsx-column-contract.md).
+Restart Panel to use it.
+
 ## MRS2 point settings: out-of-sample check (2026-10-12)
 
 A read-only study compared point facts in an earlier analysis with the same

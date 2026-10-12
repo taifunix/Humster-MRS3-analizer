@@ -343,3 +343,20 @@ def test_combined_workbook_rejects_previous_headers_with_current_header_hash(mon
         validate_combined_selection_workbook(mixed.getvalue())
 
     assert str(error.value) == "SELECTION_REVIEW_HEADER_MISMATCH"
+
+
+def test_combined_workbook_shows_rejecting_filter_for_rejected_rows() -> None:
+    rows = pd.DataFrame([
+        {"strategy_id": 7, "result_id": 70, "strategy_name": "candidate-7", "auto_status": "RESERVE",
+         "elimination_reason": "EQUITY_REGIME_STALLED_RESERVE"},
+        {"strategy_id": 3, "result_id": 30, "strategy_name": "candidate-3", "auto_status": "RESERVE",
+         "elimination_reason": "EQUITY_REGIME_STALLED_RESERVE"},
+    ])
+    data = build_combined_selection_workbook(
+        [AllPairsPartition("BTCUSDT", "LONG", "run-btc-long", rows)],
+        user_review_rows={7: {"user_status": "REJECTED", "rejection_reason": "FILTER_LOT_VARIANT_REDUNDANCY;REJECTED"}},
+    )
+
+    result = validate_combined_selection_workbook(data)
+    reasons = {row["ID"]: row["Elimination Reason"] for row in result["rows"]}
+    assert reasons == {3: "EQUITY_REGIME_STALLED_RESERVE", 7: "FILTER_LOT_VARIANT_REDUNDANCY;REJECTED"}
