@@ -8,6 +8,37 @@ Use [PRD.md](PRD.md) for the feature registry and [docs/README.md](docs/README.m
 for the documentation map. Read the linked contract only for the active task;
 do not treat this file as a replacement for a feature specification.
 
+## Equity evaluation research (2026-10-12)
+
+A read-only walk-forward study compared equity facts with what each strategy
+did next, within its pair, on three non-overlapping periods (cuts T−14, T−28
+and T−42).
+
+- **Return within a pair is not predicted** by equity speed, STRONG/WEAK,
+  smoothness, B, DD5 or the R7.3 score.
+- **Risk is predicted:** most consistently by depth below the high-water mark
+  and relative smoothness within the pair; less consistently by the latest
+  weekly loss and DECLINE (DECLINE measured only on the T−14/T−7 cuts).
+- **Filter 7 shows no measurable effect** (approximate replay).
+- **Caveat: survivorship bias.** The sample contains only strategies still in
+  the database. Rejection filters partly looked at the outcome windows (A/B
+  deterioration uses the last 14 days), so the conclusions are preliminary
+  until the protocol-v2 database is analysed before rejection filters run.
+
+Evidence:
+[walk-forward report](docs/reports/2026-10-12-equity-evaluation-walk-forward.md).
+Proposed contract, pending user confirmation of D1/D15:
+[equity risk evaluation](docs/specs/2026-10-12-equity-risk-evaluation.md).
+The recommended filter set keeps filters 2–6 and 8–10 and turns off filter 7.
+
+The research scripts are in `scripts/equity_research/`; the report lists each
+script, its input and how to run it. Metrics of the new tester report worth
+recording for the next analysis:
+[tester metrics to record](docs/reports/2026-10-12-tester-report-metrics-to-record.md).
+
+Next step: confirm D1/D15. Repeat the rolling-origin study on the protocol-v2
+database once longer tests exist.
+
 ## PerformanceDB compaction and faster verification (2026-10-12)
 
 The live PerformanceDB was compacted from 31.14 GiB to 15.76 GiB and is now
