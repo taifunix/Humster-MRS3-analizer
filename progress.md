@@ -35,8 +35,10 @@ and T−42).
   measured on the new drawdown after the cut): the mean daily worst floating
   loss is the strongest predictor of the new drawdown after the cut on all three
   cuts, ahead of CVaR, Ulcer and smoothness; against the all-time high-water
-  mark it is comparable to Ulcer (report §2a). It is proposed to replace smoothness in the in-pair
-  risk flag. Depth below the high-water mark mostly describes the current state:
+  mark it is comparable to Ulcer (report §2a). User decision 2026-10-12: keep
+  both in-pair risk flags (smoothness `ROUGH_IN_PAIR` and MAE-like
+  `HIGH_FLOAT_IN_PAIR`) and choose after the protocol-v2 recheck. Depth below
+  the high-water mark mostly describes the current state:
   on the clean outcome it predicts future drawdown only weakly. Preliminary,
   pending the protocol-v2 recheck.
 - **Caveat: survivorship bias.** The sample contains only strategies still in
