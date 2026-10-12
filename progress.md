@@ -1,12 +1,53 @@
 # MRS3 Current Status
 
-Last updated: 2026-10-09
+Last updated: 2026-10-12
 
 This file is a current-status snapshot, not a session log. Earlier progress notes remain in Git history; feature contracts and detailed evidence belong in the linked specs, reports, and plans.
 
 Use [PRD.md](PRD.md) for the feature registry and [docs/README.md](docs/README.md)
 for the documentation map. Read the linked contract only for the active task;
 do not treat this file as a replacement for a feature specification.
+
+## MRS3 evaluation protocol v2 (2026-10-12)
+
+Approved; P1 implemented, P2–P6 pending. Evaluation tests of MRS3 move to a
+fixed lot of 10 000 USDT with `LimitOrderVolumeCheck=false` and entry MA
+source `ohlc4`, and their results go to a **new** PerformanceDB. The current
+database stays the protocol-v1 database and keeps working without data
+changes; mixing protocols in one database is refused. Stage 2 of the
+optimizer keeps its own tester template with %-of-balance sizing and the
+volume check. Contract:
+[protocol v2 spec](docs/specs/2026-10-12-mrs3-evaluation-protocol-v2.md);
+decision: [ADR-0070](docs/decisions/0070-mrs3-evaluation-protocol-v2.md).
+
+Found while preparing it: in both MRS3 strategy templates the first LONG
+entry prototype is `SMA/open` (SHORT is `SMA/ohlc4`), and the generator copies
+it to every level, while the MRS2 plateau points are tested with `ohlc4`. All
+2 361 JSON files of the last finalist RETEST are LONG with `SMA/open` entries.
+PerformanceDB does not store MA type or source; P2 adds them (additive schema
+v12).
+
+Read-only evidence (2026-10-12, 30 370 current results): compounding alone
+barely changes the top-5 per pair (identical in 92–96% of pools); fixed-lot
+curves measured by the current window formulas would match only 41%, so P4
+normalizes fixed-lot metrics. A 10 000 USDT base keeps the qty-step error of
+the smallest order level under 1% for 80 of 81 pairs. Full evidence:
+[discussion A3/B2](docs/superpowers/plans/2026-10-12-universal-equity-evaluation-discussion.md).
+
+P1: optimizer Stage 2 reads `templates/tester/portfolio-stage2/config_tester.json`
+(a byte copy of the old MRS3 template); its rendered config is pinned by
+SHA-256 in tests. Verification: `.venv\Scripts\python.exe -m pytest
+-p no:cacheprovider -q tests/test_panel_portfolio.py tests/test_panel_testing.py
+tests/test_panel_fast_strategy_test.py tests/test_panel_strategy_batch.py
+tests/test_tester_run_files.py` — 466 passed, 1 skipped (Windows symlinks).
+Independent review: `CODE_REVIEW_PASS`; the pin and three nits were applied.
+
+The new tester report format of 2026-10-09 is not yet parsed by Performance
+v2 import (duplicate analytics metric names); its adaptation is a separate
+task before the tester update.
+
+Next step: P2 (schema v12 audit first). Mass testing only after P6, in the
+new database.
 
 ## Portfolio MILP composition selection (2026-10-10)
 
