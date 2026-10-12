@@ -1,0 +1,60 @@
+<!doctype html>
+<html><body>
+<div><span>hb/tester/</span><span title="Version of the program that made the report">ver.2026/10/10</span><span>/backtest_results:</span></div>
+<pre>{"name":"MRS3 Format 2026-10","exchange":{"name":"Bybit","use_upnl":true},"basic":{"symbol":"ONUSDT","time_frame":"1h","strategy":"mrs3","use_long":true,"use_short":false},"mrs3":{"ma_long":[{"id":1,"len":7,"multiplier":0.995,"lot_x":1}],"ma_short":[],"ma_close_long":{"len":3,"multiplier":1.003},"ma_close_short":{"len":3,"multiplier":0.997}}}</pre>
+<table><thead><tr><th>Year</th><th>Jan</th><th>Feb</th><th>Year</th></tr></thead><tbody>
+<tr><td>2026</td><td>0.99%</td><td>—</td><td>0.99%</td></tr>
+</tbody></table>
+<table><thead><tr><th>Metric</th><th>Value</th></tr></thead><tbody>
+<tr><td>Report range</td><td>2026-01-01 - 2026-01-09</td></tr>
+<tr><td>Initial balance</td><td>1000</td></tr>
+<tr><td>Final balance</td><td>1009.9</td></tr>
+<tr><td>Average monthly return (geometric), %</td><td>0.99</td></tr>
+</tbody></table>
+<table><thead><tr><th>Metric</th><th>Value</th></tr></thead><tbody>
+<tr><td>Total PnL</td><td>9.9</td></tr>
+<tr><td>Total PnL, %</td><td>0.99</td></tr>
+<tr><td>Gross profit</td><td>10.0</td></tr>
+<tr><td>Gross loss</td><td>0.0</td></tr>
+<tr><td>Total transactions (buy/sell)</td><td>2</td></tr>
+<tr><td>Total fees</td><td>0.1</td></tr>
+<tr><td>Funding paid</td><td>0.07</td></tr>
+<tr><td>PnL without top 5 winning trades</td><td>0.00</td></tr>
+<tr><td>PnL without best pair</td><td>n/a</td></tr>
+</tbody></table>
+<table><thead><tr><th>Metric</th><th>Value</th></tr></thead><tbody>
+<tr><td>Total Trades (entry → full exit)</td><td>1</td></tr>
+<tr><td>Win Trades</td><td>1</td></tr>
+<tr><td>Los Trades</td><td>0</td></tr>
+<tr><td>Largest win</td><td>9.9184</td></tr>
+<tr><td>Avg holding time</td><td>2h 0m</td></tr>
+<tr><td>Max holding time</td><td>1d 22h 3m</td></tr>
+<tr><td>Sortino ratio (monthly)</td><td>n/a</td></tr>
+<tr><td>Max Unrealized Drawdown, % of wallet</td><td>0.29</td></tr>
+<tr><td>Max Unrealized Drawdown — time (UTC)</td><td>2026-01-02 13:15</td></tr>
+<tr><td>Ulcer Index (hourly), %</td><td>0.0894</td></tr>
+</tbody></table>
+<table><thead><tr><th>Metric</th><th>Value</th></tr></thead><tbody>
+<tr><td>Total PnL</td><td>9.9</td></tr>
+<tr><td>PnL without best pair</td><td>n/a (single pair)</td></tr>
+<tr><td>Largest win</td><td>9.92 · ONUSDT · 2026-01-03 01:00</td></tr>
+<tr><td>Ulcer Index (hourly), %</td><td>0.0894</td></tr>
+<tr><td>Longest drawdown (peak → recovery)</td><td>7d 13h 0m</td></tr>
+<tr><td>Avg MAE (worst open PnL), all trades</td><td>-0.0455</td></tr>
+<tr><td>Losing trades that were in profit</td><td>0 of 0 (0.00%)</td></tr>
+<tr><td>VaR 95%, daily (historical)</td><td>0.09%</td></tr>
+</tbody></table>
+<table><thead><tr><th>Regime</th><th>Pair-days</th><th>PnL</th><th>Avg PnL per pair-day</th><th>Winning days, % of active</th><th>Share of PnL</th></tr></thead><tbody>
+<tr><td>Trend · High vol</td><td>2</td><td>9.90</td><td>4.9500</td><td>100.00%</td><td>100.00%</td></tr>
+<tr><td colspan="6">Totals by one dimension</td></tr>
+<tr><td>↘ Downtrend</td><td>0</td><td>0.00</td><td>n/a</td><td>n/a</td><td>0.00%</td></tr>
+</tbody></table>
+<table><thead><tr><th>Timestamp</th><th>Symbol</th><th>Order ID</th><th>Strategy</th><th>Side</th><th>Action</th><th>Size</th><th>Price</th><th>Fee</th><th>PnL</th><th>Balance</th><th>Post Size</th><th>Post Side</th><th>Cost</th><th>Cost, % of margin balance</th></tr></thead><tbody>
+<tr><td>2026-01-01T01:00:00Z</td><td>ONUSDT</td><td>1</td><td>mrs3</td><td>Buy</td><td>opened</td><td>1</td><td>10</td><td>0.05</td><td>0</td><td>999.95</td><td>1</td><td>long</td><td>10</td><td>1.00</td></tr>
+<tr><td>2026-01-03T01:00:00+00:00</td><td>ONUSDT</td><td>1</td><td>mrs3</td><td>Sell</td><td>closed</td><td>1</td><td>20</td><td>0.05</td><td>9.9</td><td>1009.9</td><td>0</td><td></td><td>20</td><td>1.98</td></tr>
+</tbody></table>
+<script>
+const walletSeries = [[1767225600000,"1000"],[1767229200000,"999.95"],[1767402000000,"1009.9"]];
+const equitySeries = [[1767225600000,"1000"],[1767229200000,"999.95"],[1767402000000,"1009.9"]];
+</script>
+</body></html>

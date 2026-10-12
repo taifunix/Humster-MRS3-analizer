@@ -8,6 +8,32 @@ Use [PRD.md](PRD.md) for the feature registry and [docs/README.md](docs/README.m
 for the documentation map. Read the linked contract only for the active task;
 do not treat this file as a replacement for a feature specification.
 
+## Next: PerformanceDB upgrade for the new tester report (2026-10-12)
+
+Approved contract: [PerformanceDB new report format](docs/specs/2026-10-12-performance-db-new-report-format.md),
+implemented together with P2–P6 of the
+[MRS3 evaluation protocol v2](docs/specs/2026-10-12-mrs3-evaluation-protocol-v2.md)
+in this session (user decision). Order: N1 parse → P2+N2 schema v12 → P3+N3
+import → N4 maintenance/compaction → P4–P6 → P7 Panel database selection.
+N1 is done: `parse_current_performance_v2_html` reads the 2026-10 format
+(version-only detection, compatible duplicate metrics, 59 analytics labels,
+regimes and monthly returns); the real sample parses fully; legacy parsing is
+unchanged (reviewed against HEAD on all fixtures and real 2026/09/22 reports).
+User decision 2026-10-12: one PerformanceDB per exchange with an
+`schema_info.exchange` marker (protocol v2 §4.1); the CSV Direct analysis DB
+(branch `feat/csv-direct-analysis`) must also record the exchange from the run
+snapshot `exchange.name` — pending, separate commit on that branch. The current parser rejects the new HTML
+(`metrics contain duplicate or empty keys`). The old database must keep
+working after the additive v11 → v12 migration; missing analytics is not an
+error. The working tree holds the user's uncommitted P6 template edits
+(`retest-mrs3/base.json`: fixed lot 10 000, `ohlc4`, `more_data=false`;
+`mrs3/config_tester.json`: `InitialBalance` 10000, `LimitOrderVolumeCheck`
+false). With them two finalist-retest tests fail until P6:
+`test_weighted_template_only_changes_name_and_mrs_priority` (named in protocol
+v2 §9) and `test_manifest_has_one_common_period_and_native_strategy_provenance`
+(asserts the old `use_fix=false`). Do not run MRS3 evaluation tests with these templates before
+P2–P5: the current import rejects `use_upnl=false` reports.
+
 ## Reason of REJECTED rows in selection workbooks (2026-10-12)
 
 In the pair selection and all-pairs workbooks, a row shown as `REJECTED` now
