@@ -5171,3 +5171,45 @@ def test_selection_row_fill_requires_trace_for_non_rejected_colors() -> None:
     assert selection_row_fill(
         outside_top_n, enabled_stage_ids=("rank_robust_top_n",), top_n=None,
     ) == "D9EAD3"
+
+
+def _fee_metric(return_pct: str | None, fees_pct: str | None, days: int = 30) -> WindowMetrics:
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    end = start + timedelta(days=days)
+    return WindowMetrics(
+        1, start, end, METRICS_VERSION, start, end, "AVAILABLE", None,
+        Decimal("1.1"), None if return_pct is None else Decimal(return_pct), None, None, Decimal("2"), None,
+        None if fees_pct is None else Decimal(fees_pct), None, 4, Decimal("100"),
+    )
+
+
+def test_fee_efficiency_uses_gross_profit_share_and_calendar_days() -> None:
+    metric = _fee_metric("6", "2", days=60)
+
+    share, per_30d = selection_module._fee_efficiency(metric, metric.requested_start_utc, metric.requested_end_utc)
+
+    assert share == Decimal("25")  # 2 / (6 + 2)
+    assert per_30d == Decimal("1")  # 2% over 60 days
+
+
+def test_fee_efficiency_blank_without_gross_profit_or_inputs() -> None:
+    loss = _fee_metric("-3", "1")
+    assert selection_module._fee_efficiency(loss, loss.requested_start_utc, loss.requested_end_utc)[0] is None
+    missing = _fee_metric("5", None)
+    assert selection_module._fee_efficiency(missing, missing.requested_start_utc, missing.requested_end_utc) == (None, None)
+    unavailable = WindowMetrics.unavailable(1, loss.requested_start_utc, loss.requested_end_utc, "NO_TRADES", METRICS_VERSION)
+    assert selection_module._fee_efficiency(unavailable, loss.requested_start_utc, loss.requested_end_utc) == (None, None)
+
+
+def test_workbook_shows_fee_efficiency_after_top5_share(tmp_path: Path) -> None:
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
+    result = run_selection(pd.DataFrame([
+        _selection_row("one", fees_share_pct=Decimal("25.4"), fees_per_30d_pct=Decimal("1.26")),
+    ]), request)
+
+    path = write_selection_workbook(result, tmp_path / "fees.xlsx", request)
+    headers = [cell.value for cell in load_workbook(path, data_only=True)["All candidates"][1]]
+    top5 = headers.index("Top 5 share, %")
+
+    assert headers[top5 + 1: top5 + 3] == ["Fees share, %", "Fees/30, %"]
+    assert "Fees share, %" in selection_module.SELECTION_LEGACY_HEADERS

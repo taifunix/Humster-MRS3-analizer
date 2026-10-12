@@ -8,6 +8,17 @@ Use [PRD.md](PRD.md) for the feature registry and [docs/README.md](docs/README.m
 for the documentation map. Read the linked contract only for the active task;
 do not treat this file as a replacement for a feature specification.
 
+## Fee efficiency columns in the selection XLSX (2026-10-12)
+
+The selection workbooks now show `Fees share, %` (fees as a share of the gross
+pre-fee return) and `Fees/30, %` right after `Top 5 share, %`. Both come from the
+cached full-report window facts and are display-only. Contract: the fee
+amendment in the
+[XLSX column contract](docs/specs/2026-10-07-performance-v2-xlsx-column-contract.md).
+Aggregate workbooks exported before these columns remain importable (the
+previous header tuple is accepted with its own hash). Verification: selection,
+aggregate workbook, publication, export and review suites, 481 passed.
+
 ## Equity evaluation research (2026-10-12)
 
 A read-only walk-forward study compared equity facts with what each strategy
@@ -44,7 +55,7 @@ script, its input and how to run it. Metrics of the new tester report worth
 recording for the next analysis:
 [tester metrics to record](docs/reports/2026-10-12-tester-report-metrics-to-record.md).
 
-Next step: a small spec for fee-efficiency columns. Repeat the rolling-origin study on the protocol-v2
+Next step: repeat the rolling-origin study on the protocol-v2
 database once longer tests exist.
 
 ## PerformanceDB compaction and faster verification (2026-10-12)

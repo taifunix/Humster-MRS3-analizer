@@ -102,6 +102,7 @@ _CANDIDATE_COLUMNS = (
     "ab_return_a_30d_pct", "ab_return_b_30d_pct", "ab_calendar_days_a", "ab_calendar_days_b", "ab_win_rate_b_pct",
     "ab_trade_rate_a_30d", "ab_trade_rate_b_30d", "ab_drawdown_b_pct", "ab_holding_p95_minutes",
     "initial_balance", "history_days", "completed_cycle_count", "reliable_completed_cycle_count", "completed_profitable_cycle_count", "completed_cycle_net_pnl", "top5_pnl", "top5_share_pct", "pnl_after_top5", "completed_cycles_reliable",
+    "fees_share_pct", "fees_per_30d_pct",
     "best_trade_profit_share_pct", "pnl_without_best_trade", "pnl_without_best_trade_pct", "completed_profitable_trade_count", "best_trade_reliable",
     "ab_completed_cycle_count",
     "positive_quarter_count", "positive_quarter_available_count", "positive_quarter_status", "robust_pnl_30d_pct", "worst_drawdown_pct", "worst_holding_p95_minutes",
@@ -756,6 +757,25 @@ def _trade_rate_30d(
     if days is None:
         return None
     return Decimal(metrics.trade_count) * 30 / days if days >= 1 else None
+
+
+def _fee_efficiency(
+    metrics: WindowMetrics,
+    report_start_utc: datetime | None = None,
+    report_end_utc: datetime | None = None,
+) -> tuple[Decimal | None, Decimal | None]:
+    """Fee share of gross profit and fees per 30 days, both from one window's facts.
+
+    ``return_pct`` and ``fees_pct`` share the window baseline, so their sum is the
+    gross (pre-fee) return; the share is blank when that gross is not positive.
+    """
+    if not metrics.available or metrics.fees_pct is None:
+        return None, None
+    gross = None if metrics.return_pct is None else metrics.return_pct + metrics.fees_pct
+    share = metrics.fees_pct / gross * 100 if gross is not None and gross > 0 else None
+    days = calendar_window_days(metrics, report_start_utc, report_end_utc)
+    per_30d = metrics.fees_pct * 30 / days if days is not None and days >= 1 else None
+    return share, per_30d
 
 
 def _ab_metrics(
@@ -1789,6 +1809,7 @@ def load_selection_candidates(
                 )
             daily_log = None if full_metrics is None else full_metrics.daily_log_return
             pnl_30d = None if full_metrics is None else _return_30d(full_metrics, report_start, report_end)
+            fees_share, fees_30d = (None, None) if full_metrics is None else _fee_efficiency(full_metrics, report_start, report_end)
             drawdown = _decimal_or_none(max_drawdown_pct)
             risk_scale = Decimal(5) / drawdown if drawdown is not None and drawdown > 0 else None
             completed_facts = cycle_facts.get(result_id, {"completed_cycles_reliable": False})
@@ -1809,6 +1830,7 @@ def load_selection_candidates(
                 "profit_factor": None if full_metrics is None else full_metrics.profit_factor,
                 "win_rate_pct": None if full_metrics is None else full_metrics.win_rate_pct,
                 "risk_scale": risk_scale, "dd5_proxy": pnl_30d * risk_scale if pnl_30d is not None and risk_scale is not None else None,
+                "fees_share_pct": fees_share, "fees_per_30d_pct": fees_30d,
                 "holding_p95_minutes": holding_minutes.get(result_id, (None, None))[0],
                 "holding_median_minutes": holding_minutes.get(result_id, (None, None))[1],
                 **ab_metrics, "ab_holding_p95_minutes": b_holding_minutes.get(result_id),
@@ -3839,7 +3861,7 @@ def write_selection_workbook(
         "pnl_30d_pct", "dd5_proxy", "ab_pnl_change_30d_pct", "ab_return_a_30d_pct", "ab_calendar_days_a", "ab_return_b_30d_pct", "ab_calendar_days_b", "positive_quarter_count",
         "capital_efficiency", "profit_factor", "max_drawdown_pct", "win_rate_pct", "total_trades", "trades_30d", "capital_proxy",
         "holding_p95_minutes", "holding_median_minutes",
-        "top5_share_pct", "ab_completed_cycle_count", "ab_win_rate_b_pct",
+        "top5_share_pct", "fees_share_pct", "fees_per_30d_pct", "ab_completed_cycle_count", "ab_win_rate_b_pct",
         "robust_pnl_30d_pct", "worst_drawdown_pct", "worst_holding_p95_minutes", "ab_stability_ratio",
         "rank_quality_robust_pnl", "rank_quality_worst_drawdown", "rank_quality_ab_stability", "rank_quality_first_shift", "rank_quality_minimum_plateau_points", "rank_quality_close_ma",
         "rank_weight_coverage_pct", "rank_weight_robust_pnl", "rank_weight_worst_drawdown", "rank_weight_ab_stability", "rank_weight_first_shift", "rank_weight_minimum_plateau_points", "rank_weight_close_ma",
@@ -3862,7 +3884,8 @@ def write_selection_workbook(
         "max_drawdown_pct": "DD", "win_rate_pct": "W/R", "total_trades": "Trades", "capital_proxy": "Lot DD5",
         "holding_p95_minutes": "Hold p95", "holding_median_minutes": "Hold M",
         "elimination_reason": "Причина",
-        "top5_share_pct": "Top 5 share, %", "ab_completed_cycle_count": "B cycles", "ab_win_rate_b_pct": "B W/R",
+        "top5_share_pct": "Top 5 share, %", "fees_share_pct": "Fees share, %", "fees_per_30d_pct": "Fees/30, %",
+        "ab_completed_cycle_count": "B cycles", "ab_win_rate_b_pct": "B W/R",
         "positive_quarter_count": "Positive windows", "trades_30d": "Trades/30",
         "robust_pnl_30d_pct": "Robust PnL/30", "worst_drawdown_pct": "Worst DD", "worst_holding_p95_minutes": "Worst Hold p95",
         "ab_stability_ratio": "A/B stability",
@@ -4015,7 +4038,7 @@ SELECTION_LEGACY_HEADERS = (
     "Стратегия", "Пара", "ТФ", "Start", "End", "ORD", "Close", "PnL/30", "PnL DD5/30", "PF",
     "Δ PnL A/B", "PnL A/30д, %", "Дней A", "PnL B/30д, %", "Дней B", "Positive windows",
     "CE", "DD", "W/R", "Trades", "Trades/30", "Lot DD5", "Hold p95", "Hold M",
-    "Top 5 share, %", "B cycles", "B W/R", "Robust PnL/30", "Worst DD", "Worst Hold p95",
+    "Top 5 share, %", "Fees share, %", "Fees/30, %", "B cycles", "B W/R", "Robust PnL/30", "Worst DD", "Worst Hold p95",
     "A/B stability", "Final score (Pair+Side)", "1 Shift", "2 Shift", "3 Shift", "Lots", "Points", "MA",
     "Equity state", "Equity basis", "Equity DD, %", "Equity smoothness", "Regime rank", "Regime reasons",
     "PRE28 direction", "PRE28 v", "PRE28 p", "W28 direction", "W28 v", "W28 p", "W14 direction",
@@ -4023,6 +4046,12 @@ SELECTION_LEGACY_HEADERS = (
     "New ATH stages", "New ATH W7", "Held ATH W7", "Elimination Reason",
 )
 SELECTION_WORKBOOK_HEADERS = tuple(dict.fromkeys(SELECTION_AGGREGATE_HEADERS + SELECTION_LEGACY_HEADERS))
+# Aggregate workbooks exported before the display-only fee columns remain
+# importable; each accepted header tuple is checked against its own hash.
+SELECTION_WORKBOOK_PREVIOUS_HEADERS = tuple(
+    header for header in SELECTION_WORKBOOK_HEADERS if header not in ("Fees share, %", "Fees/30, %")
+)
+SELECTION_WORKBOOK_ACCEPTED_HEADERS = (SELECTION_WORKBOOK_HEADERS, SELECTION_WORKBOOK_PREVIOUS_HEADERS)
 
 
 class SelectionWorkbookError(PerformanceV2SelectionError):
@@ -4194,6 +4223,7 @@ def _aggregate_row(
         "Positive windows": "positive_quarter_count", "CE": "capital_efficiency", "DD": "max_drawdown_pct",
         "W/R": "win_rate_pct", "Trades": "total_trades", "Trades/30": "trades_30d", "Lot DD5": "capital_proxy",
         "Hold p95": "holding_p95_minutes", "Hold M": "holding_median_minutes", "Top 5 share, %": "top5_share_pct",
+        "Fees share, %": "fees_share_pct", "Fees/30, %": "fees_per_30d_pct",
         "B cycles": "ab_completed_cycle_count", "B W/R": "ab_win_rate_b_pct", "Robust PnL/30": "robust_pnl_30d_pct",
         "Worst DD": "worst_drawdown_pct", "Worst Hold p95": "worst_holding_p95_minutes", "A/B stability": "ab_stability_ratio",
         "Final score (Pair+Side)": "final_score", "Lots": "lots", "Points": "points", "MA": "open_ma",
@@ -4208,7 +4238,7 @@ def _aggregate_row(
         "Held ATH W7": "equity_regime_held_w7_breakout", "Elimination Reason": "elimination_reason",
     }
     for header, source in legacy_source_columns.items():
-        if header in rendered:
+        if header in rendered or header not in SELECTION_WORKBOOK_HEADERS:
             continue
         value = raw.get(source)
         if source == "symbol":
@@ -4420,9 +4450,9 @@ def validate_combined_selection_workbook(data: bytes) -> dict[str, object]:
         raise SelectionWorkbookError("SELECTION_REVIEW_MANIFEST_MISMATCH")
     sheet = workbook["All candidates"]
     headers = tuple(cell.value for cell in sheet[1])
-    if headers != SELECTION_WORKBOOK_HEADERS:
+    if headers not in SELECTION_WORKBOOK_ACCEPTED_HEADERS:
         raise SelectionWorkbookError("SELECTION_REVIEW_HEADER_MISMATCH")
-    expected_headers = sha256(_aggregate_canonical(SELECTION_WORKBOOK_HEADERS).encode("utf-8")).hexdigest()
+    expected_headers = sha256(_aggregate_canonical(headers).encode("utf-8")).hexdigest()
     if manifest.get("headers_sha256") != expected_headers:
         raise SelectionWorkbookError("SELECTION_REVIEW_HEADER_MISMATCH")
     rows: list[dict[str, object]] = []

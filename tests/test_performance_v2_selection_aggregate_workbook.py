@@ -10,6 +10,7 @@ import pandas as pd
 import pytest
 from openpyxl import load_workbook
 
+import mrs3.performance_v2_selection as selection_module
 from mrs3.performance_v2_selection import (
     AllPairsPartition,
     SelectionWorkbookError,
@@ -300,3 +301,45 @@ def test_combined_workbook_freezes_raw_review_tuple_separately_from_presentation
     ]
     assert result["rows"][0]["Comment"] == "'=1+1"
     assert result["rows"][0]["Auto Status"] == "FILTERED"
+
+
+
+def _previous_header_workbook(monkeypatch: pytest.MonkeyPatch) -> bytes:
+    # Builds the workbook exactly as the exporter did before the fee columns.
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            selection_module, "SELECTION_WORKBOOK_HEADERS",
+            selection_module.SELECTION_WORKBOOK_PREVIOUS_HEADERS,
+        )
+        return _workbook_bytes()
+
+
+def test_combined_workbook_imports_previous_headers_without_fee_columns(monkeypatch: pytest.MonkeyPatch) -> None:
+    old = _previous_header_workbook(monkeypatch)
+    headers = [cell.value for cell in load_workbook(BytesIO(old))["All candidates"][1]]
+    assert "Fees share, %" not in headers and "Fees/30, %" not in headers
+
+    result = validate_combined_selection_workbook(old)
+
+    assert [row["Row Key"] for row in result["rows"]] == ["BTCUSDT|LONG|3", "BTCUSDT|LONG|7"]
+    assert "Fees share, %" not in result["rows"][0]
+
+
+def test_combined_workbook_rejects_previous_headers_with_current_header_hash(monkeypatch: pytest.MonkeyPatch) -> None:
+    workbook = load_workbook(BytesIO(_previous_header_workbook(monkeypatch)))
+    metadata = workbook["_MRS_SELECTION_MANIFEST"]
+    manifest = json.loads(metadata.cell(3, 2).value)
+    current_json = json.dumps(
+        list(selection_module.SELECTION_WORKBOOK_HEADERS), ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    )
+    manifest["headers_sha256"] = sha256(current_json.encode("utf-8")).hexdigest()
+    manifest_json = json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    metadata.cell(2, 2).value = sha256(manifest_json.encode("utf-8")).hexdigest()
+    metadata.cell(3, 2).value = manifest_json
+    mixed = BytesIO()
+    workbook.save(mixed)
+
+    with pytest.raises(SelectionWorkbookError) as error:
+        validate_combined_selection_workbook(mixed.getvalue())
+
+    assert str(error.value) == "SELECTION_REVIEW_HEADER_MISMATCH"

@@ -48,8 +48,8 @@ blocks.
    `РџР°СЂР°`, `Side`, `РўР¤`, `Start`, `End`.
 2. **Core strategy/result facts:** `ORD`, `Close`, `PnL/30`, `PnL DD5/30`,
    A/B PnL and day columns, positive windows, CE, PF, DD, W/R, trades,
-   Trades/30, Lot DD5, holding metrics, `Top 5 share, %`, and A/B stability
-   diagnostics. The verbose `History days`, cycle-count, completed-net-PnL,
+   Trades/30, Lot DD5, holding metrics, `Top 5 share, %`, `Fees share, %`,
+   `Fees/30, %`, and A/B stability diagnostics. The verbose `History days`, cycle-count, completed-net-PnL,
    `Top 5 PnL`, and `PnL after top 5` display columns are intentionally
    omitted; the underlying facts remain available in the database/cache.
 3. **Selection diagnostics:** rank quality/weight diagnostics and
@@ -72,6 +72,31 @@ blocks.
 control workbook renames `All candidates` to `Candidates` and preserves that
 exact header sequence.  The `Groups`, `Retest Failures`, and very-hidden
 metadata sheets keep their existing schemas.
+
+## Fee efficiency columns (amended 2026-10-12)
+
+`Fees share, %` and `Fees/30, %` follow `Top 5 share, %` in block 2 and in the
+aggregate workbook headers. Both come from the cached full-report window facts,
+the same window that gives `PnL/30` and `Trades/30`; no extra database read is
+needed.
+
+- `Fees share, %` = `fees_pct / (return_pct + fees_pct) × 100`, the share of gross
+  pre-fee return paid as fees. Both inputs use the window baseline. The cell is
+  blank when that gross is not positive.
+- `Fees/30, %` = `fees_pct × 30 / calendar days`, blank below one day.
+
+They are display-only and take no part in any filter or ranking. Funding is
+not separated: it stays inside the balance-derived return. Panel shows no
+candidate metric table, so the columns appear only in the XLSX.
+
+- When a window does not start flat, `fees_pct` counts only fees of included
+  round trips, while fees of excluded scoped actions stay inside `return_pct`.
+  Gross is then slightly understated and the share slightly overstated.
+- Under the FIXED protocol (protocol v2 §4.6), `fees_pct` and `return_pct` must
+  be rebased on the same base B, otherwise their sum is no longer gross.
+- Aggregate workbooks exported before these columns stay importable: the
+  validator accepts the previous header tuple, each checked against its own
+  `headers_sha256`. A previous header tuple with the current hash is rejected.
 
 ## Compatibility and acceptance
 
