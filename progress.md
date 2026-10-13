@@ -113,10 +113,17 @@ settings). P6c3: RETEST and finalist RETEST repeat the stored MA type/source
 of every order and of the close MA (a strategy without stored facts keeps the
 template prototype), so a template change does not turn retest reports into
 `MA_SETTINGS_CHANGED`. P6 is complete.
-Next: P7 (Panel PerformanceDB
-selection with an exchange profile: the render takes `exchange.name` and the
-exchange-specific tester fees/account fields from the active database —
-user proposal 2026-10-13, spec pending).
+P7 ([spec](docs/specs/2026-10-13-panel-performance-db-selection.md), approved
+2026-10-13): P7a spec committed. P7b: `config.local.json`
+`performance_databases.active` overrides root/protocol/exchange in
+`load_performance_v2_config`; `exchange_profiles.<exchange>` gives the strategy
+account fields, tester fees/funding and the listing-date sheet (BingX:
+`Пары_BingX`); Bybit needs no profile, another exchange without one is refused
+(`EXCHANGE_PROFILE_MISSING`). Panel renders through an effective tester
+template (`results/.tester-templates/`), the predicate requires the profile
+fields, job markers add `evaluation_database`/`evaluation_profile`, the
+finalist digest adds the profile. Next: P7c (Panel settings section: list,
+switch, create a database), then P7d (Stage 1/2 refuse a non-Bybit database).
 User decision 2026-10-12: one PerformanceDB per exchange with an
 `schema_info.exchange` marker (protocol v2 §4.1); the CSV Direct analysis DB
 (branch `feat/csv-direct-analysis`) must also record the exchange from the run

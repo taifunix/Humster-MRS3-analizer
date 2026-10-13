@@ -895,7 +895,7 @@ def test_failed_native_tester_can_start_a_tracked_retry(
     calls: list[tuple[str, str]] = []
 
     class Service:
-        def retry(self, source_job_id: str, *, job_id: str) -> dict[str, object]:
+        def retry(self, source_job_id: str, *, job_id: str, tester_config_template=None) -> dict[str, object]:
             calls.append((source_job_id, job_id))
             return {"job_id": job_id, "state": "RUNNING", "phase": "RUNNING", "progress": {}}
 

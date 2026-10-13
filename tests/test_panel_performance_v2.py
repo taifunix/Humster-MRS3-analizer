@@ -3031,9 +3031,10 @@ def test_finalist_retest_replays_only_exact_cohort_and_config(tmp_path: Path, mo
         def runtime(self, _job_id):
             return {"scope": "FINALIST", "test_start": "2025-01-01", "test_end": "2026-09-07",
                     "cohort_sha256": self.old_cohort, "config_sha256": panel_module.finalist_retest_config_digest({"LONG": str(template)}, evaluation=target),
-                    "outcomes_finalized": True, "successful_replacements": [{"strategy_id": 1}]}
+                    "outcomes_finalized": True, "successful_replacements": [{"strategy_id": 1}],
+                    **controller._protocol_v2_runtime(target)}
 
-    monkeypatch.setattr(controller, "_retest_listing_context", lambda: (listing, Path("dates.xlsx")))
+    monkeypatch.setattr(controller, "_retest_listing_context", lambda: (listing, Path("dates.xlsx"), None))
     monkeypatch.setattr(controller, "_performance_v2_config", lambda: SimpleNamespace(strategy_root=tmp_path / "Output" / "strategies"))
     monkeypatch.setattr(controller, "_workflow_defaults", lambda: {"strategy_templates": {"LONG": str(template)}})
     monkeypatch.setattr(controller, "_bulk_retest_range", lambda *_args: ("2025-01-01", "2026-09-07"))

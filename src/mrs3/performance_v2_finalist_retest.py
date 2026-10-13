@@ -1046,6 +1046,9 @@ def finalist_retest_config_digest(
     if evaluation is not None:
         # Protocol v2 §7a: the base and the exchange replace the constant 1000.
         document["evaluation"] = {"base": format(evaluation.base.normalize(), "f"), "exchange": evaluation.exchange}
+        if evaluation.profile_digest is not None:
+            # P7 spec §4: the exchange profile changes the strategies and the tester config.
+            document["evaluation"]["profile"] = evaluation.profile_digest  # type: ignore[index]
     return canonical_digest(document)
 
 

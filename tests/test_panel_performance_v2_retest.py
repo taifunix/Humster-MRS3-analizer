@@ -729,7 +729,7 @@ def test_retest_start_uses_native_single_mode_and_keeps_database_read_only(tmp_p
     monkeypatch.setattr(panel_module, "build_retest_manifest", lambda *args, **_kwargs: batch)
 
     class FakeTester:
-        def start(self, manifest_path, *, analysis_run_id, start_date, end_date, job_id):
+        def start(self, manifest_path, *, analysis_run_id, start_date, end_date, job_id, tester_config_template=None):
             seen.update(locals())
             return {"job_id": job_id, "state": "RUNNING", "phase": "RUNNING"}
 
@@ -1528,6 +1528,8 @@ def test_retest_import_requires_committed_inbox_and_builds_mapping_on_server(tmp
 
 def test_retest_import_injects_current_server_listing_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     controller = _controller(tmp_path)
+    # The job was rendered for _TARGET; the import checks it against the active database (P7 spec §4).
+    monkeypatch.setattr(PanelController, "_evaluation_target", lambda _self: _TARGET)
     tester_job_id = _committed_retest_job(controller, tmp_path, job_id="tester-server-listing")
     runtime = controller._panel_jobs.runtime(tester_job_id)
     monkeypatch.setattr(controller, "_retest_mapping", lambda _job_id: ({"alpha": 1}, runtime))

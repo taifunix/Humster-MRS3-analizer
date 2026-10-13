@@ -236,6 +236,7 @@ class PerformanceV2ImportRequest:
     test_end: str | None
     listing_dates_path: Path | None
     listing_dates_root: Path | None
+    listing_dates_sheet: str | None
     expected_current_result_ids: Mapping[str, int] | None
     expected_inbox_manifest_sha256: str | None
     expected_collection_id: str | None
@@ -258,6 +259,7 @@ class PerformanceV2ImportRequest:
         test_end: str | None = None,
         listing_dates_path: Path | None = None,
         listing_dates_root: Path | None = None,
+        listing_dates_sheet: str | None = None,
         expected_current_result_ids: Mapping[str, int] | None = None,
         expected_inbox_manifest_sha256: str | None = None,
         expected_collection_id: str | None = None,
@@ -331,6 +333,12 @@ class PerformanceV2ImportRequest:
                 raise ValueError("listing dates path must be relative to a trusted input root")
             listing_dates_path = listing_path
         object.__setattr__(self, "listing_dates_path", listing_dates_path)
+        if listing_dates_sheet is not None and (
+            not isinstance(listing_dates_sheet, str) or not listing_dates_sheet.strip() or listing_dates_path is None
+        ):
+            raise ValueError("listing dates sheet needs a listing dates path and a non-empty name")
+        # P7 spec §4: the exchange profile may name the registry sheet of its exchange.
+        object.__setattr__(self, "listing_dates_sheet", listing_dates_sheet)
         if expected_current_result_ids is not None and (
             not isinstance(expected_current_result_ids, Mapping)
             or any(
@@ -1185,6 +1193,7 @@ def _prepare_listing_ranges(
     parsed: tuple[ParsedPerformanceV2Report | None, ...],
 ) -> tuple[tuple[ParsedPerformanceV2Report | None, ...], list[dict[str, object]]]:
     path = request.listing_dates_path
+    sheet = request.listing_dates_sheet
     if path is None:
         path = prepared.listing_dates_path
     if path is None:
@@ -1232,7 +1241,7 @@ def _prepare_listing_ranges(
     path = resolved_path
     failures: list[dict[str, object]] = []
     try:
-        loaded = load_listing_dates(path)
+        loaded = load_listing_dates(path) if sheet is None else load_listing_dates(path, sheet)
         listing_dates: Mapping[str, object] = loaded
     except Exception as error:
         raise PerformanceV2ImportError("listing dates file could not be loaded") from error

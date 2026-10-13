@@ -431,6 +431,7 @@ class PerformanceV2PanelRequest:
     test_end: str | None = None
     listing_dates_path: Path | None = None
     listing_dates_root: Path | None = None
+    listing_dates_sheet: str | None = None
     tester_strategy_root: Path | None = None
     tester_bot_root: Path | None = None
     expected_current_result_ids: Mapping[str, int] | None = None
@@ -804,6 +805,7 @@ class LocalPerformanceV2Service:
                 test_end=request.test_end,
                 listing_dates_path=request.listing_dates_path,
                 listing_dates_root=request.listing_dates_root,
+                listing_dates_sheet=request.listing_dates_sheet,
                 expected_current_result_ids=request.expected_current_result_ids,
                 expected_inbox_manifest_sha256=request.expected_inbox_manifest_sha256,
                 expected_collection_id=request.expected_collection_id,

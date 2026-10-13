@@ -73,6 +73,8 @@ class _Job:
     inbox_path: Path | None = None
     single_mode: bool = False
     target_finalized: bool = False
+    # Tester template captured at start (P7 spec §4: exchange profile fees of this job).
+    tester_config_template: Path | None = None
     target_owner: TesterTargetLock | None = None
     target_snapshot: object | None = None
     cleanup_pending: bool = False
@@ -640,7 +642,7 @@ class LocalFastStrategyTestService:
                 runtime_config,
                 job.start_date,
                 job.end_date,
-                template_path=self.tester_config_template,
+                template_path=job.tester_config_template or self.tester_config_template,
                 initial_balance=job.initial_balance,
             )
             job.report_dir.mkdir(parents=True, exist_ok=True)
@@ -883,6 +885,7 @@ class LocalFastStrategyTestService:
         job_id: str | None = None,
         clear_reports: bool = False,
         initial_balance: object | None = None,
+        tester_config_template: Path | None = None,
     ) -> dict[str, object]:
         manifest = validate_strategy_manifest(Path(manifest_path))
         if manifest.analysis_run_id != analysis_run_id:
@@ -902,6 +905,7 @@ class LocalFastStrategyTestService:
             if identifier in self._jobs:
                 raise FastStrategyTestError("Fast TEST job id is already used")
             job = _Job(identifier, Path(manifest_path).resolve(), manifest, names, names, *dates, report_dir, strategy_dir, initial_balance=balance, single_mode=self.single_mode, clear_reports=clear_reports)
+            job.tester_config_template = None if tester_config_template is None else Path(tester_config_template)
             self._jobs[identifier] = job
             job.progress = {"current": 0, "total": len(names), "batch_current": 0, "batch_total": 0, "active": 0, "retries": 0, "failed": 0}
             job.thread = Thread(
@@ -1173,7 +1177,9 @@ class LocalFastStrategyTestService:
             job.phase = "COMMITTED"
             job.error = None
 
-    def retry(self, source_job_id: str, *, job_id: str | None = None) -> dict[str, object]:
+    def retry(
+        self, source_job_id: str, *, job_id: str | None = None, tester_config_template: Path | None = None,
+    ) -> dict[str, object]:
         with self._lock:
             source_job = self._jobs.get(source_job_id)
             if source_job is None:
@@ -1251,6 +1257,7 @@ class LocalFastStrategyTestService:
                 failed_names=set(failed),
                 preserve_reports=True,
                 single_mode=source_job.single_mode,
+                tester_config_template=None if tester_config_template is None else Path(tester_config_template),
             )
             job.progress = {
                 "current": len(job.verified_reports),
@@ -1652,7 +1659,7 @@ class LocalSingleModeStrategyTestService(LocalFastStrategyTestService):
             job.end_date,
             single_mode=True,
             initial_balance=job.initial_balance,
-            template_path=self.tester_config_template,
+            template_path=job.tester_config_template or self.tester_config_template,
         )
         job.tester_config_bytes = config.tester_config.read_bytes()
         batches = [

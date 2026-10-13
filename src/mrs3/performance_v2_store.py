@@ -12,6 +12,7 @@ from uuid import UUID, uuid4
 import duckdb
 
 from .config import PanelPathSettings, load_duckdb_import_settings, load_panel_path_settings
+from .exchange_profiles import PerformanceDatabaseError, load_performance_databases
 
 
 _SCHEMA_VERSION = "12"
@@ -184,10 +185,26 @@ def load_performance_v2_config(
     exchange = section.get("exchange")
     if exchange is not None and (not isinstance(exchange, str) or not exchange.strip()):
         raise ValueError("unified_performance_v2.exchange must be a non-empty string")
+    database_root = path.parent / relative_root
+    # P7 spec §3: the active entry of config.local.json replaces root, protocol and exchange.
+    databases = load_performance_databases(path.with_name("config.local.json"))
+    if databases.items:
+        default_root = database_root.resolve()
+        for item in databases.items:
+            item_root = (path.parent / item.database_root).resolve()
+            if item_root != default_root and (item_root in default_root.parents or default_root in item_root.parents):
+                raise PerformanceDatabaseError(
+                    "PERFORMANCE_DATABASES_INVALID",
+                    f"performance_databases.items.{item.name}.database_root overlaps the default database root",
+                )
+    active = databases.active_entry()
+    if active is not None:
+        database_root = path.parent / active.database_root
+        protocol, exchange = active.evaluation_protocol, active.exchange
     return PerformanceV2Config(
         evaluation_protocol=protocol,
         exchange=exchange,
-        database_root=(path.parent / relative_root),
+        database_root=database_root,
         workers=load_duckdb_import_settings(path.with_name("config.local.json")).workers,
         max_html_bytes=section.get("max_html_bytes", 67_108_864),
         max_actions_per_report=section.get("max_actions_per_report", 1_000_000),

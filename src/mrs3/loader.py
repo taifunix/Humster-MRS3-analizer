@@ -72,9 +72,16 @@ def normalize_shift(
     return result
 
 
-def _load_listing_dates(path: Path) -> dict[str, pd.Timestamp]:
+_REGISTRY_SYMBOL_COLUMN = "Пара"
+# Bybit registry sheet "Пары" and per-exchange sheets such as "Пары_BingX" (P7 spec §4).
+_REGISTRY_DATE_COLUMNS = ("Дата листинга на Bybit (UTC)", "Листинг")
+
+
+def _load_listing_dates(path: Path, sheet: str | None = None) -> dict[str, pd.Timestamp]:
     try:
         registry_format = False
+        if sheet is not None and path.suffix.casefold() == ".csv":
+            raise InputError("a listing dates sheet needs an Excel workbook, not CSV")
         if path.suffix.casefold() == ".csv":
             raw = pd.read_csv(path, dtype=str)
             required = {"ticker", "launch"}
@@ -90,7 +97,21 @@ def _load_listing_dates(path: Path) -> dict[str, pd.Timestamp]:
             with pd.ExcelFile(path) as workbook:
                 registry_sheet = "Пары"
                 registry_columns = {"Пара", "Дата листинга на Bybit (UTC)"}
-                if registry_sheet in workbook.sheet_names:
+                if sheet is not None:
+                    if sheet not in workbook.sheet_names:
+                        raise InputError(f"invalid listing dates: workbook has no sheet {sheet!r}")
+                    header = set(pd.read_excel(workbook, sheet_name=sheet, nrows=0).columns)
+                    dates = [column for column in _REGISTRY_DATE_COLUMNS if column in header]
+                    if _REGISTRY_SYMBOL_COLUMN not in header or len(dates) != 1:
+                        raise InputError(
+                            f"invalid listing dates: sheet {sheet!r} needs columns "
+                            f"{_REGISTRY_SYMBOL_COLUMN!r} and one of {list(_REGISTRY_DATE_COLUMNS)}"
+                        )
+                    registry_format = True
+                    frame = pd.read_excel(
+                        workbook, sheet_name=sheet, usecols=[_REGISTRY_SYMBOL_COLUMN, dates[0]],
+                    ).rename(columns={_REGISTRY_SYMBOL_COLUMN: "symbol", dates[0]: "listing_date"})
+                elif registry_sheet in workbook.sheet_names:
                     header = set(pd.read_excel(workbook, sheet_name=registry_sheet, nrows=0).columns)
                     missing = sorted(registry_columns.difference(header))
                     if missing:
@@ -131,9 +152,13 @@ def _load_listing_dates(path: Path) -> dict[str, pd.Timestamp]:
     return dict(zip(frame["symbol"], frame["listing_date"], strict=True))
 
 
-def load_listing_dates(path: Path) -> dict[str, pd.Timestamp]:
-    """Load the explicit UTC listing-date snapshot used by analysis adapters."""
-    return _load_listing_dates(path)
+def load_listing_dates(path: Path, sheet: str | None = None) -> dict[str, pd.Timestamp]:
+    """Load the explicit UTC listing-date snapshot used by analysis adapters.
+
+    `sheet` selects a registry sheet of an exchange profile (P7 spec §4); without
+    it the Bybit registry sheet or the first sheet is read as before.
+    """
+    return _load_listing_dates(path, sheet)
 
 
 def load_points(

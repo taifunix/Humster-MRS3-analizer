@@ -90,9 +90,19 @@ def test_target_of_a_v2_database_uses_the_tester_base_and_exchange(tmp_path: Pat
     _copy_tester_template(tmp_path)
     _protocol_v2_database(tmp_path, "BingX")
 
+    with pytest.raises(EvaluationProtocolError) as error:
+        controller._evaluation_target()
+    assert error.value.code == "EXCHANGE_PROFILE_MISSING"
+    local = controller.default_config.with_name("config.local.json")
+    document = json.loads(local.read_text(encoding="utf-8")) if local.is_file() else {}
+    document["exchange_profiles"] = {"BingX": {"strategy_exchange": {"account": "bingx"}, "tester": {"TakerFee": 0.0003}}}
+    local.write_text(json.dumps(document), encoding="utf-8")
+
     target = controller._evaluation_target()
 
     assert (str(target.base), target.exchange) == ("10000.0", "BingX")
+    assert (target.strategy_exchange, target.tester_fields) == ((("account", "bingx"),), (("TakerFee", 0.0003),))
+    assert target.database == "performance-v2"
 
 
 def test_tester_start_refuses_a_manifest_with_a_non_v2_strategy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -196,3 +206,141 @@ def test_legacy_tester_run_launches_only_protocol_v2_strategies(tmp_path: Path, 
     (tmp_path / ".out.tester-config.snapshot").write_text("{}", encoding="utf-8")
     with pytest.raises(EvaluationProtocolError, match="snapshot"):
         controller._build_command("tester-run", request)
+
+
+def _bingx_profile(controller, profile: dict[str, object]) -> None:
+    local = controller.default_config.with_name("config.local.json")
+    document = json.loads(local.read_text(encoding="utf-8")) if local.is_file() else {}
+    document["exchange_profiles"] = {"BingX": profile}
+    local.write_text(json.dumps(document, ensure_ascii=False), encoding="utf-8")
+
+
+def test_profile_fees_reach_the_tester_template_of_every_launch(tmp_path: Path) -> None:
+    from mrs3.evaluation_protocol import require_protocol_v2_tester_config
+
+    controller = _controller(tmp_path, seed=False)
+    _copy_tester_template(tmp_path)
+    _protocol_v2_database(tmp_path, "BingX")
+    _bingx_profile(controller, {"tester": {"MakerFee": 0.00012, "TakerFee": 0.0003}})
+    target = controller._evaluation_target()
+
+    effective = controller._mrs3_tester_template(target)
+
+    assert effective.parent == tmp_path / "results" / ".tester-templates"
+    document = json.loads(effective.read_text(encoding="utf-8"))
+    assert (document["MakerFee"], document["TakerFee"], document["InitialBalance"]) == (0.00012, 0.0003, 10000.0)
+    controller._require_protocol_v2_tester_template(target)
+    raw = json.loads((tmp_path / "templates" / "tester" / "mrs3" / "config_tester.json").read_text(encoding="utf-8"))
+    with pytest.raises(EvaluationProtocolError, match="MakerFee, TakerFee"):
+        require_protocol_v2_tester_config(raw, target)
+
+
+def test_without_a_profile_the_tester_template_is_the_repository_one(tmp_path: Path) -> None:
+    controller = _controller(tmp_path, seed=False)
+    _copy_tester_template(tmp_path)
+    _protocol_v2_database(tmp_path, "Bybit")
+
+    target = controller._evaluation_target()
+
+    assert target.profile_digest is None
+    assert controller._mrs3_tester_template(target) == tmp_path / "templates" / "tester" / "mrs3" / "config_tester.json"
+    assert controller._protocol_v2_runtime(target)["evaluation_profile"] == "none"
+
+
+@pytest.mark.parametrize("change", ({"profile_digest": "p" * 64}, {"database": "data/other"}))
+def test_retry_refuses_a_job_of_another_database_or_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, change: dict[str, object],
+) -> None:
+    from dataclasses import replace
+
+    controller = _controller(tmp_path, seed=False)
+    target = use_protocol_v2_target(monkeypatch)
+    monkeypatch.setattr(controller, "_start_tracked_panel_job", lambda kind, *_args, **_kwargs: {})
+
+    with pytest.raises(panel_module.PanelJobError, match="RETRY_PRE_PROTOCOL_V2"):
+        controller.strategies_tester_retry(
+            {"job_id": _failed_tester_job(controller, controller._protocol_v2_runtime(replace(target, **change)))},
+        )
+
+
+def test_listing_dates_come_from_the_profile(tmp_path: Path) -> None:
+    controller = _controller(tmp_path, seed=False)
+    _copy_tester_template(tmp_path)
+    _protocol_v2_database(tmp_path, "BingX")
+    workbook = tmp_path / "input" / "liquidity.xlsx"
+    workbook.parent.mkdir(parents=True, exist_ok=True)
+    workbook.write_bytes(b"")
+    _bingx_profile(controller, {"listing_dates": {"path": "input/liquidity.xlsx", "sheet": "Пары_BingX"}})
+
+    assert controller._listing_dates_source() == (workbook.resolve(), "Пары_BingX")
+    assert controller._retest_listing_context() == (workbook.resolve(), Path("input/liquidity.xlsx"), "Пары_BingX")
+
+
+def test_tester_start_hands_the_profile_template_to_its_job(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from dataclasses import replace
+
+    controller = _controller(tmp_path, seed=False)
+    _copy_tester_template(tmp_path)
+    target = replace(use_protocol_v2_target(monkeypatch, "BingX"), tester_fields=(("TakerFee", 0.0003),))
+    monkeypatch.setattr(panel_module.PanelController, "_evaluation_target", lambda _self: target)
+    monkeypatch.setattr(controller, "_fresh_strategy_manifest", lambda _analysis_id: tmp_path / "manifest.json")
+    started: dict[str, object] = {}
+    monkeypatch.setattr(controller, "_single_mode_strategy_test", lambda: SimpleNamespace(
+        start=lambda *_args, **kwargs: started.update(kwargs) or {}, reconcile_pending_cleanup=lambda: None,
+    ))
+    monkeypatch.setattr(controller, "_start_tracked_panel_job", lambda _kind, _request, _resources, submit, **_kwargs: submit("job"))
+
+    controller.strategies_tester_start({"analysis_run_id": "a" * 64, "start_date": "2026-01-01", "end_date": "2026-01-31"})
+
+    template = Path(started["tester_config_template"])  # type: ignore[arg-type]
+    assert template.parent == tmp_path / "results" / ".tester-templates"
+    assert json.loads(template.read_text(encoding="utf-8"))["TakerFee"] == 0.0003
+
+
+def test_import_refuses_a_job_rendered_for_another_database(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from dataclasses import replace
+
+    controller = _controller(tmp_path, seed=False)
+    target = use_protocol_v2_target(monkeypatch)
+    job_id = "committed-tester"
+    controller._panel_jobs.submit("strategies.tester.start", {}, f"panel:{job_id}", ("strategies.tester",), job_id=job_id)
+    controller._panel_jobs.transition(job_id, "RUNNING")
+    controller._panel_jobs.sync(
+        job_id, {"state": "COMMITTED", "phase": "COMMITTED", "inbox_ready": True},
+        runtime={
+            **controller._protocol_v2_runtime(replace(target, database="data/other")),
+            "performance_v2_import_verified": True,
+        },
+    )
+
+    with pytest.raises(EvaluationProtocolError) as error:
+        controller.strategies_performance_v2_import({"tester_job_id": job_id})
+    assert error.value.code == "IMPORT_TARGET_CHANGED"
+    # The refusal comes before any state change: the verified inbox stays importable.
+    assert controller._panel_jobs.runtime(job_id)["performance_v2_import_verified"] is True
+
+
+def test_import_checks_every_member_of_a_report_collection(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from dataclasses import replace
+
+    controller = _controller(tmp_path, seed=False)
+    target = use_protocol_v2_target(monkeypatch)
+    jobs = controller._panel_jobs
+    for job_id, runtime in (
+        ("member-current", controller._protocol_v2_runtime(target)),
+        ("member-other", controller._protocol_v2_runtime(replace(target, profile_digest="p" * 64))),
+    ):
+        jobs.submit("strategies.tester.start", {}, f"panel:{job_id}", ("strategies.tester",), job_id=job_id)
+        jobs.transition(job_id, "RUNNING")
+        jobs.sync(job_id, {"state": "COMMITTED", "phase": "COMMITTED"}, runtime=runtime)
+    members = [{"tester_job_id": "member-current", "superseded": False}, {"tester_job_id": "member-other", "superseded": False}]
+
+    controller._require_import_target("member-current", False)
+    jobs.submit("strategies.tester.collection", {}, "panel:collection", (), job_id="collection")
+    jobs.transition("collection", "RUNNING")
+    jobs.sync("collection", {"state": "COMMITTED"}, runtime={"members": members})
+    with pytest.raises(EvaluationProtocolError, match="IMPORT_TARGET_CHANGED"):
+        controller._require_import_target("collection", True)
+    members[1]["superseded"] = True
+    jobs.sync("collection", {"state": "COMMITTED"}, runtime={"members": members})
+    controller._require_import_target("collection", True)

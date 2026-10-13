@@ -123,6 +123,7 @@ from .config import (
 )
 from .duckdb_import import ImportJobResult, ImportPreflight, ImportProgress, ImportRequest, SnapshotProgress, import_html_tree, preflight_html_import
 from .duckdb_source_schema import migrate_source_database
+from .exchange_profiles import ExchangeProfile, ExchangeProfileError, inside_project, load_exchange_profile, materialize_tester_template
 from .loader import load_listing_dates
 from .duckdb_direct import (
     CANONICAL_GRID_VERSION,
@@ -3218,7 +3219,7 @@ class PanelController:
                 self.root / "Input" / "run_snapshot_2.json", runner.bot_root, runner.tester_config, structures,
                 start_date, end_date, runner.max_parallel_submissions, self._analysis_config_loader(self.default_config),
                 analysis_run_id=analysis_id,
-                tester_config_template=mrs3_tester_config_template(self.root),
+                tester_config_template=self._mrs3_tester_template(target),
                 pretest_ab_provenance=self._pretest_ab_provenance(options[0]),
                 analysis_input_digest=manifest.get("analysis_input_digest"),
                 shortlist_provenance=self._fresh_shortlist_provenance(evaluation, selected_ids),
@@ -3582,7 +3583,38 @@ class PanelController:
 
     def _evaluation_target(self) -> EvaluationTarget:
         """Protocol v2 target of the active PerformanceDB; refuses before any MRS3 render or launch (§7a)."""
-        return evaluation_target(self._performance_v2_config(), mrs3_tester_config_template(self.root))
+        config = self._performance_v2_config()
+        return evaluation_target(
+            config, mrs3_tester_config_template(self.root), self._exchange_profile(config), project_root=self.root,
+        )
+
+    def _exchange_profile(self, config: object) -> ExchangeProfile | None:
+        """Exchange profile of the active protocol v2 database (P7 spec §3); None for a v1 database."""
+        exchange = getattr(config, "exchange", None)
+        if getattr(config, "evaluation_protocol", "v1") != "v2" or not exchange:
+            return None
+        try:
+            return load_exchange_profile(self.default_config.with_name("config.local.json"), exchange)
+        except ExchangeProfileError as error:
+            raise EvaluationProtocolError(error.code, error.message) from error
+
+    def _mrs3_tester_template(self, target: EvaluationTarget) -> Path:
+        """MRS3 tester template with the fees of the exchange profile (P7 spec §4)."""
+        try:
+            return materialize_tester_template(
+                mrs3_tester_config_template(self.root), target.tester_fields, self.root / "results" / ".tester-templates",
+            )
+        except (ExchangeProfileError, OSError) as error:
+            raise EvaluationProtocolError(
+                "PROTOCOL_V2_TESTER_CONFIG_REJECTED", "MRS3 tester template with the exchange profile cannot be written",
+            ) from error
+
+    def _listing_dates_source(self) -> tuple[Path, str | None]:
+        """Listing dates of the active database: the exchange profile, else `panel_workflow` (P7 spec §4)."""
+        profile = self._exchange_profile(self._performance_v2_config())
+        if profile is not None and profile.listing_dates is not None:
+            return inside_project(self.root, profile.listing_dates.path, "listing_dates.path"), profile.listing_dates.sheet
+        return self._workflow_default("listing_dates_path"), None
 
     @staticmethod
     def _protocol_v2_runtime(target: EvaluationTarget) -> dict[str, object]:
@@ -3591,15 +3623,42 @@ class PanelController:
             "evaluation_protocol": "v2",
             "evaluation_base": format(target.base.normalize(), "f"),
             "evaluation_exchange": target.exchange,
+            # P7 spec §4: a switch of the database or a profile change starts jobs anew.
+            "evaluation_database": target.database,
+            "evaluation_profile": target.profile_digest or "none",
         }
 
     @classmethod
     def _matches_protocol_v2(cls, runtime: Mapping[str, object], target: EvaluationTarget) -> bool:
         return all(runtime.get(key) == value for key, value in cls._protocol_v2_runtime(target).items())
 
+    def _require_import_target(self, tester_job_id: str, is_collection_job: bool) -> None:
+        """Reports rendered for another database or profile do not enter this one (P7 spec §4).
+
+        A collection is checked through every current member; jobs without a v2 marker import as before.
+        """
+        runtime = self._panel_jobs.runtime(tester_job_id)
+        runtimes = [runtime]
+        members = runtime.get("members") if is_collection_job else None
+        for member in members if isinstance(members, list) else ():
+            if not isinstance(member, Mapping) or member.get("superseded") is True:
+                continue
+            try:
+                runtimes.append(self._panel_jobs.runtime(str(member.get("tester_job_id"))))
+            except PanelJobError:
+                continue
+        marked = [item for item in runtimes if item.get("evaluation_protocol") == "v2"]
+        if not marked:
+            return
+        target = self._evaluation_target()
+        if any(not self._matches_protocol_v2(item, target) for item in marked):
+            raise EvaluationProtocolError(
+                "IMPORT_TARGET_CHANGED", "the tester job was rendered for another PerformanceDB or exchange profile",
+            )
+
     def _require_protocol_v2_tester_template(self, target: EvaluationTarget) -> None:
         try:
-            document = json.loads(mrs3_tester_config_template(self.root).read_text(encoding="utf-8"))
+            document = json.loads(self._mrs3_tester_template(target).read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
             raise EvaluationProtocolError("PROTOCOL_V2_TESTER_CONFIG_REJECTED", "MRS3 tester template is unreadable") from error
         require_protocol_v2_tester_config(document if isinstance(document, Mapping) else {}, target)
@@ -3732,6 +3791,7 @@ class PanelController:
         expected_names = self._manifest_strategy_names(manifest) if collect_reports else ()
         request = {"analysis_run_id": analysis_id, "start_date": start_date, "end_date": end_date, "initial_balance": initial_balance, "mode": "SINGLE_MODE", "collect_reports": collect_reports}
         single_mode_service = self._single_mode_strategy_test()
+        tester_template = self._mrs3_tester_template(evaluation)
         reconcile = getattr(single_mode_service, "reconcile_pending_cleanup", None)
         if callable(reconcile):
             reconcile()
@@ -3751,6 +3811,7 @@ class PanelController:
                 start_date=start_date,
                 end_date=end_date,
                 job_id=job_id,
+                tester_config_template=tester_template,
                 **({"initial_balance": initial_balance} if initial_balance is not None else {}),
             ),
             runtime=self._protocol_v2_runtime(evaluation),
@@ -3774,6 +3835,7 @@ class PanelController:
             # Protocol v2 §7a: a job rendered before P6 or for another base/exchange is started anew.
             raise PanelJobError("RETRY_PRE_PROTOCOL_V2")
         self._require_protocol_v2_tester_template(evaluation)
+        tester_template = self._mrs3_tester_template(evaluation)
 
         def register(job_id: str) -> None:
             runtime = self._panel_jobs.runtime(source_job_id)
@@ -3798,7 +3860,9 @@ class PanelController:
             "strategies.tester.retry",
             {"source_job_id": source_job_id},
             ("strategies.tester",),
-            lambda job_id: self._single_mode_strategy_test().retry(source_job_id, job_id=job_id),
+            lambda job_id: self._single_mode_strategy_test().retry(
+                source_job_id, job_id=job_id, tester_config_template=tester_template,
+            ),
             runtime=self._protocol_v2_runtime(evaluation),
             before_start=register,
         )
@@ -4309,19 +4373,21 @@ class PanelController:
             raise ValueError("RETEST test_start must be before test_end")
         return start, end
 
-    def _retest_listing_context(self) -> tuple[Path, Path]:
-        configured = self._workflow_default("listing_dates_path")
+    def _retest_listing_context(self) -> tuple[Path, Path, str | None]:
+        configured, sheet = self._listing_dates_source()
         try:
             relative = configured.resolve().relative_to(self.root.resolve())
         except ValueError:
             raise ValueError("RETEST listing dates path must be inside the project") from None
         if not configured.is_file():
             raise ValueError("RETEST listing dates file is unavailable")
-        return configured.resolve(), Path(*relative.parts)
+        return configured.resolve(), Path(*relative.parts), sheet
 
-    def _validate_retest_listing(self, connection: duckdb.DuckDBPyConnection, path: Path, start: str) -> None:
+    def _validate_retest_listing(
+        self, connection: duckdb.DuckDBPyConnection, path: Path, start: str, sheet: str | None = None,
+    ) -> None:
         try:
-            listing_dates = load_listing_dates(path)
+            listing_dates = load_listing_dates(path) if sheet is None else load_listing_dates(path, sheet)
         except Exception as error:
             raise ValueError("RETEST listing dates file is invalid") from error
         symbols = [row[0] for row in connection.execute(
@@ -4361,13 +4427,19 @@ class PanelController:
             if not target.exists():
                 return {"count": 0, "retest_count": 0, "active_count": 0, "phase": "IDLE"}
             raise ValueError("Performance v2 RETEST status is unavailable") from error
+        try:
+            listing_path, listing_sheet = self._listing_dates_source()
+        except (EvaluationProtocolError, ValueError):
+            # Status stays readable; the launch reports the profile error with its code.
+            listing_path, listing_sheet = self._workflow_default("listing_dates_path"), None
         return {
             "count": status.active_count,
             "retest_count": status.active_count,
             "active_count": status.active_count,
             "default_start": defaults[0] if defaults else None,
             "default_end": defaults[1] if defaults else None,
-            "listing_dates_path": str(self._workflow_default("listing_dates_path")),
+            "listing_dates_path": str(listing_path),
+            **({"listing_dates_sheet": listing_sheet} if listing_sheet is not None else {}),
             "phase": "READY" if status.active_count else "IDLE",
         }
 
@@ -4544,14 +4616,15 @@ class PanelController:
             self._validate_retest_end_date(explicit[1])
         evaluation = self._evaluation_target()
         self._require_protocol_v2_tester_template(evaluation)
+        tester_template = self._mrs3_tester_template(evaluation)
         reusable = self._reusable_retest_job(evaluation)
         if reusable is not None:
             return reusable
-        listing_path, listing_relative = self._retest_listing_context()
+        listing_path, listing_relative, listing_sheet = self._retest_listing_context()
         templates = self._workflow_defaults().get("strategy_templates", {})
         with self._performance_v2_writer_lock, duckdb.connect(str(target), read_only=True) as connection:
             start, end = self._retest_range(payload, connection)
-            self._validate_retest_listing(connection, listing_path, start)
+            self._validate_retest_listing(connection, listing_path, start, listing_sheet)
             batch = build_retest_manifest(
                 connection,
                 templates if isinstance(templates, Mapping) else {},
@@ -4568,6 +4641,7 @@ class PanelController:
             "test_end": end,
             "initial_balance": initial_balance,
             "listing_dates_path": str(listing_relative),
+            **({"listing_dates_sheet": listing_sheet} if listing_sheet is not None else {}),
             **self._protocol_v2_runtime(evaluation),
         }
         request = {
@@ -4589,6 +4663,7 @@ class PanelController:
                 start_date=start,
                 end_date=end,
                 job_id=job_id,
+                tester_config_template=tester_template,
                 **({"initial_balance": initial_balance} if initial_balance is not None else {}),
             ),
             runtime=runtime,
@@ -4892,6 +4967,7 @@ class PanelController:
             expected_collection_id = tester_job_id
         if tester_job.get("state") != "COMMITTED" or tester_job.get("inbox_ready") is not True:
             raise ValueError("Performance v2 import requires a committed tester inbox")
+        self._require_import_target(tester_job_id, is_collection_job)
         if not _internal and not is_collection_job and self._panel_jobs.runtime(tester_job_id).get("performance_v2_import_verified") is not True:
             raise ValueError("Performance v2 import requires explicit inbox verification")
         if not _internal:
@@ -4957,8 +5033,9 @@ class PanelController:
             raise ValueError("test_start and test_end must be valid ISO dates")
         if payload.get("listing_dates_path") is not None:
             raise ValueError("listing_dates_path is configured by the server")
+        listing_source, listing_dates_sheet = self._listing_dates_source()
         try:
-            listing_dates_path = self._workflow_default("listing_dates_path").resolve().relative_to(self.root.resolve())
+            listing_dates_path = listing_source.resolve().relative_to(self.root.resolve())
         except ValueError:
             raise ValueError("Performance v2 listing dates file is unavailable") from None
         if self._performance_v2_jobs is None:
@@ -4983,6 +5060,7 @@ class PanelController:
             test_end=test_end if isinstance(test_end, str) else None,
             listing_dates_path=listing_dates_path,
             listing_dates_root=self.root,
+            listing_dates_sheet=listing_dates_sheet,
             expected_current_result_ids=expected_current,
             expected_inbox_manifest_sha256=expected_inbox_manifest_sha256,
             expected_collection_id=expected_collection_id,
@@ -5445,9 +5523,11 @@ class PanelController:
         if type(clear_reports) is not bool:
             raise FinalistRetestError("INVALID_REQUEST", "clear_reports must be a boolean")
         initial_balance = self._requested_initial_balance(payload)
-        listing_path, listing_relative = self._retest_listing_context()
+        listing_path, listing_relative, listing_sheet = self._retest_listing_context()
         try:
-            listing_dates = load_listing_dates(listing_path)
+            listing_dates = (
+                load_listing_dates(listing_path) if listing_sheet is None else load_listing_dates(listing_path, listing_sheet)
+            )
         except Exception as error:
             raise FinalistRetestError("LISTING_DATE_INVALID", "listing dates are invalid") from error
         config = self._performance_v2_config()
@@ -5465,6 +5545,7 @@ class PanelController:
         templates = self._workflow_defaults().get("strategy_templates", {})
         evaluation = self._evaluation_target()
         self._require_protocol_v2_tester_template(evaluation)
+        tester_template = self._mrs3_tester_template(evaluation)
         with self._performance_v2_writer_lock, duckdb.connect(str(target), read_only=True) as connection:
             start, end = self._bulk_retest_range(payload, listing_dates, connection, include_reserve)
             current_cohort = freeze_finalist_cohort(
@@ -5484,7 +5565,8 @@ class PanelController:
             except PanelJobError:
                 continue
             same_request = (
-                old_runtime.get("scope") == current_cohort.scope
+                self._matches_protocol_v2(old_runtime, evaluation)
+                and old_runtime.get("scope") == current_cohort.scope
                 and old_runtime.get("test_start") == start
                 and old_runtime.get("test_end") == end
                 and old_runtime.get("cohort_sha256") == current_cohort.cohort_sha256
@@ -5512,6 +5594,7 @@ class PanelController:
             **self._protocol_v2_runtime(evaluation),
             "config_sha256": batch.config_sha256, "manifest_sha256": sha256(batch.manifest_path.read_bytes()).hexdigest(),
             "test_start": start, "test_end": end, "listing_dates_path": str(listing_relative),
+            **({"listing_dates_sheet": listing_sheet} if listing_sheet is not None else {}),
             "initial_balance": initial_balance,
             "manifest_path": str(batch.manifest_path), "cohort_members": _json_value([dict(member) for member in batch.cohort.members]),
             "exclusions": [item.as_dict() for item in batch.cohort.exclusions],
@@ -5533,6 +5616,7 @@ class PanelController:
             ("strategies.tester", "performance-v2-finalist-retest"),
             lambda job_id: self._single_mode_strategy_test().start(
                 batch.manifest_path, analysis_run_id=batch.run_id, start_date=start, end_date=end, job_id=job_id,
+                tester_config_template=tester_template,
                 clear_reports=clear_reports,
                 **({"initial_balance": initial_balance} if initial_balance is not None else {}),
             ), runtime=runtime,
@@ -5541,9 +5625,11 @@ class PanelController:
     def strategies_performance_v2_finalist_retest_preview(self, include_reserve: bool = False) -> dict[str, object]:
         if type(include_reserve) is not bool:
             raise FinalistRetestError("INVALID_REQUEST", "include_reserve must be a boolean")
-        listing_path, _ = self._retest_listing_context()
+        listing_path, _, listing_sheet = self._retest_listing_context()
         try:
-            listing_dates = load_listing_dates(listing_path)
+            listing_dates = (
+                load_listing_dates(listing_path) if listing_sheet is None else load_listing_dates(listing_path, listing_sheet)
+            )
         except Exception as error:
             raise FinalistRetestError("LISTING_DATE_INVALID", "listing dates are invalid") from error
         target = performance_v2_database_path(self._performance_v2_config())

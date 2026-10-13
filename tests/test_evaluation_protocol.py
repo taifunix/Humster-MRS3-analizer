@@ -101,6 +101,7 @@ def test_target_reads_the_base_and_checks_the_database_marker(tmp_path: Path) ->
     config = PerformanceV2Config(tmp_path / "v2", evaluation_protocol="v2", exchange="Bybit")
 
     assert evaluation_target(config, template) == TARGET
+    assert evaluation_target(config, template, project_root=tmp_path).database == "v2"
     database = performance_v2_database_path(config)
     database.parent.mkdir(parents=True, exist_ok=True)
     with duckdb.connect(str(database)) as connection:
@@ -139,3 +140,61 @@ def test_stored_ma_facts_pair_by_order_and_keep_template_halves() -> None:
     assert (strategy["mrs3"]["ma_close_short"]["type"], strategy["mrs3"]["ma_close_short"]["source"]) == ("EMA", "ohlc4")
     with pytest.raises(EvaluationProtocolError):
         apply_stored_ma_facts(strategy, "SHORT", facts, (1, 2))
+
+
+BINGX = EvaluationTarget(
+    Decimal("10000"), "BingX",
+    strategy_exchange=(("account", "bingx"),),
+    tester_fields=(("MakerFee", 0.00012), ("TakerFee", 0.0003)),
+    profile_digest="p" * 64,
+)
+
+
+def test_a_profile_sets_the_strategy_account_and_requires_it() -> None:
+    from mrs3.evaluation_protocol import protocol_v2_unmet
+
+    strategy = apply_protocol_v2(_strategy(), BINGX)
+
+    assert strategy["exchange"]["name"] == "BingX"  # type: ignore[index]
+    assert strategy["exchange"]["account"] == "bingx"  # type: ignore[index]
+    strategy["exchange"]["account"] = "bybit_ytl"  # type: ignore[index]
+    assert protocol_v2_unmet(strategy, BINGX) == ("exchange.account",)
+
+
+def test_a_profile_requires_its_fees_in_the_tester_config() -> None:
+    config = {"InitialBalance": 10000.0, "LimitOrderVolumeCheck": False, "MakerFee": 0.00012, "TakerFee": 0.0003}
+    require_protocol_v2_tester_config(config, BINGX)
+
+    with pytest.raises(EvaluationProtocolError, match="MakerFee, TakerFee") as error:
+        require_protocol_v2_tester_config({**config, "MakerFee": 1e-05, "TakerFee": 0.0002}, BINGX)
+    assert error.value.code == PROTOCOL_V2_TESTER_CONFIG_REJECTED
+
+
+def test_the_target_carries_the_profile_and_its_digest(tmp_path: Path) -> None:
+    from mrs3.exchange_profiles import ExchangeProfile
+
+    template = _tester_template(tmp_path)
+    config = PerformanceV2Config(tmp_path / "v2", evaluation_protocol="v2", exchange="BingX")
+    profile = ExchangeProfile("BingX", (("account", "bingx"),), (("MakerFee", 0.00012),))
+
+    target = evaluation_target(config, template, profile)
+    bare = evaluation_target(config, template, ExchangeProfile("BingX"))
+
+    assert (target.strategy_exchange, target.tester_fields) == (profile.strategy_exchange, profile.tester)
+    assert target.profile_digest == profile.digest()
+    assert bare.profile_digest is None
+    with pytest.raises(EvaluationProtocolError) as error:
+        evaluation_target(config, template, ExchangeProfile("Bybit"))
+    assert error.value.code == "EXCHANGE_PROFILE_INVALID"
+
+
+def test_the_finalist_digest_changes_only_with_a_profile() -> None:
+    from mrs3.performance_v2_finalist_retest import finalist_retest_config_digest
+
+    plain = EvaluationTarget(Decimal("10000"), "BingX")
+    other = EvaluationTarget(Decimal("10000"), "BingX", profile_digest="q" * 64)
+
+    digests = {finalist_retest_config_digest({}, {}, evaluation=target) for target in (plain, BINGX, other)}
+    assert len(digests) == 3
+    assert finalist_retest_config_digest({}, {}, evaluation=EvaluationTarget(Decimal("10000"), "BingX", database="x")) \
+        == finalist_retest_config_digest({}, {}, evaluation=plain)

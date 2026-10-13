@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Mapping, MutableMapping
 
 import duckdb
 
+from .exchange_profiles import ExchangeProfile
 from .performance_v2_store import (
     PerformanceV2Config,
     PerformanceV2IdentityError,
@@ -34,10 +35,19 @@ class EvaluationProtocolError(ValueError):
 
 @dataclass(frozen=True, slots=True)
 class EvaluationTarget:
-    """Base B and exchange that every MRS3 evaluation test of the active database uses."""
+    """Base B, exchange and exchange profile that every MRS3 evaluation test of the active database uses.
+
+    Profile fields are empty for an exchange without a profile (Bybit, P7 spec §3);
+    `profile_digest` is then None and the render is the pre-P7 one.
+    """
 
     base: Decimal
     exchange: str
+    strategy_exchange: tuple[tuple[str, str], ...] = ()
+    tester_fields: tuple[tuple[str, int | float], ...] = ()
+    profile_digest: str | None = None
+    # Folder of the active database: a job marker field (P7 spec §4), not a render input.
+    database: str = field(default="", compare=False)
 
 
 def _number(value: object) -> Decimal | None:
@@ -62,8 +72,18 @@ def tester_base(tester_template: Path) -> Decimal:
     return base
 
 
-def evaluation_target(config: PerformanceV2Config, tester_template: Path) -> EvaluationTarget:
-    """Target of the active PerformanceDB; refuses before any render or launch when it is not protocol v2."""
+def evaluation_target(
+    config: PerformanceV2Config,
+    tester_template: Path,
+    profile: ExchangeProfile | None = None,
+    *,
+    project_root: Path | None = None,
+) -> EvaluationTarget:
+    """Target of the active PerformanceDB; refuses before any render or launch when it is not protocol v2.
+
+    `profile` is the exchange profile of the active database (P7 spec §3); the
+    caller loads it so that a missing or invalid profile refuses with its code.
+    """
     exchange = (config.exchange or "").strip()
     if config.evaluation_protocol != "v2" or not exchange:
         raise EvaluationProtocolError(
@@ -80,7 +100,23 @@ def evaluation_target(config: PerformanceV2Config, tester_template: Path) -> Eva
             raise EvaluationProtocolError(error.code, str(error)) from error
         except (PerformanceV2StoreError, duckdb.Error) as error:
             raise EvaluationProtocolError(DATABASE_UNAVAILABLE, "active PerformanceDB cannot be checked") from error
-    return EvaluationTarget(tester_base(tester_template), exchange)
+    if profile is not None and profile.exchange.casefold() != exchange.casefold():
+        raise EvaluationProtocolError("EXCHANGE_PROFILE_INVALID", f"profile of {profile.exchange} is not for {exchange}")
+    database = Path(config.database_root)
+    if project_root is not None:
+        try:
+            database = database.relative_to(Path(project_root).resolve())
+        except ValueError:
+            pass
+    has_profile = profile is not None and bool(profile.strategy_exchange or profile.tester or profile.listing_dates)
+    return EvaluationTarget(
+        tester_base(tester_template),
+        exchange,
+        strategy_exchange=profile.strategy_exchange if profile is not None else (),
+        tester_fields=profile.tester if profile is not None else (),
+        profile_digest=profile.digest() if has_profile else None,  # type: ignore[union-attr]
+        database=database.as_posix(),
+    )
 
 
 def protocol_v2_unmet(strategy: Mapping[str, Any], target: EvaluationTarget) -> tuple[str, ...]:
@@ -100,6 +136,9 @@ def protocol_v2_unmet(strategy: Mapping[str, Any], target: EvaluationTarget) -> 
     name = exchange.get("name")  # type: ignore[union-attr]
     if not isinstance(name, str) or name.strip().casefold() != target.exchange.casefold():
         fields.append("exchange.name")
+    for key, value in target.strategy_exchange:
+        if exchange.get(key) != value:  # type: ignore[union-attr]
+            fields.append(f"exchange.{key}")
     return tuple(dict.fromkeys(fields))
 
 
@@ -111,6 +150,7 @@ def apply_protocol_v2(strategy: MutableMapping[str, Any], target: EvaluationTarg
         raise EvaluationProtocolError(PROTOCOL_V2_RENDER_REJECTED, "strategy has no basic or exchange settings")
     basic["my_fix_balance"] = float(target.base)
     exchange["name"] = target.exchange
+    exchange.update(dict(target.strategy_exchange))
     require_protocol_v2_strategy(strategy, target)
     return strategy
 
@@ -126,12 +166,16 @@ def require_protocol_v2_strategy(strategy: Mapping[str, Any], target: Evaluation
 
 
 def require_protocol_v2_tester_config(config: Mapping[str, Any], target: EvaluationTarget) -> None:
-    """Tester config clauses of the §4.2 predicate: no volume check and the base as initial balance."""
+    """Tester config clauses of the §4.2 predicate: no volume check, the base as initial balance
+    and the fees of the exchange profile (P7 spec §4)."""
     unmet = []
     if config.get("LimitOrderVolumeCheck") is not False:
         unmet.append("LimitOrderVolumeCheck")
     if _number(config.get("InitialBalance")) != target.base:
         unmet.append("InitialBalance")
+    for key, value in target.tester_fields:
+        if _number(config.get(key)) != _number(value):
+            unmet.append(key)
     if unmet:
         raise EvaluationProtocolError(
             PROTOCOL_V2_TESTER_CONFIG_REJECTED, "tester config does not meet protocol v2: " + ", ".join(unmet),
