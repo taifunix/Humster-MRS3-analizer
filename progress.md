@@ -128,7 +128,15 @@ markers, size), switches the active one (`performance_databases.active`, refused
 with `RESOURCE_BUSY` while a job runs or a report collection is open or
 verified) and creates an empty protocol v2 database with exchange markers in a
 new folder under `data/` (`/api/v2/settings/performance-databases`,
-`…/activate`, `…/create`). Next: P7d (Stage 1/2 refuse a non-Bybit database).
+`…/activate`, `…/create`). P7d: portfolio Stage 1 (readiness blocker,
+finalist preparation, campaign submit) refuses a PerformanceDB marked with an
+exchange other than Bybit (`EXCHANGE_DATA_UNAVAILABLE`, HTTP 422); unmarked v1
+and Bybit databases work as before; Stage 2 reuses the checked campaign. P7 is
+complete. Next: BingX optimizer data (margin parameters from the exchange API,
+minute liquidity in the `BingX` folder next to the Bybit one) as a separate
+feature; the CSV Direct exchange key on `feat/csv-direct-analysis`. First run on
+BingX confirms the `exchange.name` the bot expects (the database marker must
+equal it).
 User decision 2026-10-12: one PerformanceDB per exchange with an
 `schema_info.exchange` marker (protocol v2 §4.1); the CSV Direct analysis DB
 (branch `feat/csv-direct-analysis`) must also record the exchange from the run

@@ -5761,3 +5761,58 @@ def test_stage2_tester_config_updates_data_and_keeps_report_settings_only_in_rep
     assert config["UpdateData"] is True
     assert set(config) & set(config["report"]) == set()
     assert config["report"]["enable_html_report"] is True
+
+
+def _marked_performance_db(path: Path, exchange: str) -> None:
+    from mrs3.performance_v2_store import initialize_performance_v2
+
+    with duckdb.connect(str(path)) as connection:
+        initialize_performance_v2(connection, evaluation_protocol="v2", exchange=exchange)
+
+
+def test_stage1_is_blocked_for_a_database_of_another_exchange(tmp_path: Path) -> None:
+    """P7 spec §2: optimizer margin and liquidity data exist only for Bybit."""
+    from mrs3.panel_portfolio import _require_exchange_data
+
+    path = tmp_path / "portfolio_optimizer.local.json"
+    _write_config(path)
+    _marked_performance_db(tmp_path / "performance.duckdb", "BingX")
+    service = PortfolioPanelService(tmp_path, path, finalists_reader=lambda *_: pytest.fail("finalists must not be read"))
+
+    readiness = service.readiness()
+
+    assert "EXCHANGE_DATA_UNAVAILABLE" in readiness["stage1"]["blockers"]
+    assert "NO_FINALISTS" not in readiness["stage1"]["blockers"]
+    with pytest.raises(PortfolioPanelError) as error:
+        _require_exchange_data(tmp_path / "performance.duckdb")
+    assert (error.value.code, error.value.status) == ("EXCHANGE_DATA_UNAVAILABLE", 422)
+    document = json.loads(path.read_text(encoding="utf-8"))
+    # Finalist preparation and campaign submit refuse before reading finalists.
+    with pytest.raises(PortfolioPanelError) as error:
+        service._current_finalist_metadata(document)
+    assert error.value.code == "EXCHANGE_DATA_UNAVAILABLE"
+    with pytest.raises(PortfolioPanelError) as error:
+        service._snapshot_finalists(document, {"pairs": []})
+    assert error.value.code == "EXCHANGE_DATA_UNAVAILABLE"
+
+
+def test_an_unreadable_database_is_a_typed_refusal(tmp_path: Path) -> None:
+    from mrs3.panel_portfolio import _require_exchange_data
+
+    broken = tmp_path / "broken.duckdb"
+    broken.write_bytes(b"not a duckdb file")
+
+    with pytest.raises(PortfolioPanelError) as error:
+        _require_exchange_data(broken)
+    assert (error.value.code, error.value.status) == ("PERFORMANCE_DB_UNAVAILABLE", 422)
+
+
+def test_bybit_and_unmarked_databases_keep_stage1(tmp_path: Path) -> None:
+    from mrs3.panel_portfolio import _require_exchange_data
+
+    _marked_performance_db(tmp_path / "bybit.duckdb", "Bybit")
+    with duckdb.connect(str(tmp_path / "plain.duckdb")) as connection:
+        connection.execute("create table selection_runs(symbol varchar, side varchar)")
+
+    _require_exchange_data(tmp_path / "bybit.duckdb")
+    _require_exchange_data(tmp_path / "plain.duckdb")

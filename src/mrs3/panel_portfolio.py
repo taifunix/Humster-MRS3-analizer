@@ -45,6 +45,7 @@ from .portfolio.config import (
     migrate_portfolio_config_document,
 )
 from .config import load_duckdb_import_settings
+from .performance_v2_store import database_identity
 from .performance_v2_optimizer import (
     MissingPreparedOptimizerInput,
     OptimizerIntegrityError,
@@ -155,6 +156,34 @@ class PortfolioPanelError(ValueError):
         self.status = status
         self.field_errors = [dict(item) for item in field_errors]
         super().__init__(message or code)
+
+
+def _foreign_exchange(database: Path) -> str | None:
+    """Exchange marker of a PerformanceDB other than Bybit; None for Bybit or an unmarked (v1) database."""
+    with duckdb.connect(str(database), read_only=True) as connection:
+        markers = connection.execute(
+            "select count(*) from information_schema.tables where table_name = 'schema_info'"
+        ).fetchone()[0]
+        if not markers:
+            return None
+        _protocol, exchange = database_identity(connection)
+    return exchange if exchange is not None and exchange.strip() and exchange.strip().casefold() != "bybit" else None
+
+
+def _require_exchange_data(database: Path) -> None:
+    """Stage 1/2 use Bybit margin and liquidity data only (P7 spec §2): another exchange is refused."""
+    try:
+        exchange = _foreign_exchange(database)
+    except (OSError, duckdb.Error, ValueError) as error:
+        raise PortfolioPanelError(
+            "PERFORMANCE_DB_UNAVAILABLE", "performance database cannot be read", status=422,
+        ) from error
+    if exchange is not None:
+        raise PortfolioPanelError(
+            "EXCHANGE_DATA_UNAVAILABLE",
+            f"optimizer margin and liquidity data for {exchange} are not collected yet",
+            status=422,
+        )
 
 
 def _portfolio_panel_job_error(error: PanelJobError) -> PortfolioPanelError:
@@ -1438,6 +1467,14 @@ class PortfolioPanelService:
             raise PortfolioPanelError("CONFIG_INVALID", "portfolio settings are invalid", status=422) from error
 
     @staticmethod
+    def _foreign_exchange_database(database: Path) -> bool:
+        try:
+            return _foreign_exchange(database) is not None
+        except (OSError, duckdb.Error, ValueError):
+            # An unreadable database is reported by the finalist readers.
+            return False
+
+    @staticmethod
     def _path_from_config(root: Path, value: Any) -> Path:
         path = Path(str(value))
         return (root / path).resolve() if not path.is_absolute() else path.resolve()
@@ -1449,6 +1486,7 @@ class PortfolioPanelService:
         database = self._path_from_config(self.root, inputs.get("performance_db", ""))
         if not database.is_file():
             raise PortfolioPanelError("PERFORMANCE_DB_UNAVAILABLE", "performance database is unavailable", status=422)
+        _require_exchange_data(database)
         with duckdb.connect(str(database), read_only=True) as connection:
             pair_rows = connection.execute("select distinct symbol, side from selection_runs order by symbol, side").fetchall()
         pair_keys = tuple(
@@ -1609,6 +1647,8 @@ class PortfolioPanelService:
             database = self._path_from_config(self.root, inputs.get("performance_db", ""))
             if not database.is_file():
                 stage1.append("PERFORMANCE_DB_UNAVAILABLE")
+            elif self._foreign_exchange_database(database):
+                stage1.append("EXCHANGE_DATA_UNAVAILABLE")
             else:
                 try:
                     finalist_rows: list = []
@@ -1635,7 +1675,7 @@ class PortfolioPanelService:
                     pairs = []
                     finalists = {}
                     stage1.append("FINALISTS_UNAVAILABLE")
-        if not pairs and state == "READY" and "PERFORMANCE_DB_UNAVAILABLE" not in stage1:
+        if not pairs and state == "READY" and not {"PERFORMANCE_DB_UNAVAILABLE", "EXCHANGE_DATA_UNAVAILABLE"} & set(stage1):
             stage1.append("NO_FINALISTS")
         active = self.active_job()
         if active is not None:
@@ -1660,6 +1700,8 @@ class PortfolioPanelService:
     def _snapshot_finalists(self, document: Mapping[str, Any], launch: Mapping[str, Any]) -> tuple[tuple[dict[str, Any], ...], tuple[dict[str, Any], ...]]:
         inputs = document.get("inputs") if isinstance(document.get("inputs"), Mapping) else {}
         database = self._path_from_config(self.root, inputs.get("performance_db", ""))
+        if database.is_file():
+            _require_exchange_data(database)
         pairs = tuple(
             (pair["pair"], side)
             for pair in launch["pairs"]
