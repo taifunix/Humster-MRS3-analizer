@@ -11,6 +11,7 @@ import pytest
 from mrs3.config import AlgorithmConfig
 from mrs3.pipeline import _canonical
 from mrs3.source_v6 import _canonical_json
+from tests._protocol_v2 import protocol_v2_template, use_protocol_v2_target
 
 
 def _template() -> dict[str, object]:
@@ -500,12 +501,14 @@ def test_panel_discards_staged_generation_if_artifact_changes_before_commit(
     database = tmp_path / "run.analysis-v6.duckdb"
     analysis_id, _ = _make_analysis(database)
     template = tmp_path / "template.json"
-    template.write_text(json.dumps(_template()), encoding="utf-8")
+    template.write_text(json.dumps(protocol_v2_template()), encoding="utf-8")
     config = tmp_path / "config.local.json"
     config.write_text(json.dumps({
         "panel_workflow": {"strategy_templates": {"LONG": "template.json"}},
     }), encoding="utf-8")
     controller = PanelController(tmp_path, config, analysis_config_loader=lambda _path: AlgorithmConfig.defaults())
+    # READY generation renders under protocol v2 (§7a); the target stands in for a v2 database.
+    use_protocol_v2_target(monkeypatch)
     controller._fresh_analysis_paths[analysis_id] = database
     snapshot = controller.strategies_fresh_shortlist({
         "analysis_run_id": analysis_id, "filter_version": "shortlist-v2",
