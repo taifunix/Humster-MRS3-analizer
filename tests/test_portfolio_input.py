@@ -2937,3 +2937,52 @@ def test_snapshot_measures_fixed_results_on_their_base(tmp_path: Path) -> None:
     assert abs(fixed["pnl_30d_pct"] - selection["pnl_30d_pct"]) < Decimal("1e-10")  # selection reads the 12-place cache
     assert fixed["max_drawdown_pct"] == selection["max_drawdown_pct"] == Decimal("10")
     assert "lot_mode" not in fixed and "lot_base" not in fixed
+
+
+def test_portfolio_cycles_of_a_fixed_row_are_normalised_by_the_base() -> None:
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    row = {
+        "result_id": 7, "strategy_id": 3, "symbol": "BTCUSDT", "side": "LONG",
+        "imported_at_utc": start, "report_start_utc": start, "initial_balance": Decimal("1000"),
+        "sizing_use_upnl": False, "sizing_use_frozen_balance": True, "sizing_use_fix": True,
+        "sizing_balance_percentage_long": Decimal("100"), "sizing_risk_long": Decimal("1"),
+        "sizing_max_balance": Decimal("0"), "sizing_my_fix_balance": Decimal("500"),
+        "actions": (
+            {"action_index": 0, "timestamp_utc": start + timedelta(days=1), "symbol": "BTCUSDT", "action": "opened",
+             "size": Decimal("1"), "price": Decimal("100"), "cost": Decimal("100"), "post_size": Decimal("1"),
+             "balance": Decimal("1000"), "pnl": Decimal("0"), "fee": Decimal("0")},
+            {"action_index": 1, "timestamp_utc": start + timedelta(days=2), "symbol": "BTCUSDT", "action": "closed",
+             "size": Decimal("1"), "price": Decimal("110"), "cost": Decimal("110"), "post_size": Decimal("0"),
+             "balance": Decimal("1010"), "pnl": Decimal("10"), "fee": Decimal("0")},
+        ),
+        "equity": ({"sample_index": 0, "timestamp_utc": start, "equity": Decimal("1000")},),
+    }
+
+    fixed = portfolio_input._cycle_records(row, start + timedelta(days=3))
+    dynamic = portfolio_input._cycle_records(
+        {key: value for key, value in row.items() if key != "sizing_my_fix_balance"}
+        | {"sizing_use_upnl": True, "sizing_use_fix": False},
+        start + timedelta(days=3),
+    )
+
+    assert [cycle["normalized_pnl"] for cycle in fixed] == [Decimal("10") / Decimal("500")]
+    assert [cycle["normalized_pnl"] for cycle in dynamic] == [Decimal("10") / Decimal("1000")]
+
+
+def test_only_fixed_finalists_carry_their_lot_base(tmp_path: Path) -> None:
+    database = _database(tmp_path)
+    dynamic = read_current_finalists(database, [("BTCUSDT", "LONG")])[0]
+    with duckdb.connect(str(database)) as connection:
+        connection.execute(
+            """update strategy_results set sizing_use_upnl = false, sizing_use_frozen_balance = true,
+               sizing_use_fix = true, sizing_max_balance = 0, sizing_my_fix_balance = 250,
+               sizing_balance_percentage_long = 100, sizing_risk_long = 1"""
+        )
+        result_id = int(connection.execute("select result_id from strategy_results").fetchone()[0])
+    # The new sizing changes the source digest, so the optimizer input is prepared again.
+    prepare_current_optimizer_inputs(str(database), [result_id])
+    fixed = read_current_finalists(database, [("BTCUSDT", "LONG")])[0]
+
+    assert "fixed_lot_base" not in dynamic
+    assert fixed["fixed_lot_base"] == Decimal("250")
+    assert fixed["initial_balance"] != Decimal("250")

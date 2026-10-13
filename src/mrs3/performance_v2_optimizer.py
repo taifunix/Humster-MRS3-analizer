@@ -372,6 +372,9 @@ class OptimizerSourceInput:
     sizing_max_balance: Decimal | None
     actions: Sequence[OptimizerAction | Mapping[str, Any]]
     equity: Sequence[OptimizerEquityPoint | Mapping[str, Any] | Sequence[Any]]
+    sizing_my_fix_balance: Decimal | None = None
+    sizing_balance_percentage_short: Decimal | None = None
+    sizing_risk_short: Decimal | None = None
 
     def __post_init__(self) -> None:
         # Validate at construction so an over-scale typed fact can never be
@@ -404,6 +407,11 @@ class OptimizerSourceInput:
             sizing[name] = value
         for name in ("sizing_balance_percentage_long", "sizing_risk_long", "sizing_max_balance"):
             sizing[name] = None if getattr(self, name) is None else canonical_decimal(getattr(self, name), name)
+        # Protocol v2 §4.5: schema-v12 facts appear only when set, so DYNAMIC
+        # documents and digests without them stay byte-identical.
+        for name in _V12_SIZING_FIELDS:
+            if getattr(self, name) is not None:
+                sizing[name] = canonical_decimal(getattr(self, name), name)
         return {
             "source_document_version": self.source_document_version,
             "result_id": self.result_id,
@@ -444,6 +452,39 @@ class PreparedAvailability:
         return self.status == "AVAILABLE"
 
 
+_V12_SIZING_FIELDS = ("sizing_my_fix_balance", "sizing_balance_percentage_short", "sizing_risk_short")
+_DYNAMIC_SIZING_FIELDS = (
+    "sizing_use_upnl", "sizing_use_frozen_balance", "sizing_use_fix",
+    "sizing_balance_percentage_long", "sizing_risk_long", "sizing_max_balance",
+)
+
+
+def _fixed_sizing_fields(side: object) -> tuple[str, ...]:
+    suffix = "short" if str(side).strip().upper() == "SHORT" else "long"
+    return (
+        "sizing_use_upnl", "sizing_use_frozen_balance", "sizing_use_fix", "sizing_max_balance",
+        "sizing_my_fix_balance", f"sizing_balance_percentage_{suffix}", f"sizing_risk_{suffix}",
+    )
+
+
+def _dynamic_sizing(sizing: Mapping[str, Any]) -> bool:
+    return (
+        sizing.get("sizing_use_upnl") is True
+        and sizing.get("sizing_use_frozen_balance") is True
+        and sizing.get("sizing_use_fix") is False
+        and sizing.get("sizing_balance_percentage_long") == "100.000000000000"
+        and sizing.get("sizing_risk_long") == "1.000000000000"
+        and sizing.get("sizing_max_balance") == "0.000000000000"
+    )
+
+
+def _document_fixed_base(document: Mapping[str, Any]) -> Decimal | None:
+    """Constant base B of a protocol-v2 FIXED source document (protocol v2 §4.5)."""
+    from .performance_v2_sizing import fixed_lot_base
+
+    return fixed_lot_base(document["sizing"], document["side"])
+
+
 def _prepared_availability_document(document: Mapping[str, Any]) -> PreparedAvailability:
     if not document["actions"] or not document["equity"]:
         return PreparedAvailability("UNAVAILABLE", MISSING_TYPED_FACTS)
@@ -451,16 +492,14 @@ def _prepared_availability_document(document: Mapping[str, Any]) -> PreparedAvai
     if any(any(item.get(field) is None for field in required_action_fields) for item in document["actions"]):
         return PreparedAvailability("UNAVAILABLE", MISSING_TYPED_FACTS)
     sizing = document["sizing"]
-    if any(sizing[name] is None for name in sizing):
+    # The lot mode decides which facts are required; the inactive side may be NULL.
+    # Only use_fix=true with use_upnl=false is a FIXED candidate, so every other
+    # sizing keeps the previous DYNAMIC checks and reasons.
+    fixed_mode = sizing.get("sizing_use_fix") is True and sizing.get("sizing_use_upnl") is False
+    required = _fixed_sizing_fields(document["side"]) if fixed_mode else _DYNAMIC_SIZING_FIELDS
+    if any(sizing.get(name) is None for name in required):
         return PreparedAvailability("UNAVAILABLE", MISSING_TYPED_FACTS)
-    if not (
-        sizing["sizing_use_upnl"] is True
-        and sizing["sizing_use_frozen_balance"] is True
-        and sizing["sizing_use_fix"] is False
-        and sizing["sizing_balance_percentage_long"] == "100.000000000000"
-        and sizing["sizing_risk_long"] == "1.000000000000"
-        and sizing["sizing_max_balance"] == "0.000000000000"
-    ):
+    if not (_dynamic_sizing(sizing) or _document_fixed_base(document) is not None):
         return PreparedAvailability("UNAVAILABLE", UNSUPPORTED_SIZING)
     return PreparedAvailability("AVAILABLE")
 
@@ -480,14 +519,9 @@ def _cycle_records(
     if document is None:
         document = source.to_document()
     sizing = document["sizing"]
-    dynamic_basis = (
-        sizing.get("sizing_use_upnl") is True
-        and sizing.get("sizing_use_frozen_balance") is True
-        and sizing.get("sizing_use_fix") is False
-        and sizing.get("sizing_balance_percentage_long") == "100.000000000000"
-        and sizing.get("sizing_risk_long") == "1.000000000000"
-        and sizing.get("sizing_max_balance") == "0.000000000000"
-    )
+    dynamic_basis = _dynamic_sizing(sizing)
+    # FIXED: every cycle is normalised by the constant base B (protocol v2 §4.5).
+    fixed_base = None if dynamic_basis else _document_fixed_base(document)
     rows = []
     for item in document["actions"]:
         row = dict(item)
@@ -506,7 +540,7 @@ def _cycle_records(
             closing_candidates.setdefault(action.timestamp_utc, []).append(action)
     result: list[dict[str, Any]] = []
     for cycle in reconstructed:
-        basis = None
+        basis = opening_balance = None
         opening_source_ordinal = None
         diagnostics = cycle.diagnostics
         if cycle.opened_at is not None:
@@ -517,13 +551,14 @@ def _cycle_records(
             if opening is not None:
                 opening_source_ordinal = opening.source_ordinal
                 source_row = by_ordinal.get(opening.source_ordinal, {})
-                if dynamic_basis:
+                if dynamic_basis or fixed_base is not None:
                     balance = Decimal(source_row["balance"])
                     pnl = Decimal(source_row["pnl"]) if source_row.get("pnl") is not None else Decimal("0")
                     fee = Decimal(source_row["fee"]) if source_row.get("fee") is not None else Decimal("0")
-                    basis = balance - pnl + fee
-                    if basis <= 0:
-                        basis = None
+                    opening_balance = balance - pnl + fee
+                    basis = opening_balance if dynamic_basis else fixed_base
+                    if opening_balance <= 0:
+                        basis = opening_balance = None
         closing_balance = None
         if not cycle.censored and cycle.closed_at is not None:
             closing_queue = closing_candidates.get(cycle.closed_at, [])
@@ -533,7 +568,8 @@ def _cycle_records(
                 closing_balance = Decimal(raw_balance) if raw_balance is not None else None
         normalized_pnl = None
         if basis is not None and closing_balance is not None and not cycle.censored:
-            normalized_pnl = (closing_balance - basis) / basis
+            # DYNAMIC: basis is the opening balance; FIXED: the PnL over B.
+            normalized_pnl = (closing_balance - opening_balance) / basis
         result.append({
             "cycle_id": cycle.cycle_id,
             "symbol": cycle.symbol,
@@ -607,12 +643,19 @@ def _source_rows(
     placeholders = ",".join("?" for _ in result_ids)
     predicate = f"where r.result_id in ({placeholders})" + (" and s.current_result_id = r.result_id" if current_only else "")
     parameters: list[Any] = list(result_ids)
+    from .performance_v2_sizing import has_fixed_sizing_columns
+
+    v12_sizing = (
+        ", ".join(f"r.{name}" for name in _V12_SIZING_FIELDS)
+        if has_fixed_sizing_columns(connection) else "null, null, null"
+    )
     result_rows = connection.execute(
         f"""select r.result_id, r.strategy_id, s.symbol, s.side,
                   r.report_start_utc, r.report_end_utc, r.imported_at_utc,
                   r.effective_start_utc, r.effective_end_utc, r.initial_balance,
                   r.sizing_use_upnl, r.sizing_use_frozen_balance, r.sizing_use_fix,
-                  r.sizing_balance_percentage_long, r.sizing_risk_long, r.sizing_max_balance
+                  r.sizing_balance_percentage_long, r.sizing_risk_long, r.sizing_max_balance,
+                  {v12_sizing}
              from strategy_results r join strategies s on s.strategy_id = r.strategy_id
              {predicate} order by r.result_id""",
         parameters,
@@ -657,6 +700,7 @@ def _source_rows(
             sizing_use_fix=row[12], sizing_balance_percentage_long=row[13],
             sizing_risk_long=row[14], sizing_max_balance=row[15],
             actions=tuple(actions_by_id[result_id]), equity=tuple(equity_by_id[result_id]),
+            sizing_my_fix_balance=row[16], sizing_balance_percentage_short=row[17], sizing_risk_short=row[18],
         ))
     return tuple(result)
 

@@ -54,6 +54,14 @@ def fixed_lot_base(sizing: Mapping[str, object], side: object) -> Decimal | None
     return base
 
 
+def member_fixed_base(row: Mapping[str, object]) -> Decimal | None:
+    """FIXED base of a portfolio member row: its carried `fixed_lot_base` or its sizing facts."""
+    carried = _number(row.get("fixed_lot_base"))
+    if carried is not None and carried > 0:
+        return carried
+    return fixed_lot_base(row, row.get("side"))
+
+
 def has_fixed_sizing_columns(connection: duckdb.DuckDBPyConnection) -> bool:
     """True for a schema-v12 catalog that stores the FIXED base."""
     found = connection.execute(
@@ -93,4 +101,5 @@ __all__ = [
     "has_fixed_sizing_columns",
     "load_fixed_lot_base",
     "load_fixed_lot_bases",
+    "member_fixed_base",
 ]

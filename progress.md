@@ -79,8 +79,19 @@ and base. Workbooks add `Lot mode` after `MA type`; the Panel card shows
 pinned on a synthetic fixture. The E1–E6 evidence scripts live in
 `scripts/equity_research/` (`sizing_evidence.py`, `sizing_fills.py`,
 `base_size.py`); a smoke test runs them read-only on a small synthetic database.
-Next: P5 (optimizer accepts FIXED), P6 (templates and render predicate), P7
-(Panel database selection).
+P5: the optimizer accepts FIXED results (use_fix=true and use_upnl=false with a
+stored base, active side 100%/risk 1, max_balance 0; the inactive side may be
+NULL) next to DYNAMIC; FIXED cycles are normalised as (closing − opening
+balance) / B, and tested capacity in sizing and the default pre-test evaluator
+uses B (finalist rows of FIXED results carry `fixed_lot_base`). DYNAMIC source
+documents, digests, prepared JSON and availability reasons are unchanged for
+rows without schema-v12 facts (checked on a 1 458-combination grid). DYNAMIC
+rows imported after P3 that store v12 facts get a new source digest and are
+prepared again on the next preparation.
+Next: P6 (templates and render predicate), then P7 (Panel PerformanceDB
+selection with an exchange profile: the render takes `exchange.name` and the
+exchange-specific tester fees/account fields from the active database —
+user proposal 2026-10-13, spec pending).
 User decision 2026-10-12: one PerformanceDB per exchange with an
 `schema_info.exchange` marker (protocol v2 §4.1); the CSV Direct analysis DB
 (branch `feat/csv-direct-analysis`) must also record the exchange from the run

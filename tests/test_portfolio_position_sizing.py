@@ -478,3 +478,48 @@ def test_weighted_vector_allows_independent_same_symbol_lot_caps() -> None:
     assert result.status == "PASS"
     assert [row["capacity_usdt"] for row in result.members] == [Decimal("400"), Decimal("300")]
     assert [row["actual_size_usdt"] for row in result.members] == [Decimal("400"), Decimal("300")]
+
+
+def test_member_path_tests_fixed_results_on_their_base() -> None:
+    from decimal import Decimal
+
+    from mrs3.portfolio.position_sizing import _member_path
+
+    row = {
+        "side": "LONG", "initial_balance": Decimal("1000"), "equity": (),
+        "strategy_orders": ({"lot_x": Decimal("0.25")}, {"lot_x": Decimal("0.75")}),
+    }
+    fixed = dict(
+        row, sizing_use_upnl=False, sizing_use_frozen_balance=True, sizing_use_fix=True,
+        sizing_max_balance=Decimal("0"), sizing_my_fix_balance=Decimal("10000"),
+        sizing_balance_percentage_long=Decimal("100"), sizing_risk_long=Decimal("1"),
+    )
+
+    assert _member_path(row)[2] == Decimal("1000")
+    assert _member_path(fixed)[2] == Decimal("10000")
+
+
+def test_tested_capacity_uses_a_carried_fixed_base_in_both_evaluators(monkeypatch) -> None:
+    from decimal import Decimal
+
+    import mrs3.portfolio.pretest_proxy as pretest_proxy
+    from mrs3.portfolio.candidate_search import _default_pretest_evaluator
+    from mrs3.portfolio.position_sizing import _member_path
+
+    member = {
+        "side": "LONG", "initial_balance": Decimal("1000"), "fixed_lot_base": Decimal("250"),
+        "strategy_orders": ({"lot_x": Decimal("0.5")}, {"lot_x": Decimal("0.5")}),
+        "equity": (), "actual_size_usdt": Decimal("100"),
+    }
+    seen: list[object] = []
+    real = pretest_proxy.compute_proxy_metrics
+
+    def spy(*args, **kwargs):
+        seen.append(kwargs.get("tested_size_usdt"))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(pretest_proxy, "compute_proxy_metrics", spy)
+    _default_pretest_evaluator((member,), campaign_equity=Decimal("1000"))
+
+    assert _member_path(member)[2] == Decimal("250")
+    assert seen and seen[0] == Decimal("250")

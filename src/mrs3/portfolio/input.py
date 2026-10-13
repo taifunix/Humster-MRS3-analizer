@@ -364,6 +364,7 @@ _DECIMAL_FIELD_TYPES: dict[str, tuple[str, str]] = {
     "sizing_my_fix_balance": ("money", "currency"),
     "sizing_balance_percentage_short": ("percent", "%"),
     "sizing_risk_short": ("scalar", "1"),
+    "fixed_lot_base": ("money", "currency"),
     # Selection candidate facts added after the snapshot registry was written.
     "completed_cycle_net_pnl": ("money", "currency"),
     "top5_pnl": ("money", "currency"),
@@ -1534,6 +1535,11 @@ def read_current_finalists(
                         for field in ("close_ma_type", "close_ma_source")
                         if source.get(field) is not None
                     },
+                    # Only FIXED members carry their base, so DYNAMIC rows are unchanged.
+                    **(
+                        {"fixed_lot_base": fixed_base}
+                        if (fixed_base := fixed_lot_base(source_result, side)) is not None else {}
+                    ),
                     "selection_run_id": provenance["selection_run_id"],
                     "review_import_id": provenance["review_import_id"],
                     "source_provenance": provenance,
@@ -1738,6 +1744,11 @@ def _cycle_records(row: Mapping[str, Any], period_end: datetime) -> tuple[Mappin
             sizing_max_balance=setting("sizing_max_balance", basic, setting("max_balance", basic)),
             actions=tuple(row.get("actions", row.get("action_series", ()))),
             equity=tuple(row.get("equity", row.get("equity_series", row.get("equity_path", ())))),
+            # Schema-v12 facts come from stored columns only (absent for legacy rows),
+            # never from the report metadata, so legacy source documents are unchanged.
+            sizing_my_fix_balance=row.get("sizing_my_fix_balance"),
+            sizing_balance_percentage_short=row.get("sizing_balance_percentage_short"),
+            sizing_risk_short=row.get("sizing_risk_short"),
         )
         cycles = _optimizer_cycle_records(source)
     except (OptimizerIntegrityError, InvalidOperation, TypeError, ValueError, KeyError) as error:
