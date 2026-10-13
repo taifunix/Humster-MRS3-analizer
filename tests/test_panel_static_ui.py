@@ -1520,19 +1520,19 @@ def test_tester_dates_and_local_ranges_are_sent_only_on_tester_start() -> None:
     assert "testerEndDate?.value" in tester_handler
     assert "start_date: startDate" in tester_handler
     assert "end_date: endDate" in tester_handler
-    assert "tester-initial-balance" in js
-    assert "initial_balance: initialBalance" in tester_handler
+    # Protocol v2 §4.3: the tester runs on the base of its template.
+    assert "initial_balance" not in tester_handler
     for marker in ("shortlist", "analyze", "generate"):
         assert f"tester-range-{marker}" not in js
 
 
-def test_each_single_mode_card_sends_its_initial_balance_only_to_its_start_route() -> None:
+def test_mrs3_cards_have_no_start_balance_field() -> None:
     js = _read("app.js")
 
-    assert "performance-v2-finalist-retest-initial-balance" in js
-    assert "performance-v2-retest-initial-balance" in js
-    assert "payload.initial_balance = finalistInitialBalance" in js
-    assert "initial_balance: retestInitialBalance" in js
+    # Protocol v2 §4.3: the start-balance field is removed from the three MRS3 flows.
+    for marker in ("tester-initial-balance", "performance-v2-finalist-retest-initial-balance",
+                   "performance-v2-retest-initial-balance", "initial_balance"):
+        assert marker not in js
 
 
 def test_tester_card_exposes_single_mode_and_hides_fast_controls() -> None:

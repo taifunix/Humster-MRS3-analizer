@@ -35,6 +35,8 @@ from mrs3.performance_v2_selection import (
     SELECTION_REASON_ALIASES, SelectionRequest, parse_selection_request, write_selection_workbook,
 )
 import duckdb
+
+from mrs3.evaluation_protocol import EvaluationTarget
 from mrs3.panel_testing import render_strategy
 from mrs3.panel_fast_strategy_test import LocalSingleModeStrategyTestService
 from mrs3.panel_strategy_batch import validate_strategy_manifest
@@ -153,9 +155,18 @@ def test_weighted_template_only_changes_name_and_mrs_priority() -> None:
 
     assert not set(keys(weighted)).intersection({"open_positions_limiter", "k", "size_composition_vector"})
 
+    # Protocol v2 (§4.2, §9): the retest template moved to the fixed lot and ohlc4,
+    # the weighted Stage 2 template keeps the legacy DYNAMIC prototype.
+    assert original["exchange"]["use_upnl"] is False and original["basic"]["use_fix"] is True
     normalized = deepcopy(original)
     normalized["name"] = weighted["name"]
     normalized["mrs"] = weighted["mrs"]
+    normalized["exchange"]["use_upnl"] = weighted["exchange"]["use_upnl"]
+    for field in ("use_fix", "my_fix_balance", "more_data"):
+        normalized["basic"][field] = weighted["basic"][field]
+    for key in ("ma_long", "ma_short"):
+        for entry, legacy in zip(normalized["mrs3"][key], weighted["mrs3"][key], strict=True):
+            entry["source"] = legacy["source"]
     assert weighted == normalized
 
     original_filename, rendered_original = render_strategy(original_text, "ONUSDT", "LONG")
@@ -347,12 +358,13 @@ def test_manifest_has_one_common_period_and_native_strategy_provenance(tmp_path)
         )
         batch = build_finalist_retest_manifest(
             connection,
-            {"LONG": Path("templates/strategies/retest-mrs3/base.json")},
+            {"LONG": Path(__file__).resolve().parents[1] / "templates/strategies/retest-mrs3/base.json"},
             tmp_path / "output",
             test_start="2026-01-01",
             test_end="2026-06-01",
             listing_dates={"BTCUSDT": date(2025, 12, 1)},
             job_id="bulk-1",
+            evaluation=EvaluationTarget(Decimal("10000"), "Bybit"),
         )
 
     manifest = json.loads(batch.manifest_path.read_text(encoding="utf-8"))
@@ -372,10 +384,12 @@ def test_manifest_has_one_common_period_and_native_strategy_provenance(tmp_path)
     assert LocalSingleModeStrategyTestService._require_diagnostics(validated, ("final",)) == manifest["candidate_diagnostics"]
     strategy = json.loads((batch.strategies_path / "final.json").read_text(encoding="utf-8"))
     assert strategy["name"] == "final"
-    assert strategy["basic"]["use_fix"] is False
-    assert strategy["exchange"]["use_upnl"] is True
+    # Protocol v2: fixed lot on the base of the MRS3 tester template, the active exchange.
+    assert strategy["basic"]["use_fix"] is True
+    assert strategy["exchange"]["use_upnl"] is False
     assert strategy["exchange"]["use_frozen_balance"] is True
-    assert strategy["basic"]["my_fix_balance"] == 1000.0
+    assert strategy["basic"]["my_fix_balance"] == 10000.0
+    assert strategy["exchange"]["name"] == "Bybit"
 
 
 def test_import_outcomes_replace_successful_member_and_isolate_failure() -> None:

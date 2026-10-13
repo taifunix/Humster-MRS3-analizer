@@ -8,6 +8,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests._protocol_v2 import use_protocol_v2_target
+
 from mrs3.panel_jobs import PanelJobError, PanelJobRegistry
 import mrs3.panel as panel_module
 from mrs3.panel import PanelController
@@ -291,6 +293,7 @@ def test_controller_collection_verify_then_import_binds_exact_snapshot(tmp_path:
 
 def test_controller_registers_checked_job_before_worker_callback_and_rejects_non_boolean(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     controller = PanelController(tmp_path, tmp_path / "config.local.json")
+    use_protocol_v2_target(monkeypatch)
     registry = controller._panel_jobs
     collection = PanelReportCollection(
         registry,

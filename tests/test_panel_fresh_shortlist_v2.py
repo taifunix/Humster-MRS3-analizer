@@ -7,6 +7,14 @@ import threading
 
 import pytest
 
+from tests._protocol_v2 import use_protocol_v2_target
+
+
+@pytest.fixture(autouse=True)
+def _protocol_v2_database(monkeypatch: pytest.MonkeyPatch):
+    """MRS3 evaluation flows need a protocol v2 PerformanceDB (protocol v2 §7a)."""
+    return use_protocol_v2_target(monkeypatch)
+
 from mrs3.config import AlgorithmConfig
 from mrs3.panel import PanelController, create_panel_server
 from mrs3.fresh_shortlist import ShortlistBusyError
@@ -172,11 +180,11 @@ def test_json_generation_freezes_all_applied_flags_in_thread_payload(
 
 
 def test_final_fresh_manifest_is_recovered_after_panel_cache_is_cleared(tmp_path: Path, monkeypatch) -> None:
-    from tests.test_fresh_analysis_strategies import _template
+    from tests.test_fresh_analysis_strategies import _protocol_v2_template, _template
 
     controller, _analysis_path, analysis_id = _controller(tmp_path)
     template = tmp_path / "template.json"
-    template.write_text(json.dumps(_template()), encoding="utf-8")
+    template.write_text(json.dumps(_protocol_v2_template(_template())), encoding="utf-8")
     monkeypatch.setattr(controller, "_workflow_default", lambda *_args, **_kwargs: template)
     snapshot = controller.strategies_fresh_shortlist(_selection_request(analysis_id))
 

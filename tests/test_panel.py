@@ -15,6 +15,8 @@ from types import MappingProxyType, SimpleNamespace
 
 import pytest
 
+from tests._protocol_v2 import use_protocol_v2_target
+
 from mrs3 import panel as panel_module
 from mrs3.panel import PanelController, _DirectJob, _Job, create_panel_server
 from mrs3.source_v6_importer import SourceV6WorkerFailure, source_v6_import_lock
@@ -2418,11 +2420,14 @@ def test_analysis_strategies_freezes_selected_scopes_and_allows_empty_candidates
     def strategy_func(
         connection: object, run_id: object, candidate_ids: object, selected_scopes: object,
         template_path: object, output_dir: object, config: object, criteria: object,
+        evaluation: object = None,
     ) -> object:
+        assert evaluation == target
         calls.append((run_id, candidate_ids, selected_scopes, Path(str(template_path)).name, Path(str(output_dir)).name, criteria))
         return SimpleNamespace(strategies_path=tmp_path / "out" / "strategies", strategy_count=1)
 
     monkeypatch.setattr("mrs3.panel.threading.Thread", _SynchronousThread)
+    target = use_protocol_v2_target(monkeypatch)
     controller = PanelController(
         tmp_path, tmp_path / "config.local.json",
         direct_connection_factory=lambda *_args, **_kwargs: Connection(),
@@ -2469,6 +2474,7 @@ def test_analysis_strategies_failed_lifecycle_exposes_explicit_error(
         raise ValueError("no BASE or READY candidates exist in the selected scopes")
 
     monkeypatch.setattr("mrs3.panel.threading.Thread", _SynchronousThread)
+    target = use_protocol_v2_target(monkeypatch)
     controller = PanelController(
         tmp_path, tmp_path / "config.local.json",
         direct_connection_factory=lambda *_args, **_kwargs: Connection(),
@@ -2535,6 +2541,7 @@ def test_analysis_strategies_routes_committed_v6_run_without_legacy_database(
 
     monkeypatch.setattr("mrs3.panel.generate_v6_analysis_strategies", v6_generator)
     monkeypatch.setattr("mrs3.panel.threading.Thread", _SynchronousThread)
+    target = use_protocol_v2_target(monkeypatch)
     controller = PanelController(
         tmp_path,
         tmp_path / "config.local.json",
@@ -2553,7 +2560,7 @@ def test_analysis_strategies_routes_committed_v6_run_without_legacy_database(
     args, kwargs = calls[0]
     assert Path(str(args[0])) == surface.resolve()
     assert args[1:4] == ("V6RUN", ("C_READY",), (("BTCUSDT", "LONG", "1h"),))
-    assert kwargs == {}
+    assert kwargs == {"evaluation": target}
     assert result["analysis_strategies"]["phase"] == "COMMITTED"
 
 
@@ -2589,7 +2596,8 @@ def test_analysis_shortlist_reads_ready_v6_structures_from_surface(
     }]
 
 
-def test_panel_requires_matching_v6_confirmation_before_tester_run(tmp_path: Path) -> None:
+def test_panel_requires_matching_v6_confirmation_before_tester_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    use_protocol_v2_target(monkeypatch)
     strategies = tmp_path / "strategies"
     strategies.mkdir()
     manifest = {
@@ -3701,8 +3709,9 @@ def test_import_status_never_exposes_absolute_paths_from_errors(tmp_path: Path, 
 
 
 def test_controller_builds_shell_free_tester_command_and_captures_log(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    use_protocol_v2_target(monkeypatch)
     controller = PanelController(
         root=tmp_path,
         default_config=tmp_path / "config.json",
@@ -3886,7 +3895,8 @@ def test_controller_rejects_parallel_jobs(tmp_path: Path) -> None:
         controller.start("tester-plan", payload)
 
 
-def test_controller_hides_artifacts_left_by_an_older_job(tmp_path: Path) -> None:
+def test_controller_hides_artifacts_left_by_an_older_job(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    use_protocol_v2_target(monkeypatch)
     output = tmp_path / "results/test.csv"
     output.parent.mkdir()
     output.write_text("old\n", encoding="utf-8")

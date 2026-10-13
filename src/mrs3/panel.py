@@ -219,6 +219,13 @@ from .fresh_analysis_strategies import (
 )
 from .fresh_shortlist import ShortlistBusyError, parse_fresh_shortlist_request, serialize_applied_options
 from .tester_run_files import publish_run_snapshots
+from .evaluation_protocol import (
+    EvaluationProtocolError,
+    EvaluationTarget,
+    evaluation_target,
+    require_protocol_v2_strategy,
+    require_protocol_v2_tester_config,
+)
 from .panel_strategy_batch import LocalStrategyBatchService, StrategyBatchValidationError, validate_strategy_manifest
 from .panel_tester_runs import LocalRunsBatchService
 from .panel_fast_strategy_test import (
@@ -850,7 +857,7 @@ async function startAction(action) {
   try {
     const response = await fetch('/api/start', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload(action))});
     const body = await response.json();
-    if (!response.ok) throw new Error(body.error || 'Ошибка запуска');
+    if (!response.ok) throw new Error(body.error?.code ? (body.error.message || body.error.code) : (body.error || 'Ошибка запуска'));
     notice.textContent = 'Задача запущена.'; render(body);
   } catch (error) { notice.textContent = error.message; }
 }
@@ -1812,6 +1819,8 @@ class PanelController:
                     }
                     if any(confirmation.get(key) != value for key, value in expected_confirmation.items()):
                         raise ValueError("v6 tester confirmation does not match the generated manifest")
+            if action == "tester-run":
+                self._require_protocol_v2_legacy_run(payload, strategies)
             command.extend(["--strategies", str(strategies)])
             if action in {"tester-plan", "tester-run"} and payload.get("output_csv"):
                 output = self._path(self._required(payload, "output_csv"))
@@ -2076,10 +2085,9 @@ class PanelController:
         job_id: str | None = None,
     ) -> dict[str, object]:
         job_id = uuid.uuid4().hex if job_id is None else job_id
-        self._panel_jobs.submit(kind, request, f"panel:{job_id}", resource_keys, job_id=job_id)
+        # The runtime is persisted with the job, so a journal failure leaves no half-created job.
+        self._panel_jobs.submit(kind, request, f"panel:{job_id}", resource_keys, job_id=job_id, runtime=runtime or None)
         self._panel_jobs.transition(job_id, "RUNNING")
-        if runtime:
-            self._panel_jobs.sync(job_id, {"state": "RUNNING", "phase": "RUNNING"}, runtime=runtime)
         try:
             if before_start is not None:
                 before_start(job_id)
@@ -3116,6 +3124,7 @@ class PanelController:
     def strategies_fresh_generate(self, payload: Mapping[str, object]) -> dict[str, object]:
         if "output_dir" in payload:
             raise ValueError("output_dir is server-controlled")
+        self._evaluation_target()
         if any(not isinstance(key, str) or key.startswith("_") for key in payload):
             raise ValueError("private fields are not allowed")
         options, min_shift_enabled, min_shift_pct = self._fresh_shortlist_settings(payload)
@@ -3174,6 +3183,7 @@ class PanelController:
 
     def strategies_fresh_generate_runs(self, payload: Mapping[str, object]) -> dict[str, object]:
         """Publish the selected filtered candidates as tester run snapshots."""
+        self._evaluation_target()
         options, min_shift_enabled, min_shift_pct = self._fresh_shortlist_settings(payload)
         if set(payload).difference({"analysis_run_id", "filter_version", "filters", "pretest_ab_enabled", "ladder_enabled", "pareto_enabled", "min_shift_enabled", "min_shift_pct", "selection_token", "selected_scopes", "start_date", "end_date"}):
             raise ValueError("tester run request contains unsupported fields")
@@ -3202,6 +3212,7 @@ class PanelController:
             expected_artifact_sha256=evaluation.artifact_sha256,
         )
         runner = RunnerConfig.from_json(self.default_config)
+        target = self._evaluation_target()
         with TesterTargetLock(runner.bot_root):
             result = publish_run_snapshots(
                 self.root / "Input" / "run_snapshot_2.json", runner.bot_root, runner.tester_config, structures,
@@ -3214,6 +3225,7 @@ class PanelController:
                 before_publish=lambda: self._assert_fresh_analysis_digest(
                     analysis_path, evaluation.artifact_sha256,
                 ),
+                evaluation=target,
             )
         return {"phase": "COMMITTED", "analysis_run_id": analysis_id, **result}
 
@@ -3254,6 +3266,7 @@ class PanelController:
             prepared, evaluation, scopes, require_one_side=True,
         )
         scope_sides = {scope[1] for scope in scopes}
+        target = self._evaluation_target()
         config = self._analysis_config_loader(self.default_config)
         output_root = self.root / "Output" / "fresh-shortlist-v2" / analysis_id
         output_root.mkdir(parents=True, exist_ok=True)
@@ -3273,6 +3286,7 @@ class PanelController:
                 **({"min_shift_enabled": True, "min_shift_pct": min_shift_pct}
                    if min_shift_enabled else {}),
                 selection=evaluation,
+                evaluation=target,
             )
             self._assert_fresh_analysis_digest(analysis_path, evaluation.artifact_sha256)
             staging.replace(final)
@@ -3566,6 +3580,77 @@ class PanelController:
             )
         return self._strategy_batch_service
 
+    def _evaluation_target(self) -> EvaluationTarget:
+        """Protocol v2 target of the active PerformanceDB; refuses before any MRS3 render or launch (§7a)."""
+        return evaluation_target(self._performance_v2_config(), mrs3_tester_config_template(self.root))
+
+    @staticmethod
+    def _protocol_v2_runtime(target: EvaluationTarget) -> dict[str, object]:
+        """Runtime marker of an MRS3 job rendered under protocol v2 for one base and exchange."""
+        return {
+            "evaluation_protocol": "v2",
+            "evaluation_base": format(target.base.normalize(), "f"),
+            "evaluation_exchange": target.exchange,
+        }
+
+    @classmethod
+    def _matches_protocol_v2(cls, runtime: Mapping[str, object], target: EvaluationTarget) -> bool:
+        return all(runtime.get(key) == value for key, value in cls._protocol_v2_runtime(target).items())
+
+    def _require_protocol_v2_tester_template(self, target: EvaluationTarget) -> None:
+        try:
+            document = json.loads(mrs3_tester_config_template(self.root).read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise EvaluationProtocolError("PROTOCOL_V2_TESTER_CONFIG_REJECTED", "MRS3 tester template is unreadable") from error
+        require_protocol_v2_tester_config(document if isinstance(document, Mapping) else {}, target)
+
+    def _require_protocol_v2_legacy_run(self, payload: Mapping[str, object], strategies: Path) -> None:
+        """Legacy `tester-run`: strategies, the bot tester config and any resumed config snapshot meet protocol v2."""
+        target = self._evaluation_target()
+        self._require_protocol_v2_strategy_dir(strategies, target)
+        runner = RunnerConfig.from_json(self._path(self._required(payload, "config")))
+        try:
+            tester_config = json.loads(Path(runner.tester_config).read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise EvaluationProtocolError("PROTOCOL_V2_TESTER_CONFIG_REJECTED", "bot tester config is unreadable") from error
+        require_protocol_v2_tester_config(tester_config if isinstance(tester_config, Mapping) else {}, target)
+        output = self._path(self._required(payload, "output_csv"))
+        if output.with_name(f".{output.stem}.tester-config.snapshot").exists():
+            # A resumed run would reuse the frozen pre-check config (runner/workflow.py).
+            raise EvaluationProtocolError(
+                "PROTOCOL_V2_TESTER_CONFIG_REJECTED", "a resumed run would reuse an unchecked tester config snapshot",
+            )
+
+    def _require_protocol_v2_strategy_dir(self, directory: Path, target: EvaluationTarget) -> None:
+        for path in sorted(Path(directory).glob("*.json")):
+            if path.name == "strategy_manifest.json":
+                continue
+            try:
+                strategy = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise EvaluationProtocolError("PROTOCOL_V2_RENDER_REJECTED", f"strategy {path.name} is unreadable") from error
+            require_protocol_v2_strategy(strategy if isinstance(strategy, Mapping) else {}, target)
+
+    def _require_protocol_v2_manifest(self, manifest_path: Path, target: EvaluationTarget) -> None:
+        """Every strategy of a READY/RETEST manifest and the tester template meet protocol v2 before launch."""
+        self._require_protocol_v2_tester_template(target)
+        validated = validate_strategy_manifest(Path(manifest_path))
+        self._require_protocol_v2_strategy_dir(validated.strategy_source, target)
+
+    def _require_protocol_v2_runs(self, target: EvaluationTarget) -> None:
+        """Published RUNS snapshots (strategy and embedded tester config) meet protocol v2 before launch."""
+        runner = RunnerConfig.from_json(self.default_config)
+        runs = Path(runner.bot_root) / "tester" / "runs"
+        for path in sorted(runs.glob("*.json")) if runs.is_dir() else ():
+            try:
+                snapshot = json.loads(path.read_text(encoding="utf-8"))
+                settings = snapshot["settings"]
+                strategy, tester_config = settings[0], snapshot["tester_config"]
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError, KeyError, IndexError, TypeError) as error:
+                raise EvaluationProtocolError("PROTOCOL_V2_RENDER_REJECTED", f"RUNS snapshot {path.name} is unreadable") from error
+            require_protocol_v2_strategy(strategy, target)
+            require_protocol_v2_tester_config(tester_config, target)
+
     def _runs_batch(self) -> LocalRunsBatchService:
         if self._runs_batch_service is None:
             self._runs_batch_service = LocalRunsBatchService(RunnerConfig.from_json(self.default_config), on_update=self._record_special_job)
@@ -3625,7 +3710,7 @@ class PanelController:
         return names
 
     def strategies_tester_start(self, payload: Mapping[str, object]) -> dict[str, object]:
-        unexpected = set(payload).difference({"analysis_run_id", "start_date", "end_date", "test_start", "test_end", "initial_balance", "collect_reports"})
+        unexpected = set(payload).difference({"analysis_run_id", "start_date", "end_date", "test_start", "test_end", "collect_reports"})
         if unexpected:
             raise ValueError("tester start request contains unsupported fields")
         collect_reports = payload.get("collect_reports", False)
@@ -3642,6 +3727,8 @@ class PanelController:
             raise ValueError("start_date and end_date are required")
         initial_balance = self._requested_initial_balance(payload)
         manifest = self._fresh_strategy_manifest(analysis_id)
+        evaluation = self._evaluation_target()
+        self._require_protocol_v2_manifest(Path(manifest), evaluation)
         expected_names = self._manifest_strategy_names(manifest) if collect_reports else ()
         request = {"analysis_run_id": analysis_id, "start_date": start_date, "end_date": end_date, "initial_balance": initial_balance, "mode": "SINGLE_MODE", "collect_reports": collect_reports}
         single_mode_service = self._single_mode_strategy_test()
@@ -3666,6 +3753,7 @@ class PanelController:
                 job_id=job_id,
                 **({"initial_balance": initial_balance} if initial_balance is not None else {}),
             ),
+            runtime=self._protocol_v2_runtime(evaluation),
             before_start=register if collect_reports else None,
         )
 
@@ -3681,6 +3769,11 @@ class PanelController:
             raise PanelJobError("RETEST_RETRY_NOT_ALLOWED")
         if source.get("state") not in {"FAILED", "CANCELLED"}:
             raise PanelJobError("TESTER_JOB_NOT_RECOVERABLE")
+        evaluation = self._evaluation_target()
+        if not self._matches_protocol_v2(source_runtime, evaluation):
+            # Protocol v2 §7a: a job rendered before P6 or for another base/exchange is started anew.
+            raise PanelJobError("RETRY_PRE_PROTOCOL_V2")
+        self._require_protocol_v2_tester_template(evaluation)
 
         def register(job_id: str) -> None:
             runtime = self._panel_jobs.runtime(source_job_id)
@@ -3706,12 +3799,14 @@ class PanelController:
             {"source_job_id": source_job_id},
             ("strategies.tester",),
             lambda job_id: self._single_mode_strategy_test().retry(source_job_id, job_id=job_id),
+            runtime=self._protocol_v2_runtime(evaluation),
             before_start=register,
         )
 
     def strategies_tester_runs_start(self, payload: Mapping[str, object]) -> dict[str, object]:
         if payload:
             raise ValueError("tester RUNS request contains unsupported fields")
+        self._require_protocol_v2_runs(self._evaluation_target())
         try:
             return self._start_tracked_panel_job(
                 "strategies.tester.runs", {}, ("strategies.tester",),
@@ -4191,7 +4286,7 @@ class PanelController:
     def _retest_explicit_range(self, payload: Mapping[str, object]) -> tuple[str, str] | None:
         if not isinstance(payload, Mapping):
             raise ValueError("RETEST start request must be an object")
-        allowed = {"test_start", "test_end", "start_date", "end_date", "initial_balance"}
+        allowed = {"test_start", "test_end", "start_date", "end_date"}
         if set(payload).difference(allowed):
             raise ValueError("RETEST start request contains unsupported fields")
         pairs = [("test_start", "test_end"), ("start_date", "end_date")]
@@ -4276,7 +4371,7 @@ class PanelController:
             "phase": "READY" if status.active_count else "IDLE",
         }
 
-    def _reusable_retest_job(self) -> dict[str, object] | None:
+    def _reusable_retest_job(self, evaluation: EvaluationTarget) -> dict[str, object] | None:
         """Find the newest committed RETEST inbox still backed by tester files.
 
         New registry records carry a persisted creation time.  Legacy records
@@ -4407,6 +4502,8 @@ class PanelController:
                     continue
                 if job.get("retest") is not True and runtime.get("retest") is not True:
                     continue
+                if not self._matches_protocol_v2(runtime, evaluation):
+                    continue
                 if "retest_import_job_id" in runtime:
                     previous_import_id = runtime.get("retest_import_job_id")
                     if not isinstance(previous_import_id, str) or not previous_import_id.strip():
@@ -4445,7 +4542,9 @@ class PanelController:
         explicit = self._retest_explicit_range(payload)
         if explicit is not None:
             self._validate_retest_end_date(explicit[1])
-        reusable = self._reusable_retest_job()
+        evaluation = self._evaluation_target()
+        self._require_protocol_v2_tester_template(evaluation)
+        reusable = self._reusable_retest_job(evaluation)
         if reusable is not None:
             return reusable
         listing_path, listing_relative = self._retest_listing_context()
@@ -4457,6 +4556,7 @@ class PanelController:
                 connection,
                 templates if isinstance(templates, Mapping) else {},
                 config.strategy_root.parent if config.strategy_root is not None else self.root / "Output",
+                evaluation=evaluation,
             )
         runtime = {
             "retest": True,
@@ -4468,6 +4568,7 @@ class PanelController:
             "test_end": end,
             "initial_balance": initial_balance,
             "listing_dates_path": str(listing_relative),
+            **self._protocol_v2_runtime(evaluation),
         }
         request = {
             "manifest_path": str(batch.manifest_path),
@@ -5308,7 +5409,7 @@ class PanelController:
 
     @staticmethod
     def _bulk_retest_range(payload: Mapping[str, object], listing_dates: Mapping[str, object], connection: duckdb.DuckDBPyConnection, include_reserve: bool) -> tuple[str, str]:
-        allowed = {"include_reserve", "clear_reports", "test_start", "test_end", "start_date", "end_date", "initial_balance"}
+        allowed = {"include_reserve", "clear_reports", "test_start", "test_end", "start_date", "end_date"}
         if set(payload).difference(allowed):
             raise FinalistRetestError("INVALID_REQUEST", "bulk retest request contains unsupported fields")
         if type(include_reserve) is not bool:
@@ -5337,7 +5438,7 @@ class PanelController:
     def strategies_performance_v2_finalist_retest_start(self, payload: Mapping[str, object]) -> dict[str, object]:
         if not isinstance(payload, Mapping):
             raise FinalistRetestError("INVALID_REQUEST", "bulk retest request must be an object")
-        if set(payload).difference({"include_reserve", "clear_reports", "test_start", "test_end", "start_date", "end_date", "initial_balance"}):
+        if set(payload).difference({"include_reserve", "clear_reports", "test_start", "test_end", "start_date", "end_date"}):
             raise FinalistRetestError("INVALID_REQUEST", "bulk retest request contains unsupported fields")
         include_reserve = payload.get("include_reserve", False)
         clear_reports = payload.get("clear_reports", False)
@@ -5362,6 +5463,8 @@ class PanelController:
         if not target.is_file():
             raise FinalistRetestError("PERFORMANCE_V2_NOT_FOUND", "Performance v2 database is unavailable")
         templates = self._workflow_defaults().get("strategy_templates", {})
+        evaluation = self._evaluation_target()
+        self._require_protocol_v2_tester_template(evaluation)
         with self._performance_v2_writer_lock, duckdb.connect(str(target), read_only=True) as connection:
             start, end = self._bulk_retest_range(payload, listing_dates, connection, include_reserve)
             current_cohort = freeze_finalist_cohort(
@@ -5371,7 +5474,7 @@ class PanelController:
         if not current_cohort.members:
             raise FinalistRetestError("COHORT_EMPTY", "bulk retest cohort has no runnable members")
         current_config_sha256 = finalist_retest_config_digest(
-            templates if isinstance(templates, Mapping) else {}
+            templates if isinstance(templates, Mapping) else {}, evaluation=evaluation,
         )
         for existing in self._panel_jobs.list():
             if existing.get("kind") != "strategies.performance.v2.finalist-retest":
@@ -5402,10 +5505,11 @@ class PanelController:
                 connection, templates if isinstance(templates, Mapping) else {},
                 config.strategy_root.parent if config.strategy_root is not None else self.root / "Output",
                 test_start=start, test_end=end, include_reserve=include_reserve,
-                listing_dates=listing_dates, job_id=run_id,
+                listing_dates=listing_dates, job_id=run_id, evaluation=evaluation,
             )
         runtime = {
             "bulk_retest": True, "scope": batch.cohort.scope, "cohort_sha256": batch.cohort.cohort_sha256,
+            **self._protocol_v2_runtime(evaluation),
             "config_sha256": batch.config_sha256, "manifest_sha256": sha256(batch.manifest_path.read_bytes()).hexdigest(),
             "test_start": start, "test_end": end, "listing_dates_path": str(listing_relative),
             "initial_balance": initial_balance,
@@ -8754,6 +8858,7 @@ class PanelController:
     def start_analysis_strategies(self, payload: Mapping[str, object]) -> dict[str, object]:
         run_id = self._required(payload, "run_id")
         selected_scopes = self._analysis_selected_scopes(payload)
+        self._evaluation_target()
         source_v6_surface_raw = payload.get("source_v6_surface_path")
         source_v6_surface_path = (
             self._path(source_v6_surface_raw)
@@ -8839,6 +8944,7 @@ class PanelController:
             with self._lock:
                 job.phase = "GENERATING"
             config = self._analysis_config_loader(job.config_path)
+            target = self._evaluation_target()
             if job.source_v6_surface_path is not None:
                 result = generate_v6_analysis_strategies(
                     job.source_v6_surface_path,
@@ -8848,12 +8954,13 @@ class PanelController:
                     job.template_path,
                     job.output_dir,
                     config,
+                    evaluation=target,
                 )
             else:
                 connection = self._direct_connection_factory(str(self._analysis_path()), read_only=True)
                 result = self._analysis_strategy_func(
                     connection, job.run_id, job.candidate_ids, job.selected_scopes, job.template_path, job.output_dir,
-                    config, job.criteria,
+                    config, job.criteria, evaluation=target,
                 )
             with self._lock:
                 job.strategies_path = Path(result.strategies_path)
@@ -10701,6 +10808,9 @@ class _PanelHandler(BaseHTTPRequestHandler):
                 )
                 return
             self._json(409 if error.code in {"RESOURCE_BUSY", "JOB_CAPACITY_EXHAUSTED", "IDEMPOTENCY_CONFLICT", "RESTART_BLOCKED"} else 400, {"error": error.code})
+            return
+        except EvaluationProtocolError as error:
+            self._json(409, {"error": {"code": error.code, "message": str(error)}})
             return
         except FinalistRetestError as error:
             status = 400 if error.code in {"INVALID_REQUEST", "INVALID_TEST_RANGE"} else 409

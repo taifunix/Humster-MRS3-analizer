@@ -13,6 +13,14 @@ from types import SimpleNamespace
 import pandas as pd
 import pytest
 
+from tests._protocol_v2 import protocol_v2_run_snapshot, use_protocol_v2_target
+
+
+@pytest.fixture(autouse=True)
+def _protocol_v2_database(monkeypatch: pytest.MonkeyPatch):
+    """MRS3 evaluation flows need a protocol v2 PerformanceDB (protocol v2 §7a)."""
+    return use_protocol_v2_target(monkeypatch)
+
 from mrs3.config import AlgorithmConfig
 from mrs3.panel import PanelController, create_panel_server
 import mrs3.panel_jobs as panel_jobs_module
@@ -437,12 +445,7 @@ def test_run_files_uses_filtered_ready_candidates(tmp_path: Path, monkeypatch) -
         template_root / "config_tester.json",
     )
     template = tmp_path / "Input" / "run_snapshot_2.json"; template.parent.mkdir()
-    template.write_text(json.dumps({
-        "settings": [{"name": "template", "basic": {"strategy": "mrs3", "symbol": "OLD", "time_frame": "5m", "use_long": True, "use_short": False}, "mrs3": {
-            "ma_long": [{"id": 1, "len": 1, "multiplier": 1.0, "lot_x": 0.0}], "ma_short": [],
-            "ma_close_long": {"len": 1, "multiplier": 1.0}, "ma_close_short": {"len": 1, "multiplier": 1.0},
-        }}], "tester_config": {},
-    }), encoding="utf-8")
+    template.write_text(json.dumps(protocol_v2_run_snapshot()), encoding="utf-8")
     tester_config = tmp_path / "bot" / "tester" / "config_tester.json"; tester_config.parent.mkdir(parents=True)
     tester_config.write_text('{"use_runs": false}', encoding="utf-8")
     monkeypatch.setattr("mrs3.panel.RunnerConfig.from_json", lambda _path: SimpleNamespace(
@@ -651,15 +654,15 @@ def test_tester_job_uses_the_ui_recovery_kind(tmp_path: Path, monkeypatch) -> No
     monkeypatch.setattr(controller, "_single_mode_strategy_test", lambda: SimpleNamespace(start=lambda *_args, **kwargs: started.update(kwargs)))
     monkeypatch.setattr(controller, "_manifest_strategy_names", lambda _manifest: pytest.fail("unchecked launch validated collection names"))
 
-    controller.strategies_tester_start({"analysis_run_id": "a" * 64, "start_date": "2026-01-01", "end_date": "2026-01-31", "initial_balance": "2500.5"})
+    controller.strategies_tester_start({"analysis_run_id": "a" * 64, "start_date": "2026-01-01", "end_date": "2026-01-31"})
 
     assert captured["kind"] == "strategies.tester.start"
-    assert captured["request"]["initial_balance"] == 2500.5
     captured["submit"]("tester-job")
-    assert started["initial_balance"] == 2500.5
+    # Protocol v2 §4.3: the tester runs on the base of its template, no start balance.
+    assert "initial_balance" not in started
 
 
-def test_tester_start_http_rejects_invalid_initial_balance_before_creating_job(tmp_path: Path) -> None:
+def test_tester_start_http_rejects_a_start_balance_before_creating_job(tmp_path: Path) -> None:
     controller = PanelController(tmp_path, tmp_path / "config.local.json", analysis_config_loader=lambda _: AlgorithmConfig.defaults())
     server = create_panel_server("127.0.0.1", 0, controller)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -669,7 +672,7 @@ def test_tester_start_http_rejects_invalid_initial_balance_before_creating_job(t
         connection.request(
             "POST", "/api/v2/jobs",
             json.dumps({"kind": "strategies.tester.start", "request": {
-                "analysis_run_id": "a" * 64, "start_date": "2026-01-01", "end_date": "2026-01-31", "initial_balance": "abc",
+                "analysis_run_id": "a" * 64, "start_date": "2026-01-01", "end_date": "2026-01-31", "initial_balance": 10000,
             }}).encode("utf-8"),
             {"Content-Type": "application/json"},
         )
@@ -708,7 +711,7 @@ def test_tester_start_http_reports_journal_write_failure_without_ghost_job(tmp_p
         connection.request(
             "POST", "/api/v2/jobs",
             json.dumps({"kind": "strategies.tester.start", "request": {
-                "analysis_run_id": "a" * 64, "start_date": "2026-01-01", "end_date": "2026-01-31", "initial_balance": 100,
+                "analysis_run_id": "a" * 64, "start_date": "2026-01-01", "end_date": "2026-01-31",
             }}).encode("utf-8"),
             {"Content-Type": "application/json"},
         )
@@ -764,7 +767,7 @@ def test_tester_start_http_reports_collection_journal_failure(tmp_path: Path, mo
             "POST", "/api/v2/jobs",
             json.dumps({"kind": "strategies.tester.start", "request": {
                 "analysis_run_id": "a" * 64, "start_date": "2026-01-01", "end_date": "2026-01-31",
-                "initial_balance": 100, "collect_reports": True,
+                "collect_reports": True,
             }}).encode("utf-8"),
             {"Content-Type": "application/json"},
         )
@@ -879,10 +882,13 @@ def test_panel_jobs_projects_only_tester_verified_report_maps(tmp_path: Path) ->
 
 
 @pytest.mark.parametrize(("source_kind", "source_phase"), (("strategies.tester.native.start", "FAILED"), ("strategies.tester.retry", "BOT_RUN")))
-def test_failed_native_tester_can_start_a_tracked_retry(tmp_path: Path, source_kind: str, source_phase: str) -> None:
+def test_failed_native_tester_can_start_a_tracked_retry(
+    tmp_path: Path, source_kind: str, source_phase: str, _protocol_v2_database,
+) -> None:
     controller = PanelController(tmp_path, tmp_path / "config.local.json", analysis_config_loader=lambda _: AlgorithmConfig.defaults())
     source = controller._panel_jobs.submit(
-        source_kind, {}, "native-source", ("strategies.tester",)
+        source_kind, {}, "native-source", ("strategies.tester",),
+        runtime=PanelController._protocol_v2_runtime(_protocol_v2_database),
     )
     controller._panel_jobs.transition(source["job_id"], "RUNNING")
     controller._panel_jobs.transition(source["job_id"], "FAILED", phase=source_phase)

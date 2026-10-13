@@ -228,7 +228,11 @@ class PanelJobRegistry:
     def _fingerprint(kind: str, request: dict) -> str:
         return hashlib.sha256((kind + json.dumps(request, sort_keys=True, separators=(",", ":"))).encode()).hexdigest()
 
-    def submit(self, kind: str, request: dict, idempotency_key: str, resource_keys: tuple[str, ...] = (), *, job_id: str | None = None) -> dict:
+    def submit(
+        self, kind: str, request: dict, idempotency_key: str, resource_keys: tuple[str, ...] = (), *,
+        job_id: str | None = None, runtime: dict | None = None,
+    ) -> dict:
+        """Create a job; an optional controller runtime is persisted in the same journal write."""
         with self.lock:
             if not self._valid_submit(kind, request, idempotency_key, resource_keys):
                 raise PanelJobError("INVALID_REQUEST")
@@ -256,6 +260,10 @@ class PanelJobRegistry:
                 job["campaign_id"] = request["campaign_id"]
             if request.get("retest") is True:
                 job["retest"] = True
+            if runtime is not None:
+                if not isinstance(runtime, dict):
+                    raise PanelJobError("INVALID_REQUEST")
+                job["runtime"] = _copy_runtime(runtime)
             self.jobs[job["job_id"]] = job
             try:
                 self._save()

@@ -2287,14 +2287,7 @@ if (typeof globalThis !== 'undefined') globalThis.portfolioSelectionHelpers = po
     selectedScopeKeys.clear();
     renderShortlist();
   });
-  const addInitialBalanceField = (dateInput, id) => {
-    const grid = dateInput?.closest('.field-grid');
-    if (!grid || document.getElementById(id)) return;
-    grid.insertAdjacentHTML('beforeend', `<div class="field-group"><label for="${id}">Стартовый баланс теста</label><input id="${id}" type="number" min="0" step="any" inputmode="decimal" value="1000" required></div>`);
-  };
-  addInitialBalanceField(document.querySelector('#tester-start-date'), 'tester-initial-balance');
-  addInitialBalanceField(document.querySelector('#performance-v2-finalist-retest-start'), 'performance-v2-finalist-retest-initial-balance');
-  addInitialBalanceField(document.querySelector('#performance-v2-retest-start'), 'performance-v2-retest-initial-balance');
+  // Protocol v2 §4.3: MRS3 tests run on the base of the MRS3 tester template; there is no start-balance field.
   const testerCard = strategyCards[2];
   const testerText = testerCard?.querySelector('.progress-block p');
   const testerStatus = document.querySelector('#tester-status');
@@ -2304,7 +2297,6 @@ if (typeof globalThis !== 'undefined') globalThis.portfolioSelectionHelpers = po
   const testerRetry = document.querySelector('#tester-retry');
   const testerStartDate = document.querySelector('#tester-start-date');
   const testerEndDate = document.querySelector('#tester-end-date');
-  const testerInitialBalance = document.querySelector('#tester-initial-balance');
   const testerCollectReports = document.querySelector('#tester-collect-reports');
   const testerCollectionStatus = document.querySelector('#tester-collection-status');
   const testerCollectionClear = document.querySelector('#tester-collection-clear');
@@ -2318,7 +2310,6 @@ if (typeof globalThis !== 'undefined') globalThis.portfolioSelectionHelpers = po
   let collectionImportJobId = '';
   const validIsoDate = (value) => /^\d{4}-\d{2}-\d{2}$/.test(value) && !Number.isNaN(Date.parse(`${value}T00:00:00Z`));
   const testerMaxDate = () => { const value = new Date(); value.setHours(0, 0, 0, 0); value.setDate(value.getDate() - 1); return `${value.getFullYear()}-${String(value.getMonth() + 1).padStart(2, '0')}-${String(value.getDate()).padStart(2, '0')}`; };
-  const validInitialBalance = (input) => input?.checkValidity() && Number.isFinite(Number(input.value)) && Number(input.value) > 0 ? Number(input.value) : null;
   if (testerEndDate) testerEndDate.max = testerMaxDate();
   const shiftDateMonths = (value, months) => {
     if (!validIsoDate(value)) return '';
@@ -2483,13 +2474,11 @@ if (typeof globalThis !== 'undefined') globalThis.portfolioSelectionHelpers = po
     }
     const startDate = testerStartDate?.value || '';
     const endDate = testerEndDate?.value || '';
-    const initialBalance = validInitialBalance(testerInitialBalance);
     if (!validIsoDate(startDate) || !validIsoDate(endDate)) { if (testerStatus) testerStatus.textContent = 'Enter valid tester start and end dates.'; return; }
     const maxDate = testerMaxDate();
     if (testerEndDate) testerEndDate.max = maxDate;
     if (endDate > maxDate) { if (testerStatus) testerStatus.textContent = 'Tester end date must not be later than yesterday.'; return; }
     if (startDate > endDate) { if (testerStatus) testerStatus.textContent = 'Tester start date must not be after end date.'; return; }
-    if (initialBalance === null) { if (testerStatus) testerStatus.textContent = 'Enter a positive test initial balance.'; return; }
     normalImportAuthorized = false;
     authorizedTesterJobId = '';
     normalVerifyEpoch += 1;
@@ -2500,7 +2489,7 @@ if (typeof globalThis !== 'undefined') globalThis.portfolioSelectionHelpers = po
     if (collectReports && !collectionActionLease) return;
     setTesterControls(true);
     try {
-      const result = await remoteRequest('/api/v2/jobs', { kind: 'strategies.tester.start', request: { analysis_run_id: generatedBatchAnalysisId, start_date: startDate, end_date: endDate, initial_balance: initialBalance, collect_reports: collectReports } });
+      const result = await remoteRequest('/api/v2/jobs', { kind: 'strategies.tester.start', request: { analysis_run_id: generatedBatchAnalysisId, start_date: startDate, end_date: endDate, collect_reports: collectReports } });
       testerJobId = result.job?.job_id || '';
       if (!testerJobId) throw new Error('missing job');
       renderTester(result.job); await loadTesterCollection(); await pollTester(); startTesterPolling(1000);
@@ -2817,7 +2806,6 @@ if (typeof globalThis !== 'undefined') globalThis.portfolioSelectionHelpers = po
   const retestCount = document.querySelector('#performance-v2-retest-count');
   const retestStartDate = document.querySelector('#performance-v2-retest-start');
   const retestEndDate = document.querySelector('#performance-v2-retest-end');
-  const retestInitialBalanceInput = document.querySelector('#performance-v2-retest-initial-balance');
   const retestStart = document.querySelector('#performance-v2-retest-check');
   const retestImport = document.querySelector('#performance-v2-retest-import');
   const retestProgress = document.querySelector('#performance-v2-retest-progress');
@@ -2902,7 +2890,6 @@ if (typeof globalThis !== 'undefined') globalThis.portfolioSelectionHelpers = po
   retestStart?.addEventListener('click', async () => {
     const start = retestStartDate?.value || '';
     const end = retestEndDate?.value || '';
-    const retestInitialBalance = validInitialBalance(retestInitialBalanceInput);
     retestStart.disabled = true;
     if (retestImport) retestImport.disabled = true;
     retestTesterJobId = '';
@@ -2935,8 +2922,7 @@ if (typeof globalThis !== 'undefined') globalThis.portfolioSelectionHelpers = po
         }
       }
       if (!validIsoDate(start) || !validIsoDate(end) || start >= end || end > testerMaxDate()) { if (retestStatus) retestStatus.textContent = 'Enter valid RETEST dates ending no later than yesterday.'; retestStart.disabled = false; return; }
-      if (retestInitialBalance === null) { if (retestStatus) retestStatus.textContent = 'Enter a positive test initial balance.'; retestStart.disabled = false; return; }
-      const result = await remoteRequest('/api/v2/strategies/performance-v2/retest/start', { test_start: start, test_end: end, initial_balance: retestInitialBalance });
+      const result = await remoteRequest('/api/v2/strategies/performance-v2/retest/start', { test_start: start, test_end: end });
       retestTesterJobId = result.job?.job_id || '';
       if (!retestTesterJobId) throw new Error('missing RETEST job');
       renderRetestTester(result.job); await pollRetestTester();
@@ -2978,7 +2964,6 @@ if (typeof globalThis !== 'undefined') globalThis.portfolioSelectionHelpers = po
   const finalistRetestClearReports = document.querySelector('#performance-v2-finalist-retest-clear-reports');
   const finalistRetestStartDate = document.querySelector('#performance-v2-finalist-retest-start');
   const finalistRetestEndDate = document.querySelector('#performance-v2-finalist-retest-end');
-  const finalistRetestInitialBalanceInput = document.querySelector('#performance-v2-finalist-retest-initial-balance');
   const finalistRetestStatus = document.querySelector('#performance-v2-finalist-retest-status');
   const finalistRetestCount = document.querySelector('#performance-v2-finalist-retest-count');
   const finalistRetestSuccesses = document.querySelector('#performance-v2-finalist-retest-successes');
@@ -3076,10 +3061,7 @@ if (typeof globalThis !== 'undefined') globalThis.portfolioSelectionHelpers = po
   finalistRetestStart?.addEventListener('click', async () => {
     finalistRetestStart.disabled = true;
     try {
-      const finalistInitialBalance = validInitialBalance(finalistRetestInitialBalanceInput);
-      if (finalistInitialBalance === null) throw new Error('Enter a positive test initial balance');
       const payload = { include_reserve: Boolean(finalistRetestReserve?.checked), clear_reports: Boolean(finalistRetestClearReports?.checked) };
-      payload.initial_balance = finalistInitialBalance;
       finalistRetestImportJobId = '';
       finalistRetestHasSuccessfulExport = false;
       updateFinalistRetestExport();

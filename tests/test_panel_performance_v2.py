@@ -19,6 +19,8 @@ import pandas as pd
 from openpyxl import Workbook, load_workbook
 import pytest
 
+from tests._protocol_v2 import use_protocol_v2_target
+
 import mrs3.panel as panel_module
 import mrs3.panel_jobs as panel_jobs_module
 from mrs3.panel_jobs import PanelJobRegistry
@@ -3005,6 +3007,7 @@ def test_finalist_retest_replays_only_exact_cohort_and_config(tmp_path: Path, mo
     import mrs3.panel as panel_module
 
     controller = PanelController(tmp_path, tmp_path / "config.local.json")
+    target = use_protocol_v2_target(monkeypatch)
     database = tmp_path / "performance.duckdb"
     database.touch()
     listing = tmp_path / "dates.xlsx"
@@ -3027,7 +3030,7 @@ def test_finalist_retest_replays_only_exact_cohort_and_config(tmp_path: Path, mo
         def list(self): return [{"kind": "strategies.performance.v2.finalist-retest", "job_id": "old", "state": "COMMITTED"}]
         def runtime(self, _job_id):
             return {"scope": "FINALIST", "test_start": "2025-01-01", "test_end": "2026-09-07",
-                    "cohort_sha256": self.old_cohort, "config_sha256": panel_module.finalist_retest_config_digest({"LONG": str(template)}),
+                    "cohort_sha256": self.old_cohort, "config_sha256": panel_module.finalist_retest_config_digest({"LONG": str(template)}, evaluation=target),
                     "outcomes_finalized": True, "successful_replacements": [{"strategy_id": 1}]}
 
     monkeypatch.setattr(controller, "_retest_listing_context", lambda: (listing, Path("dates.xlsx")))
@@ -3045,14 +3048,14 @@ def test_finalist_retest_replays_only_exact_cohort_and_config(tmp_path: Path, mo
     monkeypatch.setattr(panel_module.duckdb, "connect", lambda *_args, **_kwargs: Connection())
     monkeypatch.setattr(panel_module, "freeze_finalist_cohort", lambda *_args, **_kwargs: cohort)
     monkeypatch.setattr(panel_module, "build_finalist_retest_manifest", lambda *_args, **_kwargs: SimpleNamespace(
-        cohort=cohort, config_sha256=panel_module.finalist_retest_config_digest({"LONG": str(template)}),
+        cohort=cohort, config_sha256=panel_module.finalist_retest_config_digest({"LONG": str(template)}, evaluation=target),
         manifest_path=manifest, run_id="new-run",
     ))
 
     controller._panel_jobs = Jobs("old-cohort")  # type: ignore[assignment]
     started: dict[str, object] = {}
     monkeypatch.setattr(controller, "_single_mode_strategy_test", lambda: SimpleNamespace(start=lambda *_args, **kwargs: started.update(kwargs)))
-    assert controller.strategies_performance_v2_finalist_retest_start({"clear_reports": True, "initial_balance": "2500.5"})["job_id"] == "new"
+    assert controller.strategies_performance_v2_finalist_retest_start({"clear_reports": True})["job_id"] == "new"
     assert captured["runtime"]["cohort_members"] == [{"strategy_id": 1, "effective_start": "2026-01-01T00:00:00Z"}]
     snapshot = captured["runtime"]["equity_filter_snapshot"]
     assert snapshot["schema_version"] == 1
@@ -3064,9 +3067,9 @@ def test_finalist_retest_replays_only_exact_cohort_and_config(tmp_path: Path, mo
     assert snapshot["regime_policy_sha256"]
     captured["submit"]("new")
     assert captured["request"]["clear_reports"] is True
-    assert captured["request"]["initial_balance"] == 2500.5
     assert started["clear_reports"] is True
-    assert started["initial_balance"] == 2500.5
+    # Protocol v2 §4.3: the retest runs on the base of its template, no start balance.
+    assert "initial_balance" not in started
     controller._panel_jobs = Jobs("new-cohort")  # type: ignore[assignment]
     assert controller.strategies_performance_v2_finalist_retest_start({}) == {"job_id": "old", "replayed": True}
 

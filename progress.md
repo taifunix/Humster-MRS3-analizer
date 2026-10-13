@@ -95,10 +95,21 @@ applies `my_fix_balance = B` and `exchange.name` and checks the §4.2 predicate
 (`PROTOCOL_V2_RENDER_REJECTED` names the unmet fields). The READY JSON
 generators (fresh, legacy, v6), RUNS (strategy and embedded tester config),
 RETEST and finalist RETEST accept the target (the finalist config digest
-includes the base and exchange). Remaining in P6 (P6c): Panel passes the target
-to every MRS3 flow and checks before launch, drops the start-balance field,
-refuses pre-P6 retries, RETESTs take MA facts from the stored strategy; the
-protocol v2 templates are committed together with P6c.
+includes the base and exchange). P6c1: the Panel takes the target before every
+MRS3 flow (READY JSON fresh/legacy/v6, RUNS publication and start, single-mode
+tester start, RETEST, finalist RETEST, legacy `tester-run`), checks the tester
+template and every manifest strategy or RUNS snapshot before launch, answers
+refusals with HTTP 409 and their code (`DATABASE_PROTOCOL_V1`,
+`DATABASE_UNAVAILABLE`, `EVALUATION_PROTOCOL_MISMATCH`, `EXCHANGE_MISMATCH`,
+`PROTOCOL_V2_RENDER_REJECTED`, `PROTOCOL_V2_TESTER_CONFIG_REJECTED`), and no
+longer takes a start balance (API and UI). New MRS3 jobs record
+`evaluation_protocol`/`evaluation_base`/`evaluation_exchange`; a retry or a RETEST
+inbox reuse of a job without the same marker is refused
+(`RETRY_PRE_PROTOCOL_V2`) or skipped. The protocol v2 templates are committed.
+MRS3 tests need a protocol v2 PerformanceDB: set
+`unified_performance_v2.database_root` to a new folder, `evaluation_protocol: v2`
+and `exchange` in `config.performance.json` (P7 adds this to the Panel
+settings). Remaining in P6: RETESTs take MA facts from the stored strategy.
 Next: P6c, then P7 (Panel PerformanceDB
 selection with an exchange profile: the render takes `exchange.name` and the
 exchange-specific tester fees/account fields from the active database —
@@ -109,15 +120,7 @@ User decision 2026-10-12: one PerformanceDB per exchange with an
 snapshot `exchange.name` — pending, separate commit on that branch. The current parser rejects the new HTML
 (`metrics contain duplicate or empty keys`). The old database must keep
 working after the additive v11 → v12 migration; missing analytics is not an
-error. The working tree holds the user's uncommitted protocol v2 template
-edits (`retest-mrs3/base.json`: fixed lot 10 000, `ohlc4`, `more_data=false`;
-`mrs3/config_tester.json`: `InitialBalance` 10000, `LimitOrderVolumeCheck`
-false); they are committed with P6c. With them two finalist-retest tests fail
-until P6c (`test_weighted_template_only_changes_name_and_mrs_priority`,
-`test_manifest_has_one_common_period_and_native_strategy_provenance`). Until
-P6c do not launch Panel MRS3 tests and do not create a v2 database: the Panel
-does not yet check the base, so FIXED tests could run on a wrong base, and a v1
-database rejects their reports as `EVALUATION_PROTOCOL_MISMATCH`.
+error. The protocol v2 templates are committed with P6c1 (below).
 
 ## Portfolio input snapshot registry (fix 2026-10-13)
 
