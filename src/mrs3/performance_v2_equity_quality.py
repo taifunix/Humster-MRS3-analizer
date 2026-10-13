@@ -217,13 +217,22 @@ def _facts(
     )
 
 
-def _raw_risk(points: list[_Point], left: datetime, end: datetime, start_value: Decimal, end_value: Decimal) -> tuple[Decimal, Decimal, int]:
+def _raw_risk(
+    points: list[_Point], left: datetime, end: datetime, start_value: Decimal, end_value: Decimal,
+    fixed_base: Decimal | None = None,
+) -> tuple[Decimal, Decimal, int]:
     raw = [point for point in points if left <= point.timestamp_utc <= end]
     has_left = any(point.timestamp_utc == left for point in raw)
     has_end = any(point.timestamp_utc == end for point in raw)
     path = ([] if has_left else [start_value]) + [point.equity for point in raw] + ([] if has_end else [end_value])
     peak = ZERO
     drawdown = ZERO
+    if fixed_base is not None:
+        # FIXED (protocol v2 §4.6): linear drawdown and peak gap in fractions of B.
+        for equity in path:
+            peak = max(peak, equity)
+            drawdown = max(drawdown, (peak - equity) / fixed_base)
+        return drawdown, (peak - end_value) / fixed_base, len(path)
     for equity in path:
         peak = max(peak, equity)
         drawdown = max(drawdown, ONE - equity / peak)
@@ -236,6 +245,7 @@ def _window_facts(
     grid_start_index: int,
     grid_equities: list[Decimal],
     grid_logs: list[Decimal],
+    fixed_base: Decimal | None = None,
 ) -> EquityWindowFacts:
     start_index = (MAX_WINDOW_DAYS - days) * 4 - grid_start_index
     count = days * 4 + 1
@@ -251,7 +261,11 @@ def _window_facts(
     endpoint_log = logs[-1] - logs[0]
     # Triangle inequality bounds this ratio; clamp only removes Decimal rounding residue.
     er = ZERO if path == ZERO else max(-ONE, min(ONE, endpoint_log / path))
-    returns = Decimal(100) * (values[-1] / values[0] - ONE)
+    returns = (
+        Decimal(100) * (((values[-1] - values[0]) / fixed_base).exp() - ONE)
+        if fixed_base is not None
+        else Decimal(100) * (values[-1] / values[0] - ONE)
+    )
     return EquityWindowFacts(
         days,
         end - timedelta(days=days),
@@ -269,6 +283,8 @@ def calculate_equity_quality_facts(
     report_start_utc: datetime,
     report_end_utc: datetime,
     samples: Iterable[EquitySample],
+    *,
+    fixed_base: Decimal | None = None,
 ) -> EquityQualityFacts:
     """Calculate facts from rows ordered by ``(timestamp_utc, sample_index)``.
 
@@ -405,9 +421,13 @@ def calculate_equity_quality_facts(
         with localcontext(_METRIC_CONTEXT) as context:
             context.clear_flags()
             reference = horizon_grid[0]
-            horizon_logs = [(value / reference).ln() for value in horizon_grid]
+            # FIXED (protocol v2 §4.6): ln Ẽ = (E - E0) / B.
+            horizon_logs = [
+                (value - reference) / fixed_base if fixed_base is not None else (value / reference).ln()
+                for value in horizon_grid
+            ]
             windows = tuple(
-                _window_facts(days, end, horizon_grid_start, horizon_grid, horizon_logs)
+                _window_facts(days, end, horizon_grid_start, horizon_grid, horizon_logs, fixed_base)
                 for days in WINDOW_DAYS
                 if days <= horizon
             )
@@ -444,10 +464,12 @@ def calculate_equity_quality_facts(
                 end,
                 horizon_grid[0],
                 horizon_grid[-1],
+                fixed_base,
             )
             quality = max(ZERO, main.er)
             if growth > EPSILON:
-                score = growth * quality * (ONE - drawdown) * (ONE - peak_gap)
+                # Factors stop at zero: a FIXED linear drawdown or peak gap may exceed 1.
+                score = growth * quality * max(ZERO, ONE - drawdown) * max(ZERO, ONE - peak_gap)
             elif abs(growth) <= EPSILON:
                 score = ZERO
             else:

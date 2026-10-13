@@ -6022,3 +6022,44 @@ def test_v2_catalog_adds_ma_facts_only_when_set(tmp_path: Path) -> None:
 
     assert (strategy["close_ma_type"], strategy["close_ma_source"]) == ("SMA", "ohlc4")
     assert all(order["open_ma_source"] == "close" and "open_ma_type" not in order for order in strategy["orders"])
+
+
+def test_v2_catalog_shows_lot_mode_only_for_fixed_results(tmp_path: Path) -> None:
+    connection, _ = _db(tmp_path)
+    assert all("lot_mode" not in strategy for strategy in performance_v2_catalog(connection)["strategies"])
+
+    connection.execute(
+        """update strategy_results set sizing_use_upnl = false, sizing_use_frozen_balance = true,
+           sizing_use_fix = true, sizing_max_balance = 0, sizing_my_fix_balance = 10000,
+           sizing_balance_percentage_long = 100, sizing_risk_long = 1"""
+    )
+    strategy = performance_v2_catalog(connection)["strategies"][0]
+
+    assert strategy["lot_mode"] == "FIXED"
+    assert Decimal(str(strategy["lot_base"])) == Decimal("10000")
+
+
+def test_performance_v2_export_shows_fixed_drawdown_on_the_base(tmp_path: Path) -> None:
+    controller, database, result_id = _controller_for_windows(tmp_path)
+    with duckdb.connect(str(database)) as connection:
+        strategy_id = connection.execute("select strategy_id from strategies where strategy_name = 'alpha'").fetchone()[0]
+        connection.execute(
+            "insert into strategy_tags (strategy_id, tag, source, source_ref, updated_at_utc) values (?, 'RETEST', 'TEST', 'fixture', now())",
+            [strategy_id],
+        )
+        connection.execute(
+            """update strategy_results set max_drawdown = 5, max_drawdown_pct = 4, sizing_use_upnl = false,
+               sizing_use_frozen_balance = true, sizing_use_fix = true, sizing_max_balance = 0,
+               sizing_my_fix_balance = 50, sizing_balance_percentage_long = 100, sizing_risk_long = 1
+               where result_id = ?""",
+            [result_id],
+        )
+    controller.strategies_performance_v2_recalculate({"symbol": "BTCUSDT", "side": "LONG"})
+
+    _, payload = controller.strategies_performance_v2_export(panel_module.parse_performance_v2_export_query("retest=1"))
+    sheet = load_workbook(BytesIO(payload), data_only=False)["All candidates"]
+    headers = {cell.value: cell.column for cell in sheet[1]}
+
+    # 5 USDT over B = 50 is 10%, not the report's peak-relative 4%.
+    assert Decimal(str(sheet.cell(2, headers["DD"]).value)) == Decimal("10")
+    assert sheet.cell(2, headers["Lot mode"]).value == "FIXED"

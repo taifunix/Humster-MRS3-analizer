@@ -322,9 +322,10 @@ def _validate_document(document: object) -> EquityQualityFacts:
     drawdown = _parse_decimal(document["drawdown"], "drawdown", optional=True)
     peak_gap = _parse_decimal(document["peak_gap"], "peak_gap", optional=True)
     score = _parse_decimal(document["score12"], "score12", optional=True)
-    if drawdown is not None and not Decimal(0) <= drawdown <= Decimal(1):
+    # A FIXED result's linear drawdown (peak - E) / B may exceed 1 (protocol v2 §4.6).
+    if drawdown is not None and not Decimal(0) <= drawdown:
         raise EquityQualityCacheError("drawdown is out of range")
-    if peak_gap is not None and not Decimal(0) <= peak_gap <= Decimal(1):
+    if peak_gap is not None and not Decimal(0) <= peak_gap:
         raise EquityQualityCacheError("peak_gap is out of range")
     if score is not None and abs(score) > Decimal("1000000"):
         raise EquityQualityCacheError("score12 is out of range")

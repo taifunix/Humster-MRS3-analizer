@@ -2918,3 +2918,22 @@ def test_every_decimal_selection_candidate_fact_has_a_snapshot_type(tmp_path: Pa
     assert sorted(
         field for field in decimal_fields - {"lot_base"} if field not in portfolio_input._DECIMAL_FIELD_TYPES
     ) == []
+
+
+def test_snapshot_measures_fixed_results_on_their_base(tmp_path: Path) -> None:
+    database = _database(tmp_path)
+    dynamic = _snapshot(database).candidates[0]
+    with duckdb.connect(str(database)) as connection:
+        connection.execute(
+            """update strategy_results set sizing_use_upnl = false, sizing_use_frozen_balance = true,
+               sizing_use_fix = true, sizing_max_balance = 0, sizing_my_fix_balance = 50,
+               sizing_balance_percentage_long = 100, sizing_risk_long = 1"""
+        )
+        connection.execute("delete from window_metrics")
+        selection = portfolio_input.load_selection_candidates(connection, REQUEST, portfolio_input.SelectionConfig()).iloc[0]
+    fixed = _snapshot(database).candidates[0]
+
+    assert fixed["pnl_30d_pct"] != dynamic["pnl_30d_pct"]
+    assert abs(fixed["pnl_30d_pct"] - selection["pnl_30d_pct"]) < Decimal("1e-10")  # selection reads the 12-place cache
+    assert fixed["max_drawdown_pct"] == selection["max_drawdown_pct"] == Decimal("10")
+    assert "lot_mode" not in fixed and "lot_base" not in fixed

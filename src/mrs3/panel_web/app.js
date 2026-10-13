@@ -3401,7 +3401,8 @@ if (typeof globalThis !== 'undefined') globalThis.portfolioSelectionHelpers = po
     }
     const summary = document.createElement('p');
     const maKind = (type, source) => (type || source ? ` ${type || '?'} ${source || '?'}` : '');
-    summary.textContent = [strategy.symbol, strategy.side, strategy.timeframe, `Close MA ${strategy.close_ma_len ?? '—'}${maKind(strategy.close_ma_type, strategy.close_ma_source)}`].filter(Boolean).join(' · ');
+    const lotMode = strategy.lot_mode ? `Lot ${strategy.lot_mode}${strategy.lot_base != null ? ` B=${strategy.lot_base}` : ''}` : '';
+    summary.textContent = [strategy.symbol, strategy.side, strategy.timeframe, `Close MA ${strategy.close_ma_len ?? '—'}${maKind(strategy.close_ma_type, strategy.close_ma_source)}`, lotMode].filter(Boolean).join(' · ');
     performanceV2WindowStrategyDetails.append(summary);
     const orders = document.createElement('ul');
     for (const order of strategy.orders || []) {

@@ -376,3 +376,18 @@ def test_combined_workbook_imports_headers_without_ma_type_column(monkeypatch: p
     result = validate_combined_selection_workbook(old)
 
     assert [row["Row Key"] for row in result["rows"]] == ["BTCUSDT|LONG|3", "BTCUSDT|LONG|7"]
+
+
+def test_combined_workbook_imports_headers_without_lot_mode_column(monkeypatch: pytest.MonkeyPatch) -> None:
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            selection_module, "SELECTION_WORKBOOK_HEADERS",
+            selection_module.SELECTION_WORKBOOK_WITHOUT_LOT_MODE_HEADERS,
+        )
+        old = _workbook_bytes()
+    headers = [cell.value for cell in load_workbook(BytesIO(old))["All candidates"][1]]
+    assert "Lot mode" not in headers and "MA type" in headers
+
+    result = validate_combined_selection_workbook(old)
+
+    assert [row["Row Key"] for row in result["rows"]] == ["BTCUSDT|LONG|3", "BTCUSDT|LONG|7"]

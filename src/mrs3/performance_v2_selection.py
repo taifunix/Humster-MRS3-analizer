@@ -51,6 +51,7 @@ from .performance_v2_equity_regime_cache import (
     read_equity_regime_facts,
     upsert_equity_regime_facts_checked,
 )
+from .performance_v2_sizing import SIZING_DYNAMIC, SIZING_FIXED, load_fixed_lot_base, load_fixed_lot_bases
 from .performance_v2_store import PerformanceV2StoreError, require_performance_v2_readable
 from .audit import write_audit_workbook
 
@@ -115,7 +116,7 @@ _CANDIDATE_COLUMNS = (
     *(f"order_{order}_{field}" for order in range(1, 5) for field in (
         "open_ma_len", "open_multiplier", "shift_bp", "lot_x", "plateau_point_count", "plateau_key",
     )),
-    "ma_kind",
+    "ma_kind", "lot_mode", "lot_base",
 )
 
 
@@ -764,15 +765,22 @@ def _fee_efficiency(
     metrics: WindowMetrics,
     report_start_utc: datetime | None = None,
     report_end_utc: datetime | None = None,
+    *,
+    fixed: bool = False,
 ) -> tuple[Decimal | None, Decimal | None]:
     """Fee share of gross profit and fees per 30 days, both from one window's facts.
 
     ``return_pct`` and ``fees_pct`` share the window baseline, so their sum is the
     gross (pre-fee) return; the share is blank when that gross is not positive.
+    A FIXED window uses the linear return 100·ln(growth) = 100·ΔW / B instead.
     """
     if not metrics.available or metrics.fees_pct is None:
         return None, None
-    gross = None if metrics.return_pct is None else metrics.return_pct + metrics.fees_pct
+    if fixed:
+        growth = metrics.growth_factor
+        gross = None if growth is None or growth <= 0 else growth.ln() * 100 + metrics.fees_pct
+    else:
+        gross = None if metrics.return_pct is None else metrics.return_pct + metrics.fees_pct
     share = metrics.fees_pct / gross * 100 if gross is not None and gross > 0 else None
     days = calendar_window_days(metrics, report_start_utc, report_end_utc)
     per_30d = metrics.fees_pct * 30 / days if days is not None and days >= 1 else None
@@ -952,14 +960,15 @@ class _SelectionWindowJobResult:
 
 
 def _facts_from_full_source(
-    result_id: int, source: tuple[datetime, datetime, tuple[object, ...], tuple[object, ...]]
+    result_id: int, source: tuple[datetime, datetime, tuple[object, ...], tuple[object, ...]],
+    fixed_base: Decimal | None = None,
 ) -> EquityQualityFacts:
     report_start, report_end, _actions, equity = source
     samples = tuple(
         EquitySample(result_id, item.index, item.timestamp, item.equity)
         for item in equity
     )
-    return calculate_equity_quality_facts(result_id, report_start, report_end, samples)
+    return calculate_equity_quality_facts(result_id, report_start, report_end, samples, fixed_base=fixed_base)
 
 
 def _selection_window_job(
@@ -997,6 +1006,7 @@ def _selection_window_job(
         regime_publication: tuple[Mapping[str, object], EquityRegimeFacts] | None = None
         source_recheck: Mapping[str, object] | None = None
         source: tuple[datetime, datetime, tuple[object, ...], tuple[object, ...]] | None = None
+        fixed_base = load_fixed_lot_base(connection, result_id)
         if missing_windows:
             source = _load_source(connection, result_id)
             initial_balance = _load_initial_balance(connection, result_id)
@@ -1007,13 +1017,14 @@ def _selection_window_job(
                     result_id, start, end, METRICS_VERSION, *source,
                     ordered_source=True,
                     initial_balance=initial_balance,
+                    fixed_base=fixed_base,
                 )
                 for metric, (start, end) in zip(cached, windows)
             )
             if equity_missing:
                 if metadata is None:
                     raise PerformanceV2SelectionError("EQUITY_SOURCE_METADATA_MISSING")
-                publication = (metadata, _facts_from_full_source(result_id, source))
+                publication = (metadata, _facts_from_full_source(result_id, source, fixed_base))
             # Preserve the old no-flag write path, while a new opt-in warm branch
             # never rewrites already-cached window rows.
             metrics_to_write = calculated if not include_equity else tuple(
@@ -1029,7 +1040,8 @@ def _selection_window_job(
                     metadata["report_start_utc"], metadata["report_end_utc"],
                 )
                 facts = calculate_equity_quality_facts(
-                    result_id, metadata["report_start_utc"], metadata["report_end_utc"], samples
+                    result_id, metadata["report_start_utc"], metadata["report_end_utc"], samples,
+                    fixed_base=fixed_base,
                 )
                 source_recheck = metadata
                 invalid_reasons = tuple(sorted(set(facts.invalid_reasons).union(summary.invalid_reasons)))
@@ -1069,6 +1081,7 @@ def _selection_window_job(
                 samples = tuple(samples_list)
             facts = calculate_equity_regime_facts(
                 result_id, metadata["report_start_utc"], metadata["report_end_utc"], samples,
+                fixed_base=fixed_base,
             )
             regime_publication = (metadata, facts)
             source_recheck = metadata
@@ -1234,7 +1247,8 @@ def _selection_equity_quality_with_memory_fallback(
             connection, result_id, metadata["report_start_utc"], metadata["report_end_utc"]
         )
         facts = calculate_equity_quality_facts(
-            result_id, metadata["report_start_utc"], metadata["report_end_utc"], samples
+            result_id, metadata["report_start_utc"], metadata["report_end_utc"], samples,
+            fixed_base=load_fixed_lot_base(connection, result_id),
         )
         facts = replace(
             facts,
@@ -1311,6 +1325,8 @@ def _selection_equity_regime_by_result(
 
     missing_ids = tuple(result_id for result_id in result_ids if result_id not in by_result)
     if missing_ids:
+        # Read before the streaming cursor: another query would reset it.
+        fixed_bases = load_fixed_lot_bases(connection, missing_ids)
         cursor = connection.execute(
             """select result_id, sample_index, timestamp_utc, equity
                  from strategy_equity where result_id in ("""
@@ -1325,6 +1341,7 @@ def _selection_equity_regime_by_result(
                 metadata["report_start_utc"],
                 metadata["report_end_utc"],
                 samples,
+                fixed_base=fixed_bases.get(result_id),
             )
             by_result[result_id] = _equity_regime_entry(
                 facts, revision_by_result[result_id], calculated_in_memory=True,
@@ -1835,6 +1852,7 @@ def load_selection_candidates(
     ).fetchall()
     candidates: dict[int, dict[str, object]] = {}
     equity_source_rows: dict[int, tuple[object, ...]] = {}
+    fixed_bases = load_fixed_lot_bases(connection, {int(row[7]) for row in rows})
     for row in rows:
         (
             strategy_id, strategy_name, symbol, side, timeframe, close_ma_len, order_count,
@@ -1868,8 +1886,19 @@ def load_selection_candidates(
                 )
             daily_log = None if full_metrics is None else full_metrics.daily_log_return
             pnl_30d = None if full_metrics is None else _return_30d(full_metrics, report_start, report_end)
-            fees_share, fees_30d = (None, None) if full_metrics is None else _fee_efficiency(full_metrics, report_start, report_end)
+            fees_share, fees_30d = (None, None) if full_metrics is None else _fee_efficiency(
+                full_metrics, report_start, report_end, fixed=result_id in fixed_bases,
+            )
             drawdown = _decimal_or_none(max_drawdown_pct)
+            total_pnl_pct_value = _decimal_or_none(total_pnl_pct)
+            fixed_base = fixed_bases.get(result_id)
+            if fixed_base is not None:
+                # FIXED (protocol v2 §4.6): report totals become fractions of the base B;
+                # risk_scale, DD5 and CE follow from the rebased drawdown.
+                max_drawdown_value = _decimal_or_none(max_drawdown)
+                total_pnl_value = _decimal_or_none(total_pnl)
+                drawdown = None if max_drawdown_value is None else max_drawdown_value / fixed_base * 100
+                total_pnl_pct_value = None if total_pnl_value is None else total_pnl_value / fixed_base * 100
             risk_scale = Decimal(5) / drawdown if drawdown is not None and drawdown > 0 else None
             completed_facts = cycle_facts.get(result_id, {"completed_cycles_reliable": False})
             initial_balance_value = _decimal_or_none(initial_balance)
@@ -1877,7 +1906,7 @@ def load_selection_candidates(
                 "strategy_id": int(strategy_id), "strategy_name": str(strategy_name), "symbol": str(symbol),
                 "side": str(side), "timeframe": str(timeframe), "close_ma_len": int(close_ma_len),
                 "order_count": int(order_count), "result_id": result_id, "total_pnl": _decimal_or_none(total_pnl),
-                "total_pnl_pct": _decimal_or_none(total_pnl_pct), "max_drawdown": _decimal_or_none(max_drawdown),
+                "total_pnl_pct": total_pnl_pct_value, "max_drawdown": _decimal_or_none(max_drawdown),
                 "max_drawdown_pct": drawdown, "total_fees": _decimal_or_none(total_fees),
                 "report_start_utc": report_start, "report_end_utc": report_end,
                 "reported_start_utc": reported_start, "reported_end_utc": reported_end,
@@ -1903,9 +1932,11 @@ def load_selection_candidates(
                 "worst_drawdown_pct": None, "worst_holding_p95_minutes": None,
                 "ab_stability_ratio": None, "minimum_plateau_point_count": None,
                 "lot_variant_group_key": None, "lot_variant_representative_strategy_id": pd.NA,
+                "lot_mode": SIZING_FIXED if fixed_base is not None else SIZING_DYNAMIC, "lot_base": fixed_base,
             }
-            if candidate.get("pnl_without_best_trade") is not None and initial_balance_value is not None and initial_balance_value > 0:
-                candidate["pnl_without_best_trade_pct"] = candidate["pnl_without_best_trade"] / initial_balance_value * 100
+            pct_base = fixed_base if fixed_base is not None else initial_balance_value
+            if candidate.get("pnl_without_best_trade") is not None and pct_base is not None and pct_base > 0:
+                candidate["pnl_without_best_trade_pct"] = candidate["pnl_without_best_trade"] / pct_base * 100
             candidates[int(strategy_id)] = candidate
         if order_id is not None:
             number = int(order_id)
@@ -3290,8 +3321,12 @@ def _lot_variant_eliminated(
             equal_row, income_row = result.loc[equal_index], result.loc[income_index]
             equal_lots = members[next(i for i, (index, _) in enumerate(members) if index == equal_index)][1]
             income_lots = members[next(i for i, (index, _) in enumerate(members) if index == income_index)][1]
-            initial_equal = _decimal_or_none(equal_row.get("initial_balance"))
-            initial_income = _decimal_or_none(income_row.get("initial_balance"))
+            if equal_row.get("lot_mode") != income_row.get("lot_mode"):
+                continue
+            # FIXED variants compare on their base B (protocol v2 §4.6), DYNAMIC on initial balance.
+            base_field = "lot_base" if equal_row.get("lot_mode") == SIZING_FIXED else "initial_balance"
+            initial_equal = _decimal_or_none(equal_row.get(base_field))
+            initial_income = _decimal_or_none(income_row.get(base_field))
             equal_dd = _decimal_or_none(equal_row.get("max_drawdown_pct"))
             income_dd = _decimal_or_none(income_row.get("max_drawdown_pct"))
             equal_full = _decimal_or_none(equal_row.get("pnl_30d_pct"))
@@ -3949,6 +3984,7 @@ def write_selection_workbook(
         "points",
         "open_ma",
         "ma_kind",
+        "lot_mode",
         *(equity_columns if equity_block_enabled else ()),
         *(regime_columns if equity_regime_display_enabled else ()),
         "auto_status", "auto_rank", *review_columns,
@@ -3978,6 +4014,7 @@ def write_selection_workbook(
         "final_score": "Final score (Pair+Side)",
         "open_ma": "MA",
         "ma_kind": "MA type",
+        "lot_mode": "Lot mode",
         **{f"order_{order}_shift_bp": f"{order} Shift" for order in range(1, 4)},
         "lots": "Lots",
         "points": "Points",
@@ -4120,22 +4157,26 @@ SELECTION_LEGACY_HEADERS = (
     "CE", "DD", "W/R", "Trades", "Trades/30", "Lot DD5", "Hold p95", "Hold M",
     "Top 5 share, %", "Fees share, %", "Fees/30, %", "B cycles", "B W/R", "Robust PnL/30", "Worst DD", "Worst Hold p95",
     "A/B stability", "Final score (Pair+Side)", "1 Shift", "2 Shift", "3 Shift", "Lots", "Points", "MA",
-    "MA type", "Equity state", "Equity basis", "Equity DD, %", "Equity smoothness", "Regime rank", "Regime reasons",
+    "MA type", "Lot mode", "Equity state", "Equity basis", "Equity DD, %", "Equity smoothness", "Regime rank", "Regime reasons",
     "PRE28 direction", "PRE28 v", "PRE28 p", "W28 direction", "W28 v", "W28 p", "W14 direction",
     "W14 v", "W14 p", "W7 direction", "W7 v", "W7 p", "Regime DD14, %", "Regime DD7, %",
     "New ATH stages", "New ATH W7", "Held ATH W7", "Elimination Reason",
 )
 SELECTION_WORKBOOK_HEADERS = tuple(dict.fromkeys(SELECTION_AGGREGATE_HEADERS + SELECTION_LEGACY_HEADERS))
-# Aggregate workbooks exported before the display-only `MA type` and fee
-# columns remain importable; each accepted header tuple is checked against its own hash.
+# Aggregate workbooks exported before the display-only `Lot mode`, `MA type` and
+# fee columns remain importable; each accepted header tuple is checked against its own hash.
+SELECTION_WORKBOOK_WITHOUT_LOT_MODE_HEADERS = tuple(
+    header for header in SELECTION_WORKBOOK_HEADERS if header != "Lot mode"
+)
 SELECTION_WORKBOOK_WITHOUT_MA_TYPE_HEADERS = tuple(
-    header for header in SELECTION_WORKBOOK_HEADERS if header != "MA type"
+    header for header in SELECTION_WORKBOOK_WITHOUT_LOT_MODE_HEADERS if header != "MA type"
 )
 SELECTION_WORKBOOK_PREVIOUS_HEADERS = tuple(
     header for header in SELECTION_WORKBOOK_WITHOUT_MA_TYPE_HEADERS if header not in ("Fees share, %", "Fees/30, %")
 )
 SELECTION_WORKBOOK_ACCEPTED_HEADERS = (
-    SELECTION_WORKBOOK_HEADERS, SELECTION_WORKBOOK_WITHOUT_MA_TYPE_HEADERS, SELECTION_WORKBOOK_PREVIOUS_HEADERS,
+    SELECTION_WORKBOOK_HEADERS, SELECTION_WORKBOOK_WITHOUT_LOT_MODE_HEADERS,
+    SELECTION_WORKBOOK_WITHOUT_MA_TYPE_HEADERS, SELECTION_WORKBOOK_PREVIOUS_HEADERS,
 )
 
 
@@ -4312,7 +4353,7 @@ def _aggregate_row(
         "B cycles": "ab_completed_cycle_count", "B W/R": "ab_win_rate_b_pct", "Robust PnL/30": "robust_pnl_30d_pct",
         "Worst DD": "worst_drawdown_pct", "Worst Hold p95": "worst_holding_p95_minutes", "A/B stability": "ab_stability_ratio",
         "Final score (Pair+Side)": "final_score", "Lots": "lots", "Points": "points", "MA": "open_ma",
-        "MA type": "ma_kind", "Equity state": "equity_state", "Equity basis": "equity_basis", "Equity DD, %": "equity_dd_pct",
+        "MA type": "ma_kind", "Lot mode": "lot_mode", "Equity state": "equity_state", "Equity basis": "equity_basis", "Equity DD, %": "equity_dd_pct",
         "Equity smoothness": "equity_smoothness", "Regime rank": "equity_regime_rank", "Regime reasons": "equity_regime_reasons",
         "PRE28 direction": "equity_regime_pre28_direction", "PRE28 v": "equity_regime_pre28_v", "PRE28 p": "equity_regime_pre28_p",
         "W28 direction": "equity_regime_w28_direction", "W28 v": "equity_regime_w28_v", "W28 p": "equity_regime_w28_p",

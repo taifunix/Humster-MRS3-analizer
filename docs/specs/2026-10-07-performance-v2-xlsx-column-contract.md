@@ -143,6 +143,15 @@ workbooks exported before this column stay importable: the validator also
 accepts the header tuple without `MA type` (with and without the fee columns),
 each checked against its own `headers_sha256`.
 
+## Lot mode column (amended 2026-10-13)
+
+`Lot mode` follows `MA type` in block 4 and in the aggregate headers: `FIXED`
+for a result whose stored sizing is the protocol v2 fixed lot (protocol v2
+§4.5), otherwise `DYNAMIC`. For `FIXED` rows `DD`, the derived `Lot DD5`, DD5
+and CE use the drawdown as a fraction of the base B (protocol v2 §4.6). The
+portfolio input snapshot drops the column. Aggregate workbooks exported
+without it stay importable, each accepted header tuple with its own hash.
+
 ## Compatibility and acceptance
 
 - Review imports continue to use their existing protected headers and ignore

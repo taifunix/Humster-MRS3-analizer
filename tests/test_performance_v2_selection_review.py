@@ -1512,8 +1512,8 @@ def test_selection_workbook_has_compact_visible_order_and_hidden_analog_fields(t
         assert sheet.data_validations.count == 2
         visible = [header for cell, header in zip(sheet[1], headers)
                    if not sheet.column_dimensions[cell.column_letter].hidden]
-        assert visible[-11:] == [
-            "Lots", "Points", "MA", "MA type", "Auto Status", "Auto Rank", "User Status", "User Rank",
+        assert visible[-12:] == [
+            "Lots", "Points", "MA", "MA type", "Lot mode", "Auto Status", "Auto Rank", "User Status", "User Rank",
             "RETEST", "Comment", "Причина",
         ]
         assert not {"Equity state", "Equity basis", "Equity DD, %", "Equity smoothness"}.intersection(headers)

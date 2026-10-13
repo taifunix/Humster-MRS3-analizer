@@ -34,6 +34,7 @@ from .performance_v2_store import (
     require_performance_v2,
     require_performance_v2_readable,
 )
+from .performance_v2_sizing import load_fixed_lot_bases
 from .performance_v2_windows import (
     METRICS_VERSION,
     WindowMetrics,
@@ -178,7 +179,9 @@ def _export_xlsx(
             "strategy_id": strategy_id, "strategy_name": row[1], "symbol": row[2], "side": row[3],
             "timeframe": row[4], "close_ma_len": row[5], "order_count": row[6], "result_id": row[25],
             "effective_start_utc": row[31], "effective_end_utc": row[32],
-            "max_drawdown_pct": row[40], "finalist": status in {"FINALIST", "RESERVE"},
+            # A FIXED result shows its drawdown as a fraction of the base B (protocol v2 §4.6).
+            "max_drawdown_pct": candidate["max_drawdown_pct"] if candidate.get("lot_mode") == "FIXED" else row[40],
+            "finalist": status in {"FINALIST", "RESERVE"},
             "auto_status": status or "UNSELECTED", "auto_rank": rank, "final_rank": rank,
             "prior_retest": tagged, "elimination_reason": None,
         })
@@ -624,6 +627,12 @@ def performance_v2_catalog(connection: duckdb.DuckDBPyConnection) -> dict[str, o
             order = orders_by_key.get((int(strategy_id), int(order_id)))
             if order is not None:
                 order.update({key: value for key, value in (("open_ma_type", kind), ("open_ma_source", source)) if value is not None})
+    # Only FIXED results carry a lot mode, so a legacy catalog is unchanged.
+    fixed_bases = load_fixed_lot_bases(connection, [int(strategy["result_id"]) for strategy in strategies])
+    for strategy in strategies:
+        base = fixed_bases.get(int(strategy["result_id"]))
+        if base is not None:
+            strategy.update({"lot_mode": "FIXED", "lot_base": format(base.normalize(), "f")})
     return {"strategies": strategies}
 
 

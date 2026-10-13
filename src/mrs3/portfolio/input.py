@@ -29,6 +29,7 @@ from ..performance_v2_selection import (
     load_selection_candidates,
     parse_selection_request,
 )
+from ..performance_v2_sizing import fixed_lot_base
 from ..performance_v2_store import _V12_COLUMN_ADDITIONS, require_performance_v2_readable
 from ..performance_v2_store import decode_optimizer_source_metadata
 from ..performance_v2_selection_review import STATUSES as USER_STATUSES
@@ -182,6 +183,7 @@ class _SourceSeries:
     initial_balance: Decimal | None
     actions: tuple[Mapping[str, Any], ...]
     equity: tuple[Mapping[str, Any], ...]
+    fixed_base: Decimal | None = None
 
 
 class _PreparedResultRow(dict[str, Any]):
@@ -509,6 +511,7 @@ def _refresh_candidate_metrics(
     candidates: list[dict[str, Any]],
     metrics: Mapping[tuple[int, datetime, datetime, str], WindowMetrics],
     selection_config: SelectionConfig,
+    fixed_result_ids: frozenset[int] = frozenset(),
 ) -> None:
     """Replace cache-derived candidate values with metrics from frozen series."""
     for candidate in candidates:
@@ -522,7 +525,7 @@ def _refresh_candidate_metrics(
 
         pnl_30d = _return_30d(full, report_start, report_end)
         trade_rate = _trade_rate_30d(full, report_start, report_end)
-        fees_share, fees_30d = _fee_efficiency(full, report_start, report_end)
+        fees_share, fees_30d = _fee_efficiency(full, report_start, report_end, fixed=result_id in fixed_result_ids)
         candidate.update(
             total_trades=full.trade_count,
             trades_30d=trade_rate,
@@ -875,8 +878,10 @@ def read_performance_snapshot(
                 frame = load_selection_candidates(connection, request, selection_config, cache_only=True)
                 for row in frame.to_dict(orient="records"):
                     candidate = dict(row)
-                    # Display-only XLSX text; snapshot documents and digests must not change.
-                    candidate.pop("ma_kind", None)
+                    # Display and lot-mode helpers of the selection frame; snapshot
+                    # documents and digests must not change (sizing comes from result rows).
+                    for field in ("ma_kind", "lot_mode", "lot_base"):
+                        candidate.pop(field, None)
                     try:
                         symbol = candidate["symbol"]
                         side = candidate["side"]
@@ -940,6 +945,7 @@ def read_performance_snapshot(
             equity_rows = _records_for_ids(connection, "strategy_equity", "result_id", tuple(result_ids))
             provenance = _selection_provenance(connection, parsed, tuple(strategy_ids))
             provenance["admission_lineage"] = admission_lineage
+            side_by_strategy = {int(row["strategy_id"]): row.get("side") for row in strategy_rows}
             for result in result_rows:
                 result_id = int(result["result_id"])
                 source_rows[result_id] = _SourceSeries(
@@ -949,6 +955,7 @@ def read_performance_snapshot(
                     None if result.get("initial_balance") is None else _to_decimal(result["initial_balance"]),
                     tuple(row for row in action_rows if int(row["result_id"]) == result_id),
                     tuple(row for row in equity_rows if int(row["result_id"]) == result_id),
+                    fixed_lot_base(result, side_by_strategy.get(int(result["strategy_id"]))),
                 )
             connection.execute("commit")
     except PortfolioInputError:
@@ -972,8 +979,12 @@ def read_performance_snapshot(
                     actions,
                     equity,
                     initial_balance=series.initial_balance,
+                    fixed_base=series.fixed_base,
                 )
-        _refresh_candidate_metrics(candidates, metrics, selection_config)
+        _refresh_candidate_metrics(
+            candidates, metrics, selection_config,
+            frozenset(result_id for result_id, series in source_rows.items() if series.fixed_base is not None),
+        )
 
         candidate_records = tuple(
             _frozen(dict(row)) for row in sorted(candidates, key=lambda row: (int(row["strategy_id"]), int(row["result_id"])))

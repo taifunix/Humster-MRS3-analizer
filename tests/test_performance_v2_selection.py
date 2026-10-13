@@ -4233,7 +4233,7 @@ def test_equity_workbook_appends_four_precise_columns_and_labels_method(tmp_path
     sheet = workbook["All candidates"]
     headers = [cell.value for cell in sheet[1]]
 
-    equity_start = headers.index("MA type") + 1
+    equity_start = headers.index("Lot mode") + 1
     assert headers[equity_start:equity_start + 4] == ["Equity state", "Equity basis", "Equity DD, %", "Equity smoothness"]
     assert sheet.max_row == 3
     assert sheet.cell(2, headers.index("Equity DD, %") + 1).value == 12.3456789
@@ -4377,9 +4377,9 @@ def test_equity_blocks_keep_a_stable_order_for_all_request_permutations(tmp_path
         assert current.index("Auto Status") < current.index(no_headers[-1])
         assert not removed_regime_columns.intersection(current)
     assert not any(column in no_headers for column in (*quality_block, *regime_block))
-    assert quality_headers[quality_headers.index("MA type") + 1:quality_headers.index("MA type") + 5] == quality_block
-    assert regime_headers[regime_headers.index("MA type") + 1:regime_headers.index("MA type") + 1 + len(regime_block)] == regime_block
-    assert both_headers[both_headers.index("MA type") + 1:both_headers.index("MA type") + 1 + len(quality_block)] == quality_block
+    assert quality_headers[quality_headers.index("Lot mode") + 1:quality_headers.index("Lot mode") + 5] == quality_block
+    assert regime_headers[regime_headers.index("Lot mode") + 1:regime_headers.index("Lot mode") + 1 + len(regime_block)] == regime_block
+    assert both_headers[both_headers.index("Lot mode") + 1:both_headers.index("Lot mode") + 1 + len(quality_block)] == quality_block
     regime_start = both_headers.index("Regime rank")
     assert both_headers[regime_start:regime_start + len(regime_block)] == regime_block
 
@@ -4640,8 +4640,8 @@ def test_workbook_keeps_all_candidates_and_ab_30d_columns(tmp_path: Path) -> Non
     assert "PointsALL" not in headers and "PointsMin" not in headers
     assert headers.index("CE") + 1 == headers.index("PF")
     shifts_start = headers.index("1 Shift")
-    assert headers[shifts_start:shifts_start + 7] == [
-        "1 Shift", "2 Shift", "3 Shift", "Lots", "Points", "MA", "MA type",
+    assert headers[shifts_start:shifts_start + 8] == [
+        "1 Shift", "2 Shift", "3 Shift", "Lots", "Points", "MA", "MA type", "Lot mode",
     ]
     first_order_shift = headers.index("1 Shift") + 1
     assert {book["All candidates"].cell(row, first_order_shift).value for row in (2, 3)} == {0.3, 2.7}
@@ -5333,3 +5333,128 @@ def test_strategy_ma_kinds_is_empty_before_schema_v12(tmp_path: Path) -> None:
         assert selection_module.strategy_ma_kinds(connection, [1]) == {}
     finally:
         connection.close()
+
+
+def _make_fixed(connection: duckdb.DuckDBPyConnection, base: int = 50) -> None:
+    connection.execute(
+        f"""update strategy_results set sizing_use_upnl = false, sizing_use_frozen_balance = true,
+           sizing_use_fix = true, sizing_max_balance = 0, sizing_my_fix_balance = {base},
+           sizing_balance_percentage_long = 100, sizing_risk_long = 1"""
+    )
+
+
+def test_loader_rebases_fixed_report_totals_on_the_base(tmp_path: Path) -> None:
+    connection = _candidate_db(tmp_path)
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
+    try:
+        legacy = load_selection_candidates(connection, request).iloc[0]
+        _make_fixed(connection)
+        connection.execute("delete from window_metrics")
+        fixed = load_selection_candidates(connection, request).iloc[0]
+    finally:
+        connection.close()
+
+    # Fixture result: total_pnl 10, max_drawdown 5, max_drawdown_pct 5, initial balance 100.
+    assert (legacy["lot_mode"], legacy["lot_base"]) == ("DYNAMIC", None)
+    assert (legacy["max_drawdown_pct"], legacy["total_pnl_pct"], legacy["risk_scale"]) == (Decimal("5"), Decimal("10"), Decimal("1"))
+    assert (fixed["lot_mode"], fixed["lot_base"]) == ("FIXED", Decimal("50"))
+    assert (fixed["max_drawdown_pct"], fixed["total_pnl_pct"]) == (Decimal("10"), Decimal("20"))
+    assert fixed["risk_scale"] == Decimal("0.5")
+    path = write_selection_workbook(run_selection(pd.DataFrame([fixed]), request), tmp_path / "lot.xlsx", request)
+    sheet = load_workbook(path)["All candidates"]
+    headers = [cell.value for cell in sheet[1]]
+    assert headers[headers.index("MA type") + 1] == "Lot mode"
+    assert sheet.cell(2, headers.index("Lot mode") + 1).value == "FIXED"
+
+
+def test_lot_variants_compare_only_within_one_lot_mode_and_base() -> None:
+    def variants(equal_mode: str, income_mode: str, income_base: int = 100) -> pd.DataFrame:
+        def base(mode: str, value: int) -> dict[str, object]:
+            return {"lot_mode": mode, "lot_base": Decimal(value) if mode == "FIXED" else None}
+
+        equal = _lot_variant_row(
+            "equal", 1, lots=("1", "1"), initial_balance=100, max_drawdown_pct=Decimal("10"),
+            pnl_30d_pct=Decimal("30"), ab_return_b_30d_pct=Decimal("4"), **base(equal_mode, 100),
+        )
+        income = _lot_variant_row(
+            "income", 2, lots=("0.5", "1.5"), initial_balance=100, max_drawdown_pct=Decimal("10"),
+            pnl_30d_pct=Decimal("40"), ab_return_b_30d_pct=Decimal("5"), **base(income_mode, income_base),
+        )
+        return pd.DataFrame([equal, income])
+
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "filter_lot_variant_redundancy", "enabled": True, "scope": "pair_side_timeframe"},
+    ]})
+
+    fixed = run_selection(variants("FIXED", "FIXED"), request).set_index("strategy_name")
+    assert not fixed.loc["equal", "finalist"] and fixed.loc["income", "finalist"]
+    for frame in (variants("DYNAMIC", "FIXED"), variants("FIXED", "FIXED", income_base=200)):
+        result = run_selection(frame, request)
+        assert not result["eliminated_by_filter_lot_variant_redundancy"].any()
+
+
+def _record_fixed_bases(monkeypatch: pytest.MonkeyPatch) -> dict[str, list[object]]:
+    seen: dict[str, list[object]] = {"window": [], "quality": [], "regime": []}
+    for name, key in (("_calculate", "window"), ("calculate_equity_quality_facts", "quality"),
+                      ("calculate_equity_regime_facts", "regime")):
+        original = getattr(selection_module, name)
+
+        def spy(*args, _original=original, _key=key, **kwargs):
+            seen[_key].append(kwargs.get("fixed_base"))
+            return _original(*args, **kwargs)
+
+        monkeypatch.setattr(selection_module, name, spy)
+    return seen
+
+
+_EQUITY_STAGES = [
+    {"id": "filter_equity_regime", "enabled": True, "scope": "pair_side"},
+    {"id": "rank_robust_top_n", "enabled": True, "scope": "pair_side", "top_n": 1, "method": "equity_quality_v1"},
+]
+
+
+def test_cache_warm_job_passes_the_fixed_base(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    connection = _candidate_db(tmp_path)
+    _make_fixed(connection)
+    connection.close()
+    seen = _record_fixed_bases(monkeypatch)
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": _EQUITY_STAGES})
+
+    prepare_selection_window_cache(
+        tmp_path / "strategy_performance.duckdb", request, SelectionConfig(), workers=1, include_equity=True,
+    )
+
+    assert seen["window"] and set(seen["window"]) == {Decimal("50")}
+    assert seen["quality"] and set(seen["quality"]) == {Decimal("50")}
+    assert seen["regime"] and set(seen["regime"]) == {Decimal("50")}
+
+
+def test_in_memory_equity_facts_pass_the_fixed_base(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    connection = _candidate_db(tmp_path)
+    _make_fixed(connection)
+    seen = _record_fixed_bases(monkeypatch)
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": _EQUITY_STAGES})
+    try:
+        candidate = load_selection_candidates(connection, request).iloc[0]
+    finally:
+        connection.close()
+
+    assert seen["quality"] and set(seen["quality"]) == {Decimal("50")}
+    assert seen["regime"] and set(seen["regime"]) == {Decimal("50")}
+
+
+def test_fixed_pnl_without_best_trade_pct_uses_the_base(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    connection = _candidate_db(tmp_path)
+    _make_fixed(connection)
+    result_id = connection.execute("select result_id from strategy_results").fetchone()[0]
+    monkeypatch.setattr(selection_module, "_completed_cycle_facts", lambda *_args, **_kwargs: {
+        result_id: {"completed_cycles_reliable": True, "pnl_without_best_trade": Decimal("5")},
+    })
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
+    try:
+        candidate = load_selection_candidates(connection, request).iloc[0]
+    finally:
+        connection.close()
+
+    # 5 USDT over B = 50, not over the initial balance of 100.
+    assert candidate["pnl_without_best_trade_pct"] == Decimal("10")

@@ -66,8 +66,19 @@ transaction; a report whose core the import recomputes (warm-up trim) stores no
 analytics. Consequence until P6: reports rendered from the user's edited
 `retest-mrs3` template (`use_upnl=false`) are rejected by a v1 database as
 `EVALUATION_PROTOCOL_MISMATCH`; they need a v2 database.
-Next: P4 (FIXED metrics), P5 (optimizer accepts FIXED), P6 (templates and
-render predicate), P7 (Panel database selection).
+P4 (FIXED metrics): `performance_v2_sizing.fixed_lot_base` recognises a stored
+protocol-v2 fixed lot (use_upnl=false, frozen balance, use_fix, max_balance=0,
+active side 100%/risk 1) and gives B = my_fix_balance × percentage / 100. For
+such results window metrics use R = ΔW / B (growth exp(R), daily log R/days,
+fees / B, linear drawdown (peak − E) / B), equity quality and regime use
+ln Ẽ = (E − E0) / B with linear drawdowns and peak gap, and selection rebases
+the report `max_drawdown_pct`, `total_pnl_pct` and `pnl_without_best_trade_pct`
+on B (hence risk_scale, DD5, CE); EQUAL/INCOME compare only within one lot mode
+and base. Workbooks add `Lot mode` after `MA type`; the Panel card shows
+`Lot FIXED B=…`. DYNAMIC and legacy results are unchanged. Invariant 2 is
+pinned on a synthetic fixture. Remaining in P4: scripts E1–E6 into `scripts/`.
+Next: P5 (optimizer accepts FIXED), P6 (templates and render predicate), P7
+(Panel database selection).
 User decision 2026-10-12: one PerformanceDB per exchange with an
 `schema_info.exchange` marker (protocol v2 §4.1); the CSV Direct analysis DB
 (branch `feat/csv-direct-analysis`) must also record the exchange from the run
