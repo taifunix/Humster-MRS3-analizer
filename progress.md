@@ -76,7 +76,9 @@ the report `max_drawdown_pct`, `total_pnl_pct` and `pnl_without_best_trade_pct`
 on B (hence risk_scale, DD5, CE); EQUAL/INCOME compare only within one lot mode
 and base. Workbooks add `Lot mode` after `MA type`; the Panel card shows
 `Lot FIXED B=…`. DYNAMIC and legacy results are unchanged. Invariant 2 is
-pinned on a synthetic fixture. Remaining in P4: scripts E1–E6 into `scripts/`.
+pinned on a synthetic fixture. The E1–E6 evidence scripts live in
+`scripts/equity_research/` (`sizing_evidence.py`, `sizing_fills.py`,
+`base_size.py`); a smoke test runs them read-only on a small synthetic database.
 Next: P5 (optimizer accepts FIXED), P6 (templates and render predicate), P7
 (Panel database selection).
 User decision 2026-10-12: one PerformanceDB per exchange with an
