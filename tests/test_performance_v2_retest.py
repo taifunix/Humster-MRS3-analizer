@@ -909,3 +909,25 @@ def test_retest_renders_protocol_v2_with_the_base_and_exchange(tmp_path: Path) -
     strategy = json.loads((batch.strategies_path / "stored.json").read_text(encoding="utf-8"))
     assert strategy["basic"]["my_fix_balance"] == 10000.0
     assert strategy["exchange"]["name"] == "BingX"
+
+
+def test_retest_repeats_the_stored_ma_facts_not_the_template(tmp_path: Path) -> None:
+    from decimal import Decimal
+
+    from mrs3.evaluation_protocol import EvaluationTarget
+    from tests._protocol_v2 import protocol_v2_template
+
+    connection, _ = _single_order_retest_db(tmp_path / "db.duckdb")
+    try:
+        connection.execute("update strategies set close_ma_type = 'EMA', close_ma_source = 'close'")
+        connection.execute("update strategy_orders set open_ma_type = 'EMA', open_ma_source = 'hl2'")
+        batch = build_retest_manifest(
+            connection, {"LONG": protocol_v2_template()}, tmp_path / "output",
+            evaluation=EvaluationTarget(Decimal("10000"), "Bybit"),
+        )
+    finally:
+        connection.close()
+
+    strategy = json.loads((batch.strategies_path / "stored.json").read_text(encoding="utf-8"))
+    assert [(entry["type"], entry["source"]) for entry in strategy["mrs3"]["ma_long"]] == [("EMA", "hl2")]
+    assert (strategy["mrs3"]["ma_close_long"]["type"], strategy["mrs3"]["ma_close_long"]["source"]) == ("EMA", "close")

@@ -31,7 +31,7 @@ from .performance_v2_selection_review import (
     _reconcile_prior_finalist_user_fields,
     effective_selection_decisions,
 )
-from .evaluation_protocol import EvaluationTarget, apply_protocol_v2
+from .evaluation_protocol import EvaluationTarget, apply_protocol_v2, apply_stored_ma_facts, load_stored_ma_facts
 from .strategy_json import generate_strategy
 
 
@@ -1075,6 +1075,10 @@ def build_finalist_retest_manifest(
     if not isinstance(templates, Mapping):
         raise FinalistRetestError("CONFIG_INVALID", "retest templates are invalid")
     run_id = job_id or f"finalist-retest-{sha256(cohort.cohort_sha256.encode('ascii')).hexdigest()[:24]}"
+    stored_ma = (
+        load_stored_ma_facts(connection, [int(member["strategy_id"]) for member in cohort.members])
+        if evaluation is not None else {}
+    )
     generated: list[dict[str, object]] = []
     strategy_runs: dict[str, str] = {}
     names_by_candidate: dict[str, list[str]] = {}
@@ -1120,6 +1124,10 @@ def build_finalist_retest_manifest(
                 "risk_short": 1.0,
             })
         if evaluation is not None:
+            apply_stored_ma_facts(
+                strategy, member["side"], stored_ma.get(int(member["strategy_id"])),
+                [item["order_id"] for item in member["orders"]],  # type: ignore[index]
+            )
             apply_protocol_v2(strategy, evaluation)
         filename = f"{member['strategy_name']}.json"
         strategy_runs[filename] = str(member["analysis_run_id"])

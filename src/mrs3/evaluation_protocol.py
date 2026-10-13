@@ -138,6 +138,63 @@ def require_protocol_v2_tester_config(config: Mapping[str, Any], target: Evaluat
         )
 
 
+_Facts = tuple[Any, Any]
+StoredMaFacts = tuple[_Facts, dict[int, _Facts]]
+
+
+def load_stored_ma_facts(connection: duckdb.DuckDBPyConnection, strategy_ids: Any) -> dict[int, StoredMaFacts]:
+    """Stored MA type/source of the close MA and of every order by strategy; empty before schema v12."""
+    from .performance_v2_selection import has_ma_fact_columns
+
+    ids = sorted({int(value) for value in strategy_ids})
+    if not ids or not has_ma_fact_columns(connection):
+        return {}
+    close = {
+        int(strategy_id): (kind, source)
+        for strategy_id, kind, source in connection.execute(
+            """select strategy_id, close_ma_type, close_ma_source from strategies
+                where strategy_id in (select unnest(?::bigint[]))""",
+            [ids],
+        ).fetchall()
+    }
+    orders: dict[int, dict[int, _Facts]] = {}
+    for strategy_id, order_id, kind, source in connection.execute(
+        """select strategy_id, order_id, open_ma_type, open_ma_source from strategy_orders
+            where strategy_id in (select unnest(?::bigint[]))""",
+        [ids],
+    ).fetchall():
+        orders.setdefault(int(strategy_id), {})[int(order_id)] = (kind, source)
+    return {strategy_id: (facts, orders.get(strategy_id, {})) for strategy_id, facts in close.items()}
+
+
+def apply_stored_ma_facts(
+    strategy: MutableMapping[str, Any], side: object, facts: StoredMaFacts | None, order_ids: Any,
+) -> None:
+    """Set each order's and the close MA's type/source from the stored strategy (protocol v2 §4.5, §7a).
+
+    A RETEST repeats the strategy as tested; empty (legacy) facts keep the template prototype.
+    """
+    if facts is None:
+        return
+    suffix = "short" if str(side).strip().upper() == "SHORT" else "long"
+    try:
+        entries = strategy["mrs3"][f"ma_{suffix}"]
+        close = strategy["mrs3"][f"ma_close_{suffix}"]
+    except (KeyError, TypeError) as error:
+        raise EvaluationProtocolError(PROTOCOL_V2_RENDER_REJECTED, "strategy has no MA settings") from error
+    order_ids = [int(value) for value in order_ids]
+    if len(entries) != len(order_ids):
+        raise EvaluationProtocolError(PROTOCOL_V2_RENDER_REJECTED, "strategy orders do not match the stored strategy")
+    close_facts, order_facts = facts
+    for entry, order_id in zip(entries, order_ids, strict=True):
+        for key, value in zip(("type", "source"), order_facts.get(order_id, (None, None)), strict=True):
+            if value is not None:
+                entry[key] = value
+    for key, value in zip(("type", "source"), close_facts, strict=True):
+        if value is not None:
+            close[key] = value
+
+
 __all__ = [
     "DATABASE_PROTOCOL_V1",
     "DATABASE_UNAVAILABLE",
@@ -146,6 +203,8 @@ __all__ = [
     "EvaluationProtocolError",
     "EvaluationTarget",
     "apply_protocol_v2",
+    "apply_stored_ma_facts",
+    "load_stored_ma_facts",
     "evaluation_target",
     "protocol_v2_unmet",
     "require_protocol_v2_strategy",

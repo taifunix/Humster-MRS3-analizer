@@ -109,8 +109,11 @@ inbox reuse of a job without the same marker is refused
 MRS3 tests need a protocol v2 PerformanceDB: set
 `unified_performance_v2.database_root` to a new folder, `evaluation_protocol: v2`
 and `exchange` in `config.performance.json` (P7 adds this to the Panel
-settings). Remaining in P6: RETESTs take MA facts from the stored strategy.
-Next: P6c, then P7 (Panel PerformanceDB
+settings). P6c3: RETEST and finalist RETEST repeat the stored MA type/source
+of every order and of the close MA (a strategy without stored facts keeps the
+template prototype), so a template change does not turn retest reports into
+`MA_SETTINGS_CHANGED`. P6 is complete.
+Next: P7 (Panel PerformanceDB
 selection with an exchange profile: the render takes `exchange.name` and the
 exchange-specific tester fees/account fields from the active database —
 user proposal 2026-10-13, spec pending).

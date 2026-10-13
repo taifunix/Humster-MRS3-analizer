@@ -18,7 +18,7 @@ from tests._protocol_v2 import protocol_v2_template
 TARGET = EvaluationTarget(Decimal("10000"), "BingX")
 
 
-def _build(tmp_path: Path, template: dict[str, object]):
+def _build(tmp_path: Path, template: dict[str, object], *, stored_facts: bool = False):
     with duckdb.connect(":memory:") as connection:
         initialize_performance_v2(connection)
         now = datetime(2026, 1, 1, tzinfo=UTC)
@@ -54,6 +54,9 @@ def _build(tmp_path: Path, template: dict[str, object]):
         connection.execute(
             """insert into selection_review_rows values ('review-1', 1, 'FINALIST', 1, null, 'keep')"""
         )
+        if stored_facts:
+            connection.execute("update strategies set close_ma_type = 'EMA', close_ma_source = 'close'")
+            connection.execute("update strategy_orders set open_ma_type = 'EMA', open_ma_source = 'hl2'")
         return build_finalist_retest_manifest(
             connection,
             {"LONG": template},
@@ -95,3 +98,11 @@ def test_finalist_retest_config_digest_follows_the_base_and_exchange() -> None:
         finalist_retest_config_digest(templates, evaluation=EvaluationTarget(Decimal("10000"), "Bybit")),
     }
     assert len(digests) == 4
+
+
+def test_finalist_retest_repeats_the_stored_ma_facts(tmp_path: Path) -> None:
+    batch = _build(tmp_path, protocol_v2_template(), stored_facts=True)
+
+    strategy = json.loads((batch.strategies_path / "final.json").read_text(encoding="utf-8"))
+    assert [(entry["type"], entry["source"]) for entry in strategy["mrs3"]["ma_long"]] == [("EMA", "hl2")]
+    assert (strategy["mrs3"]["ma_close_long"]["type"], strategy["mrs3"]["ma_close_long"]["source"]) == ("EMA", "close")

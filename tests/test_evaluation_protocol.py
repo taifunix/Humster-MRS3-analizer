@@ -120,3 +120,22 @@ def test_use_upnl_must_be_exactly_false() -> None:
             strategy["exchange"]["use_upnl"] = value  # type: ignore[index]
         with pytest.raises(EvaluationProtocolError, match="exchange.use_upnl"):
             apply_protocol_v2(strategy, TARGET)
+
+
+def test_stored_ma_facts_pair_by_order_and_keep_template_halves() -> None:
+    from mrs3.evaluation_protocol import apply_stored_ma_facts
+
+    strategy = {"mrs3": {
+        "ma_short": [{"id": index, "type": "SMA", "source": "ohlc4"} for index in (1, 2, 3)],
+        "ma_close_short": {"type": "SMA", "source": "ohlc4"},
+    }}
+    facts = (("EMA", None), {1: ("WMA", "hl2"), 2: (None, "close")})
+
+    apply_stored_ma_facts(strategy, "SHORT", facts, (1, 2, 3))
+
+    assert [(entry["type"], entry["source"]) for entry in strategy["mrs3"]["ma_short"]] == [
+        ("WMA", "hl2"), ("SMA", "close"), ("SMA", "ohlc4"),
+    ]
+    assert (strategy["mrs3"]["ma_close_short"]["type"], strategy["mrs3"]["ma_close_short"]["source"]) == ("EMA", "ohlc4")
+    with pytest.raises(EvaluationProtocolError):
+        apply_stored_ma_facts(strategy, "SHORT", facts, (1, 2))
