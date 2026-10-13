@@ -141,9 +141,13 @@ RETEST; launch checks compare `exchange.account` and the fee/funding fields
 complete.
 Plan (deferred, user decision 2026-10-13): optimizer adaptation for BingX
 (margin parameters from the exchange API, minute liquidity in the `BingX`
-folder next to the Bybit one, `portfolio-*.json` for BingX). Next work: CSV
-Direct and the analysis database (`feat/csv-direct-analysis`, including the
-exchange key) — finishing and optimisation.
+folder next to the Bybit one, `portfolio-*.json` for BingX). Next work: the
+[CSV Direct integration and shift grid 7.5% plan](docs/superpowers/plans/2026-10-13-csv-direct-integration-and-shift-grid-750.md)
+— part A merges `feat/csv-direct-analysis` into main (ADR renumber to 0071,
+exchange key in the analysis DB, background job); part B extends the MRS2 shift
+grid 5.5% → 7.5% (step 0.4%) with backward compatibility (effective grid =
+legacy grid plus the longest present extension prefix); seven user decisions
+listed in B3.
 User decision 2026-10-12: one PerformanceDB per exchange with an
 `schema_info.exchange` marker (protocol v2 §4.1); the CSV Direct analysis DB
 (branch `feat/csv-direct-analysis`) must also record the exchange from the run
