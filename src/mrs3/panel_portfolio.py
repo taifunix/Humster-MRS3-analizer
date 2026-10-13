@@ -3645,6 +3645,7 @@ class PortfolioPanelService:
                 "MM saturation %": percentage_of_saturation(_weighted_value(metrics, "M_all_usdt")),
                 "MaxDD SUM USDT": _weighted_source_maxdd_sum(campaign, weighted_members),
                 "Total full notional USDT": total_notional,
+                "Legacy MA prototype members": _weighted_value(variant, "legacy_ma_prototype_members"),
                 "Weighted members": weighted_members,
             })
         return summary

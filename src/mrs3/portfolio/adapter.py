@@ -1270,6 +1270,44 @@ def _safe_weighted_variant(candidate: Any, result: Any) -> Mapping[str, Any]:
     return variant
 
 
+_MA_FACT_FIELDS = (("type", "open_ma_type", "close_ma_type"), ("source", "open_ma_source", "close_ma_source"))
+
+
+def _has_complete_ma_facts(source: Mapping[str, Any]) -> bool:
+    """True when every order and the close MA carry both type and source facts."""
+    orders = source.get("strategy_orders")
+    if isinstance(orders, (str, bytes)) or not isinstance(orders, Sequence) or not orders:
+        return False
+    return all(
+        isinstance(order, Mapping) and all(order.get(field) is not None for _key, field, _close in _MA_FACT_FIELDS)
+        for order in orders
+    ) and all(source.get(close) is not None for _key, _field, close in _MA_FACT_FIELDS)
+
+
+def _apply_ma_facts(
+    strategy: dict[str, Any], source: Mapping[str, Any], source_orders: Sequence[Mapping[str, Any]],
+) -> None:
+    """Set each order's and the close MA's type/source from stored facts (protocol v2 §4.5).
+
+    Without facts the template prototype stays, so legacy Stage 2 JSON is unchanged.
+    """
+    suffix = "short" if source.get("side") == "SHORT" else "long"
+    try:
+        entries = strategy["mrs3"][f"ma_{suffix}"]
+        close = strategy["mrs3"][f"ma_close_{suffix}"]
+    except (KeyError, TypeError) as error:
+        raise CampaignContractError(WEIGHTED_INPUT_SNAPSHOT_UNAVAILABLE) from error
+    if len(entries) != len(source_orders):
+        raise CampaignContractError(WEIGHTED_INPUT_SNAPSHOT_UNAVAILABLE)
+    for entry, order in zip(entries, source_orders, strict=True):
+        for key, field, _close in _MA_FACT_FIELDS:
+            if order.get(field) is not None:
+                entry[key] = order[field]
+    for key, _field, close_field in _MA_FACT_FIELDS:
+        if source.get(close_field) is not None:
+            close[key] = source[close_field]
+
+
 def _build_strategy_payloads(
     template: Mapping[str, Any],
     candidate_members: Sequence[Mapping[str, Any]],
@@ -1370,6 +1408,7 @@ def _build_strategy_payloads(
             )
             if not isinstance(strategy, dict) or not isinstance(strategy.get("basic"), dict):
                 raise CampaignContractError(WEIGHTED_INPUT_SNAPSHOT_UNAVAILABLE)
+            _apply_ma_facts(strategy, source, source_orders)
         except (ArithmeticError, KeyError, TypeError, ValueError, OverflowError) as error:
             raise CampaignContractError(WEIGHTED_INPUT_SNAPSHOT_UNAVAILABLE) from error
         strategy["name"] = f"PORTFOLIO_{source['symbol']}_{source['strategy_id']}_{source['result_id']}"
@@ -2131,6 +2170,17 @@ def _build_portfolio_candidates_single(
                         executable_members=executable_members,
                     )
                     variant["executable_members"] = executable_members
+                    # Members with any missing MA fact take it from the legacy template prototype.
+                    legacy_identities = {
+                        _weighted_input_identity(row)
+                        for row in selected_for_adapter
+                        if not _has_complete_ma_facts(row)
+                    }
+                    variant["legacy_ma_prototype_members"] = sum(
+                        1 for member in executable_members
+                        if _weighted_decimal(member.get("actual_size_usdt", member.get("x_usdt"))) > 0
+                        and _weighted_input_identity(member) in legacy_identities
+                    )
                     variant["member_exclusions"] = rounding_exclusions
                     variant["allocation_rounding"] = {
                         "basis": "INDEPENDENT_EXCHANGE_ROUND_DOWN_V1",

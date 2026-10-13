@@ -4789,7 +4789,10 @@ def test_weighted_summary_enriches_identity_only_members_from_payload_facts() ->
     }
 
     summary = PortfolioPanelService._summary(campaign, (), (), (variant,), ())
+    counted = PortfolioPanelService._summary(campaign, (), (), ({**variant, "legacy_ma_prototype_members": 1},), ())
 
+    assert summary["Legacy MA prototype members"] == "UNKNOWN"
+    assert counted["Legacy MA prototype members"] == 1
     assert summary["Historical bank USDT"] == Decimal("150")
     assert summary["Own-history DD bank USDT"] == Decimal("190")
     assert summary["Stress bank P95 USDT"] == Decimal("180")

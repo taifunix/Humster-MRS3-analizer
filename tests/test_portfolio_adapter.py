@@ -1,3 +1,4 @@
+import hashlib
 import json
 from collections.abc import Mapping
 from copy import deepcopy
@@ -5219,3 +5220,138 @@ def test_weighted_payload_rejects_derived_value_out_of_range_before_formatting(m
     with pytest.raises(CampaignContractError) as error:
         build_weighted_strategy_payload(template, dict(member, x_usdt="1"), Decimal("1e30"), Decimal("1e30"), 3)
     assert error.value.code == "WEIGHTED_PAYLOAD_INVALID"
+
+
+@pytest.mark.parametrize("side", ("LONG", "SHORT"))
+def test_build_strategy_payloads_apply_stored_ma_facts_and_keep_legacy_json(side):
+    suffix = side.lower()
+    orders = (
+        {"order_id": 1, "open_ma_len": 34, "shift_bp": 50, "lot_x": Decimal("0.5")},
+        {"order_id": 2, "open_ma_len": 21, "shift_bp": 150, "lot_x": Decimal("0.5")},
+    )
+    legacy_source = {
+        "symbol": "BTCUSDT", "side": side, "strategy_id": 11, "result_id": 101,
+        "timeframe": "3h", "close_ma_len": 55, "order_count": 2, "strategy_orders": orders,
+    }
+    fact_source = dict(
+        legacy_source, close_ma_type="SMA", close_ma_source="ohlc4",
+        strategy_orders=(
+            dict(orders[0], open_ma_type="SMA", open_ma_source="ohlc4"),
+            dict(orders[1], open_ma_source="close"),
+        ),
+    )
+    member = {
+        "symbol": "BTCUSDT", "side": side, "strategy_id": 11, "result_id": 101,
+        "x_usdt": Decimal("100"), "capacity_usdt": Decimal("400"), "priority": 3,
+    }
+
+    def build(source):
+        enriched = dict(source, position_size_usdt=Decimal("400"), planned_leverage=Decimal("10"))
+        return adapter_module._build_strategy_payloads(
+            _weighted_strategy_template_fixture(), (member,), (source,), (enriched,), Decimal("1000"), 2,
+        )[0]["strategy"]
+
+    legacy = build(legacy_source)
+    with_facts = build(fact_source)
+
+    legacy_orders = legacy["mrs3"][f"ma_{suffix}"]
+    assert all("type" not in entry and "source" not in entry for entry in legacy_orders)
+    assert "type" not in legacy["mrs3"][f"ma_close_{suffix}"]
+    fact_orders = with_facts["mrs3"][f"ma_{suffix}"]
+    assert (fact_orders[0]["type"], fact_orders[0]["source"]) == ("SMA", "ohlc4")
+    assert "type" not in fact_orders[1] and fact_orders[1]["source"] == "close"
+    assert (with_facts["mrs3"][f"ma_close_{suffix}"]["type"], with_facts["mrs3"][f"ma_close_{suffix}"]["source"]) == ("SMA", "ohlc4")
+    for legacy_entry, fact_entry in zip(legacy_orders, fact_orders, strict=True):
+        assert {k: v for k, v in fact_entry.items() if k not in {"type", "source"}} == legacy_entry
+    stripped = json.loads(json.dumps(with_facts, default=str))
+    for entry in stripped["mrs3"][f"ma_{suffix}"] + [stripped["mrs3"][f"ma_close_{suffix}"]]:
+        entry.pop("type", None)
+        entry.pop("source", None)
+    assert stripped == json.loads(json.dumps(legacy, default=str))
+    complete_source = dict(
+        fact_source, strategy_orders=tuple(dict(order, open_ma_type="SMA", open_ma_source="ohlc4") for order in orders),
+    )
+    assert adapter_module._has_complete_ma_facts(complete_source)
+    assert not adapter_module._has_complete_ma_facts(fact_source)
+    assert not adapter_module._has_complete_ma_facts(legacy_source)
+
+
+def test_build_adapter_counts_members_built_from_legacy_ma_prototype(monkeypatch):
+    def source(side, strategy_id, result_id, facts):
+        order = {"order_id": 1, "open_ma_len": 34, "shift_bp": 50, "lot_x": Decimal("1")}
+        row = {
+            "symbol": "BTCUSDT", "side": side, "strategy_id": strategy_id, "result_id": result_id,
+            "timeframe": "3h", "close_ma_len": 55, "order_count": 1, "strategy_orders": (order,),
+            "actions": (), "equity": (),
+        }
+        if facts:
+            row.update(close_ma_type="SMA", close_ma_source="ohlc4",
+                       strategy_orders=(dict(order, open_ma_type="SMA", open_ma_source="ohlc4"),))
+        return row
+
+    selected = (source("LONG", 11, 101, False), source("SHORT", 22, 202, True))
+    enriched = tuple(_weighted_required_evidence(dict(
+        row, position_size_usdt=Decimal("400"), planned_leverage=Decimal("9"),
+    )) for row in selected)
+    solver_members = tuple({
+        "symbol": "BTCUSDT", "side": side, "strategy_id": strategy_id, "result_id": result_id,
+        "x_usdt": Decimal("357"), "capacity_usdt": Decimal("400"), "priority": 3,
+    } for side, strategy_id, result_id in (("LONG", 11, 101), ("SHORT", 22, 202)))
+    candidate = candidate_search.PortfolioCandidate(
+        schema_version="portfolio_candidate_v1", profile_id="BALANCED", scenario_id="BALANCED",
+        identity="solver-candidate", members=solver_members,
+        metrics={"limiter_L": 2, "required_bank_usdt": Decimal("100")},
+    )
+    campaign = _weighted_build_campaign()
+    campaign["weighted_input_rows"] = selected
+    monkeypatch.setattr(adapter_module, "enrich_finalist_rows", lambda *_args, **_kwargs: SimpleNamespace(
+        status="PASS", rows=enriched, exclusions=(), reason=None,
+    ))
+    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *args: _prepared_stub(*args))
+    monkeypatch.setattr(adapter_module, "_run_weighted_search", lambda *_args, **_kwargs: candidate_search.SearchResult(
+        status="PASS", candidates=(candidate,), mode=CAMPAIGN_SEARCH_MODE,
+    ))
+
+    result = build_portfolio_candidates(
+        selected, campaign, capacities={}, reference=_payload_reference(), mark_prices={"BTCUSDT": Decimal("100")},
+        spread_observations={}, spread_history_statuses={"BTCUSDT": "READY"}, now_ms=0,
+        margin_coefficients=_margin_evidence(11, 22), strategy_template=_weighted_strategy_template_fixture(),
+    )
+
+    assert result.status == "PASS", (result.blockers, result.excluded)
+    variant = result.variants[0]
+    assert variant["legacy_ma_prototype_members"] == 1
+    payloads = {payload["side"]: payload["strategy"]["mrs3"] for payload in variant["strategy_payloads"]}
+    assert "type" not in payloads["LONG"]["ma_long"][0]
+    assert payloads["SHORT"]["ma_short"][0]["type"] == "SMA"
+    assert payloads["SHORT"]["ma_close_short"]["source"] == "ohlc4"
+
+
+def _real_weighted_template_payload(side):
+    template = json.loads(
+        (Path(__file__).resolve().parents[1] / "templates/strategies/portfolio-weighted-mrs/base.json").read_text(encoding="utf-8")
+    )
+    orders = tuple(
+        {"order_id": number, "open_ma_len": length, "shift_bp": shift, "lot_x": Decimal("0.25")}
+        for number, (length, shift) in enumerate(((34, 50), (21, 150), (55, 300), (13, 600)), start=1)
+    )
+    source = {
+        "symbol": "BTCUSDT", "side": side, "strategy_id": 11, "result_id": 101,
+        "timeframe": "3h", "close_ma_len": 55, "order_count": 4, "strategy_orders": orders,
+    }
+    member = {
+        "symbol": "BTCUSDT", "side": side, "strategy_id": 11, "result_id": 101,
+        "x_usdt": Decimal("100"), "capacity_usdt": Decimal("400"), "priority": 3,
+    }
+    enriched = dict(source, position_size_usdt=Decimal("400"), planned_leverage=Decimal("10"))
+    payload = adapter_module._build_strategy_payloads(template, (member,), (source,), (enriched,), Decimal("1000"), 2)[0]
+    return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+@pytest.mark.parametrize(("side", "digest"), [
+    ("LONG", "e1520da93bb5ea08344ab6671c9ec92c17763af0e349e8cdd94c7ee8671fe9e4"),
+    ("SHORT", "a769ac18f7f02c0ac34403ff41ef15caaf704748b0d88b1372b282f213bfff06"),
+])
+def test_legacy_stage2_payload_from_real_template_is_byte_identical(side, digest):
+    # Golden digests of the pre-P2c payload: rows without MA facts keep the legacy prototype.
+    assert _real_weighted_template_payload(side) == digest

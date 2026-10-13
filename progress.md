@@ -1,6 +1,6 @@
 # MRS3 Current Status
 
-Last updated: 2026-10-12
+Last updated: 2026-10-13
 
 This file is a current-status snapshot, not a session log. Earlier progress notes remain in Git history; feature contracts and detailed evidence belong in the linked specs, reports, and plans.
 
@@ -19,7 +19,7 @@ N1 is done: `parse_current_performance_v2_html` reads the 2026-10 format
 (version-only detection, compatible duplicate metrics, 59 analytics labels,
 regimes and monthly returns); the real sample parses fully; legacy parsing is
 unchanged (reviewed against HEAD on all fixtures and real 2026/09/22 reports).
-P2a is done in the working tree (schema v12): additive migration v11 → v12
+P2a is committed (schema v12): additive migration v11 → v12
 (MA type/source columns, three sizing columns, `tester_version`,
 `report_format`, tables `strategy_report_metrics`, `strategy_report_regimes`,
 `strategy_report_monthly`), optional `schema_info` markers
@@ -36,12 +36,20 @@ v11 database (16.9 GB, 49 125 strategies, 122 M equity rows) migrated in 45 s
 with identical row counts and empty new columns/tables. Broad suite: the only
 failures besides the 57 that already fail on clean HEAD are the two
 template-pinned finalist-retest tests.
-P2b is done in the working tree: the import records MA type/source of the
+P2b is committed: the import records MA type/source of the
 close MA and every order (ADD writes them, REPLACE fills empty ones) and the
 v12 sizing facts (`my_fix_balance`, SHORT percentage/risk); a report whose
 known MA facts differ from the stored strategy or from its same-batch
 representative is rejected alone as `REJECTED:MA_SETTINGS_CHANGED` on the
 REPLACE, non-covering SKIPPED and tombstone paths.
+P2c: Stage 2 builds each strategy with the stored MA type/source of every
+order and of the close MA (protocol v2 §4.5); a member without facts keeps the
+`portfolio-weighted-mrs` prototype and its JSON is unchanged. Finalist source
+documents carry the facts only when set. The Stage 2 variant records
+`legacy_ma_prototype_members` (members with any missing fact) and the Panel
+summary shows it as `Legacy MA prototype members` (`UNKNOWN` for older results).
+Next: P2d (MA type/source in XLSX and Panel views), then P3+N3 import of v2 and
+2026-10 reports.
 User decision 2026-10-12: one PerformanceDB per exchange with an
 `schema_info.exchange` marker (protocol v2 §4.1); the CSV Direct analysis DB
 (branch `feat/csv-direct-analysis`) must also record the exchange from the run

@@ -2830,3 +2830,35 @@ def test_current_result_common_period_shorter_than_minimum_fails_closed() -> Non
     result = resolve_common_pretest_period((row,), minimum_common_days=14)
     assert not result.available
     assert result.reason == "COMMON_PRETEST_PERIOD_UNAVAILABLE"
+
+
+def test_read_current_finalists_carries_ma_facts_only_when_set(tmp_path: Path) -> None:
+    database = _database(tmp_path)
+    with duckdb.connect(str(database)) as connection:
+        strategy_id = connection.execute("select strategy_id from strategies where symbol = 'BTCUSDT' and side = 'LONG'").fetchone()[0]
+        connection.execute(
+            """insert into strategy_orders (strategy_id, order_id, open_ma_len, open_multiplier, shift_bp, lot_x,
+               analysis_run_id, plateau_id, base_point_trades)
+               select strategy_id, 2, open_ma_len + 1, open_multiplier, shift_bp + 100, lot_x,
+                      analysis_run_id, plateau_id, base_point_trades
+                 from strategy_orders where strategy_id = ? and order_id = 1""",
+            [strategy_id],
+        )
+        connection.execute("update strategies set order_count = 2 where strategy_id = ?", [strategy_id])
+    legacy = read_current_finalists(database, [("BTCUSDT", "LONG")])[0]
+    assert "close_ma_type" not in legacy and "close_ma_source" not in legacy
+    assert all("open_ma_type" not in order and "open_ma_source" not in order for order in legacy["strategy_orders"])
+
+    with duckdb.connect(str(database)) as connection:
+        connection.execute("update strategies set close_ma_type = 'SMA', close_ma_source = 'ohlc4'")
+        connection.execute(
+            "update strategy_orders set open_ma_type = 'EMA', open_ma_source = 'close'"
+            " where strategy_id = ? and order_id = 2",
+            [strategy_id],
+        )
+    row = read_current_finalists(database, [("BTCUSDT", "LONG")])[0]
+
+    assert (row["close_ma_type"], row["close_ma_source"]) == ("SMA", "ohlc4")
+    first, second = row["strategy_orders"]
+    assert first["order_id"] == 1 and "open_ma_type" not in first and "open_ma_source" not in first
+    assert (second["order_id"], second["open_ma_type"], second["open_ma_source"]) == (2, "EMA", "close")

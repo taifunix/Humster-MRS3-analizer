@@ -1189,13 +1189,18 @@ def _finalist_order(row: Mapping[str, Any]) -> dict[str, Any]:
     shift_bp = _source_integer(row.get("shift_bp"), "shift_bp")
     if order_id <= 0 or open_ma_len <= 0 or shift_bp < 0:
         raise PortfolioInputError("invalid source strategy order", code="INVALID_SOURCE_VALUE")
-    return {
+    order = {
         "order_id": order_id,
         "open_ma_len": open_ma_len,
         "open_multiplier": _source_decimal(row.get("open_multiplier"), "open_multiplier", minimum=Decimal("0"), exclusive_minimum=True),
         "shift_bp": shift_bp,
         "lot_x": _source_decimal(row.get("lot_x"), "lot_x", minimum=Decimal("0"), exclusive_minimum=True),
     }
+    # MA facts (schema v12) enter the document only when set (protocol v2 §4.5).
+    for field in ("open_ma_type", "open_ma_source"):
+        if row.get(field) is not None:
+            order[field] = _source_text(row.get(field), field)
+    return order
 
 
 def apply_finalist_cutoff(
@@ -1479,6 +1484,11 @@ def read_current_finalists(
                     "max_drawdown_pct": max_drawdown_pct,
                     "recovery_factor": recovery_factor,
                     "strategy_orders": ordered_orders,
+                    **{
+                        field: _source_text(source.get(field), field)
+                        for field in ("close_ma_type", "close_ma_source")
+                        if source.get(field) is not None
+                    },
                     "selection_run_id": provenance["selection_run_id"],
                     "review_import_id": provenance["review_import_id"],
                     "source_provenance": provenance,
