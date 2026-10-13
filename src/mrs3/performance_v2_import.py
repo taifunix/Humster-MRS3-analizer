@@ -19,7 +19,12 @@ import duckdb
 import pandas as pd
 
 from .performance import PerformanceParseError, report_range
-from .performance_v2_html import PerformanceV2HtmlError, ParsedPerformanceV2Report, parse_current_performance_v2_html
+from .performance_v2_html import (
+    REPORT_FORMAT_2026_10,
+    PerformanceV2HtmlError,
+    ParsedPerformanceV2Report,
+    parse_current_performance_v2_html,
+)
 from .loader import load_listing_dates
 from .performance_v2_input import (
     PerformanceV2InputError,
@@ -35,6 +40,8 @@ from .performance_v2_store import (
     PerformanceV2Config,
     PerformanceV2IdentityError,
     PerformanceV2StoreError,
+    REPORT_METRIC_COLUMNS,
+    database_identity,
     initialize_performance_v2,
     performance_v2_database_path,
     require_database_identity,
@@ -663,6 +670,115 @@ def _ma_facts_conflict(known: _MaFacts, incoming: _MaFacts) -> bool:
     return _match_ma_facts(known, incoming) is None
 
 
+_PROTOCOL_V2_INCOMPLETE = "PROTOCOL_V2_INCOMPLETE"
+
+
+def report_evaluation_protocol(
+    settings: Mapping[str, object], expected_side: str | None = None,
+) -> tuple[str, tuple[str, ...]]:
+    """Evaluation protocol of a report and the unmet fields of the v2 predicate (protocol v2 §4.2, §4.4).
+
+    The base itself (`my_fix_balance`) is not compared with the template on import,
+    and the tester-config clauses are not visible in a report. With `expected_side`
+    the active side flags must name that side.
+    """
+    def section(name: str) -> Mapping[str, object]:
+        value = settings.get(name)
+        return value if isinstance(value, Mapping) else {}
+
+    exchange, basic = section("exchange"), section("basic")
+    if exchange.get("use_upnl") is True:
+        return "v1", ()
+    unmet: list[str] = []
+
+    def number(name: str) -> Decimal | None:
+        return _phase8_decimal(basic.get(name))
+
+    if exchange.get("use_frozen_balance") is not True:
+        unmet.append("exchange.use_frozen_balance")
+    if basic.get("use_fix") is not True:
+        unmet.append("basic.use_fix")
+    base = number("my_fix_balance")
+    if base is None or base <= 0:
+        unmet.append("basic.my_fix_balance")
+    flags = (basic.get("use_long"), basic.get("use_short"))
+    side = {(True, False): "long", (False, True): "short"}.get(flags)  # type: ignore[arg-type]
+    if side is not None and expected_side is not None and side != expected_side.strip().casefold():
+        side = None
+    if side is None:
+        unmet.append("basic.use_long/use_short")
+    else:
+        if number(f"balance_percentage_{side}") != Decimal("100"):
+            unmet.append(f"basic.balance_percentage_{side}")
+        if number(f"risk_{side}") != Decimal("1"):
+            unmet.append(f"basic.risk_{side}")
+    if number("max_balance") != Decimal("0"):
+        unmet.append("basic.max_balance")
+    if side is not None:
+        strategy = basic.get("strategy")
+        block = settings.get(strategy) if isinstance(strategy, str) else None
+        block = block if isinstance(block, Mapping) else {}
+        entries = block.get(f"ma_{side}")
+        close = block.get(f"ma_close_{side}")
+
+        def has_facts(item: object) -> bool:
+            return isinstance(item, Mapping) and all(_ma_text(item.get(key)) is not None for key in ("type", "source"))
+
+        if not isinstance(entries, (list, tuple)) or not entries or not all(has_facts(item) for item in entries):
+            unmet.append(f"ma_{side}.type/source")
+        if not has_facts(close):
+            unmet.append(f"ma_close_{side}.type/source")
+    return "v2", tuple(unmet)
+
+
+def _identity_rejection(
+    entry: PreparedV2Entry, settings: Mapping[str, object], database_protocol: str, database_exchange: str | None,
+) -> tuple[str, str] | None:
+    """Per-report protocol and exchange check against the database markers, or None."""
+    protocol, unmet = report_evaluation_protocol(settings, str(entry.identity.side))
+    if protocol == "v2" and not unmet:
+        _close, order_facts = _report_ma_facts(settings, entry)
+        unmet = tuple(
+            f"order {slot} type/source" for slot, _settings, facts in order_facts if None in facts
+        )
+    if unmet:
+        return _PROTOCOL_V2_INCOMPLETE, "protocol v2 report does not meet: " + ", ".join(unmet)
+    if protocol != database_protocol:
+        return "EVALUATION_PROTOCOL_MISMATCH", f"report is {protocol}, database is {database_protocol}"
+    if database_exchange is not None:
+        exchange = settings.get("exchange")
+        name = exchange.get("name") if isinstance(exchange, Mapping) else None
+        reported = name.strip() if isinstance(name, str) else ""
+        if reported.casefold() != database_exchange.strip().casefold():
+            return "EXCHANGE_MISMATCH", f"report exchange is {reported or 'not set'}, database is {database_exchange}"
+    return None
+
+
+def _write_report_analytics(connection: duckdb.DuckDBPyConnection, result_id: int, report: ParsedPerformanceV2Report) -> None:
+    """Store the 2026-10 report analytics of one result (new-format spec §3.1-§3.2)."""
+    analytics = report.analytics
+    if analytics is None:
+        return
+    columns = [column for column, _sql_type in REPORT_METRIC_COLUMNS]
+    connection.execute(
+        f"insert into strategy_report_metrics (result_id, {', '.join(columns)}) "
+        f"values (?, {', '.join('?' for _ in columns)})",
+        [result_id, *(analytics.metrics.get(column) for column in columns)],
+    )
+    for regime in analytics.regimes:
+        connection.execute(
+            """insert into strategy_report_regimes (result_id, regime, pair_days, pnl_usdt,
+               avg_pnl_per_pair_day_usdt, winning_days_pct, pnl_share_pct) values (?, ?, ?, ?, ?, ?, ?)""",
+            [result_id, regime.regime, regime.pair_days, regime.pnl_usdt, regime.avg_pnl_per_pair_day_usdt,
+             regime.winning_days_pct, regime.pnl_share_pct],
+        )
+    for month, return_pct in analytics.monthly:
+        connection.execute(
+            "insert into strategy_report_monthly (result_id, month, return_pct) values (?, ?, ?)",
+            [result_id, month, return_pct],
+        )
+
+
 def _verify_child_counts(
     connection: duckdb.DuckDBPyConnection,
     written_results: tuple[tuple[int, int, int], ...],
@@ -1045,6 +1161,7 @@ def _warmup_report(
     return replace(
         report,
         metrics=metrics,
+        analytics=None,
         actions=actions,
         wallet_series=wallet,
         equity_series=equity,
@@ -1928,9 +2045,11 @@ def _publish(
                        excluded_trade_count, exclusion_reason, optimizer_source_metadata_json,
                        sizing_use_upnl, sizing_use_frozen_balance, sizing_use_fix,
                        sizing_balance_percentage_long, sizing_risk_long, sizing_max_balance,
-                       sizing_my_fix_balance, sizing_balance_percentage_short, sizing_risk_short)
-                       values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) returning result_id""",
-                        [strategy_id, *ordered_values, source_metadata, *sizing_facts],
+                       sizing_my_fix_balance, sizing_balance_percentage_short, sizing_risk_short,
+                       tester_version, report_format)
+                       values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) returning result_id""",
+                        [strategy_id, *ordered_values, source_metadata, *sizing_facts,
+                         report.tester_version, report.report_format],
                 ).fetchone()[0])
                 connection.execute("update strategies set current_result_id = ?, updated_at_utc = ? where strategy_id = ?", [result_id, now, strategy_id])
             else:
@@ -1943,11 +2062,14 @@ def _publish(
                        excluded_trade_count = ?, exclusion_reason = ?, optimizer_source_metadata_json = ?,
                        sizing_use_upnl = ?, sizing_use_frozen_balance = ?, sizing_use_fix = ?,
                        sizing_balance_percentage_long = ?, sizing_risk_long = ?, sizing_max_balance = ?,
-                       sizing_my_fix_balance = ?, sizing_balance_percentage_short = ?, sizing_risk_short = ?
+                       sizing_my_fix_balance = ?, sizing_balance_percentage_short = ?, sizing_risk_short = ?,
+                       tester_version = ?, report_format = ?
                        where result_id = ?""",
-                        [*ordered_values, source_metadata, *sizing_facts, result_id],
+                        [*ordered_values, source_metadata, *sizing_facts,
+                         report.tester_version, report.report_format, result_id],
                 )
                 replacement_strategy_ids.append(strategy_id)
+            _write_report_analytics(connection, result_id, report)
             for action in report.actions:
                 action_rows.append((result_id, action.action_index, action.timestamp_utc, action.symbol,
                                     action.order_id, action.action, action.size, action.post_size, action.post_side,
@@ -2063,10 +2185,16 @@ def _result_values(entry: PreparedV2Entry, report: ParsedPerformanceV2Report, co
         _decimal_metric(report.metrics, "Final balance", default=Decimal("0")),
         _decimal_metric(report.metrics, "Total PnL"),
         _decimal_metric(report.metrics, "Total PnL, %", "Total PnL %"),
-        _decimal_metric(report.metrics, "Max Drawdown", "Max drawdown"),
+        _decimal_metric(report.metrics, "Max Drawdown, USDT", "Max Drawdown", "Max drawdown")
+        if report.report_format == REPORT_FORMAT_2026_10
+        else _decimal_metric(report.metrics, "Max Drawdown", "Max drawdown"),
         _decimal_metric(report.metrics, "Max Drawdown, %", "Max Drawdown %", "Max drawdown, %"),
         _decimal_metric(report.metrics, "Total fees", "Total Fees"),
-        _int_metric(report.metrics, "Total Trades"),
+        # 2026-10 keeps the column meaning "closing fills"; a warm-up trimmed
+        # report carries only the recomputed "Total Trades".
+        _int_metric(report.metrics, "Fills (reduce / close)", "Total Trades")
+        if report.report_format == REPORT_FORMAT_2026_10
+        else _int_metric(report.metrics, "Total Trades"),
         now,
         reported_start,
         reported_end,
@@ -2179,6 +2307,7 @@ def import_performance_v2(
             require_database_identity(connection, config)
             initialize_performance_v2(connection, create_if_missing=False)
             require_performance_v2(connection)
+            database_protocol, database_exchange = database_identity(connection)
         except PerformanceV2IdentityError as error:
             raise PerformanceV2ImportError(str(error)) from error
         except (PerformanceV2StoreError, duckdb.Error) as error:
@@ -2215,6 +2344,17 @@ def import_performance_v2(
                     "symbol": entry.identity.symbol,
                     "reason": "INVALID_REPORT",
                     "error": str(error),
+                })
+                continue
+            # Protocol v2 §4.4: a report of another protocol or exchange is rejected alone.
+            rejection = _identity_rejection(entry, report.settings, database_protocol, database_exchange)
+            if rejection is not None:
+                validated.append(None)
+                validation_failures.append({
+                    "strategy_name": entry.strategy_name,
+                    "symbol": entry.identity.symbol,
+                    "reason": rejection[0],
+                    "error": rejection[1],
                 })
             else:
                 validated.append(report)

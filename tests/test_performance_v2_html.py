@@ -272,10 +272,14 @@ def test_parser_enforces_action_limit() -> None:
         parse_current_performance_v2_html(_current(), _limits(max_actions_per_report=1))
 
 
-def test_parser_requires_upnl() -> None:
-    source = _current().replace(b'"use_upnl":true', b'"use_upnl":false', 1)
-    with pytest.raises(PerformanceV2HtmlError, match="use_upnl"):
-        parse_current_performance_v2_html(source, _limits())
+def test_parser_requires_boolean_upnl_and_accepts_protocol_v2() -> None:
+    # use_upnl=false is a protocol v2 report; the import checks it against the database marker.
+    v2 = _current().replace(b'"use_upnl":true', b'"use_upnl":false', 1)
+    assert parse_current_performance_v2_html(v2, _limits()).settings["exchange"]["use_upnl"] is False
+    for invalid in (b'"use_upnl":"false"', b'"use_upnl_missing":true'):
+        source = _current().replace(b'"use_upnl":true', invalid, 1)
+        with pytest.raises(PerformanceV2HtmlError, match="use_upnl"):
+            parse_current_performance_v2_html(source, _limits())
 
 
 def test_worker_is_pure(monkeypatch: pytest.MonkeyPatch) -> None:

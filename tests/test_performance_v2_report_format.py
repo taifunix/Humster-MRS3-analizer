@@ -199,3 +199,9 @@ def test_frozen_v12_metric_catalog_matches_parser_labels() -> None:
     assert REPORT_METRIC_COLUMNS == tuple(
         (column, sql_types[kind]) for column, _label, kind in REPORT_ANALYTICS_LABELS
     )
+
+
+def test_new_format_rejects_integer_analytics_beyond_bigint() -> None:
+    data = _new_format(**{"<td>Trend · High vol</td><td>2</td>": f"<td>Trend · High vol</td><td>{2**63}</td>"})
+    with pytest.raises(PerformanceV2HtmlError, match="REPORT_ANALYTICS_INVALID: Regime Trend · High vol"):
+        parse_current_performance_v2_html(data, _limits())

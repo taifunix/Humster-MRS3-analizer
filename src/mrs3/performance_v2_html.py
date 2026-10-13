@@ -300,8 +300,10 @@ def _check_current_header(data: bytes) -> tuple[str, list[tuple[tuple[str, ...],
 
 def _settings_identity(settings: Mapping[str, object]) -> str:
     exchange = settings.get("exchange")
-    if not isinstance(exchange, Mapping) or exchange.get("use_upnl") is not True:
-        raise PerformanceV2HtmlError("current Performance v2 reports require use_upnl=true")
+    # use_upnl selects the evaluation protocol (true: v1, false: v2); the import
+    # checks the protocol against the database marker (protocol v2 §4.4).
+    if not isinstance(exchange, Mapping) or type(exchange.get("use_upnl")) is not bool:
+        raise PerformanceV2HtmlError("current Performance v2 reports require a boolean exchange.use_upnl")
     basic = settings.get("basic")
     if not isinstance(basic, Mapping):
         raise PerformanceV2HtmlError("settings basic metadata is missing")
@@ -435,7 +437,17 @@ def _analytics_invalid(label: str) -> PerformanceV2HtmlError:
     return PerformanceV2HtmlError(f"REPORT_ANALYTICS_INVALID: {label}")
 
 
+_BIGINT_MAX = 2**63 - 1
+
+
 def _analytics_value(text: str, kind: str, label: str) -> object:
+    parsed = _analytics_value_unbounded(text, kind, label)
+    if type(parsed) is int and parsed > _BIGINT_MAX:
+        raise _analytics_invalid(label)
+    return parsed
+
+
+def _analytics_value_unbounded(text: str, kind: str, label: str) -> object:
     value = text.strip()
     folded = value.casefold()
     if folded in _UNAVAILABLE or folded in _NON_FINITE or folded.startswith("n/a"):

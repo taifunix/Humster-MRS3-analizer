@@ -54,7 +54,20 @@ column after `MA` (amendment in the
 legacy rows and pre-v12 databases give blank cells; aggregate workbooks
 exported without it stay importable. The Panel strategy card shows the MA
 type/source next to Close MA and each Open MA when stored.
-Next: P3+N3 import of v2 and 2026-10 reports.
+P3+N3: the parser accepts `use_upnl` true (protocol v1) or false (v2); the
+import rejects a report alone when it is an incomplete v2
+(`PROTOCOL_V2_INCOMPLETE`, names the unmet fields), when its protocol differs
+from the database marker (`EVALUATION_PROTOCOL_MISMATCH`, an unmarked database
+is v1) or when the database has an exchange marker and `exchange.name` differs
+(`EXCHANGE_MISMATCH`). Every result records `tester_version`/`report_format`;
+2026-10 reports take `max_drawdown` from `Max Drawdown, USDT` and `total_trades`
+from `Fills (reduce / close)` and store the analytics tables in the same
+transaction; a report whose core the import recomputes (warm-up trim) stores no
+analytics. Consequence until P6: reports rendered from the user's edited
+`retest-mrs3` template (`use_upnl=false`) are rejected by a v1 database as
+`EVALUATION_PROTOCOL_MISMATCH`; they need a v2 database.
+Next: P4 (FIXED metrics), P5 (optimizer accepts FIXED), P6 (templates and
+render predicate), P7 (Panel database selection).
 User decision 2026-10-12: one PerformanceDB per exchange with an
 `schema_info.exchange` marker (protocol v2 §4.1); the CSV Direct analysis DB
 (branch `feat/csv-direct-analysis`) must also record the exchange from the run
