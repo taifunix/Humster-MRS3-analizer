@@ -292,7 +292,8 @@ def test_facts_decoder_rejects_corrupt_version_and_out_of_range_payloads(mutatio
     if mutation == "version":
         document["algo_version"] = "unknown"
     elif mutation == "range":
-        document["drawdown"] = "1.1"
+        # A FIXED drawdown may exceed 1 (protocol v2 §4.6); a negative one is invalid.
+        document["drawdown"] = "-0.1"
     elif mutation == "nonfinite":
         document["score12"] = "NaN"
     elif mutation == "extra":
