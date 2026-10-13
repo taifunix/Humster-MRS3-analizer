@@ -189,3 +189,13 @@ def test_source_v6_keeps_rejecting_the_new_format() -> None:
 
     with pytest.raises(Exception, match="duplicate or empty keys"):
         normalize_source_v6(NEW_FORMAT.read_bytes(), source_name="report_2026_10.html")
+
+
+def test_frozen_v12_metric_catalog_matches_parser_labels() -> None:
+    from mrs3.performance_v2_html import REPORT_ANALYTICS_LABELS
+    from mrs3.performance_v2_store import REPORT_METRIC_COLUMNS
+
+    sql_types = {"decimal": "DOUBLE", "integer": "BIGINT", "count_of": "BIGINT", "duration": "BIGINT", "timestamp": "TIMESTAMPTZ"}
+    assert REPORT_METRIC_COLUMNS == tuple(
+        (column, sql_types[kind]) for column, _label, kind in REPORT_ANALYTICS_LABELS
+    )

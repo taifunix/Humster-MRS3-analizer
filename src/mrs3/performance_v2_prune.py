@@ -18,7 +18,17 @@ from .performance_v2_store import (
 
 
 DEFAULT_CUTOFF = "2026-09-06"
+# Schema v12 report analytics; absent in v10/v11 databases.
+_REPORT_TABLES = ("strategy_report_metrics", "strategy_report_regimes", "strategy_report_monthly")
+_RESULT_TABLES = (
+    "equity_quality_metrics",
+    "window_metrics",
+    "strategy_actions",
+    "strategy_equity",
+    "optimizer_prepared_inputs",
+)
 _CHILD_TABLES = (
+    *_REPORT_TABLES,
     "equity_quality_metrics",
     "window_metrics",
     "strategy_actions",
@@ -28,6 +38,15 @@ _CHILD_TABLES = (
     "strategy_tags",
     "strategy_orders",
 )
+
+
+def _result_tables(connection: duckdb.DuckDBPyConnection) -> tuple[str, ...]:
+    existing = {
+        str(row[0]) for row in connection.execute(
+            "select table_name from information_schema.tables where table_schema = 'main'"
+        ).fetchall()
+    }
+    return tuple(table for table in _REPORT_TABLES if table in existing) + _RESULT_TABLES
 
 
 class PerformanceV2PruneError(PerformanceV2StoreError):
@@ -70,9 +89,9 @@ def _open_read_only(target: Path) -> duckdb.DuckDBPyConnection:
         raise PerformanceV2PruneError("Performance v2 database could not be opened") from error
     try:
         schema_version = require_performance_v2_readable(connection)
-        if schema_version not in {10, 11}:
+        if schema_version not in {10, 11, 12}:
             raise PerformanceV2StoreError(
-                f"Performance v2 prune requires schema v10 or v11; found {schema_version}"
+                f"Performance v2 prune requires schema v10, v11 or v12; found {schema_version}"
             )
     except PerformanceV2StoreError as error:
         connection.close()
@@ -131,13 +150,7 @@ def _plan(connection: duckdb.DuckDBPyConnection, cutoff: datetime) -> tuple[list
                 [stale_ids],
             ).fetchone()[0]
         )
-    for table in (
-        "equity_quality_metrics",
-        "window_metrics",
-        "strategy_actions",
-        "strategy_equity",
-        "optimizer_prepared_inputs",
-    ):
+    for table in _result_tables(connection):
         counts[table] = int(
             connection.execute(
                 f"""
@@ -163,13 +176,7 @@ def _delete(connection: duckdb.DuckDBPyConnection, stale_ids: list[int]) -> None
             [stale_ids],
         ).fetchall()
     ]
-    for table in (
-        "equity_quality_metrics",
-        "window_metrics",
-        "strategy_actions",
-        "strategy_equity",
-        "optimizer_prepared_inputs",
-    ):
+    for table in _result_tables(connection):
         if result_ids:
             connection.execute(
                 f"delete from {table} where result_id in (select unnest(?::BIGINT[]))",

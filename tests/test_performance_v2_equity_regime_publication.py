@@ -44,7 +44,7 @@ def _database() -> duckdb.DuckDBPyConnection:
     connection = duckdb.connect(":memory:")
     initialize_performance_v2(connection)
     connection.execute(
-        """insert into strategies values
+        """insert into strategies (strategy_id, strategy_name, symbol, side, timeframe, close_ma_len, order_count, analysis_run_id, candidate_identity, lifecycle_status, current_result_id, created_at_utc, updated_at_utc) values
            (1, 'strategy-1', 'BTCUSDT', 'LONG', '1h', 5, 1, 'run', 'candidate',
             'ACTIVE', null, ?, ?)""",
         [NOW, NOW],

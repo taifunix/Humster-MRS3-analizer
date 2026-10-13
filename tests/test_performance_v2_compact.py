@@ -61,6 +61,23 @@ def test_compact_copies_complete_small_v11_fixture(tmp_path: Path) -> None:
            ) values (?, ?, ?, ?, ?, ?, ?, ?, now())""",
         source_evidence,
     )
+    connection.execute(
+        "update strategy_results set tester_version = '2026/10/10', report_format = '2026-10' where result_id = ?",
+        [result_id],
+    )
+    connection.execute(
+        "insert into strategy_report_metrics (result_id, gross_profit_usdt, trades_full_exit, max_unrealized_dd_at_utc) "
+        "values (?, 7.42, 248, '2026-08-31 13:15:00+00')",
+        [result_id],
+    )
+    connection.execute(
+        "insert into strategy_report_regimes values (?, 'TREND_HIGH_VOL', 9, 2.15, 0.2394, 100.0, 48.12)", [result_id],
+    )
+    connection.execute("insert into strategy_report_monthly values (?, '2026-08-01', 3.32)", [result_id])
+    report_rows_before = {
+        table: connection.execute(f"select * from {table} order by all").fetchall()
+        for table in ("strategy_report_metrics", "strategy_report_regimes", "strategy_report_monthly")
+    }
     selection_result_before = connection.execute(
         "select * from selection_results"
     ).fetchall()
@@ -83,6 +100,7 @@ def test_compact_copies_complete_small_v11_fixture(tmp_path: Path) -> None:
             "selection_review_imports", "selection_review_rows", "strategy_tags",
             "optimizer_prepared_inputs", "equity_quality_metrics", "strategy_rejection_sources",
             "selection_publications", "selection_publication_runs", "selection_aggregate_imports",
+            "strategy_report_metrics", "strategy_report_regimes", "strategy_report_monthly",
         )
     }
     connection.close()
@@ -92,12 +110,15 @@ def test_compact_copies_complete_small_v11_fixture(tmp_path: Path) -> None:
     report = compact_performance_v2(source, target, workers=2)
 
     assert report["source_stat_unchanged"] is True
-    assert report["source_schema_version"] == 11
-    assert report["target"]["schema_version"] == 11
+    assert report["source_schema_version"] == 12
+    assert report["target"]["schema_version"] == 12
     assert report["memory_limit"] == "16GB"
     assert report["table_counts"] == {name: int(count) for name, count in before.items()}
     assert report["verified_table_counts"] == report["table_counts"]
     with duckdb.connect(str(target), read_only=True) as compacted:
+        assert {
+            table: compacted.execute(f"select * from {table} order by all").fetchall() for table in report_rows_before
+        } == report_rows_before
         assert compacted.execute("select * from selection_results").fetchall() == selection_result_before
         assert compacted.execute("select * from strategy_rejection_sources").fetchall() == rejection_sources_before
         assert compacted.execute(
@@ -179,7 +200,7 @@ def test_compact_migrates_empty_v6_schema_to_v11(tmp_path: Path) -> None:
     report = compact_performance_v2(source, target, workers=1)
 
     assert report["source_schema_version"] == 6
-    assert report["target"]["schema_version"] == 11
+    assert report["target"]["schema_version"] == 12
 
 
 def test_compact_migrates_v10_source_and_keeps_legacy_review_unlinked(tmp_path: Path) -> None:
@@ -202,11 +223,11 @@ def test_compact_migrates_v10_source_and_keeps_legacy_review_unlinked(tmp_path: 
     report = compact_performance_v2(source, target, workers=1)
 
     assert report["source_schema_version"] == 10
-    assert report["target"]["schema_version"] == 11
+    assert report["target"]["schema_version"] == 12
     with duckdb.connect(str(source), read_only=True) as original:
         assert require_performance_v2_readable(original) == 10
     with duckdb.connect(str(target), read_only=True) as compacted:
-        assert require_performance_v2_readable(compacted) == 11
+        assert require_performance_v2_readable(compacted) == 12
         assert compacted.execute(
             "select aggregate_import_id from selection_review_imports where review_import_id = 'compact-v10-review'"
         ).fetchone() == (None,)
@@ -217,7 +238,7 @@ def test_compact_migrates_v10_source_and_keeps_legacy_review_unlinked(tmp_path: 
         source, target, verified_output, workers=1,
     )
     assert verified["source_schema_version"] == 10
-    assert verified["candidate_schema_version"] == 11
+    assert verified["candidate_schema_version"] == 12
     assert verified["verified_table_counts"]["selection_review_imports"] == 1
 
 
@@ -230,7 +251,7 @@ def test_verify_candidate_requires_v11_target_for_v10_source(tmp_path: Path) -> 
     candidate = tmp_path / "candidate-v10.duckdb"
     shutil.copyfile(source, candidate)
 
-    with pytest.raises(ValueError, match="candidate schema version must be 11"):
+    with pytest.raises(ValueError, match="candidate schema version must be 12"):
         compact_module.verify_existing_candidate(
             source, candidate, workers=1, spill_parent=tmp_path, smoke_ranges=1,
         )
@@ -254,7 +275,7 @@ def test_compact_accepts_v5_commission_rate_not_nullability(tmp_path: Path) -> N
     report = compact_performance_v2(source, target, workers=1)
 
     assert report["source_schema_version"] == 5
-    assert report["target"]["schema_version"] == 11
+    assert report["target"]["schema_version"] == 12
     with duckdb.connect(str(source), read_only=True) as connection:
         assert require_performance_v2_readable(connection) == 5
         assert connection.execute(
@@ -318,13 +339,13 @@ def test_compact_migrates_v8_selection_rows_without_backfill(tmp_path: Path) -> 
     report = compact_performance_v2(source, target, workers=1)
 
     assert report["source_schema_version"] == 8
-    assert report["target"]["schema_version"] == 11
+    assert report["target"]["schema_version"] == 12
     assert report["table_counts"]["selection_results"] == 1
     assert report["verified_table_counts"]["selection_results"] == 1
     assert report["table_counts"]["strategy_rejection_sources"] == 0
     assert report["verified_table_counts"]["strategy_rejection_sources"] == 0
     with duckdb.connect(str(target), read_only=True) as connection:
-        assert require_performance_v2_readable(connection) == 11
+        assert require_performance_v2_readable(connection) == 12
         assert connection.execute("select * from selection_results").fetchall() == [
             (*selection_before[0], None)
         ]

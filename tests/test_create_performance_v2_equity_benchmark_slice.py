@@ -77,7 +77,7 @@ def _source_v5(path: Path, *, version: int = 5) -> Path:
         connection.execute("insert into analysis_plateaus values (?, 'P1', 12, 34)", [f"run-{name}"])
         connection.execute("insert into analysis_plateaus values (?, 'UNUSED', 1, 0)", [f"run-{name}"])
         connection.execute(
-            "insert into strategy_orders values (?, 1, 7, .995, 125, 1, ?, 'P1', 8)",
+            "insert into strategy_orders (strategy_id, order_id, open_ma_len, open_multiplier, shift_bp, lot_x, analysis_run_id, plateau_id, base_point_trades) values (?, 1, 7, .995, 125, 1, ?, 'P1', 8)",
             [strategy_id, f"run-{name}"],
         )
         connection.execute(

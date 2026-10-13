@@ -245,6 +245,8 @@ from .performance_v2_store import (
     performance_v2_database_path,
     require_performance_v2,
     require_performance_v2_readable,
+    require_database_identity,
+    PerformanceV2IdentityError,
 )
 from .performance_v2_maintenance import (
     PerformanceV2MaintenanceError,
@@ -4608,6 +4610,9 @@ class PanelController:
                 stat = target.stat()
             except OSError as error:
                 raise PerformanceV2ApiError("PERFORMANCE_V2_NOT_FOUND", status=404, message="Performance v2 database is unavailable") from error
+            config = self._performance_v2_config()
+            # The configured protocol/exchange is part of the key: a config change
+            # without a database change must be checked again (protocol v2 §4.1).
             identity = (
                 str(target.resolve()),
                 int(stat.st_dev),
@@ -4615,12 +4620,14 @@ class PanelController:
                 int(stat.st_ctime_ns),
                 int(stat.st_mtime_ns),
                 int(stat.st_size),
+                config.evaluation_protocol,
+                config.exchange,
             )
             if identity in self._performance_v2_schema_ready:
                 return
             try:
                 if stat.st_size == 0:
-                    self._initialize_missing_performance_v2_target(self._performance_v2_config())
+                    self._initialize_missing_performance_v2_target(config)
                 version = None
                 schema_repair_required = False
                 with duckdb.connect(str(target), read_only=True) as connection:
@@ -4644,8 +4651,10 @@ class PanelController:
                                 "PERFORMANCE_V2_MIGRATION_REQUIRED", status=409,
                                 message="Existing Performance v2 database requires an explicit offline migration",
                             )
-                        if version in {"9", "10", "11"}:
+                        if version in {"9", "10", "11", "12"}:
                             require_performance_v2_readable(connection)
+                            # Refuse a mismatching database before any migration writes to it.
+                            require_database_identity(connection, config)
                             repairable_columns = {
                                 ("window_metrics", "holding_seconds"),
                                 ("window_metrics", "time_in_market_pct"),
@@ -4667,13 +4676,17 @@ class PanelController:
                                       and table_name in ('window_metrics', 'strategy_results')"""
                             ).fetchall())
                             schema_repair_required = not repairable_columns.issubset(existing_columns)
-                if version != "11" or schema_repair_required:
+                if version != "12" or schema_repair_required:
                     with self._performance_v2_writer_guard(target):
                         with duckdb.connect(str(target)) as connection:
                             initialize_performance_v2(connection)
                             require_performance_v2(connection)
+                with duckdb.connect(str(target), read_only=True) as connection:
+                    require_database_identity(connection, config)
             except PerformanceV2ApiError:
                 raise
+            except PerformanceV2IdentityError as error:
+                raise PerformanceV2ApiError(error.code, status=409, message=str(error)) from error
             except PerformanceV2StoreError as error:
                 raise PerformanceV2ApiError("PERFORMANCE_V2_SCHEMA_INVALID", status=500, message=str(error)) from error
             except duckdb.Error as error:
@@ -4686,6 +4699,7 @@ class PanelController:
             identity = (
                 str(target.resolve()), int(stat.st_dev), int(stat.st_ino),
                 int(stat.st_ctime_ns), int(stat.st_mtime_ns), int(stat.st_size),
+                config.evaluation_protocol, config.exchange,
             )
             self._performance_v2_schema_ready.add(identity)
 
@@ -4711,7 +4725,9 @@ class PanelController:
                         int(existing.st_mtime_ns), int(existing.st_size),
                     )
                 with duckdb.connect(str(staging)) as connection:
-                    initialize_performance_v2(connection)
+                    initialize_performance_v2(
+                        connection, evaluation_protocol=config.evaluation_protocol, exchange=config.exchange,
+                    )
                     require_performance_v2(connection)
                 if empty_identity is not None:
                     current = target.stat()

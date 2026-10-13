@@ -226,7 +226,7 @@ def test_build_retest_manifest_renders_typed_mixed_run_strategies(tmp_path: Path
             "insert into analysis_plateaus values ('run-a', 'P1', 5, 100), ('run-b', 'P2', 4, 80), ('run-b', 'P3', 6, 120)"
         )
         connection.execute(
-            "insert into strategy_orders values (?, 1, 10, .99, 100, .7, 'run-a', 'P1', 15), (?, 1, 11, 1.01, 100, .6, 'run-b', 'P2', 20), (?, 2, 12, 1.02, 200, .4, 'run-b', 'P3', 25)",
+            "insert into strategy_orders (strategy_id, order_id, open_ma_len, open_multiplier, shift_bp, lot_x, analysis_run_id, plateau_id, base_point_trades) values (?, 1, 10, .99, 100, .7, 'run-a', 'P1', 15), (?, 1, 11, 1.01, 100, .6, 'run-b', 'P2', 20), (?, 2, 12, 1.02, 200, .4, 'run-b', 'P3', 25)",
             [first, second, second],
         )
         connection.execute(
@@ -289,7 +289,7 @@ def _single_order_retest_db(path: Path, names: tuple[str, ...] = ("stored",)) ->
             "insert into analysis_plateaus values (?, 'P1', 4, 80)", [f"run-{index}"]
         )
         connection.execute(
-            "insert into strategy_orders values (?, 1, 7, .995, 50, 1, ?, 'P1', 20)",
+            "insert into strategy_orders (strategy_id, order_id, open_ma_len, open_multiplier, shift_bp, lot_x, analysis_run_id, plateau_id, base_point_trades) values (?, 1, 7, .995, 50, 1, ?, 'P1', 20)",
             [strategy_id, f"run-{index}"],
         )
         connection.execute(
@@ -744,7 +744,7 @@ def _mixed_ingest_retest_db(path: Path) -> duckdb.DuckDBPyConnection:
             "insert into analysis_plateaus values (?, ?, 4, ?)", [run_id, plateau_id, 80 + index]
         )
         connection.execute(
-            "insert into strategy_orders values (?, 1, 7, .995, 50, ?, ?, ?, ?)",
+            "insert into strategy_orders (strategy_id, order_id, open_ma_len, open_multiplier, shift_bp, lot_x, analysis_run_id, plateau_id, base_point_trades) values (?, 1, 7, .995, 50, ?, ?, ?, ?)",
             [strategy_id, lot, run_id, plateau_id, 20 + index],
         )
         result_id = connection.execute(

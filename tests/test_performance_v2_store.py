@@ -162,7 +162,7 @@ def test_initialize_is_idempotent_and_requires_internal_schema_v11() -> None:
         initialize_performance_v2(connection)
 
         require_performance_v2(connection)
-        assert connection.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("11",)
+        assert connection.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("12",)
         instance_id = connection.execute(
             "select value from schema_info where key = 'database_instance_id'"
         ).fetchone()[0]
@@ -181,7 +181,7 @@ def test_fresh_v11_has_additive_equity_regime_schema_and_preserves_auto_status_c
     with duckdb.connect(":memory:") as connection:
         initialize_performance_v2(connection)
 
-        assert connection.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("11",)
+        assert connection.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("12",)
         assert connection.execute(
             "select is_nullable from information_schema.columns "
             "where table_name = 'selection_review_rows' and column_name = 'user_status'"
@@ -257,7 +257,7 @@ def test_v8_to_v11_migration_is_additive_and_leaves_old_rows_untouched() -> None
 
         initialize_performance_v2(connection)
 
-        assert connection.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("11",)
+        assert connection.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("12",)
         migrated_selection = connection.execute("select * from selection_results").fetchall()
         migrated_metrics = connection.execute("select * from equity_quality_metrics").fetchall()
         assert connection.execute("select * from selection_results").fetchall() == [
@@ -303,7 +303,7 @@ def test_v8_to_v9_migration_rolls_back_atomically_and_can_retry(monkeypatch: pyt
         ).fetchone() == (0,)
 
         initialize_performance_v2(connection)
-        assert connection.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("11",)
+        assert connection.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("12",)
 
 
 def test_v9_to_v11_migration_preserves_reviews_and_allows_null_status() -> None:
@@ -339,7 +339,7 @@ def test_v9_to_v11_migration_preserves_reviews_and_allows_null_status() -> None:
         ).fetchall()
         initialize_performance_v2(connection)
 
-        assert require_performance_v2_readable(connection) == 11
+        assert require_performance_v2_readable(connection) == 12
         assert connection.execute(
             "select strategy_id, user_status, user_rank, comment from selection_review_rows"
         ).fetchall() == before_rows == [(strategy_id, "FINALIST", 4, "keep")]
@@ -431,7 +431,7 @@ def test_v9_to_v10_migration_rolls_back_after_validation_failure_and_can_retry(
 
         assert connection.execute(
             "select value from schema_info where key = 'schema_version'"
-        ).fetchone() == ("11",)
+        ).fetchone() == ("12",)
         assert connection.execute(
             "select is_nullable from information_schema.columns "
             "where table_name = 'selection_review_rows' and column_name = 'user_status'"
@@ -523,7 +523,7 @@ def test_v10_to_v11_migration_is_additive_and_enforces_aggregate_run_uniqueness(
 
         assert connection.execute(
             "select value from schema_info where key = 'schema_version'"
-        ).fetchone() == ("11",)
+        ).fetchone() == ("12",)
         assert {
             row[0] for row in connection.execute(
                 "select table_name from information_schema.tables where table_schema = 'main'"
@@ -603,15 +603,15 @@ def test_v11_validator_rejects_wrong_aggregate_unique_index(replacement_sql: str
 
 
 def test_fresh_and_migrated_v11_catalogs_have_exact_shape_and_types() -> None:
-    from mrs3.performance_v2_store import _require_v11_catalog
+    from mrs3.performance_v2_store import _require_v12_catalog
 
     with duckdb.connect(":memory:") as fresh, duckdb.connect(":memory:") as migrated:
         initialize_performance_v2(fresh)
         _prepare_v10_migration_fixture(migrated)
         initialize_performance_v2(migrated)
 
-        _require_v11_catalog(fresh)
-        _require_v11_catalog(migrated)
+        _require_v12_catalog(fresh)
+        _require_v12_catalog(migrated)
         assert _v11_catalog_snapshot(fresh) == _v11_catalog_snapshot(migrated)
         for table, column in (
             ("selection_publications", "created_at_utc"),
@@ -781,7 +781,7 @@ def test_v10_to_v11_migration_rolls_back_every_change_and_can_retry(
         initialize_performance_v2(retry)
         assert retry.execute(
             "select value from schema_info where key = 'schema_version'"
-        ).fetchone() == ("11",)
+        ).fetchone() == ("12",)
 
 
 def test_v10_migration_inside_caller_transaction_fails_closed() -> None:
@@ -1003,7 +1003,7 @@ def test_v4_invalid_instance_id_is_rejected_before_window_repair() -> None:
         with pytest.raises(PerformanceV2StoreError, match="invalid instance identity"):
             initialize_performance_v2(connection)
 
-        assert connection.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("11",)
+        assert connection.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("12",)
         assert connection.execute("select column_name from information_schema.columns where table_name = 'window_metrics' and column_name in ('holding_seconds', 'time_in_market_pct')").fetchall() == []
 
 
@@ -1026,7 +1026,7 @@ def test_initialize_migrates_schema_v2_through_v4_without_changing_existing_fact
         assert connection.execute("select strategy_name from strategies where strategy_id = ?", [strategy_id]).fetchone() == (
             "before-migration",
         )
-        assert connection.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("11",)
+        assert connection.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("12",)
         assert connection.execute("select count(*) from information_schema.tables where table_name = 'strategy_tags'").fetchone() == (1,)
         assert connection.execute("select count(*) from information_schema.columns where table_name = 'window_metrics' and column_name in ('holding_seconds', 'time_in_market_pct')").fetchone() == (2,)
 
@@ -1045,9 +1045,11 @@ def test_v4_to_v5_phase8_columns_are_appended_in_contract_order() -> None:
             "select column_name from information_schema.columns where table_name = 'strategy_results' order by ordinal_position"
         ).fetchall()]
         assert action_columns[-2:] == ["price", "cost"]
-        assert result_columns[-6:] == [
+        assert result_columns[-11:] == [
             "sizing_use_upnl", "sizing_use_frozen_balance", "sizing_use_fix",
             "sizing_balance_percentage_long", "sizing_risk_long", "sizing_max_balance",
+            "sizing_my_fix_balance", "sizing_balance_percentage_short", "sizing_risk_short",
+            "tester_version", "report_format",
         ]
 
 
@@ -1130,7 +1132,7 @@ def test_v3_to_v4_migration_persists_rows_and_exact_tag_index(tmp_path: Path) ->
         initialize_performance_v2(connection)
         require_performance_v2(connection)
 
-        assert connection.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("11",)
+        assert connection.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("12",)
         assert connection.execute(
             "select strategy_id, tag, source, source_ref, updated_at_utc from strategy_tags order by strategy_id"
         ).fetchall() == [
@@ -1523,7 +1525,7 @@ def test_fresh_v11_allows_unknown_commission_rate_and_validates_nullable_catalog
         ).fetchone()[0]
 
         require_performance_v2(connection)
-        assert require_performance_v2_readable(connection) == 11
+        assert require_performance_v2_readable(connection) == 12
         assert connection.execute(
             "select commission_rate from strategy_results where result_id = ?", [result_id]
         ).fetchone() == (None,)
@@ -1551,9 +1553,9 @@ def test_v6_to_v7_migration_preserves_decimal_and_child_facts() -> None:
 
         initialize_performance_v2(connection)
 
-        assert require_performance_v2_readable(connection) == 11
+        assert require_performance_v2_readable(connection) == 12
         assert {
-            table: connection.execute(f"select * from {table} where result_id = ?", [result_id]).fetchall()
+            table: _pre_v12_rows(connection, table, before_rows[table], "where result_id = ?", [result_id])
             for table in tables
         } == before_rows
         assert [row for row in connection.execute(
@@ -1670,11 +1672,11 @@ def test_reopened_disk_v6_to_v7_migration_preserves_decimal_and_child_facts(tmp_
         initialize_performance_v2(connection)
 
     with duckdb.connect(str(database)) as connection:
-        assert require_performance_v2_readable(connection) == 11
+        assert require_performance_v2_readable(connection) == 12
         assert connection.execute(
             "select commission_rate from strategy_results where result_id = ?", [result_id]
         ).fetchone() == (Decimal("0.000400000001"),)
-        assert {table: connection.execute(f"select * from {table}").fetchall() for table in tables} == before_rows
+        assert {table: _pre_v12_rows(connection, table, before_rows[table]) for table in tables} == before_rows
         assert [row for row in connection.execute(
             "select index_name, sql from duckdb_indexes() where schema_name = 'main' order by index_name"
         ).fetchall() if row[0] != "selection_review_imports_aggregate_run_uq"] == before_indexes
@@ -1684,7 +1686,8 @@ def test_reopened_disk_v6_to_v7_migration_preserves_decimal_and_child_facts(tmp_
         assert sorted(connection.execute(
             "select table_name, constraint_type, constraint_column_names, referenced_table "
             "from duckdb_constraints() where schema_name = 'main' and not "
-            "table_name in ('selection_publications', 'selection_publication_runs', 'selection_aggregate_imports') and not "
+            "table_name in ('selection_publications', 'selection_publication_runs', 'selection_aggregate_imports', "
+            "'strategy_report_metrics', 'strategy_report_regimes', 'strategy_report_monthly') and not "
             "table_name = 'strategy_rejection_sources' and not "
                 "(table_name = 'selection_review_rows' and constraint_type = 'NOT NULL' "
                 "and list_contains(constraint_column_names, 'user_status')) and not "
@@ -1701,7 +1704,7 @@ def test_reopened_disk_v4_chain_reaches_v7_with_legacy_rows(tmp_path: Path) -> N
 
     with duckdb.connect(str(database)) as connection:
         initialize_performance_v2(connection)
-        assert require_performance_v2_readable(connection) == 11
+        assert require_performance_v2_readable(connection) == 12
         assert connection.execute("select count(*) from strategy_results").fetchone() == (1,)
         assert connection.execute("select count(*) from strategy_actions").fetchone() == (1,)
         assert connection.execute(
@@ -1750,7 +1753,7 @@ def test_failed_v6_to_v7_late_index_rolls_back_reopened_disk_catalog_and_facts(t
 
     with duckdb.connect(str(database)) as connection:
         _require_v6_catalog(connection)
-        assert {table: connection.execute(f"select * from {table}").fetchall() for table in tables} == before_rows
+        assert {table: _pre_v12_rows(connection, table, before_rows[table]) for table in tables} == before_rows
         assert connection.execute(
             "select index_name, sql from duckdb_indexes() where schema_name = 'main' order by index_name"
         ).fetchall() == before_indexes
@@ -1762,6 +1765,14 @@ def test_failed_v6_to_v7_late_index_rolls_back_reopened_disk_catalog_and_facts(t
         ).fetchone() == ("NO",)
 
 
+def _pre_v12_rows(connection: duckdb.DuckDBPyConnection, table: str, before: list[tuple], where: str = "", params: list[object] | None = None) -> list[tuple]:
+    """Rows after a v12 migration restricted to the pre-v12 columns; appended v12 columns must stay NULL."""
+    rows = connection.execute(f"select * from {table} {where}", params or []).fetchall()
+    width = len(before[0]) if before else len(rows[0]) if rows else 0
+    assert all(value is None for row in rows for value in row[width:])
+    return [row[:width] for row in rows]
+
+
 def test_v6_validator_rejects_v7_nullability_and_v11_is_current() -> None:
     with duckdb.connect(":memory:") as connection:
         initialize_performance_v2(connection)
@@ -1769,15 +1780,15 @@ def test_v6_validator_rejects_v7_nullability_and_v11_is_current() -> None:
         with pytest.raises(PerformanceV2StoreError, match="catalog"):
             _require_v6_catalog(connection)
 
-        connection.execute("update schema_info set value = '11' where key = 'schema_version'")
+        connection.execute("update schema_info set value = '12' where key = 'schema_version'")
         require_performance_v2(connection)
-        assert require_performance_v2_readable(connection) == 11
+        assert require_performance_v2_readable(connection) == 12
 
 
 def test_future_schema_marker_is_rejected_without_catalog_mutation() -> None:
     with duckdb.connect(":memory:") as connection:
         initialize_performance_v2(connection)
-        connection.execute("update schema_info set value = '12' where key = 'schema_version'")
+        connection.execute("update schema_info set value = '13' where key = 'schema_version'")
         before_tables = connection.execute(
             "select table_name from information_schema.tables where table_schema = 'main' order by table_name"
         ).fetchall()
@@ -1789,7 +1800,7 @@ def test_future_schema_marker_is_rejected_without_catalog_mutation() -> None:
 
         assert connection.execute(
             "select value from schema_info where key = 'schema_version'"
-        ).fetchone() == ("12",)
+        ).fetchone() == ("13",)
         assert connection.execute(
             "select table_name from information_schema.tables where table_schema = 'main' order by table_name"
         ).fetchall() == before_tables
@@ -1799,7 +1810,7 @@ def test_schema_v6_preserves_typed_phase8_facts_and_prepared_constraints() -> No
     with duckdb.connect(":memory:") as connection:
         initialize_performance_v2(connection)
 
-        assert connection.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("11",)
+        assert connection.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("12",)
         result_columns = {
             row[0]: row[1]
             for row in connection.execute(
@@ -1843,7 +1854,7 @@ def test_v4_migration_backfills_only_exact_revision_checked_typed_facts_without_
 
         initialize_performance_v2(connection)
 
-        assert connection.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("11",)
+        assert connection.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("12",)
         assert connection.execute(
             "select price, cost from strategy_actions where result_id = ?", [result_id]
         ).fetchone() == (Decimal("1.230000000000"), Decimal("4.560000000000"))
@@ -1927,7 +1938,7 @@ def test_supported_v2_v3_v4_migration_chains_end_at_v6(version: str) -> None:
                 connection.execute("alter table window_metrics drop column time_in_market_pct")
             connection.execute("update schema_info set value = ? where key = 'schema_version'", [version])
         initialize_performance_v2(connection)
-        assert connection.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("11",)
+        assert connection.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("12",)
 
 
 def test_schema_v7_adds_exact_equity_quality_cache_table_and_migrates_v5() -> None:
@@ -1938,7 +1949,7 @@ def test_schema_v7_adds_exact_equity_quality_cache_table_and_migrates_v5() -> No
 
         initialize_performance_v2(connection)
 
-        assert connection.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("11",)
+        assert connection.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("12",)
         assert connection.execute(
             "select column_name, data_type, is_nullable from information_schema.columns "
             "where table_name = 'equity_quality_metrics' order by ordinal_position"
@@ -2075,3 +2086,64 @@ def test_readable_schema_keeps_legacy_versions_upgrade_required(version: str) ->
         assert connection.execute(
             "select value from schema_info where key = 'schema_version'"
         ).fetchone() == (version,)
+
+
+def test_identity_markers_are_written_at_creation_and_validated() -> None:
+    from mrs3.performance_v2_store import (
+        PerformanceV2Config, PerformanceV2IdentityError, database_identity, require_database_identity,
+    )
+
+    with duckdb.connect(":memory:") as v2, duckdb.connect(":memory:") as v1_bound, duckdb.connect(":memory:") as v1:
+        initialize_performance_v2(v2, evaluation_protocol="v2", exchange=" Bybit ")
+        initialize_performance_v2(v1_bound, exchange="OKX")
+        initialize_performance_v2(v1)
+        for connection in (v2, v1_bound, v1):
+            require_performance_v2(connection)
+            assert require_performance_v2_readable(connection) == 12
+        assert database_identity(v2) == ("v2", "Bybit")
+        assert database_identity(v1_bound) == ("v1", "OKX")
+        assert database_identity(v1) == ("v1", None)
+
+        root = Path("data/performance-v2")
+        require_database_identity(v2, PerformanceV2Config(root, evaluation_protocol="v2", exchange="bybit"))
+        require_database_identity(v1, PerformanceV2Config(root, exchange="Bybit"))  # unbound database ignores it
+        with pytest.raises(PerformanceV2IdentityError) as protocol_error:
+            require_database_identity(v2, PerformanceV2Config(root))
+        assert protocol_error.value.code == "EVALUATION_PROTOCOL_MISMATCH"
+        with pytest.raises(PerformanceV2IdentityError) as exchange_error:
+            require_database_identity(v2, PerformanceV2Config(root, evaluation_protocol="v2", exchange="OKX"))
+        assert exchange_error.value.code == "EXCHANGE_MISMATCH"
+        with pytest.raises(PerformanceV2IdentityError, match="EXCHANGE_MISMATCH"):
+            require_database_identity(v1_bound, PerformanceV2Config(root))
+
+        v2.execute("delete from schema_info where key = 'exchange'")
+        with pytest.raises(PerformanceV2StoreError, match="requires an exchange marker"):
+            require_performance_v2(v2)
+        v1.execute("insert into schema_info values ('evaluation_protocol', 'v1')")
+        with pytest.raises(PerformanceV2StoreError, match="invalid evaluation_protocol marker"):
+            require_performance_v2(v1)
+
+
+def test_v2_database_cannot_be_created_without_exchange() -> None:
+    with duckdb.connect(":memory:") as connection:
+        with pytest.raises(ValueError, match="exchange is required"):
+            initialize_performance_v2(connection, evaluation_protocol="v2")
+        assert connection.execute("select count(*) from information_schema.tables").fetchone() == (0,)
+
+
+def test_config_loader_reads_protocol_and_exchange(tmp_path: Path) -> None:
+    from mrs3.performance_v2_store import load_performance_v2_config
+
+    (tmp_path / "config.local.json").write_text("{}", encoding="utf-8")
+    path = tmp_path / "config.performance.json"
+    path.write_text(json.dumps({"unified_performance_v2": {"database_root": "db"}}), encoding="utf-8")
+    config = load_performance_v2_config(path)
+    assert (config.evaluation_protocol, config.exchange) == ("v1", None)
+    path.write_text(json.dumps({"unified_performance_v2": {
+        "database_root": "db", "evaluation_protocol": "v2", "exchange": " Bybit "}}), encoding="utf-8")
+    config = load_performance_v2_config(path)
+    assert (config.evaluation_protocol, config.exchange) == ("v2", "Bybit")
+    for section in ({"evaluation_protocol": "v2"}, {"evaluation_protocol": "v3", "exchange": "Bybit"}, {"exchange": " "}):
+        path.write_text(json.dumps({"unified_performance_v2": {"database_root": "db", **section}}), encoding="utf-8")
+        with pytest.raises(ValueError):
+            load_performance_v2_config(path)

@@ -175,7 +175,49 @@ def test_normalization_30d_is_additive_to_window_document() -> None:
     }
 
 
-def _db(tmp_path: Path) -> tuple[duckdb.DuckDBPyConnection, int]:
+def _initialize_v11(connection: duckdb.DuckDBPyConnection) -> None:
+    """Create a schema-v11 database: the current initializer stops before the v12 migration.
+
+    DuckDB cannot drop columns from FK-referenced tables, so legacy-catalog
+    fixtures start from v11 instead of downgrading a v12 database.
+    """
+    import mrs3.performance_v2_store as store
+
+    migrate, require = store._migrate_schema_v11_to_v12, store.require_performance_v2
+    store._migrate_schema_v11_to_v12 = lambda _connection: None
+    store.require_performance_v2 = store._require_v11_catalog
+    try:
+        store.initialize_performance_v2(connection)
+    finally:
+        store._migrate_schema_v11_to_v12, store.require_performance_v2 = migrate, require
+
+
+def _rebuild_as_v11(database: Path) -> None:
+    """Copy a Panel-migrated v12 fixture into a fresh v11 database with the same markers and rows."""
+    from mrs3.performance_v2_compact import TABLES
+
+    rebuilt = database.with_name(f"{database.stem}.v11-rebuild.duckdb")
+    with duckdb.connect(str(rebuilt)) as target:
+        _initialize_v11(target)
+        origin = database.as_posix().replace("'", "''")
+        target.execute(f"attach '{origin}' as origin (read_only)")
+        target.execute("delete from main.schema_info")
+        target.execute("insert into main.schema_info select * from origin.main.schema_info")
+        target.execute("update main.schema_info set value = '11' where key = 'schema_version'")
+        for table in TABLES:
+            columns = [row[0] for row in target.execute(
+                "select column_name from information_schema.columns where table_catalog = current_database() "
+                "and table_schema = 'main' and table_name = ? order by ordinal_position", [table],
+            ).fetchall()]
+            if columns:
+                names = ", ".join(columns)
+                target.execute(f"insert into main.{table} ({names}) select {names} from origin.main.{table}")
+        target.execute("detach origin")
+    database.unlink()
+    rebuilt.rename(database)
+
+
+def _db(tmp_path: Path, *, legacy_v11: bool = False) -> tuple[duckdb.DuckDBPyConnection, int]:
     tmp_path.mkdir(parents=True, exist_ok=True)
     target = (tmp_path / "strategy_performance.duckdb").resolve()
     known_production_targets = {
@@ -186,7 +228,10 @@ def _db(tmp_path: Path) -> tuple[duckdb.DuckDBPyConnection, int]:
     assert target not in known_production_targets, "known production PerformanceDB paths are forbidden"
     assert not target.is_relative_to(Path(__file__).resolve().parents[1]), "repository databases are read-only"
     connection = duckdb.connect(str(target))
-    initialize_performance_v2(connection)
+    if legacy_v11:
+        _initialize_v11(connection)
+    else:
+        initialize_performance_v2(connection)
     now = datetime(2026, 1, 1, tzinfo=UTC)
     strategy_id = connection.execute(
         """insert into strategies (strategy_name, symbol, side, timeframe, close_ma_len,
@@ -793,7 +838,7 @@ def test_v2_panel_first_import_bootstrap_initializes_empty_and_preserves_foreign
         with duckdb.connect(str(target), read_only=True) as connection:
             assert connection.execute(
                 "select value from schema_info where key = 'schema_version'"
-            ).fetchone() == ("11",)
+            ).fetchone() == ("12",)
     else:
         assert target.read_bytes() == existing
 
@@ -1890,8 +1935,8 @@ def test_j4_missing_tester_still_publishes_terminal_import(tmp_path):
     assert registry.get(import_id)["state"] == "FAILED"
 
 
-def _controller_for_windows(tmp_path: Path) -> tuple[PanelController, Path, int]:
-    connection, result_id = _db(tmp_path / "data")
+def _controller_for_windows(tmp_path: Path, *, legacy_v11: bool = False) -> tuple[PanelController, Path, int]:
+    connection, result_id = _db(tmp_path / "data", legacy_v11=legacy_v11)
     connection.close()
     config = tmp_path / "config.local.json"
     config.write_text(json.dumps({"panel_paths": {"performance_db_root": "v1"}}), encoding="utf-8")
@@ -4404,7 +4449,7 @@ def test_selection_memo_reloads_filter_only_candidates_for_rank_only_request(
 
 
 def test_recalculate_requires_offline_migration_for_existing_v8_database(tmp_path: Path) -> None:
-    controller, database, _ = _controller_for_windows(tmp_path)
+    controller, database, _ = _controller_for_windows(tmp_path, legacy_v11=True)
     with duckdb.connect(str(database)) as connection:
         _make_v8_catalog(connection)
     before_file = (sha256(database.read_bytes()).hexdigest(), database.stat().st_mtime_ns)
@@ -4435,7 +4480,7 @@ def test_panel_schema_preflight_initializes_an_empty_new_database(tmp_path: Path
     with duckdb.connect(str(database), read_only=True) as connection:
         assert connection.execute(
             "select value from schema_info where key = 'schema_version'"
-        ).fetchone() == ("11",)
+        ).fetchone() == ("12",)
         assert connection.execute(
             "select count(*) from information_schema.tables where table_name = 'strategy_rejection_sources'"
         ).fetchone() == (1,)
@@ -4452,7 +4497,7 @@ def test_panel_schema_preflight_migrates_v9_to_v11(tmp_path: Path) -> None:
     controller._ensure_performance_v2_schema(database)
 
     with duckdb.connect(str(database), read_only=True) as connection:
-        assert connection.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("11",)
+        assert connection.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("12",)
         assert connection.execute(
             "select is_nullable from information_schema.columns "
             "where table_name = 'selection_review_rows' and column_name = 'user_status'"
@@ -4472,7 +4517,7 @@ def test_panel_schema_preflight_migrates_exact_v10_catalog_to_v11(tmp_path: Path
     with duckdb.connect(str(database), read_only=True) as connection:
         assert connection.execute(
             "select value from schema_info where key = 'schema_version'"
-        ).fetchone() == ("11",)
+        ).fetchone() == ("12",)
 
 
 def test_panel_read_only_catalog_opens_exact_v10_without_migrating(tmp_path: Path) -> None:
@@ -4612,8 +4657,9 @@ def test_equity_rank_readiness_is_gated_only_by_enabled_rank(
 def test_equity_rank_cache_status_maps_v5_upgrade_and_keeps_disabled_method_legacy(
     tmp_path: Path,
 ) -> None:
-    controller, database, _ = _controller_for_windows(tmp_path)
+    controller, database, _ = _controller_for_windows(tmp_path, legacy_v11=True)
     controller.strategies_performance_v2_recalculate({"symbol": "BTCUSDT", "side": "LONG"})
+    _rebuild_as_v11(database)
     with duckdb.connect(str(database)) as connection:
         _make_v5_catalog(connection)
 
@@ -4641,7 +4687,7 @@ def test_equity_rank_cache_status_maps_v5_upgrade_and_keeps_disabled_method_lega
 
 
 def test_equity_rank_v5_upgrade_error_precedes_empty_cohort_readiness(tmp_path: Path) -> None:
-    controller, database, _ = _controller_for_windows(tmp_path)
+    controller, database, _ = _controller_for_windows(tmp_path, legacy_v11=True)
     with duckdb.connect(str(database)) as connection:
         _make_v5_catalog(connection)
     payload = {"symbol": "NO_CANDIDATES", "side": "LONG", "stages": [
@@ -4719,9 +4765,10 @@ def test_selection_preview_reuses_candidates_until_recalculation(tmp_path: Path,
 
 
 def test_performance_v2_catalog_and_cache_status_do_not_upgrade_v5_on_read(tmp_path: Path) -> None:
-    controller, database, _ = _controller_for_windows(tmp_path)
+    controller, database, _ = _controller_for_windows(tmp_path, legacy_v11=True)
     payload = {"symbol": "BTCUSDT", "side": "LONG", "stages": []}
     controller.strategies_performance_v2_recalculate(payload)
+    _rebuild_as_v11(database)
     with duckdb.connect(str(database)) as connection:
         _make_v5_catalog(connection)
 
@@ -5053,7 +5100,7 @@ def test_valid_v11_schema_check_does_not_open_writer_with_reader_present(tmp_pat
         return original_connect(*args, **kwargs)
 
     with duckdb.connect(str(database), read_only=True) as reader:
-        assert reader.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("11",)
+        assert reader.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("12",)
         monkeypatch.setattr(panel_module.duckdb, "connect", reject_writer)
         controller._ensure_performance_v2_schema(database)
 
@@ -5063,7 +5110,7 @@ def test_cached_v11_schema_check_skips_reopen_with_reader_present(tmp_path: Path
     controller._ensure_performance_v2_schema(database)
 
     with duckdb.connect(str(database), read_only=True) as reader:
-        assert reader.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("11",)
+        assert reader.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("12",)
 
         def unexpected_reopen(*_args, **_kwargs):
             raise AssertionError("schema cache hit reopened the database")
@@ -5317,9 +5364,10 @@ def test_recalculate_runs_real_window_workers_under_controller_lock(
 def test_selection_recalculate_maps_equity_cache_errors_to_typed_api_errors(
     tmp_path: Path, monkeypatch, schema: str, code: str, status: int,
 ) -> None:
-    controller, database, _ = _controller_for_windows(tmp_path)
+    controller, database, _ = _controller_for_windows(tmp_path, legacy_v11=True)
     if schema == "v5":
         controller.strategies_performance_v2_recalculate({"symbol": "BTCUSDT", "side": "LONG"})
+        _rebuild_as_v11(database)
         with duckdb.connect(str(database)) as connection:
             _make_v5_catalog(connection)
     else:
@@ -5905,3 +5953,56 @@ def test_v2_current_result_switch_does_not_reuse_r1_window_cache(tmp_path: Path)
     assert r2["result_id"] == r2_id != r1_id
     assert r2["window_a"]["availability_status"] == "AVAILABLE"
     assert r2["window_a"]["return_pct"] == "25.000000000000"
+
+
+def test_panel_creates_bound_database_and_refuses_a_different_exchange(tmp_path: Path) -> None:
+    controller, database, _ = _controller_for_windows(tmp_path)
+    database.unlink()
+    database.write_bytes(b"")
+    (tmp_path / "config.performance.json").write_text(json.dumps({"unified_performance_v2": {
+        "database_root": "data", "evaluation_protocol": "v2", "exchange": "Bybit"}}), encoding="utf-8")
+
+    controller._ensure_performance_v2_schema(database)
+
+    with duckdb.connect(str(database), read_only=True) as connection:
+        assert dict(connection.execute(
+            "select key, value from schema_info where key in ('schema_version', 'evaluation_protocol', 'exchange')"
+        ).fetchall()) == {"schema_version": "12", "evaluation_protocol": "v2", "exchange": "Bybit"}
+
+    (tmp_path / "config.performance.json").write_text(json.dumps({"unified_performance_v2": {
+        "database_root": "data", "evaluation_protocol": "v2", "exchange": "OKX"}}), encoding="utf-8")
+    restarted = PanelController(tmp_path, tmp_path / "config.local.json")
+    with pytest.raises(PerformanceV2ApiError) as raised:
+        restarted._ensure_performance_v2_schema(database)
+    assert (raised.value.code, raised.value.status) == ("EXCHANGE_MISMATCH", 409)
+
+
+def test_panel_rechecks_identity_when_only_the_configuration_changes(tmp_path: Path) -> None:
+    controller, database, _ = _controller_for_windows(tmp_path)
+    database.unlink()
+    database.write_bytes(b"")
+    config_path = tmp_path / "config.performance.json"
+    config_path.write_text(json.dumps({"unified_performance_v2": {
+        "database_root": "data", "evaluation_protocol": "v2", "exchange": "Bybit"}}), encoding="utf-8")
+    controller._ensure_performance_v2_schema(database)
+    controller._ensure_performance_v2_schema(database)  # cached
+
+    config_path.write_text(json.dumps({"unified_performance_v2": {"database_root": "data"}}), encoding="utf-8")
+    with pytest.raises(PerformanceV2ApiError) as raised:
+        controller._ensure_performance_v2_schema(database)
+    assert (raised.value.code, raised.value.status) == ("EVALUATION_PROTOCOL_MISMATCH", 409)
+
+
+def test_panel_refuses_mismatching_v11_database_without_migrating_it(tmp_path: Path) -> None:
+    controller, database, _ = _controller_for_windows(tmp_path, legacy_v11=True)
+    (tmp_path / "config.performance.json").write_text(json.dumps({"unified_performance_v2": {
+        "database_root": "data", "evaluation_protocol": "v2", "exchange": "Bybit"}}), encoding="utf-8")
+
+    with pytest.raises(PerformanceV2ApiError) as raised:
+        controller._ensure_performance_v2_schema(database)
+
+    assert raised.value.code == "EVALUATION_PROTOCOL_MISMATCH"
+    with duckdb.connect(str(database), read_only=True) as connection:
+        assert connection.execute(
+            "select value from schema_info where key = 'schema_version'"
+        ).fetchone() == ("11",)

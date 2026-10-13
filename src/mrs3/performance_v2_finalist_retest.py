@@ -1338,8 +1338,8 @@ def current_effective_finalist_members(
     the already effective selection decision.
     """
     schema_version = require_performance_v2_readable(connection)
-    if schema_version not in {10, 11}:
-        raise PerformanceV2StoreError("Performance database does not have schema version 10 or 11")
+    if schema_version not in {10, 11, 12}:
+        raise PerformanceV2StoreError("Performance database does not have schema version 10, 11 or 12")
     if type(include_reserve) is not bool:
         raise FinalistRetestError("INVALID_REQUEST", "include_reserve must be a boolean")
     decisions = effective_selection_decisions(connection)

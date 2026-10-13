@@ -81,7 +81,7 @@ def _database(tmp_path: Path, *, filename: str = "performance.duckdb") -> duckdb
     now = datetime(2026, 9, 2, tzinfo=UTC)
     for strategy_id in (1, 2):
         connection.execute(
-            """insert into strategies values (?, ?, 'BTCUSDT', 'LONG', '1h', 5, 1, 'run', ?, 'ACTIVE', null, ?, ?)""",
+            """insert into strategies (strategy_id, strategy_name, symbol, side, timeframe, close_ma_len, order_count, analysis_run_id, candidate_identity, lifecycle_status, current_result_id, created_at_utc, updated_at_utc) values (?, ?, 'BTCUSDT', 'LONG', '1h', 5, 1, 'run', ?, 'ACTIVE', null, ?, ?)""",
             [strategy_id, f"strategy-{strategy_id}", f"candidate-{strategy_id}", now, now],
         )
         connection.execute(
@@ -1403,7 +1403,7 @@ def test_mixed_equity_retest_cohort_keeps_rejected_pass_candidate_as_reserve(tmp
     start = datetime(2026, 1, 1, tzinfo=UTC)
     end = start + timedelta(days=28)
     connection.execute(
-        """insert into strategies values (3, 'strategy-3', 'BTCUSDT', 'LONG', '1h', 5, 1, 'run', ?, 'ACTIVE', null, ?, ?)""",
+        """insert into strategies (strategy_id, strategy_name, symbol, side, timeframe, close_ma_len, order_count, analysis_run_id, candidate_identity, lifecycle_status, current_result_id, created_at_utc, updated_at_utc) values (3, 'strategy-3', 'BTCUSDT', 'LONG', '1h', 5, 1, 'run', ?, 'ACTIVE', null, ?, ?)""",
         ["candidate-3", now, now],
     )
     connection.execute(
@@ -1700,7 +1700,7 @@ def test_reviewed_decisions_survive_new_ordinary_run_and_result_replacement(tmp_
 
     now = datetime(2026, 9, 3, tzinfo=UTC)
     connection.execute(
-        """insert into strategies values (3, 'strategy-3', 'BTCUSDT', 'LONG', '1h', 5, 1, 'run',
+        """insert into strategies (strategy_id, strategy_name, symbol, side, timeframe, close_ma_len, order_count, analysis_run_id, candidate_identity, lifecycle_status, current_result_id, created_at_utc, updated_at_utc) values (3, 'strategy-3', 'BTCUSDT', 'LONG', '1h', 5, 1, 'run',
            'candidate-3', 'ACTIVE', null, ?, ?)""", [now, now]
     )
     connection.execute("update strategies set current_result_id = null where strategy_id in (1, 2)")
@@ -1919,7 +1919,7 @@ def test_retest_sync_overwrites_asserted_and_leaves_absent_ids_untouched(tmp_pat
     connection = _database(tmp_path)
     now = datetime(2026, 1, 1, tzinfo=UTC)
     connection.execute(
-        "insert into strategies values (3, 'strategy-3', 'BTCUSDT', 'LONG', '1h', 5, 1, 'run', 'candidate-3', 'ACTIVE', null, ?, ?)",
+        "insert into strategies (strategy_id, strategy_name, symbol, side, timeframe, close_ma_len, order_count, analysis_run_id, candidate_identity, lifecycle_status, current_result_id, created_at_utc, updated_at_utc) values (3, 'strategy-3', 'BTCUSDT', 'LONG', '1h', 5, 1, 'run', 'candidate-3', 'ACTIVE', null, ?, ?)",
         [now, now],
     )
     connection.execute(
@@ -2413,7 +2413,7 @@ def test_partial_selection_reconciles_prior_finalist_absent_from_current_run(tmp
     _, metadata = _export(connection, tmp_path)
     now = datetime(2026, 9, 2, tzinfo=UTC)
     connection.execute(
-        "insert into strategies values (3, 'older-run-only', 'BTCUSDT', 'LONG', '1h', 5, 1, 'run', 'candidate-3', 'ACTIVE', null, ?, ?)",
+        "insert into strategies (strategy_id, strategy_name, symbol, side, timeframe, close_ma_len, order_count, analysis_run_id, candidate_identity, lifecycle_status, current_result_id, created_at_utc, updated_at_utc) values (3, 'older-run-only', 'BTCUSDT', 'LONG', '1h', 5, 1, 'run', 'candidate-3', 'ACTIVE', null, ?, ?)",
         [now, now],
     )
     old_run_id = "older-run-btc-long"
@@ -2490,7 +2490,7 @@ def test_partial_selection_reconciliation_does_not_touch_other_pair_or_side(tmp_
     now = datetime(2026, 9, 2, tzinfo=UTC)
     for strategy_id, symbol, side in ((3, "ETHUSDT", "LONG"), (4, "BTCUSDT", "SHORT")):
         connection.execute(
-            "insert into strategies values (?, ?, ?, ?, '1h', 5, 1, 'run', ?, 'ACTIVE', null, ?, ?)",
+            "insert into strategies (strategy_id, strategy_name, symbol, side, timeframe, close_ma_len, order_count, analysis_run_id, candidate_identity, lifecycle_status, current_result_id, created_at_utc, updated_at_utc) values (?, ?, ?, ?, '1h', 5, 1, 'run', ?, 'ACTIVE', null, ?, ?)",
             [strategy_id, f"strategy-{strategy_id}", symbol, side, f"candidate-{strategy_id}", now, now],
         )
         run_id = f"prior-{strategy_id}"
@@ -2875,7 +2875,7 @@ def test_partial_selection_import_checks_instance_run_and_snapshot_without_lates
 
     now = datetime(2026, 9, 2, tzinfo=UTC)
     connection.execute(
-        """insert into strategies values (3, 'outside-run', 'BTCUSDT', 'LONG', '1h', 5, 1,
+        """insert into strategies (strategy_id, strategy_name, symbol, side, timeframe, close_ma_len, order_count, analysis_run_id, candidate_identity, lifecycle_status, current_result_id, created_at_utc, updated_at_utc) values (3, 'outside-run', 'BTCUSDT', 'LONG', '1h', 5, 1,
            'run', 'candidate-3', 'ACTIVE', null, ?, ?)""",
         [now, now],
     )

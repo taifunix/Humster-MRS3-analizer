@@ -19,6 +19,23 @@ N1 is done: `parse_current_performance_v2_html` reads the 2026-10 format
 (version-only detection, compatible duplicate metrics, 59 analytics labels,
 regimes and monthly returns); the real sample parses fully; legacy parsing is
 unchanged (reviewed against HEAD on all fixtures and real 2026/09/22 reports).
+P2a is done in the working tree (schema v12): additive migration v11 → v12
+(MA type/source columns, three sizing columns, `tester_version`,
+`report_format`, tables `strategy_report_metrics`, `strategy_report_regimes`,
+`strategy_report_monthly`), optional `schema_info` markers
+`evaluation_protocol`/`exchange` written at creation from
+`unified_performance_v2.evaluation_protocol`/`exchange`. The Panel schema
+gate (`_ensure_performance_v2_schema`, keyed also by the configured protocol
+and exchange) and the import runner refuse a mismatching database before any
+migration (`EVALUATION_PROTOCOL_MISMATCH`, `EXCHANGE_MISMATCH`); read-only
+routes that bypass the gate do not check identity yet (P7 adds database
+selection). Readers accept v5–v12; Panel migrates a v9–v11 database to v12 on
+open. Maintenance, compaction and prune cover the new tables and appended
+columns; import REPLACE clears the report rows. Evidence: a copy of the live
+v11 database (16.9 GB, 49 125 strategies, 122 M equity rows) migrated in 45 s
+with identical row counts and empty new columns/tables. Broad suite: the only
+failures besides the 57 that already fail on clean HEAD are the two
+template-pinned finalist-retest tests.
 User decision 2026-10-12: one PerformanceDB per exchange with an
 `schema_info.exchange` marker (protocol v2 §4.1); the CSV Direct analysis DB
 (branch `feat/csv-direct-analysis`) must also record the exchange from the run

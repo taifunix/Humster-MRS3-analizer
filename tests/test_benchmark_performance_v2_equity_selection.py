@@ -51,7 +51,7 @@ def _frozen_fixture(tmp_path: Path) -> Path:
         "insert into analysis_plateaus values ('run', 'P1', 12, 34)"
     )
     connection.execute(
-        "insert into strategy_orders values (?, 1, 7, .995, 125, 1, 'run', 'P1', 8)", [strategy_id],
+        "insert into strategy_orders (strategy_id, order_id, open_ma_len, open_multiplier, shift_bp, lot_x, analysis_run_id, plateau_id, base_point_trades) values (?, 1, 7, .995, 125, 1, 'run', 'P1', 8)", [strategy_id],
     )
     connection.executemany(
         """insert into strategy_actions (result_id, action_index, timestamp_utc, symbol,

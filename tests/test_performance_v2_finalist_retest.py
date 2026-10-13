@@ -227,7 +227,7 @@ def test_freeze_uses_effective_user_status_and_listing_warmup_without_writes() -
         initialize_performance_v2(connection)
         now = datetime(2026, 1, 1, tzinfo=UTC)
         connection.execute(
-            """insert into strategies values
+            """insert into strategies (strategy_id, strategy_name, symbol, side, timeframe, close_ma_len, order_count, analysis_run_id, candidate_identity, lifecycle_status, current_result_id, created_at_utc, updated_at_utc) values
             (1, 'final', 'BTCUSDT', 'LONG', '1h', 5, 1, 'run', 'candidate-1', 'ACTIVE', 11, ?, ?),
             (2, 'reserve', 'ETHUSDT', 'SHORT', '4h', 7, 1, 'run', 'candidate-2', 'ACTIVE', 12, ?, ?),
             (3, 'filtered', 'SOLUSDT', 'LONG', '1h', 5, 1, 'run', 'candidate-3', 'ACTIVE', 13, ?, ?)""",
@@ -314,7 +314,7 @@ def test_manifest_has_one_common_period_and_native_strategy_provenance(tmp_path)
         initialize_performance_v2(connection)
         now = datetime(2026, 1, 1, tzinfo=UTC)
         connection.execute(
-            "insert into strategies values (1, 'final', 'BTCUSDT', 'LONG', '1h', 5, 1, 'run', 'candidate', 'ACTIVE', 11, ?, ?)",
+            "insert into strategies (strategy_id, strategy_name, symbol, side, timeframe, close_ma_len, order_count, analysis_run_id, candidate_identity, lifecycle_status, current_result_id, created_at_utc, updated_at_utc) values (1, 'final', 'BTCUSDT', 'LONG', '1h', 5, 1, 'run', 'candidate', 'ACTIVE', 11, ?, ?)",
             [now, now],
         )
         connection.execute(
@@ -383,7 +383,7 @@ def test_import_outcomes_replace_successful_member_and_isolate_failure() -> None
         initialize_performance_v2(connection)
         now = datetime(2026, 1, 1, tzinfo=UTC)
         connection.execute(
-            """insert into strategies values
+            """insert into strategies (strategy_id, strategy_name, symbol, side, timeframe, close_ma_len, order_count, analysis_run_id, candidate_identity, lifecycle_status, current_result_id, created_at_utc, updated_at_utc) values
             (1, 'one', 'BTCUSDT', 'LONG', '1h', 5, 1, 'run', 'one', 'ACTIVE', 11, ?, ?),
             (2, 'two', 'BTCUSDT', 'LONG', '1h', 5, 1, 'run', 'two', 'ACTIVE', 12, ?, ?)""",
             [now, now, now, now],
@@ -489,7 +489,7 @@ def test_combined_control_import_is_atomic_and_idempotent() -> None:
         initialize_performance_v2(connection)
         now = datetime(2026, 1, 1, tzinfo=UTC)
         connection.execute(
-            "insert into strategies values (1, 'one', 'BTCUSDT', 'LONG', '1h', 5, 1, 'run', 'one', 'ACTIVE', 11, ?, ?)",
+            "insert into strategies (strategy_id, strategy_name, symbol, side, timeframe, close_ma_len, order_count, analysis_run_id, candidate_identity, lifecycle_status, current_result_id, created_at_utc, updated_at_utc) values (1, 'one', 'BTCUSDT', 'LONG', '1h', 5, 1, 'run', 'one', 'ACTIVE', 11, ?, ?)",
             [now, now],
         )
         connection.execute(
@@ -499,11 +499,11 @@ def test_combined_control_import_is_atomic_and_idempotent() -> None:
         connection.execute("insert into selection_runs values ('sel', (select value from schema_info where key='database_instance_id'), 'BTCUSDT', 'LONG', 'v1', '{}', ?, '{}', ?, 1, 1, 1, 20, ?, ?)", ["a" * 64, "b" * 64, "c" * 64, now])
         connection.execute("insert into selection_results (selection_run_id, strategy_id, result_id_at_selection, auto_status, auto_rank, prior_rejected, stage_trace_json) values ('sel', 1, 11, 'FINALIST', 1, false, '{}')")
         connection.execute(
-            "insert into strategies values (2, 'two', 'BTCUSDT', 'LONG', '1h', 5, 1, 'run', 'two', 'ACTIVE', 12, ?, ?)",
+            "insert into strategies (strategy_id, strategy_name, symbol, side, timeframe, close_ma_len, order_count, analysis_run_id, candidate_identity, lifecycle_status, current_result_id, created_at_utc, updated_at_utc) values (2, 'two', 'BTCUSDT', 'LONG', '1h', 5, 1, 'run', 'two', 'ACTIVE', 12, ?, ?)",
             [now, now],
         )
         connection.execute(
-            "insert into strategies values (3, 'three', 'BTCUSDT', 'SHORT', '1h', 5, 1, 'run', 'three', 'ACTIVE', 13, ?, ?)",
+            "insert into strategies (strategy_id, strategy_name, symbol, side, timeframe, close_ma_len, order_count, analysis_run_id, candidate_identity, lifecycle_status, current_result_id, created_at_utc, updated_at_utc) values (3, 'three', 'BTCUSDT', 'SHORT', '1h', 5, 1, 'run', 'three', 'ACTIVE', 13, ?, ?)",
             [now, now],
         )
         previous_imported = datetime(2025, 12, 31, tzinfo=UTC)
@@ -588,7 +588,7 @@ def test_server_issued_control_accepts_user_edits_and_failure_only_group(reason:
         initialize_performance_v2(connection)
         now = datetime(2026, 1, 1, tzinfo=UTC)
         connection.execute(
-            "insert into strategies values (1, 'one', 'BTCUSDT', 'LONG', '1h', 5, 1, 'run', 'one', 'ACTIVE', 11, ?, ?)",
+            "insert into strategies (strategy_id, strategy_name, symbol, side, timeframe, close_ma_len, order_count, analysis_run_id, candidate_identity, lifecycle_status, current_result_id, created_at_utc, updated_at_utc) values (1, 'one', 'BTCUSDT', 'LONG', '1h', 5, 1, 'run', 'one', 'ACTIVE', 11, ?, ?)",
             [now, now],
         )
         connection.execute(

@@ -32,9 +32,11 @@ from .performance_v2_input import (
 )
 from .performance_v2_store import (
     PerformanceV2Config,
+    PerformanceV2IdentityError,
     PerformanceV2StoreError,
     initialize_performance_v2,
     performance_v2_database_path,
+    require_database_identity,
     require_performance_v2,
     PerformanceV2WriterLock,
 )
@@ -1632,6 +1634,7 @@ def _publish(
             for table in (
                 "strategy_actions", "strategy_equity", "window_metrics",
                 "equity_quality_metrics", "optimizer_prepared_inputs",
+                "strategy_report_metrics", "strategy_report_regimes", "strategy_report_monthly",
             ):
                 if len(replacement_result_ids) == 1:
                     connection.execute(
@@ -2010,8 +2013,12 @@ def import_performance_v2(
         # The existing non-empty target may be an older supported schema. Migrate
         # it under the writer lock, but never initialize a bare database here.
         try:
+            # Refuse a database bound to another protocol or exchange before migrating it.
+            require_database_identity(connection, config)
             initialize_performance_v2(connection, create_if_missing=False)
             require_performance_v2(connection)
+        except PerformanceV2IdentityError as error:
+            raise PerformanceV2ImportError(str(error)) from error
         except (PerformanceV2StoreError, duckdb.Error) as error:
             raise PerformanceV2ImportError(
                 "Performance v2 target does not have a supported schema or migration failed"

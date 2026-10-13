@@ -2215,10 +2215,10 @@ def test_import_migrates_existing_v4_target_before_current_schema_gate(tmp_path:
     with duckdb.connect(str(target), read_only=True) as connection:
         from mrs3.performance_v2_store import require_performance_v2_readable
 
-        assert require_performance_v2_readable(connection) == 11
+        assert require_performance_v2_readable(connection) == 12
         assert connection.execute(
             "select value from schema_info where key = 'schema_version'"
-        ).fetchone() == ("11",)
+        ).fetchone() == ("12",)
 
 
 def test_bare_duckdb_target_is_not_initialized_by_import(tmp_path: Path) -> None:
@@ -2748,6 +2748,7 @@ def test_replace_batches_child_deletes_for_admitted_results(tmp_path: Path, admi
     child_tables = (
         "strategy_actions", "strategy_equity", "window_metrics",
         "equity_quality_metrics", "optimizer_prepared_inputs",
+        "strategy_report_metrics", "strategy_report_regimes", "strategy_report_monthly",
     )
     order_by = {
         "strategy_actions": "action_index",
@@ -2755,6 +2756,9 @@ def test_replace_batches_child_deletes_for_admitted_results(tmp_path: Path, admi
         "window_metrics": "requested_start_utc, requested_end_utc, metrics_version",
         "equity_quality_metrics": "algo_version",
         "optimizer_prepared_inputs": "result_id",
+        "strategy_report_metrics": "result_id",
+        "strategy_report_regimes": "regime",
+        "strategy_report_monthly": "month",
     }
     with duckdb.connect(str(target), read_only=True) as connection:
         ids = dict(connection.execute(
@@ -2851,7 +2855,7 @@ def test_replace_batches_child_deletes_for_admitted_results(tmp_path: Path, admi
         raw.close()
 
     assert (imported, skipped, rejected) == (admitted_count, 0, 3 - admitted_count)
-    assert len(recording.delete_sql) == 5
+    assert len(recording.delete_sql) == len(child_tables)
     assert [
         sql.casefold().split("delete from ", 1)[1].split(None, 1)[0]
         for sql in recording.delete_sql
@@ -3546,3 +3550,17 @@ def test_same_batch_incomparable_typed_intervals_roll_back(tmp_path: Path) -> No
         import_performance_v2(request)
     with duckdb.connect(str(performance_v2_database_path(request.config)), read_only=True) as connection:
         assert connection.execute("select count(*) from strategies").fetchone() == (0,)
+
+
+def test_import_refuses_a_database_bound_to_another_exchange_before_writing(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path, initialize_db=False)
+    target = performance_v2_database_path(request.config)
+    target.parent.mkdir(parents=True)
+    with duckdb.connect(str(target)) as connection:
+        initialize_performance_v2(connection, exchange="OKX")
+    before = target.read_bytes()
+
+    with pytest.raises(PerformanceV2ImportError, match="EXCHANGE_MISMATCH"):
+        import_performance_v2(request)
+
+    assert target.read_bytes() == before

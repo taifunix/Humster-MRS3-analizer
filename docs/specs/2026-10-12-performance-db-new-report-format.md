@@ -181,8 +181,9 @@
 
 ## 6. Схема v12 (аддитивно, одной миграцией с P2 протокола v2)
 
-- `strategy_results`: `tester_version VARCHAR`, `report_format VARCHAR`
-  (`CHECK (report_format IS NULL OR report_format IN ('legacy', '2026-10'))`).
+- `strategy_results`: `tester_version VARCHAR`, `report_format VARCHAR`.
+  DuckDB не умеет добавлять колонку с ограничением через `ALTER TABLE ADD
+  COLUMN`, поэтому значение (`legacy`, `2026-10` или NULL) проверяет импорт.
 - `strategy_report_metrics(result_id BIGINT PRIMARY KEY REFERENCES
   strategy_results(result_id), …)`: колонки §3.1, все nullable. Типы:
   денежные, процентные и отношения — `DOUBLE` (значения отчёта округлены, а

@@ -89,7 +89,7 @@ _STAGE_IDS = frozenset((
 ))
 _SCOPES = frozenset(("pair_side", "pair_side_timeframe"))
 SELECTION_REASON_ALIASES = {"PARETO_PLATEAU_POINTS_PER_ORDER": "PARETO_PL_PTS_PER_ORDER"}
-_EQUITY_CACHE_SCHEMA_VERSIONS = frozenset(range(6, 12))
+_EQUITY_CACHE_SCHEMA_VERSIONS = frozenset(range(6, 13))
 _CANDIDATE_COLUMNS = (
     "strategy_id", "strategy_name", "symbol", "side", "timeframe", "close_ma_len", "order_count",
     "result_id", "total_pnl", "total_pnl_pct", "max_drawdown", "max_drawdown_pct", "total_fees",

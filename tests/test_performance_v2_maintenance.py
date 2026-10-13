@@ -282,7 +282,7 @@ def test_maintenance_mutation_gate_rejects_exact_v10_until_migrated() -> None:
         _prepare_v10_migration_fixture(connection)
         with pytest.raises(
             maintenance.PerformanceV2MaintenanceSchemaError,
-            match="requires PerformanceDB schema v11; found 10",
+            match="requires PerformanceDB schema v12; found 10",
         ):
             maintenance._require_schema_v11(connection)
 
@@ -809,7 +809,7 @@ def test_rejected_apply_retains_dedup_identity_and_removes_operational_facts(mai
                 assert all(
                     row[4] == before_by_id[row[1]][4]
                     and row[5:14] == (None, Decimal("0"), Decimal("0"), None, None, None, None, None, None)
-                    and row[23:] == (None,) * 9
+                    and row[23:] == (None,) * 14
                     for row in after
                     if row[1] in {1, 2}
                 )
@@ -1133,7 +1133,7 @@ def test_full_delete_recovers_from_legacy_migrated_strategy_results_reference(ma
             "select count(*) from strategies where symbol = 'BTCUSDT'"
         ).fetchone() == (0,)
         assert result["table_counts"]["strategies"] == 1
-        assert connection.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("11",)
+        assert connection.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("12",)
         assert connection.execute(
             "select count(*) from information_schema.tables "
             "where table_schema = 'main' and table_name = '__performance_v2_v7_strategy_results'"
@@ -1152,7 +1152,7 @@ def test_legacy_recovery_rolls_back_compatibility_table_when_strategy_retry_fail
             "select count(*) from information_schema.tables "
             "where table_schema = 'main' and table_name = '__performance_v2_v7_strategy_results'"
         ).fetchone() == (0,)
-        assert connection.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("11",)
+        assert connection.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("12",)
 
 
 @pytest.mark.parametrize(
@@ -1294,3 +1294,53 @@ def test_full_delete_workers_have_identical_results_and_report_benchmark(mainten
     for field in ("final_sha256", "table_counts", "pair_counts", "global_counts"):
         assert single[field] == configured[field]
     print("maintenance_worker_benchmark=" + json.dumps(measurements, sort_keys=True))
+
+
+def _add_report_rows(connection: duckdb.DuckDBPyConnection) -> list[int]:
+    result_ids = [row[0] for row in connection.execute("select result_id from strategy_results order by result_id").fetchall()]
+    for result_id in result_ids:
+        connection.execute("insert into strategy_report_metrics (result_id, gross_profit_usdt) values (?, 1.5)", [result_id])
+        connection.execute("insert into strategy_report_regimes values (?, 'TREND', 3, 1.0, 0.3, 100.0, 50.0)", [result_id])
+        connection.execute("insert into strategy_report_monthly values (?, '2026-08-01', 1.0)", [result_id])
+    return result_ids
+
+
+def _report_result_ids(connection: duckdb.DuckDBPyConnection) -> dict[str, list[int]]:
+    return {
+        table: [row[0] for row in connection.execute(f"select distinct result_id from {table} order by 1").fetchall()]
+        for table in ("strategy_report_metrics", "strategy_report_regimes", "strategy_report_monthly")
+    }
+
+
+def test_rejected_apply_removes_report_analytics_of_rejected_results(maintenance_db: Path) -> None:
+    with _writable_fixture(maintenance_db, maintenance_db.parent) as connection:
+        _add_report_rows(connection)
+        connection.execute("update strategy_results set tester_version = '2026/10/10', report_format = '2026-10'")
+        active = [row[0] for row in connection.execute(
+            "select r.result_id from strategy_results r join strategies s using (strategy_id) where s.strategy_id = 3"
+        ).fetchall()]
+        preview = create_preview(connection, ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"], "rejected")
+        apply_preview(connection, preview)
+        # The tombstone keeps the report identity of the rejected results.
+        assert connection.execute(
+            "select distinct tester_version, report_format from strategy_results where strategy_id in (1, 2)"
+        ).fetchall() == [("2026/10/10", "2026-10")]
+        assert _report_result_ids(connection) == {
+            "strategy_report_metrics": active, "strategy_report_regimes": active, "strategy_report_monthly": active,
+        }
+
+
+def test_full_delete_removes_report_analytics(maintenance_db: Path) -> None:
+    with _writable_fixture(maintenance_db, maintenance_db.parent) as connection:
+        _add_report_rows(connection)
+        preview = create_preview(connection, ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"], "full")
+        assert {table: preview["table_counts"][table] for table in _report_result_ids(connection)} == {
+            table: len(ids) for table, ids in _report_result_ids(connection).items()
+        }
+        deleted = {row[0] for row in connection.execute(
+            "select r.result_id from strategy_results r join strategies s using (strategy_id) "
+            "where s.symbol in ('BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT')"
+        ).fetchall()}
+        assert deleted
+        apply_preview(connection, preview)
+        assert all(not (set(ids) & deleted) for ids in _report_result_ids(connection).values())

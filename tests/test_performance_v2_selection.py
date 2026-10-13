@@ -1230,7 +1230,7 @@ def _candidate_db(tmp_path: Path) -> duckdb.DuckDBPyConnection:
     connection.execute("update strategies set current_result_id = ? where strategy_id = ?", [result_id, strategy_id])
     connection.execute("insert into analysis_plateaus values ('run', 'P1', 12, 34)")
     connection.execute(
-        """insert into strategy_orders values (?, 1, 7, .995, 125, 1, 'run', 'P1', 8)""",
+        """insert into strategy_orders (strategy_id, order_id, open_ma_len, open_multiplier, shift_bp, lot_x, analysis_run_id, plateau_id, base_point_trades) values (?, 1, 7, .995, 125, 1, 'run', 'P1', 8)""",
         [strategy_id],
     )
     connection.executemany(
@@ -1253,14 +1253,14 @@ def _candidate_db(tmp_path: Path) -> duckdb.DuckDBPyConnection:
     return connection
 
 
-@pytest.mark.parametrize("schema_version", [None, 10], ids=["v11", "v10"])
-def test_selection_equity_token_reads_cache_for_v10_and_v11(
+@pytest.mark.parametrize("schema_version", [None, 10], ids=["v12", "v10"])
+def test_selection_equity_token_reads_cache_for_v10_and_v12(
     tmp_path: Path, schema_version: int | None,
 ) -> None:
     connection = _candidate_db(tmp_path)
     assert connection.execute(
         "select value from schema_info where key = 'schema_version'"
-    ).fetchone() == ("11",)
+    ).fetchone() == ("12",)
     request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
     queries: list[str] = []
 

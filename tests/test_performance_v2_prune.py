@@ -206,6 +206,9 @@ def test_apply_backups_and_deletes_only_old_unprotected_strategy(tmp_path: Path)
         assert connection.execute("select count(*) from strategies").fetchone() == (4,)
         assert connection.execute("select count(*) from optimizer_prepared_inputs").fetchone() == (4,)
     assert result["counts"] == {
+        "strategy_report_metrics": 0,
+        "strategy_report_regimes": 0,
+        "strategy_report_monthly": 0,
         "equity_quality_metrics": 2,
         "window_metrics": 2,
         "strategy_actions": 2,
@@ -350,3 +353,21 @@ def test_cli_reports_a_missing_config_as_an_argument_error(
 
     assert error.value.code == 2
     assert "invalid config.performance.json" in capsys.readouterr().err
+
+
+def test_apply_deletes_report_analytics_before_results(tmp_path: Path) -> None:
+    database = _database(tmp_path)
+    with duckdb.connect(str(database)) as connection:
+        result_ids = [row[0] for row in connection.execute("select result_id from strategy_results").fetchall()]
+        for result_id in result_ids:
+            connection.execute("insert into strategy_report_metrics (result_id, gross_profit_usdt) values (?, 1.0)", [result_id])
+            connection.execute("insert into strategy_report_regimes values (?, 'TREND', 1, 1.0, 1.0, 100.0, 100.0)", [result_id])
+            connection.execute("insert into strategy_report_monthly values (?, '2026-08-01', 1.0)", [result_id])
+
+    result = prune_performance_v2(database, CUTOFF, apply=True)
+
+    assert result["counts"]["strategy_report_metrics"] == result["counts"]["strategy_results"] == 2
+    with duckdb.connect(str(database), read_only=True) as connection:
+        remaining = {row[0] for row in connection.execute("select result_id from strategy_results").fetchall()}
+        for table in ("strategy_report_metrics", "strategy_report_regimes", "strategy_report_monthly"):
+            assert {row[0] for row in connection.execute(f"select result_id from {table}").fetchall()} == remaining
