@@ -28,7 +28,7 @@ from ..performance_v2_selection import (
     load_selection_candidates,
     parse_selection_request,
 )
-from ..performance_v2_store import require_performance_v2_readable
+from ..performance_v2_store import _V12_COLUMN_ADDITIONS, require_performance_v2_readable
 from ..performance_v2_store import decode_optimizer_source_metadata
 from ..performance_v2_selection_review import STATUSES as USER_STATUSES
 from ..performance_v2_optimizer import (
@@ -213,14 +213,26 @@ def _in_clause(ids: Sequence[int]) -> str:
     return ",".join("?" for _ in ids)
 
 
+# Schema-v12 columns enter source documents only when set, so documents and
+# digests of rows without the new facts stay byte-identical (protocol v2 §4.5).
+_V12_OPTIONAL_COLUMNS = frozenset(column for _table, column, _type in _V12_COLUMN_ADDITIONS)
+_V12_TABLES = frozenset(table for table, _column, _type in _V12_COLUMN_ADDITIONS)
+
+
 def _records_for_ids(connection: duckdb.DuckDBPyConnection, table: str, column: str, ids: Sequence[int]) -> tuple[dict[str, Any], ...]:
     if not ids:
         return ()
     # Table and column names are constants at every call site.
-    return _fetch_records(
+    rows = _fetch_records(
         connection,
         f"select * from {table} where {column} in ({_in_clause(ids)})",
         ids,
+    )
+    if table not in _V12_TABLES:
+        return rows
+    return tuple(
+        {key: value for key, value in row.items() if not (key in _V12_OPTIONAL_COLUMNS and value is None)}
+        for row in rows
     )
 
 
@@ -346,6 +358,9 @@ _DECIMAL_FIELD_TYPES: dict[str, tuple[str, str]] = {
     "sizing_balance_percentage_long": ("percent", "%"),
     "sizing_risk_long": ("scalar", "1"),
     "sizing_max_balance": ("money", "currency"),
+    "sizing_my_fix_balance": ("money", "currency"),
+    "sizing_balance_percentage_short": ("percent", "%"),
+    "sizing_risk_short": ("scalar", "1"),
 }
 for _field in (
     "total_pnl_pct", "max_drawdown_pct", "return_pct", "daily_growth_pct", "fees_pct", "win_rate_pct",

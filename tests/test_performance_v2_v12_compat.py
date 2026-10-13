@@ -68,3 +68,33 @@ def test_v11_database_keeps_rows_and_outputs_after_v12_migration(tmp_path: Path)
         assert _selection_outputs(connection, tmp_path / "after.xlsx") == outputs_before
     finally:
         connection.close()
+
+
+def test_portfolio_source_records_ignore_unset_v12_columns(tmp_path: Path) -> None:
+    from decimal import Decimal
+
+    from mrs3.portfolio.input import _canonical_value, _records_for_ids
+
+    connection, result_id = _db(tmp_path / "db", legacy_v11=True)
+    try:
+        strategy_id = connection.execute("select strategy_id from strategy_results where result_id = ?", [result_id]).fetchone()[0]
+        lookups = (("strategies", "strategy_id", strategy_id), ("strategy_orders", "strategy_id", strategy_id),
+                   ("strategy_results", "result_id", result_id))
+        before = {table: _records_for_ids(connection, table, column, [value]) for table, column, value in lookups}
+
+        initialize_performance_v2(connection)
+
+        assert {table: _records_for_ids(connection, table, column, [value]) for table, column, value in lookups} == before
+        connection.execute(
+            "update strategy_results set sizing_my_fix_balance = 10000, sizing_balance_percentage_short = 100, "
+            "sizing_risk_short = 1, tester_version = '2026/10/10', report_format = '2026-10'"
+        )
+        connection.execute("update strategy_orders set open_ma_type = 'SMA', open_ma_source = 'ohlc4'")
+        result = _records_for_ids(connection, "strategy_results", "result_id", [result_id])[0]
+        order = _records_for_ids(connection, "strategy_orders", "strategy_id", [strategy_id])[0]
+        assert result["sizing_my_fix_balance"] == Decimal("10000")
+        assert (order["open_ma_type"], order["open_ma_source"]) == ("SMA", "ohlc4")
+        _canonical_value(result)
+        _canonical_value(order)
+    finally:
+        connection.close()
