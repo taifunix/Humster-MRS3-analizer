@@ -83,6 +83,20 @@ v2 §9) and `test_manifest_has_one_common_period_and_native_strategy_provenance`
 (asserts the old `use_fix=false`). Do not run MRS3 evaluation tests with these templates before
 P2–P5: the current import rejects `use_upnl=false` reports.
 
+## Portfolio input snapshot registry (fix 2026-10-13)
+
+Since `eae54c0` (2026-10-01) every portfolio input snapshot failed with
+`UNKNOWN_DECIMAL_FIELD`: 33 new Decimal `SelectionConfig` settings and the
+candidate facts `history_days`, `completed_cycle_net_pnl`, `top5_pnl`,
+`pnl_after_top5`, `fees_share_pct`, `fees_per_30d_pct` had no snapshot type.
+All are registered explicitly (a test fails when a new Decimal setting or
+candidate fact has no type), as are the stage settings `min_shift_pct` and
+`pnl_tolerance_pct`. The snapshot now also recomputes `fees_share_pct` and
+`fees_per_30d_pct` from the frozen series, so its digest no longer depends on
+the window cache. 14 tests in `test_portfolio_input.py` still fail on stale
+fixtures (`selection_results` 12 columns, `selection_review_imports` 6 columns,
+schema version `'12' == '8'`), unrelated to this fix.
+
 ## Reason of REJECTED rows in selection workbooks (2026-10-12)
 
 In the pair selection and all-pairs workbooks, a row shown as `REJECTED` now

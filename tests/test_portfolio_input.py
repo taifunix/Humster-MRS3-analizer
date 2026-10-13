@@ -2885,3 +2885,36 @@ def test_snapshot_candidates_exclude_display_only_ma_kind(tmp_path: Path, monkey
 
     assert all("ma_kind" not in candidate for candidate in snapshot.candidates)
     assert all("ma_kind" not in item for item in snapshot.payload["candidates"].items)
+
+
+def test_every_selection_config_decimal_has_a_snapshot_type() -> None:
+    from dataclasses import fields
+
+    config = portfolio_input.SelectionConfig()
+    decimals = {field.name for field in fields(config) if isinstance(getattr(config, field.name), Decimal)}
+
+    # A new Decimal setting must get a deliberate snapshot type (UNKNOWN_DECIMAL_FIELD otherwise).
+    missing = sorted(name for name in decimals if name not in portfolio_input._DECIMAL_FIELD_TYPES)
+    assert not missing
+    assert portfolio_input._decimal_type("researched_dd_abs", "USDT") == ("percent", "%")
+    assert portfolio_input._decimal_type("researched_dd5_abs", "USDT") == ("scalar", "1")
+    for stage_field in ("min_shift_pct", "pnl_tolerance_pct"):
+        assert portfolio_input._decimal_type(stage_field, "USDT") == ("percent", "%")
+
+
+def test_every_decimal_selection_candidate_fact_has_a_snapshot_type(tmp_path: Path) -> None:
+    database = _database(tmp_path)
+    with duckdb.connect(str(database)) as connection:
+        frame = portfolio_input.load_selection_candidates(
+            connection, REQUEST, portfolio_input.SelectionConfig(),
+        )
+    decimal_fields = {
+        column for column in frame.columns
+        # Missing optional columns are NaN in the frame; only real numbers need a type.
+        if any(isinstance(value, Decimal) or (isinstance(value, float) and value == value) for value in frame[column].tolist())
+    }
+
+    assert decimal_fields
+    assert sorted(
+        field for field in decimal_fields - {"lot_base"} if field not in portfolio_input._DECIMAL_FIELD_TYPES
+    ) == []

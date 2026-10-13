@@ -22,6 +22,7 @@ from ..performance_v2_selection import (
     _ab_metrics_from_windows,
     _consistency_summary,
     _consistency_windows,
+    _fee_efficiency,
     _return_30d,
     _selection_windows,
     _trade_rate_30d,
@@ -361,6 +362,13 @@ _DECIMAL_FIELD_TYPES: dict[str, tuple[str, str]] = {
     "sizing_my_fix_balance": ("money", "currency"),
     "sizing_balance_percentage_short": ("percent", "%"),
     "sizing_risk_short": ("scalar", "1"),
+    # Selection candidate facts added after the snapshot registry was written.
+    "completed_cycle_net_pnl": ("money", "currency"),
+    "top5_pnl": ("money", "currency"),
+    "pnl_after_top5": ("money", "currency"),
+    "history_days": ("scalar", "1"),
+    "fees_share_pct": ("percent", "%"),
+    "fees_per_30d_pct": ("percent", "%"),
 }
 for _field in (
     "total_pnl_pct", "max_drawdown_pct", "return_pct", "daily_growth_pct", "fees_pct", "win_rate_pct",
@@ -395,6 +403,27 @@ for _order in range(1, 5):
 for _order in range(1, 5):
     _DECIMAL_FIELD_TYPES[f"order_{_order}_open_multiplier"] = ("multiplier", "1")
     _DECIMAL_FIELD_TYPES[f"order_{_order}_lot_x"] = ("lot", "1")
+
+# Selection settings added in the filter-sequence revision. Absolute research
+# thresholds compared with percent facts are percentage points; the rest are ratios.
+for _field in (
+    "ab_decline_cap_pct", "hard_dd_pct", "hard_pnl30_floor_pct", "top5_share_pct",
+    "researched_b_abs", "researched_dd_abs", "researched_stage3_near_b_abs", "researched_stage3_near_dd_abs",
+    # Stage settings canonicalized through the request payload.
+    "min_shift_pct", "pnl_tolerance_pct",
+):
+    _DECIMAL_FIELD_TYPES[_field] = ("percent", "%")
+for _field in (
+    "lot_full_dd5_multiplier", "lot_full_dd_multiplier", "lot_tolerance", "hard_dd_profit_multiplier",
+    "hard_ratio", "researched_pnl_dd5_ratio", "researched_pnl_b_ratio", "researched_b_rel",
+    "researched_dd5_abs", "researched_dd5_rel", "researched_dd_rel", "researched_stage3_near_b_rel",
+    "researched_stage3_near_dd5_abs", "researched_stage3_near_dd5_rel", "researched_stage3_near_dd_rel",
+    "researched_stage3_near_points_ratio", "researched_points_mean_ratio", "researched_points_same_floor_ratio",
+    "researched_points_cross_floor_ratio", "researched_points_single_best_ratio", "researched_open_ma_delta",
+    "researched_close_ma_delta", "researched_hold_p95_ratio", "researched_hold_median_ratio",
+    "researched_hold_p95_veto_ratio",
+):
+    _DECIMAL_FIELD_TYPES[_field] = ("scalar", "1")
 
 
 def _decimal_type(field: str, currency: str) -> tuple[str, str]:
@@ -493,12 +522,15 @@ def _refresh_candidate_metrics(
 
         pnl_30d = _return_30d(full, report_start, report_end)
         trade_rate = _trade_rate_30d(full, report_start, report_end)
+        fees_share, fees_30d = _fee_efficiency(full, report_start, report_end)
         candidate.update(
             total_trades=full.trade_count,
             trades_30d=trade_rate,
             pnl_30d_pct=pnl_30d,
             profit_factor=full.profit_factor,
             win_rate_pct=full.win_rate_pct,
+            fees_share_pct=fees_share,
+            fees_per_30d_pct=fees_30d,
         )
         drawdown = candidate.get("max_drawdown_pct")
         risk_scale = Decimal(5) / drawdown if isinstance(drawdown, Decimal) and drawdown > 0 else None
