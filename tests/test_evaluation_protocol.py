@@ -170,25 +170,25 @@ def test_a_profile_requires_its_fees_in_the_tester_config() -> None:
     assert error.value.code == PROTOCOL_V2_TESTER_CONFIG_REJECTED
 
 
-def test_the_target_carries_the_profile_and_its_digest(tmp_path: Path) -> None:
-    from mrs3.exchange_profiles import ExchangeProfile
+def test_the_target_carries_the_exchange_templates(tmp_path: Path) -> None:
+    from mrs3.exchange_profiles import load_exchange_profile
 
-    template = _tester_template(tmp_path)
+    repository = Path(__file__).resolve().parents[1]
+    profile = load_exchange_profile(repository, "BingX")
     config = PerformanceV2Config(tmp_path / "v2", evaluation_protocol="v2", exchange="BingX")
-    profile = ExchangeProfile("BingX", (("account", "bingx"),), (("MakerFee", 0.00012),))
 
-    target = evaluation_target(config, template, profile)
-    bare = evaluation_target(config, template, ExchangeProfile("BingX"))
+    target = evaluation_target(config, profile.mrs3_tester, profile)
 
+    assert target.base == Decimal("10000")
     assert (target.strategy_exchange, target.tester_fields) == (profile.strategy_exchange, profile.tester)
-    assert target.profile_digest == profile.digest()
-    assert bare.profile_digest is None
+    assert target.profile_digest == profile.digest
+    assert (target.strategy_template, target.tester_template) == (profile.mrs3_strategy, profile.mrs3_tester)
     with pytest.raises(EvaluationProtocolError) as error:
-        evaluation_target(config, template, ExchangeProfile("Bybit"))
-    assert error.value.code == "EXCHANGE_PROFILE_INVALID"
+        evaluation_target(config, profile.mrs3_tester, load_exchange_profile(repository, "Bybit"))
+    assert error.value.code == "EXCHANGE_TEMPLATES_INVALID"
 
 
-def test_the_finalist_digest_changes_only_with_a_profile() -> None:
+def test_the_finalist_digest_changes_with_the_exchange_templates() -> None:
     from mrs3.performance_v2_finalist_retest import finalist_retest_config_digest
 
     plain = EvaluationTarget(Decimal("10000"), "BingX")

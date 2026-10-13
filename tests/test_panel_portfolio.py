@@ -239,7 +239,7 @@ def test_panel_freeze_emits_weighted_contract_without_legacy_stage1(monkeypatch:
 def test_panel_freeze_carries_dedicated_weighted_template_and_digest(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     path = tmp_path / "portfolio_optimizer.local.json"
     digest = _write_config(path)
-    template_path = Path(__file__).parents[1] / "templates" / "strategies" / "portfolio-weighted-mrs" / "base.json"
+    template_path = Path(__file__).parents[1] / "templates" / "exchanges" / "Bybit" / "portfolio-strategy.json"
     expected_template = json.loads(template_path.read_text(encoding="utf-8"))
     expected_digest = hashlib.sha256(template_path.read_bytes()).hexdigest()
 
@@ -267,7 +267,7 @@ def test_panel_freeze_carries_dedicated_weighted_template_and_digest(monkeypatch
 def test_panel_freeze_keeps_template_snapshot_after_file_changes(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     path = tmp_path / "portfolio_optimizer.local.json"
     digest = _write_config(path)
-    source_path = Path(__file__).parents[1] / "templates" / "strategies" / "portfolio-weighted-mrs" / "base.json"
+    source_path = Path(__file__).parents[1] / "templates" / "exchanges" / "Bybit" / "portfolio-strategy.json"
     template_path = tmp_path / "base.json"
     template_path.write_bytes(source_path.read_bytes())
     monkeypatch.setattr("mrs3.panel_portfolio._WEIGHTED_TEMPLATE_PATH", template_path)
@@ -3603,7 +3603,7 @@ def test_stage2_baseline_preparation_uses_first_persisted_candidate_and_exact_pa
     assert prepared["pretest_period"] == {"start_utc": "2026-01-01T00:00:00Z", "end_utc": "2026-01-15T00:00:00Z"}
 
     config = json.loads(prepared["tester_config_json"])
-    template = json.loads((Path(__file__).parents[1] / "templates/tester/portfolio-stage2/config_tester.json").read_text(encoding="utf-8"))
+    template = json.loads((Path(__file__).parents[1] / "templates/exchanges/Bybit/portfolio-tester.json").read_text(encoding="utf-8"))
     expected_config = {**template, "name_comment": "a" * 64, "StartDate": "2026-01-01", "EndDate": "2026-01-14", "InitialBalance": 10000, "single_mode": False, "UpdateData": True}
     assert config == expected_config
     assert type(config["InitialBalance"]) is int
@@ -5739,7 +5739,7 @@ def test_stage2_tester_config_comes_only_from_its_own_template(tmp_path: Path, m
 
     stage2_path = portfolio_stage2_tester_config_template()
     assert stage2_path != mrs3_tester_config_template()
-    assert stage2_path.parent.name == "portfolio-stage2"
+    assert stage2_path.name == "portfolio-tester.json" and stage2_path.parent.name == "Bybit"
     assert not hasattr(pp, "mrs3_tester_config_template")
     # Stage 2 keeps the liquidity-aware fill model of the trading test (ADR-0070).
     assert json.loads(stage2_path.read_text(encoding="utf-8"))["LimitOrderVolumeCheck"] is True

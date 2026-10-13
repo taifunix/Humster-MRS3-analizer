@@ -1,4 +1,4 @@
-"""Performance databases and exchange profiles of `config.local.json` (P7 spec §3)."""
+"""Performance databases of `config.local.json` and exchange template folders (P7 spec §3)."""
 
 from __future__ import annotations
 
@@ -6,24 +6,19 @@ import hashlib
 import json
 import math
 import os
-import threading
 import uuid
 from dataclasses import dataclass
-from decimal import Decimal
 from pathlib import Path
 from typing import Mapping
 
 EVALUATION_PROTOCOLS = ("v1", "v2")
-# The repository templates are the Bybit profile, so Bybit needs no profile (P7 spec §3).
-PROFILE_FREE_EXCHANGE = "bybit"
-STRATEGY_EXCHANGE_KEYS = ("account", "subaccount_name", "account_type", "bybit_transfer_profit")
-TESTER_KEYS = ("MakerFee", "TakerFee", "FundingRate", "FundingIntervalHours", "SlippagePercent")
-_NON_NEGATIVE_TESTER_KEYS = frozenset({"MakerFee", "TakerFee", "SlippagePercent"})
+EXCHANGE_TEMPLATES = Path("templates") / "exchanges"
+# Fields every launch check compares with the exchange templates; account_type is a Bybit-only notion.
+CHECKED_STRATEGY_FIELDS = ("account",)
+CHECKED_TESTER_FIELDS = ("MakerFee", "TakerFee", "FundingRate", "FundingIntervalHours")
+_NON_NEGATIVE_TESTER_KEYS = frozenset({"MakerFee", "TakerFee"})
 _DATABASE_KEYS = frozenset({"database_root", "evaluation_protocol", "exchange"})
-_PROFILE_KEYS = frozenset({"strategy_exchange", "tester", "listing_dates"})
-_LISTING_KEYS = frozenset({"path", "sheet"})
-# Renders and launches of one Panel process may write the same effective template at once.
-_TEMPLATE_WRITE_LOCK = threading.Lock()
+_EXCHANGE_KEYS = frozenset({"exchange", "listing_dates_sheet"})
 
 
 class _CodedError(ValueError):
@@ -61,30 +56,19 @@ class PerformanceDatabases:
 
 
 @dataclass(frozen=True, slots=True)
-class ListingDatesSource:
-    path: Path
-    sheet: str | None
-
-
-@dataclass(frozen=True, slots=True)
 class ExchangeProfile:
-    """Fields one exchange changes in the rendered strategy and tester config."""
+    """Templates of one exchange in `templates/exchanges/<exchange>/` (P7 spec §3)."""
 
     exchange: str
-    strategy_exchange: tuple[tuple[str, str], ...] = ()
-    tester: tuple[tuple[str, int | float], ...] = ()
-    listing_dates: ListingDatesSource | None = None
-
-    def digest(self) -> str:
-        """SHA-256 of the fields a render depends on (P7 spec §4: job marker, finalist digest)."""
-        document = {
-            "strategy_exchange": dict(self.strategy_exchange),
-            "tester": {key: format(Decimal(str(value)).normalize(), "f") for key, value in self.tester},
-            "listing_dates": None if self.listing_dates is None else [
-                self.listing_dates.path.as_posix(), self.listing_dates.sheet,
-            ],
-        }
-        return hashlib.sha256(json.dumps(document, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+    folder: Path
+    mrs3_strategy: Path
+    mrs3_tester: Path
+    portfolio_strategy: Path | None
+    portfolio_tester: Path | None
+    listing_dates_sheet: str | None
+    strategy_exchange: tuple[tuple[str, str], ...]
+    tester: tuple[tuple[str, int | float], ...]
+    digest: str
 
 
 def _local_config(path: Path) -> dict[str, object]:
@@ -196,135 +180,110 @@ def save_performance_databases(local_config: Path, section: Mapping[str, object]
     return parsed
 
 
-def exchange_profile_names(local_config: Path) -> tuple[str, ...]:
-    """Exchanges a new database can use: the profiles plus Bybit, which needs none."""
-    profiles = _local_config(local_config).get("exchange_profiles", {})
-    names = [key.strip() for key in profiles if isinstance(key, str) and key.strip()] if isinstance(profiles, dict) else []
-    if not any(name.casefold() == PROFILE_FREE_EXCHANGE for name in names):
-        names.append("Bybit")
-    return tuple(sorted(dict.fromkeys(names), key=str.casefold))
-
-
 def _tester_value(key: str, value: object) -> int | float:
     try:
         finite = not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(value)
     except OverflowError:
         finite = False
     if not finite:
-        raise ExchangeProfileError("EXCHANGE_PROFILE_INVALID", f"tester.{key} must be a finite number")
+        raise ExchangeProfileError("EXCHANGE_TEMPLATES_INVALID", f"mrs3-tester.json {key} must be a finite number")
     if key in _NON_NEGATIVE_TESTER_KEYS and value < 0:
-        raise ExchangeProfileError("EXCHANGE_PROFILE_INVALID", f"tester.{key} must not be negative")
+        raise ExchangeProfileError("EXCHANGE_TEMPLATES_INVALID", f"mrs3-tester.json {key} must not be negative")
     if key == "FundingIntervalHours" and value <= 0:
-        raise ExchangeProfileError("EXCHANGE_PROFILE_INVALID", "tester.FundingIntervalHours must be positive")
+        raise ExchangeProfileError("EXCHANGE_TEMPLATES_INVALID", "mrs3-tester.json FundingIntervalHours must be positive")
     return value
 
 
-def _profile(exchange: str, raw: object) -> ExchangeProfile:
-    if not isinstance(raw, dict) or set(raw).difference(_PROFILE_KEYS):
-        raise ExchangeProfileError("EXCHANGE_PROFILE_INVALID", f"profile of {exchange} has unknown keys")
-    strategy = raw.get("strategy_exchange", {})
-    if not isinstance(strategy, dict) or set(strategy).difference(STRATEGY_EXCHANGE_KEYS):
-        raise ExchangeProfileError(
-            "EXCHANGE_PROFILE_INVALID", "strategy_exchange allows only " + ", ".join(STRATEGY_EXCHANGE_KEYS),
-        )
-    if any(not isinstance(value, str) for value in strategy.values()):
-        raise ExchangeProfileError("EXCHANGE_PROFILE_INVALID", "strategy_exchange values must be strings")
-    tester = raw.get("tester", {})
-    if not isinstance(tester, dict) or set(tester).difference(TESTER_KEYS):
-        raise ExchangeProfileError("EXCHANGE_PROFILE_INVALID", "tester allows only " + ", ".join(TESTER_KEYS))
-    listing = raw.get("listing_dates")
-    source = None
-    if listing is not None:
-        if not isinstance(listing, dict) or set(listing).difference(_LISTING_KEYS):
-            raise ExchangeProfileError("EXCHANGE_PROFILE_INVALID", "listing_dates allows only path and sheet")
-        try:
-            path = relative_project_path(listing.get("path"), "listing_dates.path")
-        except ValueError as error:
-            raise ExchangeProfileError("EXCHANGE_PROFILE_INVALID", str(error)) from None
-        sheet = listing.get("sheet")
-        if sheet is not None and (not isinstance(sheet, str) or not sheet.strip()):
-            raise ExchangeProfileError("EXCHANGE_PROFILE_INVALID", "listing_dates.sheet must be a non-empty string")
-        source = ListingDatesSource(path, None if sheet is None else sheet.strip())
-    return ExchangeProfile(
-        exchange,
-        tuple((key, strategy[key]) for key in STRATEGY_EXCHANGE_KEYS if key in strategy),
-        tuple((key, _tester_value(key, tester[key])) for key in TESTER_KEYS if key in tester),
-        source,
-    )
-
-
-def load_exchange_profile(local_config: Path, exchange: str) -> ExchangeProfile:
-    """Profile of one exchange; Bybit falls back to the templates, another exchange needs one."""
-    profiles = _local_config(local_config).get("exchange_profiles", {})
-    if not isinstance(profiles, dict):
-        raise ExchangeProfileError("EXCHANGE_PROFILE_INVALID", "exchange_profiles must be an object")
-    wanted = exchange.strip().casefold()
-    matches = [key for key in profiles if isinstance(key, str) and key.strip().casefold() == wanted]
-    if len(matches) > 1:
-        raise ExchangeProfileError("EXCHANGE_PROFILE_INVALID", f"more than one profile for {exchange}")
-    if matches:
-        return _profile(exchange.strip(), profiles[matches[0]])
-    if wanted == PROFILE_FREE_EXCHANGE:
-        return ExchangeProfile(exchange.strip())
-    raise ExchangeProfileError(
-        "EXCHANGE_PROFILE_MISSING", f"exchange_profiles.{exchange} is required to test on {exchange}",
-    )
-
-
-def materialize_tester_template(
-    template: Path, tester: tuple[tuple[str, int | float], ...] | Mapping[str, int | float], directory: Path,
-) -> Path:
-    """The tester template with profile fields: the template itself, or an immutable content-addressed copy."""
-    fields = dict(tester)
-    if not fields:
-        return Path(template)
+def _template_document(path: Path) -> tuple[dict[str, object], bytes]:
     try:
-        document = json.loads(Path(template).read_text(encoding="utf-8"))
+        payload = path.read_bytes()
+        document = json.loads(payload.decode("utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise ExchangeProfileError("EXCHANGE_PROFILE_INVALID", "MRS3 tester template is unreadable") from error
+        raise ExchangeProfileError("EXCHANGE_TEMPLATES_INVALID", f"{path.parent.name}/{path.name} is unreadable") from error
     if not isinstance(document, dict):
-        raise ExchangeProfileError("EXCHANGE_PROFILE_INVALID", "MRS3 tester template must be an object")
-    document.update(fields)
-    payload = (json.dumps(document, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
-    target = Path(directory) / f"mrs3-tester-{hashlib.sha256(payload).hexdigest()[:16]}.json"
-    with _TEMPLATE_WRITE_LOCK:
-        if _holds(target, payload):
-            return target
-        target.parent.mkdir(parents=True, exist_ok=True)
-        temporary = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
+        raise ExchangeProfileError("EXCHANGE_TEMPLATES_INVALID", f"{path.parent.name}/{path.name} must be an object")
+    return document, payload
+
+
+def exchange_template_names(root: Path) -> tuple[str, ...]:
+    """Exchanges with a valid template folder: the exchanges a database can be created for."""
+    base = Path(root) / EXCHANGE_TEMPLATES
+    if not base.is_dir():
+        return ()
+    names = []
+    for folder in base.iterdir():
+        if not folder.is_dir():
+            continue
         try:
-            temporary.write_bytes(payload)
-            os.replace(temporary, target)
-        except OSError:
-            # Another process may hold the target on Windows; equal bytes are success.
-            if not _holds(target, payload):
-                raise
-        finally:
-            temporary.unlink(missing_ok=True)
-    return target
+            names.append(load_exchange_profile(root, folder.name).exchange)
+        except ExchangeProfileError:
+            continue
+    return tuple(sorted(dict.fromkeys(names), key=str.casefold))
 
 
-def _holds(path: Path, payload: bytes) -> bool:
-    try:
-        return path.is_file() and path.read_bytes() == payload
-    except OSError:
-        return False
+def load_exchange_profile(root: Path, exchange: str) -> ExchangeProfile:
+    """Templates of the exchange of the active database; another exchange needs its own folder."""
+    wanted = exchange.strip().casefold()
+    base = Path(root) / EXCHANGE_TEMPLATES
+    folders = [folder for folder in base.iterdir() if folder.is_dir() and folder.name.casefold() == wanted] if base.is_dir() else []
+    if not folders:
+        raise ExchangeProfileError(
+            "EXCHANGE_TEMPLATES_MISSING", f"templates/exchanges/{exchange.strip()} is required to test on {exchange.strip()}",
+        )
+    if len(folders) > 1:
+        raise ExchangeProfileError("EXCHANGE_TEMPLATES_INVALID", f"more than one template folder for {exchange.strip()}")
+    folder = folders[0]
+    meta, _ = _template_document(folder / "exchange.json")
+    if set(meta) != _EXCHANGE_KEYS or meta["exchange"] != folder.name:
+        raise ExchangeProfileError(
+            "EXCHANGE_TEMPLATES_INVALID", f"{folder.name}/exchange.json needs exchange={folder.name} and listing_dates_sheet",
+        )
+    sheet = meta["listing_dates_sheet"]
+    if sheet is not None and (not isinstance(sheet, str) or not sheet.strip()):
+        raise ExchangeProfileError("EXCHANGE_TEMPLATES_INVALID", f"{folder.name}/exchange.json listing_dates_sheet is invalid")
+    strategy, _ = _template_document(folder / "mrs3-strategy.json")
+    block = strategy.get("exchange")
+    if not isinstance(block, dict) or block.get("name") != folder.name:
+        raise ExchangeProfileError(
+            "EXCHANGE_TEMPLATES_INVALID", f"{folder.name}/mrs3-strategy.json exchange.name must be {folder.name}",
+        )
+    if any(not isinstance(block.get(key), str) for key in CHECKED_STRATEGY_FIELDS):
+        raise ExchangeProfileError("EXCHANGE_TEMPLATES_INVALID", f"{folder.name}/mrs3-strategy.json needs exchange.account")
+    tester, _ = _template_document(folder / "mrs3-tester.json")
+    fields = tuple((key, _tester_value(key, tester.get(key))) for key in CHECKED_TESTER_FIELDS)
+    # Canonical JSON, not file bytes: a line-ending change in a checkout is not a template change.
+    canonical = json.dumps(
+        {"strategy": strategy, "tester": tester, "listing_dates_sheet": sheet}, sort_keys=True, ensure_ascii=False,
+    )
+    digest = hashlib.sha256(canonical.encode("utf-8"))
+    portfolio_strategy, portfolio_tester = folder / "portfolio-strategy.json", folder / "portfolio-tester.json"
+    return ExchangeProfile(
+        exchange=folder.name,
+        folder=folder,
+        mrs3_strategy=folder / "mrs3-strategy.json",
+        mrs3_tester=folder / "mrs3-tester.json",
+        portfolio_strategy=portfolio_strategy if portfolio_strategy.is_file() else None,
+        portfolio_tester=portfolio_tester if portfolio_tester.is_file() else None,
+        listing_dates_sheet=None if sheet is None else sheet.strip(),
+        strategy_exchange=tuple((key, block[key]) for key in CHECKED_STRATEGY_FIELDS),
+        tester=fields,
+        digest=digest.hexdigest(),
+    )
 
 
 __all__ = [
+    "CHECKED_STRATEGY_FIELDS",
+    "CHECKED_TESTER_FIELDS",
+    "EXCHANGE_TEMPLATES",
     "ExchangeProfile",
     "ExchangeProfileError",
-    "ListingDatesSource",
     "PerformanceDatabaseEntry",
     "PerformanceDatabaseError",
     "PerformanceDatabases",
-    "STRATEGY_EXCHANGE_KEYS",
-    "TESTER_KEYS",
-    "exchange_profile_names",
+    "exchange_template_names",
     "inside_project",
     "load_exchange_profile",
     "load_performance_databases",
-    "materialize_tester_template",
     "parse_performance_databases",
     "relative_project_path",
     "require_apart_from_default",

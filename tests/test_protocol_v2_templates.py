@@ -16,7 +16,7 @@ def test_repository_templates_meet_protocol_v2_with_one_base() -> None:
     root = Path(__file__).resolve().parents[1]
     base = tester_base(mrs3_tester_config_template(root))
     tester = json.loads(mrs3_tester_config_template(root).read_text(encoding="utf-8"))
-    strategy = json.loads((root / "templates/strategies/retest-mrs3/base.json").read_text(encoding="utf-8"))
+    strategy = json.loads((root / "templates/exchanges/Bybit/mrs3-strategy.json").read_text(encoding="utf-8"))
 
     # Protocol v2 §4.3: one base for the strategy and the tester.
     assert Decimal(str(strategy["basic"]["my_fix_balance"])) == base

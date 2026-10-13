@@ -4662,7 +4662,7 @@ def test_weighted_payload_rewrites_basic_symbol_for_member_without_exchange_symb
 
 
 def test_weighted_payload_accepts_new_disk_template_for_btcusdt_fixture():
-    template_path = Path(__file__).parents[1] / "templates" / "strategies" / "portfolio-weighted-mrs" / "base.json"
+    template_path = Path(__file__).parents[1] / "templates" / "exchanges" / "Bybit" / "portfolio-strategy.json"
     template = json.loads(template_path.read_text(encoding="utf-8"))
     member = {"symbol": "BTCUSDT", "side": "LONG", "x_usdt": "100", "priority": 3}
 
@@ -5329,7 +5329,7 @@ def test_build_adapter_counts_members_built_from_legacy_ma_prototype(monkeypatch
 
 def _real_weighted_template_payload(side):
     template = json.loads(
-        (Path(__file__).resolve().parents[1] / "templates/strategies/portfolio-weighted-mrs/base.json").read_text(encoding="utf-8")
+        (Path(__file__).resolve().parents[1] / "templates/exchanges/Bybit/portfolio-strategy.json").read_text(encoding="utf-8")
     )
     orders = tuple(
         {"order_id": number, "open_ma_len": length, "shift_bp": shift, "lot_x": Decimal("0.25")}

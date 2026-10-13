@@ -128,8 +128,8 @@ def test_bulk_control_candidate_workbook_uses_regime_column_contract() -> None:
 
 def test_weighted_template_only_changes_name_and_mrs_priority() -> None:
     root = Path(__file__).resolve().parents[1]
-    original_text = (root / "templates/strategies/retest-mrs3/base.json").read_text(encoding="utf-8")
-    weighted_text = (root / "templates/strategies/portfolio-weighted-mrs/base.json").read_text(encoding="utf-8")
+    original_text = (root / "templates/exchanges/Bybit/mrs3-strategy.json").read_text(encoding="utf-8")
+    weighted_text = (root / "templates/exchanges/Bybit/portfolio-strategy.json").read_text(encoding="utf-8")
     original = json.loads(original_text)
     weighted = json.loads(weighted_text)
 
@@ -358,7 +358,7 @@ def test_manifest_has_one_common_period_and_native_strategy_provenance(tmp_path)
         )
         batch = build_finalist_retest_manifest(
             connection,
-            {"LONG": Path(__file__).resolve().parents[1] / "templates/strategies/retest-mrs3/base.json"},
+            {"LONG": Path(__file__).resolve().parents[1] / "templates/exchanges/Bybit/mrs3-strategy.json"},
             tmp_path / "output",
             test_start="2026-01-01",
             test_end="2026-06-01",

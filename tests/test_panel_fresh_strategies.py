@@ -438,11 +438,11 @@ def test_run_files_uses_filtered_ready_candidates(tmp_path: Path, monkeypatch) -
     from tests.test_fresh_analysis_strategies import _make_analysis
 
     config = tmp_path / "config.local.json"; config.write_text("{}", encoding="utf-8")
-    template_root = tmp_path / "templates" / "tester" / "mrs3"
+    template_root = tmp_path / "templates" / "exchanges" / "Bybit"
     template_root.mkdir(parents=True)
     shutil.copyfile(
-        Path(__file__).parents[1] / "templates" / "tester" / "mrs3" / "config_tester.json",
-        template_root / "config_tester.json",
+        Path(__file__).parents[1] / "templates" / "exchanges" / "Bybit" / "mrs3-tester.json",
+        template_root / "mrs3-tester.json",
     )
     template = tmp_path / "Input" / "run_snapshot_2.json"; template.parent.mkdir()
     template.write_text(json.dumps(protocol_v2_run_snapshot()), encoding="utf-8")

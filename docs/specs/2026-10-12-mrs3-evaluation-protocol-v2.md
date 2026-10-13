@@ -101,6 +101,12 @@
 
 ### 4.2 Шаблоны и рендер
 
+С P7e (2026-10-13) шаблоны MRS3 и оптимизатора лежат по биржам в
+`templates/exchanges/<биржа>/` (`mrs3-strategy.json`, `mrs3-tester.json`,
+`portfolio-strategy.json`, `portfolio-tester.json`); пути ниже — исторические
+имена файлов, перенесённых в `templates/exchanges/Bybit/`
+([P7 §3](2026-10-13-panel-performance-db-selection.md)).
+
 | Файл | Изменение |
 | --- | --- |
 | `templates/tester/mrs3/config_tester.json` | `LimitOrderVolumeCheck=false`, `InitialBalance=10000` |

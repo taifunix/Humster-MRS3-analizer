@@ -3,24 +3,19 @@
 from __future__ import annotations
 
 import json
-from decimal import Decimal
 from pathlib import Path
 
 import pytest
 
 from mrs3.exchange_profiles import (
     ExchangeProfileError,
+    exchange_template_names,
     load_exchange_profile,
     load_performance_databases,
-    materialize_tester_template,
 )
 from mrs3.performance_v2_store import load_performance_v2_config
 
-BINGX_PROFILE = {
-    "strategy_exchange": {"account": "bingx"},
-    "tester": {"MakerFee": 0.00012, "TakerFee": 0.0003, "FundingRate": 0.00025, "FundingIntervalHours": 8},
-    "listing_dates": {"path": "input/liquidity.xlsx", "sheet": "Пары_BingX"},
-}
+REPOSITORY = Path(__file__).resolve().parents[1]
 
 
 def _write(path: Path, document: dict[str, object]) -> Path:
@@ -92,64 +87,77 @@ def test_an_invalid_section_is_refused(tmp_path: Path, section: dict[str, object
         load_performance_v2_config(_performance_config(tmp_path), v1_database_root=tmp_path)
 
 
-def test_bybit_needs_no_profile_and_another_exchange_does(tmp_path: Path) -> None:
-    local = tmp_path / "config.local.json"
+def _copy_exchange(root: Path, exchange: str) -> Path:
+    import shutil
 
-    bybit = load_exchange_profile(local, "Bybit")
-    assert (bybit.strategy_exchange, bybit.tester, bybit.listing_dates) == ((), (), None)
+    target = root / "templates" / "exchanges" / exchange
+    shutil.copytree(REPOSITORY / "templates" / "exchanges" / exchange, target)
+    return target
+
+
+def test_repository_exchange_templates_load() -> None:
+    bybit = load_exchange_profile(REPOSITORY, "Bybit")
+    bingx = load_exchange_profile(REPOSITORY, " bingx ")
+
+    assert exchange_template_names(REPOSITORY) == ("BingX", "Bybit")
+    assert (bybit.strategy_exchange, bybit.listing_dates_sheet) == ((("account", "bybit_ytl"),), None)
+    assert dict(bybit.tester) == {"MakerFee": 1e-05, "TakerFee": 0.0002, "FundingRate": 0.00025, "FundingIntervalHours": 8}
+    assert bybit.portfolio_strategy is not None and bybit.portfolio_tester is not None
+    assert (bingx.exchange, bingx.strategy_exchange, bingx.listing_dates_sheet) == ("BingX", (("account", "bingx"),), "Пары_BingX")
+    assert dict(bingx.tester) == {"MakerFee": 0.00012, "TakerFee": 0.0003, "FundingRate": 0.00025, "FundingIntervalHours": 8}
+    # The optimizer is not adapted to BingX yet.
+    assert bingx.portfolio_strategy is None and bingx.portfolio_tester is None
+    assert bybit.digest != bingx.digest
+
+
+def test_bingx_templates_differ_from_bybit_only_in_exchange_values() -> None:
+    base = REPOSITORY / "templates" / "exchanges"
+    bybit = json.loads((base / "Bybit" / "mrs3-strategy.json").read_text(encoding="utf-8"))
+    bingx = json.loads((base / "BingX" / "mrs3-strategy.json").read_text(encoding="utf-8"))
+    bybit["exchange"].update({"name": "BingX", "account": "bingx"})
+    assert bingx == bybit
+    bybit_tester = json.loads((base / "Bybit" / "mrs3-tester.json").read_text(encoding="utf-8"))
+    bingx_tester = json.loads((base / "BingX" / "mrs3-tester.json").read_text(encoding="utf-8"))
+    bybit_tester.update({"MakerFee": 0.00012, "TakerFee": 0.0003})
+    assert bingx_tester == bybit_tester
+
+
+def test_an_exchange_without_templates_is_refused(tmp_path: Path) -> None:
+    _copy_exchange(tmp_path, "Bybit")
+
     with pytest.raises(ExchangeProfileError) as error:
-        load_exchange_profile(local, "BingX")
-    assert error.value.code == "EXCHANGE_PROFILE_MISSING"
+        load_exchange_profile(tmp_path, "OKX")
+    assert error.value.code == "EXCHANGE_TEMPLATES_MISSING"
 
 
-def test_a_profile_is_matched_without_case(tmp_path: Path) -> None:
-    local = _write(tmp_path / "config.local.json", {"exchange_profiles": {"bingx": BINGX_PROFILE}})
-
-    profile = load_exchange_profile(local, "BingX")
-
-    assert profile.strategy_exchange == (("account", "bingx"),)
-    assert dict(profile.tester)["TakerFee"] == 0.0003
-    assert (profile.listing_dates.path, profile.listing_dates.sheet) == (Path("input/liquidity.xlsx"), "Пары_BingX")
-
-
-@pytest.mark.parametrize("profile, message", [
-    ({"strategy_exchange": {"name": "BingX"}}, "strategy_exchange"),
-    ({"tester": {"InitialBalance": 1}}, "tester"),
-    ({"tester": {"MakerFee": "0.1"}}, "MakerFee"),
-    ({"tester": {"TakerFee": -0.1}}, "TakerFee"),
-    ({"tester": {"FundingIntervalHours": 0}}, "FundingIntervalHours"),
-    ({"tester": {"FundingRate": 10 ** 400}}, "FundingRate"),
-    ({"listing_dates": {"path": "../dates.xlsx"}}, "listing_dates"),
-    ({"listing_dates": {"path": "input/d.xlsx", "sheet": ""}}, "sheet"),
-    ({"margin": {}}, "unknown"),
+@pytest.mark.parametrize("file, change, message", [
+    ("exchange.json", {"exchange": "Other"}, "exchange.json"),
+    ("exchange.json", {"extra": 1}, "exchange.json"),
+    ("exchange.json", {"listing_dates_sheet": ""}, "listing_dates_sheet"),
+    ("mrs3-strategy.json", {"exchange": {"name": "Bybit", "account": "x"}}, "exchange.name"),
+    ("mrs3-strategy.json", {"exchange": {"name": "BingX"}}, "exchange.account"),
+    ("mrs3-tester.json", {"TakerFee": "0.1"}, "TakerFee"),
+    ("mrs3-tester.json", {"MakerFee": -0.1}, "MakerFee"),
+    ("mrs3-tester.json", {"FundingIntervalHours": 0}, "FundingIntervalHours"),
+    ("mrs3-tester.json", {"FundingRate": 10 ** 400}, "FundingRate"),
 ])
-def test_an_invalid_profile_is_refused(tmp_path: Path, profile: dict[str, object], message: str) -> None:
-    local = _write(tmp_path / "config.local.json", {"exchange_profiles": {"BingX": profile}})
+def test_an_inconsistent_template_folder_is_refused(tmp_path: Path, file: str, change: dict[str, object], message: str) -> None:
+    folder = _copy_exchange(tmp_path, "BingX")
+    document = json.loads((folder / file).read_text(encoding="utf-8"))
+    document.update(change)
+    (folder / file).write_text(json.dumps(document), encoding="utf-8")
 
     with pytest.raises(ExchangeProfileError, match=message) as error:
-        load_exchange_profile(local, "BingX")
-    assert error.value.code == "EXCHANGE_PROFILE_INVALID"
+        load_exchange_profile(tmp_path, "BingX")
+    assert error.value.code == "EXCHANGE_TEMPLATES_INVALID"
 
 
-def test_two_profiles_for_one_exchange_are_ambiguous(tmp_path: Path) -> None:
-    local = _write(tmp_path / "config.local.json", {"exchange_profiles": {"BingX": {}, "bingx": {}}})
+def test_a_missing_template_file_is_refused(tmp_path: Path) -> None:
+    folder = _copy_exchange(tmp_path, "BingX")
+    (folder / "mrs3-tester.json").unlink()
 
-    with pytest.raises(ExchangeProfileError, match="more than one"):
-        load_exchange_profile(local, "BingX")
-
-
-def test_the_effective_tester_template_is_content_addressed(tmp_path: Path) -> None:
-    template = _write(tmp_path / "config_tester.json", {"InitialBalance": 10000.0, "MakerFee": 1e-05, "TakerFee": 0.0002})
-    directory = tmp_path / "results" / ".tester-templates"
-
-    assert materialize_tester_template(template, (), directory) == template
-    first = materialize_tester_template(template, (("MakerFee", 0.00012), ("TakerFee", 0.0003)), directory)
-    second = materialize_tester_template(template, (("MakerFee", 0.00012), ("TakerFee", 0.0003)), directory)
-
-    assert first == second and first.parent == directory
-    document = json.loads(first.read_text(encoding="utf-8"))
-    assert document == {"InitialBalance": 10000.0, "MakerFee": 0.00012, "TakerFee": 0.0003}
-    assert Decimal(str(document["MakerFee"])) == Decimal("0.00012")
+    with pytest.raises(ExchangeProfileError, match="unreadable"):
+        load_exchange_profile(tmp_path, "BingX")
 
 
 def _workbook(path: Path) -> Path:
@@ -195,14 +203,15 @@ def test_a_listing_sheet_needs_a_workbook(tmp_path: Path) -> None:
         load_listing_dates(dates, "Пары_BingX")
 
 
-def test_concurrent_renders_write_one_template(tmp_path: Path) -> None:
-    from concurrent.futures import ThreadPoolExecutor
+def test_the_digest_ignores_line_endings_and_lists_only_valid_folders(tmp_path: Path) -> None:
+    folder = _copy_exchange(tmp_path, "BingX")
+    before = load_exchange_profile(tmp_path, "BingX").digest
+    for name in ("mrs3-strategy.json", "mrs3-tester.json"):
+        path = folder / name
+        path.write_bytes(path.read_bytes().replace(b"\r\n", b"\n").replace(b"\n", b"\r\n"))
 
-    template = _write(tmp_path / "config_tester.json", {"InitialBalance": 10000.0, "MakerFee": 1e-05})
-    fields = (("MakerFee", 0.00012),)
-    for round_ in range(10):
-        directory = tmp_path / f"round-{round_}"
-        with ThreadPoolExecutor(8) as pool:
-            paths = set(pool.map(lambda _i: materialize_tester_template(template, fields, directory), range(16)))
-        assert len(paths) == 1
-        assert [path.name for path in directory.iterdir()] == [next(iter(paths)).name]
+    assert load_exchange_profile(tmp_path, "BingX").digest == before
+    broken = tmp_path / "templates" / "exchanges" / "Broken"
+    broken.mkdir()
+    (broken / "exchange.json").write_text("{}", encoding="utf-8")
+    assert exchange_template_names(tmp_path) == ("BingX",)

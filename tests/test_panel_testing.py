@@ -29,7 +29,7 @@ def test_canonical_strategy_templates_are_tracked_by_mode() -> None:
     expected = {
         "templates/strategies/source-v6-mrs2/long.json": ("mrs2", True, False),
         "templates/strategies/source-v6-mrs2/short.json": ("mrs2", False, True),
-        "templates/strategies/retest-mrs3/base.json": ("mrs3", True, False),
+        "templates/exchanges/Bybit/mrs3-strategy.json": ("mrs3", True, False),
     }
 
     for relative, contract in expected.items():
@@ -112,7 +112,7 @@ def test_canonical_mrs2_templates_are_strict_and_render_worker_count() -> None:
                 "1,039", "1,043", "1,047", "1,051", "1,055",
             ]
 
-    mrs3 = root / "templates" / "tester" / "mrs3" / "config_tester.json"
+    mrs3 = root / "templates" / "exchanges" / "Bybit" / "mrs3-tester.json"
     document = json.loads(mrs3.read_text(encoding="utf-8"))
     assert isinstance(document, dict)
     assert document["parameter_mining"] == []

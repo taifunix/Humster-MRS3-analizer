@@ -22,9 +22,10 @@ from tests.test_panel_performance_v2_retest import _controller
 
 
 def _copy_tester_template(root: Path) -> None:
-    target = root / "templates" / "tester" / "mrs3" / "config_tester.json"
-    target.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(REPOSITORY / "templates" / "tester" / "mrs3" / "config_tester.json", target)
+    """The exchange template folders of the repository under a test project root."""
+    target = root / "templates" / "exchanges"
+    if not target.exists():
+        shutil.copytree(REPOSITORY / "templates" / "exchanges", target)
 
 
 def _protocol_v2_database(root: Path, exchange: str = "Bybit") -> None:
@@ -90,19 +91,16 @@ def test_target_of_a_v2_database_uses_the_tester_base_and_exchange(tmp_path: Pat
     _copy_tester_template(tmp_path)
     _protocol_v2_database(tmp_path, "BingX")
 
-    with pytest.raises(EvaluationProtocolError) as error:
-        controller._evaluation_target()
-    assert error.value.code == "EXCHANGE_PROFILE_MISSING"
-    local = controller.default_config.with_name("config.local.json")
-    document = json.loads(local.read_text(encoding="utf-8")) if local.is_file() else {}
-    document["exchange_profiles"] = {"BingX": {"strategy_exchange": {"account": "bingx"}, "tester": {"TakerFee": 0.0003}}}
-    local.write_text(json.dumps(document), encoding="utf-8")
-
     target = controller._evaluation_target()
 
     assert (str(target.base), target.exchange) == ("10000.0", "BingX")
-    assert (target.strategy_exchange, target.tester_fields) == ((("account", "bingx"),), (("TakerFee", 0.0003),))
+    assert target.strategy_exchange == (("account", "bingx"),)
+    assert dict(target.tester_fields)["TakerFee"] == 0.0003
     assert target.database == "performance-v2"
+    shutil.rmtree(tmp_path / "templates" / "exchanges" / "BingX")
+    with pytest.raises(EvaluationProtocolError) as error:
+        controller._evaluation_target()
+    assert error.value.code == "EXCHANGE_TEMPLATES_MISSING"
 
 
 def test_tester_start_refuses_a_manifest_with_a_non_v2_strategy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -208,43 +206,36 @@ def test_legacy_tester_run_launches_only_protocol_v2_strategies(tmp_path: Path, 
         controller._build_command("tester-run", request)
 
 
-def _bingx_profile(controller, profile: dict[str, object]) -> None:
-    local = controller.default_config.with_name("config.local.json")
-    document = json.loads(local.read_text(encoding="utf-8")) if local.is_file() else {}
-    document["exchange_profiles"] = {"BingX": profile}
-    local.write_text(json.dumps(document, ensure_ascii=False), encoding="utf-8")
-
-
-def test_profile_fees_reach_the_tester_template_of_every_launch(tmp_path: Path) -> None:
+def test_bingx_launches_use_the_bingx_templates(tmp_path: Path) -> None:
     from mrs3.evaluation_protocol import require_protocol_v2_tester_config
 
     controller = _controller(tmp_path, seed=False)
     _copy_tester_template(tmp_path)
     _protocol_v2_database(tmp_path, "BingX")
-    _bingx_profile(controller, {"tester": {"MakerFee": 0.00012, "TakerFee": 0.0003}})
     target = controller._evaluation_target()
+    folder = tmp_path / "templates" / "exchanges" / "BingX"
 
-    effective = controller._mrs3_tester_template(target)
-
-    assert effective.parent == tmp_path / "results" / ".tester-templates"
-    document = json.loads(effective.read_text(encoding="utf-8"))
-    assert (document["MakerFee"], document["TakerFee"], document["InitialBalance"]) == (0.00012, 0.0003, 10000.0)
+    assert controller._mrs3_tester_template(target) == folder / "mrs3-tester.json"
+    assert controller._mrs3_strategy_templates(target) == {
+        "LONG": str(folder / "mrs3-strategy.json"), "SHORT": str(folder / "mrs3-strategy.json"),
+    }
     controller._require_protocol_v2_tester_template(target)
-    raw = json.loads((tmp_path / "templates" / "tester" / "mrs3" / "config_tester.json").read_text(encoding="utf-8"))
+    bybit = json.loads((tmp_path / "templates" / "exchanges" / "Bybit" / "mrs3-tester.json").read_text(encoding="utf-8"))
     with pytest.raises(EvaluationProtocolError, match="MakerFee, TakerFee"):
-        require_protocol_v2_tester_config(raw, target)
+        require_protocol_v2_tester_config(bybit, target)
 
 
-def test_without_a_profile_the_tester_template_is_the_repository_one(tmp_path: Path) -> None:
+def test_bybit_launches_use_the_bybit_templates(tmp_path: Path) -> None:
     controller = _controller(tmp_path, seed=False)
     _copy_tester_template(tmp_path)
     _protocol_v2_database(tmp_path, "Bybit")
 
     target = controller._evaluation_target()
 
-    assert target.profile_digest is None
-    assert controller._mrs3_tester_template(target) == tmp_path / "templates" / "tester" / "mrs3" / "config_tester.json"
-    assert controller._protocol_v2_runtime(target)["evaluation_profile"] == "none"
+    folder = tmp_path / "templates" / "exchanges" / "Bybit"
+    assert controller._mrs3_tester_template(target) == folder / "mrs3-tester.json"
+    assert controller._mrs3_strategy_templates(target)["LONG"] == str(folder / "mrs3-strategy.json")
+    assert controller._protocol_v2_runtime(target)["evaluation_profile"] == target.profile_digest
 
 
 @pytest.mark.parametrize("change", ({"profile_digest": "p" * 64}, {"database": "data/other"}))
@@ -263,25 +254,23 @@ def test_retry_refuses_a_job_of_another_database_or_profile(
         )
 
 
-def test_listing_dates_come_from_the_profile(tmp_path: Path) -> None:
+def test_listing_dates_use_the_sheet_of_the_exchange(tmp_path: Path) -> None:
     controller = _controller(tmp_path, seed=False)
     _copy_tester_template(tmp_path)
     _protocol_v2_database(tmp_path, "BingX")
-    workbook = tmp_path / "input" / "liquidity.xlsx"
-    workbook.parent.mkdir(parents=True, exist_ok=True)
-    workbook.write_bytes(b"")
-    _bingx_profile(controller, {"listing_dates": {"path": "input/liquidity.xlsx", "sheet": "Пары_BingX"}})
+    workbook = (tmp_path / "input" / "dates.xlsx").resolve()
 
-    assert controller._listing_dates_source() == (workbook.resolve(), "Пары_BingX")
-    assert controller._retest_listing_context() == (workbook.resolve(), Path("input/liquidity.xlsx"), "Пары_BingX")
+    assert controller._listing_dates_source() == (workbook, "Пары_BingX")
+    assert controller._retest_listing_context() == (workbook, Path("input/dates.xlsx"), "Пары_BingX")
 
 
-def test_tester_start_hands_the_profile_template_to_its_job(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_tester_start_hands_the_exchange_template_to_its_job(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from dataclasses import replace
 
     controller = _controller(tmp_path, seed=False)
     _copy_tester_template(tmp_path)
-    target = replace(use_protocol_v2_target(monkeypatch, "BingX"), tester_fields=(("TakerFee", 0.0003),))
+    bingx = tmp_path / "templates" / "exchanges" / "BingX" / "mrs3-tester.json"
+    target = replace(use_protocol_v2_target(monkeypatch, "BingX"), tester_template=bingx)
     monkeypatch.setattr(panel_module.PanelController, "_evaluation_target", lambda _self: target)
     monkeypatch.setattr(controller, "_fresh_strategy_manifest", lambda _analysis_id: tmp_path / "manifest.json")
     started: dict[str, object] = {}
@@ -292,9 +281,7 @@ def test_tester_start_hands_the_profile_template_to_its_job(tmp_path: Path, monk
 
     controller.strategies_tester_start({"analysis_run_id": "a" * 64, "start_date": "2026-01-01", "end_date": "2026-01-31"})
 
-    template = Path(started["tester_config_template"])  # type: ignore[arg-type]
-    assert template.parent == tmp_path / "results" / ".tester-templates"
-    assert json.loads(template.read_text(encoding="utf-8"))["TakerFee"] == 0.0003
+    assert started["tester_config_template"] == bingx
 
 
 def test_import_refuses_a_job_rendered_for_another_database(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

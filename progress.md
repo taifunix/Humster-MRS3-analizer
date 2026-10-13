@@ -114,15 +114,13 @@ of every order and of the close MA (a strategy without stored facts keeps the
 template prototype), so a template change does not turn retest reports into
 `MA_SETTINGS_CHANGED`. P6 is complete.
 P7 ([spec](docs/specs/2026-10-13-panel-performance-db-selection.md), approved
-2026-10-13): P7a spec committed. P7b: `config.local.json`
-`performance_databases.active` overrides root/protocol/exchange in
-`load_performance_v2_config`; `exchange_profiles.<exchange>` gives the strategy
-account fields, tester fees/funding and the listing-date sheet (BingX:
-`Пары_BingX`); Bybit needs no profile, another exchange without one is refused
-(`EXCHANGE_PROFILE_MISSING`). Panel renders through an effective tester
-template (`results/.tester-templates/`), the predicate requires the profile
-fields, job markers add `evaluation_database`/`evaluation_profile`, the
-finalist digest adds the profile. P7c: Settings → «PerformanceDB и биржа»
+2026-10-13): P7a spec. P7b: `config.local.json` `performance_databases.active`
+overrides root/protocol/exchange in `load_performance_v2_config`; job markers
+add `evaluation_database`/`evaluation_profile`; the finalist digest adds the
+exchange templates; imports of jobs rendered for another target are refused
+(`IMPORT_TARGET_CHANGED`); listing dates read the exchange's sheet. (The P7b
+`exchange_profiles` overrides and `results/.tester-templates` were replaced by
+P7e template folders.) P7c: Settings → «PerformanceDB и биржа»
 lists the default and registered databases (folder, protocol, exchange, file
 markers, size), switches the active one (`performance_databases.active`, refused
 with `RESOURCE_BUSY` while a job runs or a report collection is open or
@@ -131,12 +129,21 @@ new folder under `data/` (`/api/v2/settings/performance-databases`,
 `…/activate`, `…/create`). P7d: portfolio Stage 1 (readiness blocker,
 finalist preparation, campaign submit) refuses a PerformanceDB marked with an
 exchange other than Bybit (`EXCHANGE_DATA_UNAVAILABLE`, HTTP 422); unmarked v1
-and Bybit databases work as before; Stage 2 reuses the checked campaign. P7 is
-complete. Next: BingX optimizer data (margin parameters from the exchange API,
-minute liquidity in the `BingX` folder next to the Bybit one) as a separate
-feature; the CSV Direct exchange key on `feat/csv-direct-analysis`. First run on
-BingX confirms the `exchange.name` the bot expects (the database marker must
-equal it).
+and Bybit databases work as before; Stage 2 reuses the checked campaign. P7e
+(user decision 2026-10-13): exchange templates replace the `config.local.json`
+profiles. `templates/exchanges/<exchange>/` holds `exchange.json` (listing-date
+sheet), `mrs3-strategy.json`, `mrs3-tester.json` and the optional optimizer
+`portfolio-*.json`; the former MRS3 and optimizer templates moved byte-for-byte
+to `templates/exchanges/Bybit/`, `BingX/` has the BingX account and fees. The
+active database's exchange picks the folder for READY, RETEST and finalist
+RETEST; launch checks compare `exchange.account` and the fee/funding fields
+(`account_type` is not checked). A new exchange is a new folder. P7 is
+complete.
+Plan (deferred, user decision 2026-10-13): optimizer adaptation for BingX
+(margin parameters from the exchange API, minute liquidity in the `BingX`
+folder next to the Bybit one, `portfolio-*.json` for BingX). Next work: CSV
+Direct and the analysis database (`feat/csv-direct-analysis`, including the
+exchange key) — finishing and optimisation.
 User decision 2026-10-12: one PerformanceDB per exchange with an
 `schema_info.exchange` marker (protocol v2 §4.1); the CSV Direct analysis DB
 (branch `feat/csv-direct-analysis`) must also record the exchange from the run

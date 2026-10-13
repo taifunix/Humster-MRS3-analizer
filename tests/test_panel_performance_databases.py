@@ -15,20 +15,16 @@ from mrs3.panel import create_panel_server
 from mrs3.performance_v2_store import database_identity, load_performance_v2_config
 from tests.test_panel_performance_v2_retest import _controller
 
-BINGX = {"strategy_exchange": {"account": "bingx"}, "tester": {"MakerFee": 0.00012, "TakerFee": 0.0003}}
+def _setup(tmp_path: Path, *, templates: bool = True):
+    from tests.test_panel_protocol_v2 import _copy_tester_template
 
-
-def _setup(tmp_path: Path, *, profile: bool = True):
     controller = _controller(tmp_path, seed=False)
     (tmp_path / "config.performance.json").write_text(json.dumps({"unified_performance_v2": {
         "database_root": "data/performance-v2", "workers": 1,
     }}), encoding="utf-8")
-    local = controller.default_config.with_name("config.local.json")
-    document = json.loads(local.read_text(encoding="utf-8"))
-    if profile:
-        document["exchange_profiles"] = {"BingX": BINGX}
-    local.write_text(json.dumps(document), encoding="utf-8")
-    return controller, local
+    if templates:
+        _copy_tester_template(tmp_path)
+    return controller, controller.default_config.with_name("config.local.json")
 
 
 def _performance_config(tmp_path: Path):
@@ -36,12 +32,12 @@ def _performance_config(tmp_path: Path):
 
 
 def test_without_entries_only_the_default_database_is_listed(tmp_path: Path) -> None:
-    controller, _local = _setup(tmp_path, profile=False)
+    controller, _local = _setup(tmp_path, templates=False)
 
     result = controller.performance_databases_get()
 
     assert result["active"] is None and result["busy"] is False
-    assert result["exchanges"] == ["Bybit"]
+    assert result["exchanges"] == []
     assert [(row["name"], row["database_root"], row["active"]) for row in result["items"]] == [
         (None, "data/performance-v2", True),
     ]
@@ -71,7 +67,7 @@ def test_create_writes_an_empty_v2_database_with_markers_and_keeps_the_config(tm
 
 
 @pytest.mark.parametrize("payload, code", [
-    ({"name": "x", "database_root": "data/x", "exchange": "OKX"}, "EXCHANGE_PROFILE_MISSING"),
+    ({"name": "x", "database_root": "data/x", "exchange": "OKX"}, "EXCHANGE_TEMPLATES_MISSING"),
     ({"name": "x", "database_root": "results/x", "exchange": "BingX"}, "INVALID_REQUEST"),
     ({"name": "x", "database_root": "data/../x", "exchange": "BingX"}, "INVALID_REQUEST"),
     ({"name": "x", "database_root": "data", "exchange": "BingX"}, "INVALID_REQUEST"),
@@ -163,10 +159,7 @@ def test_the_list_skips_markers_while_a_writer_works(tmp_path: Path) -> None:
 
 
 def test_activate_switches_the_database_and_back(tmp_path: Path) -> None:
-    from tests.test_panel_protocol_v2 import _copy_tester_template
-
     controller, _local = _setup(tmp_path)
-    _copy_tester_template(tmp_path)
     controller.performance_databases_create({"name": "bingx-v2", "database_root": "data/bingx", "exchange": "BingX"})
 
     result = controller.performance_databases_activate({"name": "bingx-v2"})
@@ -256,3 +249,11 @@ def test_settings_screen_has_the_performance_database_card() -> None:
     # Rows are built with textContent, never as HTML from server values.
     block = script[script.index("function renderPerformanceDatabases"):script.index("async function loadPerformanceDatabases")]
     assert "innerHTML" not in block
+
+
+def test_create_stores_the_exchange_as_its_template_folder_names_it(tmp_path: Path) -> None:
+    controller, local = _setup(tmp_path)
+
+    controller.performance_databases_create({"name": "x", "database_root": "data/x", "exchange": "bingx"})
+
+    assert json.loads(local.read_text(encoding="utf-8"))["performance_databases"]["items"]["x"]["exchange"] == "BingX"

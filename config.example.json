@@ -134,8 +134,8 @@
     "listing_dates_path": "input/dates.xlsx",
     "algorithm_version": "0.7-canonical-phase1",
     "strategy_templates": {
-      "LONG": "templates/strategies/retest-mrs3/base.json",
-      "SHORT": "templates/strategies/retest-mrs3/base.json"
+      "LONG": "templates/exchanges/Bybit/mrs3-strategy.json",
+      "SHORT": "templates/exchanges/Bybit/mrs3-strategy.json"
     }
   },
   "panel_paths": {

@@ -92,7 +92,7 @@ _PATH = re.compile(
     r"|(?<![\w])(?:[^\\/\s,;)]+[\\/])+\.\.(?:[\\/][^\s,;)]*)?"
     r"|(?<![\w])\.\.(?:[\\/][^\s,;)]*)+"
 )
-_WEIGHTED_TEMPLATE_PATH = Path(__file__).resolve().parents[2] / "templates" / "strategies" / "portfolio-weighted-mrs" / "base.json"
+_WEIGHTED_TEMPLATE_PATH = Path(__file__).resolve().parents[2] / "templates" / "exchanges" / "Bybit" / "portfolio-strategy.json"
 SUMMARY_HEADERS = ("Key", "Value")
 FINALIST_HEADERS = (
     "Campaign ID", "Strategy ID", "Result ID", "Pair", "Direction", "User Status", "User Rank",

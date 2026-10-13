@@ -35,10 +35,11 @@ class EvaluationProtocolError(ValueError):
 
 @dataclass(frozen=True, slots=True)
 class EvaluationTarget:
-    """Base B, exchange and exchange profile that every MRS3 evaluation test of the active database uses.
+    """Base B, exchange and exchange templates that every MRS3 evaluation test of the active database uses.
 
-    Profile fields are empty for an exchange without a profile (Bybit, P7 spec §3);
-    `profile_digest` is then None and the render is the pre-P7 one.
+    The checked fields and the digest come from `templates/exchanges/<exchange>/`
+    (P7 spec §3, §4); a target built without templates (tests) checks base and
+    exchange only.
     """
 
     base: Decimal
@@ -48,6 +49,9 @@ class EvaluationTarget:
     profile_digest: str | None = None
     # Folder of the active database: a job marker field (P7 spec §4), not a render input.
     database: str = field(default="", compare=False)
+    # Templates of the exchange: render inputs whose content the digest already covers.
+    strategy_template: Path | None = field(default=None, compare=False)
+    tester_template: Path | None = field(default=None, compare=False)
 
 
 def _number(value: object) -> Decimal | None:
@@ -81,8 +85,8 @@ def evaluation_target(
 ) -> EvaluationTarget:
     """Target of the active PerformanceDB; refuses before any render or launch when it is not protocol v2.
 
-    `profile` is the exchange profile of the active database (P7 spec §3); the
-    caller loads it so that a missing or invalid profile refuses with its code.
+    `profile` holds the exchange templates of the active database (P7 spec §3);
+    the caller loads them so that a missing or invalid folder refuses with its code.
     """
     exchange = (config.exchange or "").strip()
     if config.evaluation_protocol != "v2" or not exchange:
@@ -101,20 +105,21 @@ def evaluation_target(
         except (PerformanceV2StoreError, duckdb.Error) as error:
             raise EvaluationProtocolError(DATABASE_UNAVAILABLE, "active PerformanceDB cannot be checked") from error
     if profile is not None and profile.exchange.casefold() != exchange.casefold():
-        raise EvaluationProtocolError("EXCHANGE_PROFILE_INVALID", f"profile of {profile.exchange} is not for {exchange}")
+        raise EvaluationProtocolError("EXCHANGE_TEMPLATES_INVALID", f"templates of {profile.exchange} are not for {exchange}")
     database = Path(config.database_root)
     if project_root is not None:
         try:
             database = database.relative_to(Path(project_root).resolve())
         except ValueError:
             pass
-    has_profile = profile is not None and bool(profile.strategy_exchange or profile.tester or profile.listing_dates)
     return EvaluationTarget(
         tester_base(tester_template),
         exchange,
         strategy_exchange=profile.strategy_exchange if profile is not None else (),
         tester_fields=profile.tester if profile is not None else (),
-        profile_digest=profile.digest() if has_profile else None,  # type: ignore[union-attr]
+        profile_digest=profile.digest if profile is not None else None,
+        strategy_template=profile.mrs3_strategy if profile is not None else None,
+        tester_template=profile.mrs3_tester if profile is not None else None,
         database=database.as_posix(),
     )
 
@@ -167,7 +172,7 @@ def require_protocol_v2_strategy(strategy: Mapping[str, Any], target: Evaluation
 
 def require_protocol_v2_tester_config(config: Mapping[str, Any], target: EvaluationTarget) -> None:
     """Tester config clauses of the §4.2 predicate: no volume check, the base as initial balance
-    and the fees of the exchange profile (P7 spec §4)."""
+    and the fees of the exchange templates (P7 spec §4)."""
     unmet = []
     if config.get("LimitOrderVolumeCheck") is not False:
         unmet.append("LimitOrderVolumeCheck")

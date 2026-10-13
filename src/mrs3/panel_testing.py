@@ -51,12 +51,12 @@ def _template_root(repo_root: Path | None) -> Path:
 
 
 def mrs3_tester_config_template(repo_root: Path | None = None) -> Path:
-    return _template_root(repo_root) / "templates/tester/mrs3/config_tester.json"
+    return _template_root(repo_root) / "templates/exchanges/Bybit/mrs3-tester.json"
 
 
 def portfolio_stage2_tester_config_template(repo_root: Path | None = None) -> Path:
     """Tester config for optimizer Stage 2 runs, separate from MRS3 evaluation tests (ADR-0070)."""
-    return _template_root(repo_root) / "templates/tester/portfolio-stage2/config_tester.json"
+    return _template_root(repo_root) / "templates/exchanges/Bybit/portfolio-tester.json"
 
 
 def _resolve_repo_path(repo_root: Path, relative: str) -> Path:

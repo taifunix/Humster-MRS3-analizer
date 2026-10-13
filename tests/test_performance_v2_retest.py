@@ -208,7 +208,7 @@ def test_mark_retest_rejects_nonblank_row_with_missing_target(tmp_path: Path) ->
 
 
 def test_build_retest_manifest_renders_typed_mixed_run_strategies(tmp_path: Path) -> None:
-    template = Path("templates/strategies/retest-mrs3/base.json").resolve()
+    template = Path("templates/exchanges/Bybit/mrs3-strategy.json").resolve()
     with duckdb.connect(":memory:") as connection:
         initialize_performance_v2(connection)
         first = _strategy(connection, name="stored-long")
@@ -312,7 +312,7 @@ def test_retest_rejects_casefolded_filename_collision_before_output_write(tmp_pa
         with pytest.raises(PerformanceV2StoreError, match="case-insensitively"):
             build_retest_manifest(
                 connection,
-                {"LONG": Path("templates/strategies/retest-mrs3/base.json")},
+                {"LONG": Path("templates/exchanges/Bybit/mrs3-strategy.json")},
                 output,
             )
     finally:
@@ -324,7 +324,7 @@ def test_retest_rejects_casefolded_filename_collision_before_output_write(tmp_pa
 def test_retest_publication_rollback_preserves_previous_batch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     connection, _ = _single_order_retest_db(tmp_path / "db.duckdb")
     output = tmp_path / "output"
-    template = Path("templates/strategies/retest-mrs3/base.json")
+    template = Path("templates/exchanges/Bybit/mrs3-strategy.json")
     first = build_retest_manifest(connection, {"LONG": template}, output)
     old_strategy = (first.strategies_path / "stored.json").read_bytes()
     old_manifest = first.manifest_path.read_bytes()
@@ -355,7 +355,7 @@ def test_retest_publication_rollback_restores_after_old_strategy_move_failure(
 ) -> None:
     connection, _ = _single_order_retest_db(tmp_path / "db.duckdb")
     output = tmp_path / "output"
-    template = Path("templates/strategies/retest-mrs3/base.json")
+    template = Path("templates/exchanges/Bybit/mrs3-strategy.json")
     first = build_retest_manifest(connection, {"LONG": template}, output)
     old_strategy = (first.strategies_path / "stored.json").read_bytes()
     old_manifest = first.manifest_path.read_bytes()
@@ -386,7 +386,7 @@ def test_retest_rollback_failure_keeps_backup_and_both_failure_causes(
 ) -> None:
     connection, _ = _single_order_retest_db(tmp_path / "db.duckdb")
     output = tmp_path / "output"
-    template = Path("templates/strategies/retest-mrs3/base.json")
+    template = Path("templates/exchanges/Bybit/mrs3-strategy.json")
     build_retest_manifest(connection, {"LONG": template}, output)
     original_rename = retest_module.Path.rename
     original_rmtree = retest_module.shutil.rmtree
@@ -418,7 +418,7 @@ def test_retest_rollback_failure_keeps_backup_and_both_failure_causes(
 def test_retest_publication_replaces_existing_output_successfully(tmp_path: Path) -> None:
     connection, _ = _single_order_retest_db(tmp_path / "db.duckdb")
     output = tmp_path / "output"
-    template = Path("templates/strategies/retest-mrs3/base.json")
+    template = Path("templates/exchanges/Bybit/mrs3-strategy.json")
     try:
         first = build_retest_manifest(connection, {"LONG": template}, output)
         first_run_id = json.loads(first.manifest_path.read_text(encoding="utf-8"))["analysis_run_id"]
@@ -436,7 +436,7 @@ def test_retest_publication_uses_acl_inheriting_outer_stage(
 ) -> None:
     connection, _ = _single_order_retest_db(tmp_path / "db.duckdb")
     output = tmp_path / "output"
-    template = Path("templates/strategies/retest-mrs3/base.json")
+    template = Path("templates/exchanges/Bybit/mrs3-strategy.json")
     original_stage = retest_module._publication_staging_dir
     prefixes: list[str] = []
 
@@ -458,7 +458,7 @@ def test_retest_publication_has_process_local_single_writer_guard(
 ) -> None:
     connection, _ = _single_order_retest_db(tmp_path / "db.duckdb")
     output = tmp_path / "output"
-    template = Path("templates/strategies/retest-mrs3/base.json")
+    template = Path("templates/exchanges/Bybit/mrs3-strategy.json")
     first = build_retest_manifest(connection, {"LONG": template}, output)
     connection.close()
     generated = [json.loads((first.strategies_path / "stored.json").read_text(encoding="utf-8"))]
@@ -506,7 +506,7 @@ def test_retest_publication_has_cross_process_writer_guard(tmp_path: Path) -> No
 def test_retest_staged_validation_failure_keeps_existing_output(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     connection, _ = _single_order_retest_db(tmp_path / "db.duckdb")
     output = tmp_path / "output"
-    template = Path("templates/strategies/retest-mrs3/base.json")
+    template = Path("templates/exchanges/Bybit/mrs3-strategy.json")
     first = build_retest_manifest(connection, {"LONG": template}, output)
     old_strategy = (first.strategies_path / "stored.json").read_bytes()
     old_manifest = first.manifest_path.read_bytes()
@@ -547,7 +547,7 @@ def test_retest_binds_manifest_hash_to_serialized_staged_strategy(
         with pytest.raises(PerformanceV2StoreError, match="staged strategy hash mismatch"):
             build_retest_manifest(
                 connection,
-                {"LONG": Path("templates/strategies/retest-mrs3/base.json")},
+                {"LONG": Path("templates/exchanges/Bybit/mrs3-strategy.json")},
                 output,
             )
     finally:
@@ -573,7 +573,7 @@ def test_retest_rejects_extra_staged_strategy_file_before_manifest_validation(
         with pytest.raises(PerformanceV2StoreError, match="files do not match manifest hash map"):
             build_retest_manifest(
                 connection,
-                {"LONG": Path("templates/strategies/retest-mrs3/base.json")},
+                {"LONG": Path("templates/exchanges/Bybit/mrs3-strategy.json")},
                 output,
             )
     finally:
@@ -585,7 +585,7 @@ def test_retest_rejects_extra_staged_strategy_file_before_manifest_validation(
 def test_retest_recovers_stale_backup_before_republication(tmp_path: Path) -> None:
     connection, _ = _single_order_retest_db(tmp_path / "db.duckdb")
     output = tmp_path / "output"
-    template = Path("templates/strategies/retest-mrs3/base.json")
+    template = Path("templates/exchanges/Bybit/mrs3-strategy.json")
     try:
         first = build_retest_manifest(connection, {"LONG": template}, output)
         stale_backup = output / ".retest-backup-stale"
@@ -603,7 +603,7 @@ def test_retest_recovers_stale_backup_before_republication(tmp_path: Path) -> No
 def test_retest_recovers_stale_stage_before_republication(tmp_path: Path) -> None:
     connection, _ = _single_order_retest_db(tmp_path / "db.duckdb")
     output = tmp_path / "output"
-    template = Path("templates/strategies/retest-mrs3/base.json")
+    template = Path("templates/exchanges/Bybit/mrs3-strategy.json")
     try:
         first = build_retest_manifest(connection, {"LONG": template}, output)
         stale_stage = output / ".retest-stage-stale"
@@ -621,7 +621,7 @@ def test_retest_recovers_stale_stage_before_republication(tmp_path: Path) -> Non
 def test_retest_rejects_ambiguous_stale_publication_candidates(tmp_path: Path) -> None:
     connection, _ = _single_order_retest_db(tmp_path / "db.duckdb")
     output = tmp_path / "output"
-    template = Path("templates/strategies/retest-mrs3/base.json")
+    template = Path("templates/exchanges/Bybit/mrs3-strategy.json")
     try:
         first = build_retest_manifest(connection, {"LONG": template}, output)
         for suffix in ("one", "two"):
@@ -659,7 +659,7 @@ def test_retest_rejects_null_base_point_trades_before_rendering(tmp_path: Path, 
         with pytest.raises(PerformanceV2StoreError, match="stored"):
             build_retest_manifest(
                 _ConnectionWithNullBase(),
-                {"LONG": Path("templates/strategies/retest-mrs3/base.json")},
+                {"LONG": Path("templates/exchanges/Bybit/mrs3-strategy.json")},
                 tmp_path / "output",
             )
     finally:
@@ -714,7 +714,7 @@ def test_retest_rejects_untyped_identity_fields_before_output(
         with pytest.raises(PerformanceV2StoreError):
             build_retest_manifest(
                 _MutatingConnection(),
-                {"LONG": Path("templates/strategies/retest-mrs3/base.json")},
+                {"LONG": Path("templates/exchanges/Bybit/mrs3-strategy.json")},
                 tmp_path / "output",
             )
     finally:
@@ -767,7 +767,7 @@ def _mixed_ingest_retest_db(path: Path) -> duckdb.DuckDBPyConnection:
 def test_retest_manifest_round_trips_through_v2_store_ingest_with_mixed_runs(tmp_path: Path) -> None:
     source = _mixed_ingest_retest_db(tmp_path / "source.duckdb")
     output = tmp_path / "output"
-    template = Path("templates/strategies/retest-mrs3/base.json")
+    template = Path("templates/exchanges/Bybit/mrs3-strategy.json")
     try:
         batch = build_retest_manifest(source, {"LONG": template}, output)
     finally:

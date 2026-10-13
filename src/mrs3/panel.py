@@ -127,11 +127,10 @@ from .exchange_profiles import (
     ExchangeProfile,
     ExchangeProfileError,
     PerformanceDatabaseError,
-    exchange_profile_names,
+    exchange_template_names,
     inside_project,
     load_exchange_profile,
     load_performance_databases,
-    materialize_tester_template,
     parse_performance_databases,
     relative_project_path,
     require_apart_from_default,
@@ -2053,7 +2052,7 @@ class PanelController:
             for item in databases.items
         )
         return {
-            "active": databases.active, "items": rows, "exchanges": list(exchange_profile_names(local)),
+            "active": databases.active, "items": rows, "exchanges": list(exchange_template_names(self.root)),
             "busy": busy,
         }
 
@@ -2105,7 +2104,8 @@ class PanelController:
         if len(root.parts) < 2 or root.parts[0].casefold() != "data":
             raise PerformanceDatabaseError("INVALID_REQUEST", "database_root must be a folder inside data/")
         try:
-            load_exchange_profile(local, exchange)
+            # The marker takes the spelling of the template folder: it is the exchange.name of the bot.
+            exchange = load_exchange_profile(self.root, exchange).exchange
         except ExchangeProfileError as error:
             raise PerformanceDatabaseError(error.code, error.message) from error
         with self._lock:
@@ -3482,7 +3482,7 @@ class PanelController:
                 analysis_id,
                 selected_ids,
                 scopes,
-                self._workflow_default("strategy_templates", side=next(iter(scope_sides))),
+                self._ready_strategy_template(target, next(iter(scope_sides))),
                 staging,
                 config,
                 surface_path=self._fresh_analysis_surfaces.get(analysis_id),
@@ -3784,40 +3784,48 @@ class PanelController:
             )
         return self._strategy_batch_service
 
+    def _ready_strategy_template(self, target: EvaluationTarget, side: str) -> Path:
+        if target.strategy_template is not None:
+            return Path(target.strategy_template)
+        return self._workflow_default("strategy_templates", side=side)
+
     def _evaluation_target(self) -> EvaluationTarget:
         """Protocol v2 target of the active PerformanceDB; refuses before any MRS3 render or launch (§7a)."""
         config = self._performance_v2_config()
+        profile = self._exchange_profile(config)
         return evaluation_target(
-            config, mrs3_tester_config_template(self.root), self._exchange_profile(config), project_root=self.root,
+            config, profile.mrs3_tester if profile is not None else mrs3_tester_config_template(self.root), profile,
+            project_root=self.root,
         )
 
     def _exchange_profile(self, config: object) -> ExchangeProfile | None:
-        """Exchange profile of the active protocol v2 database (P7 spec §3); None for a v1 database."""
+        """Templates of the exchange of the active protocol v2 database (P7 spec §3); None for a v1 database."""
         exchange = getattr(config, "exchange", None)
         if getattr(config, "evaluation_protocol", "v1") != "v2" or not exchange:
             return None
         try:
-            return load_exchange_profile(self.default_config.with_name("config.local.json"), exchange)
+            return load_exchange_profile(self.root, exchange)
         except ExchangeProfileError as error:
             raise EvaluationProtocolError(error.code, error.message) from error
 
     def _mrs3_tester_template(self, target: EvaluationTarget) -> Path:
-        """MRS3 tester template with the fees of the exchange profile (P7 spec §4)."""
-        try:
-            return materialize_tester_template(
-                mrs3_tester_config_template(self.root), target.tester_fields, self.root / "results" / ".tester-templates",
-            )
-        except (ExchangeProfileError, OSError) as error:
-            raise EvaluationProtocolError(
-                "PROTOCOL_V2_TESTER_CONFIG_REJECTED", "MRS3 tester template with the exchange profile cannot be written",
-            ) from error
+        """MRS3 tester template of the exchange of `target` (P7 spec §4)."""
+        return target.tester_template or mrs3_tester_config_template(self.root)
+
+    def _mrs3_strategy_templates(self, target: EvaluationTarget) -> Mapping[str, object]:
+        """MRS3 strategy template of the exchange for both sides (P7 spec §4).
+
+        A target without exchange templates (tests) keeps `panel_workflow.strategy_templates`.
+        """
+        if target.strategy_template is not None:
+            return {"LONG": str(target.strategy_template), "SHORT": str(target.strategy_template)}
+        templates = self._workflow_defaults().get("strategy_templates", {})
+        return templates if isinstance(templates, Mapping) else {}
 
     def _listing_dates_source(self) -> tuple[Path, str | None]:
-        """Listing dates of the active database: the exchange profile, else `panel_workflow` (P7 spec §4)."""
+        """Listing dates of the active database: the file of `panel_workflow`, the sheet of the exchange (P7 spec §4)."""
         profile = self._exchange_profile(self._performance_v2_config())
-        if profile is not None and profile.listing_dates is not None:
-            return inside_project(self.root, profile.listing_dates.path, "listing_dates.path"), profile.listing_dates.sheet
-        return self._workflow_default("listing_dates_path"), None
+        return self._workflow_default("listing_dates_path"), None if profile is None else profile.listing_dates_sheet
 
     @staticmethod
     def _protocol_v2_runtime(target: EvaluationTarget) -> dict[str, object]:
@@ -4824,7 +4832,7 @@ class PanelController:
         if reusable is not None:
             return reusable
         listing_path, listing_relative, listing_sheet = self._retest_listing_context()
-        templates = self._workflow_defaults().get("strategy_templates", {})
+        templates = self._mrs3_strategy_templates(evaluation)
         with self._performance_v2_writer_lock, duckdb.connect(str(target), read_only=True) as connection:
             start, end = self._retest_range(payload, connection)
             self._validate_retest_listing(connection, listing_path, start, listing_sheet)
@@ -5745,8 +5753,8 @@ class PanelController:
         target = performance_v2_database_path(config)
         if not target.is_file():
             raise FinalistRetestError("PERFORMANCE_V2_NOT_FOUND", "Performance v2 database is unavailable")
-        templates = self._workflow_defaults().get("strategy_templates", {})
         evaluation = self._evaluation_target()
+        templates = self._mrs3_strategy_templates(evaluation)
         self._require_protocol_v2_tester_template(evaluation)
         tester_template = self._mrs3_tester_template(evaluation)
         with self._performance_v2_writer_lock, duckdb.connect(str(target), read_only=True) as connection:

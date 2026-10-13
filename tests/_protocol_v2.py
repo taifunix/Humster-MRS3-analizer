@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 
 REPOSITORY = Path(__file__).resolve().parents[1]
-RETEST_TEMPLATE = REPOSITORY / "templates" / "strategies" / "retest-mrs3" / "base.json"
+RETEST_TEMPLATE = REPOSITORY / "templates" / "exchanges" / "Bybit" / "mrs3-strategy.json"
 
 
 def protocol_v2_template(exchange: str = "Template", my_fix_balance: float = 0.0) -> dict[str, object]:
