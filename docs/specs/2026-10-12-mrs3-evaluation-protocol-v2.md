@@ -117,8 +117,10 @@
 JSON с любым выбранным шаблоном, RUNS, оба RETEST) проверяет этот предикат для
 каждой стратегии и **для каждого встроенного `tester_config` снимка RUNS** и
 **отказывает до запуска**, если хотя бы что-то не выполнено. Рендер ничего не
-подменяет молча, кроме одного: `my_fix_balance` устанавливается равным базе
-(§4.3).
+подменяет молча, кроме двух полей: `my_fix_balance` устанавливается равным базе
+(§4.3), а `exchange.name` — бирже активной базы (решение пользователя
+2026-10-13: один глобальный шаблон на обе биржи; база выбирается в настройках,
+P7). Импорт по-прежнему отклоняет отчёт чужой биржи (§4.4).
 
 Следствие для RUNS: локальный `Input/run_snapshot_2.json` сейчас содержит
 `InitialBalance` 1000 и `LimitOrderVolumeCheck=true`, а его шаблон
@@ -350,6 +352,49 @@ PerformanceDB нет: разовое слияние v6→v8 — завершён
   - ретрай задания до P6 отклоняется.
 - **Перед массовым тестом:** один реальный отчёт v2 в новой базе проходит
   импорт, нормировку и подготовку входа оптимизатора (smoke).
+
+## 7a. Карта реализации P6 (2026-10-13)
+
+Общий модуль `src/mrs3/evaluation_protocol.py`:
+
+- `evaluation_target(config, tester_template)` → база B (`InitialBalance`
+  MRS3-шаблона тестера) и биржа из `unified_performance_v2` в
+  `config.performance.json`. Если активный
+  протокол не `v2` или биржа не задана — `EvaluationProtocolError` с кодом
+  `DATABASE_PROTOCOL_V1` до любого рендера и запуска («запуск в базу v1
+  отклоняется до запуска тестера»). Существующая база проверяется
+  `require_database_identity`; ошибка чтения базы — `DATABASE_UNAVAILABLE`.
+  Генераторы бросают `EvaluationProtocolError` (подкласс `ValueError`), и
+  Panel в P6c отображает его код в ответе API.
+- `apply_protocol_v2(strategy, target)` ставит `basic.my_fix_balance = B` и
+  `exchange.name = биржа` и проверяет предикат §4.2 той же функцией, что и
+  импорт (`report_evaluation_protocol`, сторона из `basic.use_long/use_short`),
+  плюс равенство базы и биржи. Нарушение — `PROTOCOL_V2_RENDER_REJECTED` со
+  списком несовпавших полей.
+- `require_protocol_v2_tester_config(config, target)` — `LimitOrderVolumeCheck`
+  = false и `InitialBalance` = B.
+
+Точки вызова:
+
+| Поток | Где | Что |
+| --- | --- | --- |
+| READY JSON (свежий анализ, legacy, v6, опубликованный конвейер) | `fresh_analysis_strategies`, `analysis_strategies`, `pipeline` через Panel | `apply_protocol_v2` после `generate_strategy` |
+| RUNS | `tester_run_files.render_run_snapshot` | стратегия и встроенный `tester_config` снимка |
+| RETEST | `performance_v2_retest` | `apply_protocol_v2` |
+| Финалистский RETEST | `performance_v2_finalist_retest` | константы 1000 в стратегии и дайджесте конфига заменяются базой B; дайджест включает базу и биржу |
+| Запуск тестера | `panel_fast_strategy_test`, `panel_strategy_batch` | конфиг тестера и каждая стратегия проверяются до запуска |
+
+Stage 2 оптимизатора (`portfolio-weighted-mrs`, шаблон `portfolio-stage2`) не
+затрагивается (инвариант 4). Панель убирает поле стартового баланса из трёх
+MRS3-потоков; API отклоняет ключ `initial_balance`. Ретрай и восстановление
+задания без отметки протокола v2 в его runtime отклоняются
+(`RETRY_PRE_PROTOCOL_V2`). Шаблоны `retest-mrs3/base.json` и
+`mrs3/config_tester.json` фиксируются по §4.2 вместе с P6c (раньше Панель
+рендерила бы `FIXED`-стратегии без проверки базы); тест закрепляет
+`my_fix_balance` шаблона стратегии = `InitialBalance` шаблона тестера.
+RETEST и финалистский RETEST в P6c берут тип и источник MA из фактов
+стратегии, как Stage 2 (§4.5), иначе смена шаблона давала бы
+`MA_SETTINGS_CHANGED` на каждом отчёте.
 
 ## 8. Фазы
 

@@ -13,6 +13,7 @@ from typing import Callable, Mapping
 from .config import AlgorithmConfig
 from .lots import LotMethod, allocate_lots
 from .panel_testing import mrs3_tester_config_template
+from .evaluation_protocol import EvaluationTarget, apply_protocol_v2, require_protocol_v2_tester_config
 from .strategy_json import generate_strategy
 
 
@@ -52,6 +53,8 @@ def render_run_snapshot(
     end_date: str,
     max_parallel_runs: int,
     config: AlgorithmConfig,
+    *,
+    evaluation: EvaluationTarget | None = None,
 ) -> tuple[str, dict[str, object]]:
     """Render one EQUAL-lot snapshot without touching the tester filesystem."""
     if type(max_parallel_runs) is not int or max_parallel_runs <= 0:
@@ -74,6 +77,9 @@ def render_run_snapshot(
     strategy = generate_strategy(
         settings[0], structure, allocate_lots(orders, LotMethod.EQUAL, config), LotMethod.EQUAL, config
     )
+    if evaluation is not None:
+        apply_protocol_v2(strategy, evaluation)
+        require_protocol_v2_tester_config(tester_config, evaluation)
     name = str(strategy["name"])
     rendered = deepcopy(snapshot)
     rendered["settings"] = [strategy]
@@ -160,6 +166,7 @@ def publish_run_snapshots(
     analysis_input_digest: str | None = None,
     shortlist_provenance: Mapping[str, object] | None = None,
     before_publish: Callable[[], None] | None = None,
+    evaluation: EvaluationTarget | None = None,
 ) -> dict[str, object]:
     """Replace the exact tester runs directory with all selected snapshots."""
     if not structures:
@@ -238,7 +245,12 @@ def publish_run_snapshots(
     if any(path.is_symlink() for path in existing):
         raise ValueError("tester runs directory contains a symbolic link")
     owned_previous = _owned_previous_runs(root, runs, existing)
-    rendered = [render_run_snapshot(template_path, row, start_date, end_date, max_parallel_runs, config) for row in structures]
+    if evaluation is not None:
+        require_protocol_v2_tester_config(config_document, evaluation)
+    rendered = [
+        render_run_snapshot(template_path, row, start_date, end_date, max_parallel_runs, config, evaluation=evaluation)
+        for row in structures
+    ]
     if len({name for name, _ in rendered}) != len(rendered):
         raise ValueError("READY candidates must have unique strategy names")
     if before_publish is not None:

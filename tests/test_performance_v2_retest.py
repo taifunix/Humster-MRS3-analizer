@@ -885,3 +885,27 @@ def test_retest_manifest_round_trips_through_v2_store_ingest_with_mixed_runs(tmp
             "select analysis_run_id, plateau_id, plateau_point_count, plateau_total_trades "
             "from analysis_plateaus order by analysis_run_id, plateau_id"
         ).fetchall() == plateaus_before
+
+
+def test_retest_renders_protocol_v2_with_the_base_and_exchange(tmp_path: Path) -> None:
+    from decimal import Decimal
+
+    from mrs3.evaluation_protocol import EvaluationProtocolError, EvaluationTarget
+
+    connection, _ = _single_order_retest_db(tmp_path / "db.duckdb")
+    from tests._protocol_v2 import protocol_v2_template
+
+    target = EvaluationTarget(Decimal("10000"), "BingX")
+    template = protocol_v2_template()
+    try:
+        batch = build_retest_manifest(connection, {"LONG": template}, tmp_path / "output", evaluation=target)
+        dynamic = protocol_v2_template()
+        dynamic["exchange"]["use_upnl"] = True  # type: ignore[index]
+        with pytest.raises(EvaluationProtocolError, match="exchange.use_upnl"):
+            build_retest_manifest(connection, {"LONG": dynamic}, tmp_path / "rejected", evaluation=target)
+    finally:
+        connection.close()
+
+    strategy = json.loads((batch.strategies_path / "stored.json").read_text(encoding="utf-8"))
+    assert strategy["basic"]["my_fix_balance"] == 10000.0
+    assert strategy["exchange"]["name"] == "BingX"

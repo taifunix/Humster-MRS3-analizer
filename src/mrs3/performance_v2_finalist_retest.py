@@ -31,6 +31,7 @@ from .performance_v2_selection_review import (
     _reconcile_prior_finalist_user_fields,
     effective_selection_decisions,
 )
+from .evaluation_protocol import EvaluationTarget, apply_protocol_v2
 from .strategy_json import generate_strategy
 
 
@@ -1029,17 +1030,23 @@ def _config_digest(config: object) -> str:
     })
 
 
-def finalist_retest_config_digest(templates: Mapping[object, object], tester_config: object = None) -> str:
+def finalist_retest_config_digest(
+    templates: Mapping[object, object], tester_config: object = None, evaluation: EvaluationTarget | None = None,
+) -> str:
     """Hash the inputs that can change generated retest strategy JSON."""
     if not isinstance(templates, Mapping):
         raise FinalistRetestError("CONFIG_INVALID", "retest templates are invalid")
-    return canonical_digest({
+    document: dict[str, object] = {
         "tester_config_sha256": _config_digest(tester_config),
         "template_sha256": {
             str(side): _config_digest(Path(template) if isinstance(template, str) else template)
             for side, template in sorted(templates.items(), key=lambda item: str(item[0]))
         },
-    })
+    }
+    if evaluation is not None:
+        # Protocol v2 §7a: the base and the exchange replace the constant 1000.
+        document["evaluation"] = {"base": format(evaluation.base.normalize(), "f"), "exchange": evaluation.exchange}
+    return canonical_digest(document)
 
 
 def build_finalist_retest_manifest(
@@ -1053,6 +1060,7 @@ def build_finalist_retest_manifest(
     listing_dates: Mapping[str, object] | Path | None = None,
     tester_config: object = None,
     job_id: str | None = None,
+    evaluation: EvaluationTarget | None = None,
 ) -> FinalistRetestBatch:
     """Freeze and publish one native SINGLE_MODE manifest for the cohort."""
     cohort = freeze_finalist_cohort(
@@ -1105,12 +1113,14 @@ def build_finalist_retest_manifest(
         basic = strategy.get("basic")
         if isinstance(basic, dict):
             basic.update({
-                "my_fix_balance": 1000.0,
+                "my_fix_balance": 1000.0 if evaluation is None else float(evaluation.base),
                 "balance_percentage_long": 100.0,
                 "balance_percentage_short": 100.0,
                 "risk_long": 1.0,
                 "risk_short": 1.0,
             })
+        if evaluation is not None:
+            apply_protocol_v2(strategy, evaluation)
         filename = f"{member['strategy_name']}.json"
         strategy_runs[filename] = str(member["analysis_run_id"])
         candidate_identity = str(member["candidate_identity"])
@@ -1129,7 +1139,7 @@ def build_finalist_retest_manifest(
         f"{member['strategy_name']}.json": canonical_digest(strategy)
         for member, strategy in zip(cohort.members, generated, strict=True)
     }
-    config_sha256 = finalist_retest_config_digest(templates, tester_config)
+    config_sha256 = finalist_retest_config_digest(templates, tester_config, evaluation=evaluation)
     unsigned: dict[str, object] = {
         "format_version": 1,
         "analysis_run_id": run_id,

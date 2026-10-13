@@ -768,3 +768,49 @@ def test_fresh_shortlist_returns_only_safe_candidate_summary(tmp_path: Path) -> 
     assert group["ready"] == group["ready_after_filters"] == group["total"] == 1
     assert group["candidate_ids"] == ["STR-READY"]
     assert not ({"orders", "points", "lot", "pnl_pct"} & set(group))
+
+
+def _protocol_v2_template(template: dict[str, object]) -> dict[str, object]:
+    """The test template with the protocol v2 sizing and MA facts (protocol v2 §4.2)."""
+    result = json.loads(json.dumps(template))
+    result["exchange"] = {"name": "Template", "use_upnl": False, "use_frozen_balance": True}
+    result["basic"].update({
+        "use_fix": True, "my_fix_balance": 0.0, "balance_percentage_long": 100.0, "balance_percentage_short": 100.0,
+        "risk_long": 1.0, "risk_short": 1.0, "max_balance": 0.0,
+    })
+    for key in ("ma_long", "ma_short"):
+        for entry in result["mrs3"][key]:
+            entry.update({"type": "SMA", "source": "ohlc4"})
+    for key in ("ma_close_long", "ma_close_short"):
+        result["mrs3"][key].update({"type": "SMA", "source": "ohlc4"})
+    return result
+
+
+def test_fresh_generation_applies_protocol_v2_to_every_strategy(tmp_path: Path) -> None:
+    from decimal import Decimal
+
+    from mrs3.evaluation_protocol import EvaluationProtocolError, EvaluationTarget
+    from mrs3.fresh_analysis_strategies import generate_fresh_analysis_strategies
+
+    database = tmp_path / "run.analysis-v6.duckdb"
+    analysis_id, _ = _make_analysis(database)
+    selection = _fresh_selection(database, analysis_id)
+    target = EvaluationTarget(Decimal("10000"), "Bybit")
+    template = tmp_path / "template.json"
+    template.write_text(json.dumps(_protocol_v2_template(_template())), encoding="utf-8")
+
+    result = generate_fresh_analysis_strategies(
+        database, analysis_id, selection.ready_candidate_ids, [("BTCUSDT", "LONG", "1h")],
+        template, tmp_path / "out", AlgorithmConfig.defaults(), selection=selection, evaluation=target,
+    )
+
+    strategies = [json.loads(path.read_text(encoding="utf-8")) for path in result.strategies_path.glob("*.json")]
+    assert strategies and all(
+        item["basic"]["my_fix_balance"] == 10000.0 and item["exchange"]["name"] == "Bybit" for item in strategies
+    )
+    template.write_text(json.dumps(_template()), encoding="utf-8")
+    with pytest.raises(EvaluationProtocolError):
+        generate_fresh_analysis_strategies(
+            database, analysis_id, selection.ready_candidate_ids, [("BTCUSDT", "LONG", "1h")],
+            template, tmp_path / "rejected", AlgorithmConfig.defaults(), selection=selection, evaluation=target,
+        )

@@ -25,6 +25,7 @@ from .performance_v2_store import (
     require_performance_v2_readable,
 )
 from .pipeline import _publication_staging_dir, _publish_strategies, _write_json_atomic
+from .evaluation_protocol import EvaluationTarget, apply_protocol_v2
 from .strategy_json import generate_strategy
 from .performance_v2_input import adapt_strategy_identity
 
@@ -500,6 +501,8 @@ def build_retest_manifest(
     connection: duckdb.DuckDBPyConnection,
     templates: Mapping[object, object],
     output_dir: Path,
+    *,
+    evaluation: EvaluationTarget | None = None,
 ) -> RetestBatch:
     """Render active RETEST strategies from typed Performance v2 rows."""
     require_performance_v2_readable(connection)
@@ -531,6 +534,8 @@ def build_retest_manifest(
             AlgorithmConfig.defaults(),
         )
         strategy["name"] = name
+        if evaluation is not None:
+            apply_protocol_v2(strategy, evaluation)
         identity = adapt_strategy_identity(
             strategy,
             strategy_name=name,

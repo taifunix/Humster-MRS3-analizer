@@ -27,6 +27,7 @@ from .analysis_strategies import (
 )
 from .config import AlgorithmConfig
 from .lots import LotMethod, allocate_lots
+from .evaluation_protocol import EvaluationTarget, apply_protocol_v2
 from .strategy_json import generate_strategy, validate_strategy, validate_unique_names
 from .source_v6 import _canonical_json
 from .source_v6_surface_fresh import FINGERPRINT as SURFACE_FINGERPRINT, read_multiscope_surface
@@ -634,6 +635,7 @@ def generate_fresh_analysis_strategies(
     min_shift_enabled: object = _MISSING_GENERATOR_OPTION,
     min_shift_pct: object = _MISSING_GENERATOR_OPTION,
     selection: object,
+    evaluation: EvaluationTarget | None = None,
 ) -> FreshAnalysisStrategies:
     """Generate EQUAL/INCOME JSON for exact READY candidates in one fresh run."""
     if type(pretest_ab_enabled) is not bool:
@@ -772,6 +774,8 @@ def generate_fresh_analysis_strategies(
                 template, structure, allocate_lots(structure["orders"], method, config), method, config,
             )
             validate_strategy(strategy, structure, points, config)
+            if evaluation is not None:
+                apply_protocol_v2(strategy, evaluation)
             generated.append(strategy)
             variants.append({
                 "strategy_name": strategy["name"], "structure_id": structure["structure_id"],
