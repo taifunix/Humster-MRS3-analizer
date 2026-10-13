@@ -360,3 +360,19 @@ def test_combined_workbook_shows_rejecting_filter_for_rejected_rows() -> None:
     result = validate_combined_selection_workbook(data)
     reasons = {row["ID"]: row["Elimination Reason"] for row in result["rows"]}
     assert reasons == {3: "EQUITY_REGIME_STALLED_RESERVE", 7: "FILTER_LOT_VARIANT_REDUNDANCY;REJECTED"}
+
+
+def test_combined_workbook_imports_headers_without_ma_type_column(monkeypatch: pytest.MonkeyPatch) -> None:
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            selection_module, "SELECTION_WORKBOOK_HEADERS",
+            selection_module.SELECTION_WORKBOOK_WITHOUT_MA_TYPE_HEADERS,
+        )
+        old = _workbook_bytes()
+    headers = [cell.value for cell in load_workbook(BytesIO(old))["All candidates"][1]]
+    assert "MA type" not in headers and "Fees share, %" in headers
+    assert "MA type" in selection_module.SELECTION_WORKBOOK_HEADERS
+
+    result = validate_combined_selection_workbook(old)
+
+    assert [row["Row Key"] for row in result["rows"]] == ["BTCUSDT|LONG|3", "BTCUSDT|LONG|7"]

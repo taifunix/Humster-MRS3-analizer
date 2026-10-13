@@ -843,6 +843,8 @@ def read_performance_snapshot(
                 frame = load_selection_candidates(connection, request, selection_config, cache_only=True)
                 for row in frame.to_dict(orient="records"):
                     candidate = dict(row)
+                    # Display-only XLSX text; snapshot documents and digests must not change.
+                    candidate.pop("ma_kind", None)
                     try:
                         symbol = candidate["symbol"]
                         side = candidate["side"]

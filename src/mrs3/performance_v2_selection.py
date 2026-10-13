@@ -115,6 +115,7 @@ _CANDIDATE_COLUMNS = (
     *(f"order_{order}_{field}" for order in range(1, 5) for field in (
         "open_ma_len", "open_multiplier", "shift_bp", "lot_x", "plateau_point_count", "plateau_key",
     )),
+    "ma_kind",
 )
 
 
@@ -1744,6 +1745,64 @@ def selection_cache_status(
     return status
 
 
+def _ma_fact_text(value: object) -> str | None:
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def ma_kind_label(close: Sequence[object], orders: Sequence[Sequence[object]]) -> str | None:
+    """Text of the display-only `MA type` column (XLSX contract, amended 2026-10-13).
+
+    Each argument holds (type, source) facts; a strategy without any fact gets None.
+    """
+    def label(facts: Sequence[object]) -> tuple[str | None, bool]:
+        kind, source = _ma_fact_text(facts[0]), _ma_fact_text(facts[1])
+        if kind is None and source is None:
+            return None, False
+        return f"{kind or '?'} {source or '?'}", kind is not None and source is not None
+
+    close_label, close_complete = label(close)
+    order_labels = [label(order) for order in orders]
+    if close_label is None and all(text is None for text, _complete in order_labels):
+        return None
+    if close_complete and all(complete and text == close_label for text, complete in order_labels):
+        return close_label
+    return " / ".join(text or "—" for text, _complete in order_labels) + f"; Close {close_label or '—'}"
+
+
+def has_ma_fact_columns(connection: duckdb.DuckDBPyConnection) -> bool:
+    found = connection.execute(
+        """select count(*) from information_schema.columns
+            where table_catalog = current_database() and table_schema = 'main'
+              and ((table_name = 'strategies' and column_name in ('close_ma_type', 'close_ma_source'))
+                or (table_name = 'strategy_orders' and column_name in ('open_ma_type', 'open_ma_source')))"""
+    ).fetchone()[0]
+    return int(found) == 4
+
+
+def strategy_ma_kinds(connection: duckdb.DuckDBPyConnection, strategy_ids: Sequence[int]) -> dict[int, str]:
+    """`MA type` text by strategy; empty for a database older than schema v12 or without facts."""
+    ids = sorted({int(value) for value in strategy_ids})
+    if not ids or not has_ma_fact_columns(connection):
+        return {}
+    close = {
+        int(strategy_id): (kind, source)
+        for strategy_id, kind, source in connection.execute(
+            """select strategy_id, close_ma_type, close_ma_source from strategies
+                where strategy_id in (select unnest(?::bigint[]))""",
+            [ids],
+        ).fetchall()
+    }
+    orders: dict[int, list[tuple[object, object]]] = {}
+    for strategy_id, kind, source in connection.execute(
+        """select strategy_id, open_ma_type, open_ma_source from strategy_orders
+            where strategy_id in (select unnest(?::bigint[])) order by strategy_id, order_id""",
+        [ids],
+    ).fetchall():
+        orders.setdefault(int(strategy_id), []).append((kind, source))
+    labels = {strategy_id: ma_kind_label(facts, orders.get(strategy_id, ())) for strategy_id, facts in close.items()}
+    return {strategy_id: text for strategy_id, text in labels.items() if text is not None}
+
+
 def load_selection_candidates(
     connection: duckdb.DuckDBPyConnection,
     request: SelectionRequest,
@@ -1869,7 +1928,9 @@ def load_selection_candidates(
                 lots.append(lot)
             if points is not None:
                 points_list.append(points)
+    ma_kinds = strategy_ma_kinds(connection, list(candidates))
     for candidate in candidates.values():
+        candidate["ma_kind"] = ma_kinds.get(int(candidate["strategy_id"]))
         lots = candidate.pop("_lots", [])
         points = candidate.pop("_points", [])
         risk_scale = candidate["risk_scale"]
@@ -3887,6 +3948,7 @@ def write_selection_workbook(
         "lots",
         "points",
         "open_ma",
+        "ma_kind",
         *(equity_columns if equity_block_enabled else ()),
         *(regime_columns if equity_regime_display_enabled else ()),
         "auto_status", "auto_rank", *review_columns,
@@ -3915,6 +3977,7 @@ def write_selection_workbook(
         "rank_weight_close_ma": "Rank w Close MA",
         "final_score": "Final score (Pair+Side)",
         "open_ma": "MA",
+        "ma_kind": "MA type",
         **{f"order_{order}_shift_bp": f"{order} Shift" for order in range(1, 4)},
         "lots": "Lots",
         "points": "Points",
@@ -4057,18 +4120,23 @@ SELECTION_LEGACY_HEADERS = (
     "CE", "DD", "W/R", "Trades", "Trades/30", "Lot DD5", "Hold p95", "Hold M",
     "Top 5 share, %", "Fees share, %", "Fees/30, %", "B cycles", "B W/R", "Robust PnL/30", "Worst DD", "Worst Hold p95",
     "A/B stability", "Final score (Pair+Side)", "1 Shift", "2 Shift", "3 Shift", "Lots", "Points", "MA",
-    "Equity state", "Equity basis", "Equity DD, %", "Equity smoothness", "Regime rank", "Regime reasons",
+    "MA type", "Equity state", "Equity basis", "Equity DD, %", "Equity smoothness", "Regime rank", "Regime reasons",
     "PRE28 direction", "PRE28 v", "PRE28 p", "W28 direction", "W28 v", "W28 p", "W14 direction",
     "W14 v", "W14 p", "W7 direction", "W7 v", "W7 p", "Regime DD14, %", "Regime DD7, %",
     "New ATH stages", "New ATH W7", "Held ATH W7", "Elimination Reason",
 )
 SELECTION_WORKBOOK_HEADERS = tuple(dict.fromkeys(SELECTION_AGGREGATE_HEADERS + SELECTION_LEGACY_HEADERS))
-# Aggregate workbooks exported before the display-only fee columns remain
-# importable; each accepted header tuple is checked against its own hash.
-SELECTION_WORKBOOK_PREVIOUS_HEADERS = tuple(
-    header for header in SELECTION_WORKBOOK_HEADERS if header not in ("Fees share, %", "Fees/30, %")
+# Aggregate workbooks exported before the display-only `MA type` and fee
+# columns remain importable; each accepted header tuple is checked against its own hash.
+SELECTION_WORKBOOK_WITHOUT_MA_TYPE_HEADERS = tuple(
+    header for header in SELECTION_WORKBOOK_HEADERS if header != "MA type"
 )
-SELECTION_WORKBOOK_ACCEPTED_HEADERS = (SELECTION_WORKBOOK_HEADERS, SELECTION_WORKBOOK_PREVIOUS_HEADERS)
+SELECTION_WORKBOOK_PREVIOUS_HEADERS = tuple(
+    header for header in SELECTION_WORKBOOK_WITHOUT_MA_TYPE_HEADERS if header not in ("Fees share, %", "Fees/30, %")
+)
+SELECTION_WORKBOOK_ACCEPTED_HEADERS = (
+    SELECTION_WORKBOOK_HEADERS, SELECTION_WORKBOOK_WITHOUT_MA_TYPE_HEADERS, SELECTION_WORKBOOK_PREVIOUS_HEADERS,
+)
 
 
 class SelectionWorkbookError(PerformanceV2SelectionError):
@@ -4244,7 +4312,7 @@ def _aggregate_row(
         "B cycles": "ab_completed_cycle_count", "B W/R": "ab_win_rate_b_pct", "Robust PnL/30": "robust_pnl_30d_pct",
         "Worst DD": "worst_drawdown_pct", "Worst Hold p95": "worst_holding_p95_minutes", "A/B stability": "ab_stability_ratio",
         "Final score (Pair+Side)": "final_score", "Lots": "lots", "Points": "points", "MA": "open_ma",
-        "Equity state": "equity_state", "Equity basis": "equity_basis", "Equity DD, %": "equity_dd_pct",
+        "MA type": "ma_kind", "Equity state": "equity_state", "Equity basis": "equity_basis", "Equity DD, %": "equity_dd_pct",
         "Equity smoothness": "equity_smoothness", "Regime rank": "equity_regime_rank", "Regime reasons": "equity_regime_reasons",
         "PRE28 direction": "equity_regime_pre28_direction", "PRE28 v": "equity_regime_pre28_v", "PRE28 p": "equity_regime_pre28_p",
         "W28 direction": "equity_regime_w28_direction", "W28 v": "equity_regime_w28_v", "W28 p": "equity_regime_w28_p",

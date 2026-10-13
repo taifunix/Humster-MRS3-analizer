@@ -6006,3 +6006,19 @@ def test_panel_refuses_mismatching_v11_database_without_migrating_it(tmp_path: P
         assert connection.execute(
             "select value from schema_info where key = 'schema_version'"
         ).fetchone() == ("11",)
+
+
+def test_v2_catalog_adds_ma_facts_only_when_set(tmp_path: Path) -> None:
+    connection, _ = _db(tmp_path)
+    legacy = performance_v2_catalog(connection)
+    assert all(
+        "close_ma_type" not in strategy and all("open_ma_type" not in order for order in strategy["orders"])
+        for strategy in legacy["strategies"]
+    )
+
+    connection.execute("update strategies set close_ma_type = 'SMA', close_ma_source = 'ohlc4'")
+    connection.execute("update strategy_orders set open_ma_source = 'close'")
+    strategy = performance_v2_catalog(connection)["strategies"][0]
+
+    assert (strategy["close_ma_type"], strategy["close_ma_source"]) == ("SMA", "ohlc4")
+    assert all(order["open_ma_source"] == "close" and "open_ma_type" not in order for order in strategy["orders"])

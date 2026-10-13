@@ -45,8 +45,10 @@ from .performance_v2_windows import (
 from .performance_v2_selection import (
     SelectionConfig,
     SelectionRequest,
+    has_ma_fact_columns,
     load_selection_candidates,
     retest_cohort_request,
+    strategy_ma_kinds,
     write_selection_workbook,
 )
 from .performance_v2_selection_review import (
@@ -366,6 +368,8 @@ def export_performance_v2(
                 review["user_rank"] = None if decision is None else decision[1]
                 user_reviews[strategy_id] = review
             cached_candidates = _export_cached_candidates(connection, rows, selection_config)
+            for strategy_id, ma_kind in strategy_ma_kinds(connection, [int(row[0]) for row in rows]).items():
+                cached_candidates[strategy_id] = {**cached_candidates.get(strategy_id, {}), "ma_kind": ma_kind}
             equity_regime_snapshots = _export_equity_regime_snapshots(connection, rows, schema_version)
             decision_order = {"FINALIST": 1, "RESERVE": 2}
             rows.sort(key=lambda row: (
@@ -599,6 +603,27 @@ def performance_v2_catalog(connection: duckdb.DuckDBPyConnection) -> dict[str, o
     for strategy in strategies:
         strategy["current_result_id"] = strategy["result_id"]
         strategy["orders"] = orders_by_strategy[int(strategy["strategy_id"])]
+    if strategies and has_ma_fact_columns(connection):
+        # Schema-v12 MA facts are added only when set, so a legacy catalog is unchanged.
+        by_id = {int(strategy["strategy_id"]): strategy for strategy in strategies}
+        for strategy_id, kind, source in connection.execute(
+            "select strategy_id, close_ma_type, close_ma_source from strategies"
+            " where close_ma_type is not null or close_ma_source is not null"
+        ).fetchall():
+            strategy = by_id.get(int(strategy_id))
+            if strategy is not None:
+                strategy.update({key: value for key, value in (("close_ma_type", kind), ("close_ma_source", source)) if value is not None})
+        orders_by_key = {
+            (int(strategy["strategy_id"]), int(order["order_id"])): order
+            for strategy in strategies for order in strategy["orders"]
+        }
+        for strategy_id, order_id, kind, source in connection.execute(
+            "select strategy_id, order_id, open_ma_type, open_ma_source from strategy_orders"
+            " where open_ma_type is not null or open_ma_source is not null"
+        ).fetchall():
+            order = orders_by_key.get((int(strategy_id), int(order_id)))
+            if order is not None:
+                order.update({key: value for key, value in (("open_ma_type", kind), ("open_ma_source", source)) if value is not None})
     return {"strategies": strategies}
 
 

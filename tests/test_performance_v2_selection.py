@@ -4233,7 +4233,7 @@ def test_equity_workbook_appends_four_precise_columns_and_labels_method(tmp_path
     sheet = workbook["All candidates"]
     headers = [cell.value for cell in sheet[1]]
 
-    equity_start = headers.index("MA") + 1
+    equity_start = headers.index("MA type") + 1
     assert headers[equity_start:equity_start + 4] == ["Equity state", "Equity basis", "Equity DD, %", "Equity smoothness"]
     assert sheet.max_row == 3
     assert sheet.cell(2, headers.index("Equity DD, %") + 1).value == 12.3456789
@@ -4377,9 +4377,9 @@ def test_equity_blocks_keep_a_stable_order_for_all_request_permutations(tmp_path
         assert current.index("Auto Status") < current.index(no_headers[-1])
         assert not removed_regime_columns.intersection(current)
     assert not any(column in no_headers for column in (*quality_block, *regime_block))
-    assert quality_headers[quality_headers.index("MA") + 1:quality_headers.index("MA") + 5] == quality_block
-    assert regime_headers[regime_headers.index("MA") + 1:regime_headers.index("MA") + 1 + len(regime_block)] == regime_block
-    assert both_headers[both_headers.index("MA") + 1:both_headers.index("MA") + 1 + len(quality_block)] == quality_block
+    assert quality_headers[quality_headers.index("MA type") + 1:quality_headers.index("MA type") + 5] == quality_block
+    assert regime_headers[regime_headers.index("MA type") + 1:regime_headers.index("MA type") + 1 + len(regime_block)] == regime_block
+    assert both_headers[both_headers.index("MA type") + 1:both_headers.index("MA type") + 1 + len(quality_block)] == quality_block
     regime_start = both_headers.index("Regime rank")
     assert both_headers[regime_start:regime_start + len(regime_block)] == regime_block
 
@@ -4640,8 +4640,8 @@ def test_workbook_keeps_all_candidates_and_ab_30d_columns(tmp_path: Path) -> Non
     assert "PointsALL" not in headers and "PointsMin" not in headers
     assert headers.index("CE") + 1 == headers.index("PF")
     shifts_start = headers.index("1 Shift")
-    assert headers[shifts_start:shifts_start + 6] == [
-        "1 Shift", "2 Shift", "3 Shift", "Lots", "Points", "MA",
+    assert headers[shifts_start:shifts_start + 7] == [
+        "1 Shift", "2 Shift", "3 Shift", "Lots", "Points", "MA", "MA type",
     ]
     first_order_shift = headers.index("1 Shift") + 1
     assert {book["All candidates"].cell(row, first_order_shift).value for row in (2, 3)} == {0.3, 2.7}
@@ -5290,3 +5290,46 @@ def test_attach_rejection_reasons_prefers_stored_source_then_this_run(tmp_path: 
     assert reviews[9001]["rejection_reason"] == "FILTER_HARD_CUTOFFS;REJECTED"
     assert rejection_reason_label("SELECTION_AUTOMATIC_REJECTION") == "AUTOMATIC_FILTER;REJECTED"
     assert "rejection_reason" not in reviews[9002]
+
+
+@pytest.mark.parametrize(("close", "orders", "expected"), [
+    ((None, None), [(None, None), (None, None)], None),
+    (("SMA", "ohlc4"), [("SMA", "ohlc4"), ("SMA", "ohlc4")], "SMA ohlc4"),
+    (("SMA", "ohlc4"), [("SMA", "ohlc4"), ("EMA", "close")], "SMA ohlc4 / EMA close; Close SMA ohlc4"),
+    ((None, None), [("SMA", None), (None, None)], "SMA ? / —; Close —"),
+    (("SMA", "ohlc4"), [], "SMA ohlc4"),
+    (("SMA", None), [("SMA", None)], "SMA ?; Close SMA ?"),
+])
+def test_ma_kind_label_renders_xlsx_ma_type_text(close, orders, expected) -> None:
+    assert selection_module.ma_kind_label(close, orders) == expected
+
+
+def test_loader_and_workbook_show_ma_type_from_v12_facts(tmp_path: Path) -> None:
+    connection = _candidate_db(tmp_path)
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
+    try:
+        legacy = load_selection_candidates(connection, request).iloc[0]
+        connection.execute("update strategies set close_ma_type = 'SMA', close_ma_source = 'ohlc4'")
+        connection.execute("update strategy_orders set open_ma_type = 'SMA', open_ma_source = 'ohlc4'")
+        candidates = load_selection_candidates(connection, request)
+    finally:
+        connection.close()
+
+    assert legacy["ma_kind"] is None
+    assert candidates.iloc[0]["ma_kind"] == "SMA ohlc4"
+    path = write_selection_workbook(run_selection(candidates, request), tmp_path / "ma.xlsx", request)
+    sheet = load_workbook(path)["All candidates"]
+    headers = [cell.value for cell in sheet[1]]
+    assert headers[headers.index("MA") + 1] == "MA type"
+    assert sheet.cell(2, headers.index("MA type") + 1).value == "SMA ohlc4"
+
+
+def test_strategy_ma_kinds_is_empty_before_schema_v12(tmp_path: Path) -> None:
+    connection = duckdb.connect(str(tmp_path / "legacy.duckdb"))
+    try:
+        connection.execute("create table strategies (strategy_id bigint, close_ma_len integer)")
+        connection.execute("create table strategy_orders (strategy_id bigint, order_id integer)")
+        connection.execute("insert into strategies values (1, 3)")
+        assert selection_module.strategy_ma_kinds(connection, [1]) == {}
+    finally:
+        connection.close()

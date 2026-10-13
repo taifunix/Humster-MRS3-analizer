@@ -120,6 +120,29 @@ their `Причина` column is the importer's protected `Auto Reason`. Labels:
 starts with the same filter, its detailed text stays. Display only: persisted
 `selection_results.auto_reason` and stage traces are unchanged.
 
+## MA type column (amended 2026-10-13)
+
+Protocol v2 §4.4 records the MA type and source of the close MA and of every
+opening order (schema v12). `MA type` follows `MA` in block 4 and in the
+aggregate workbook headers. The column is always present, so the header does
+not depend on the data.
+
+- An order or the close MA is shown as `<type> <source>`; a missing half is
+  `?`; an order with no facts is `—` (an em dash, so the aggregate workbook
+  does not escape it as a formula).
+- If every order and the close MA have the same complete pair, the cell is that
+  pair once, for example `SMA ohlc4`.
+- Otherwise the orders are joined with ` / ` and the close MA follows after
+  `; Close `, for example `SMA ohlc4 / EMA close; Close SMA ohlc4`.
+- A strategy without any facts (every legacy row) gets a blank cell.
+
+Display only: no filter or ranking reads it, and the portfolio input snapshot
+drops it, so snapshot documents and digests do not change. Selection reads the facts only
+from a schema-v12 database; an older database gives blank cells. Aggregate
+workbooks exported before this column stay importable: the validator also
+accepts the header tuple without `MA type` (with and without the fee columns),
+each checked against its own `headers_sha256`.
+
 ## Compatibility and acceptance
 
 - Review imports continue to use their existing protected headers and ignore

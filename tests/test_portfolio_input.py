@@ -2862,3 +2862,26 @@ def test_read_current_finalists_carries_ma_facts_only_when_set(tmp_path: Path) -
     first, second = row["strategy_orders"]
     assert first["order_id"] == 1 and "open_ma_type" not in first and "open_ma_source" not in first
     assert (second["order_id"], second["open_ma_type"], second["open_ma_source"]) == (2, "EMA", "close")
+
+
+def test_snapshot_candidates_exclude_display_only_ma_kind(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Isolate from the pre-existing unregistered selection Decimal fields.
+    original = portfolio_input._decimal_type
+
+    def tolerant(field, currency):
+        try:
+            return original(field, currency)
+        except PortfolioInputError:
+            return ("scalar", "1")
+
+    monkeypatch.setattr(portfolio_input, "_decimal_type", tolerant)
+    database = _database(tmp_path)
+    with duckdb.connect(str(database)) as connection:
+        if connection.execute(
+            "select count(*) from information_schema.columns where table_name = 'strategies' and column_name = 'close_ma_type'"
+        ).fetchone()[0]:
+            connection.execute("update strategies set close_ma_type = 'SMA', close_ma_source = 'ohlc4'")
+    snapshot = _snapshot(database, [REQUEST])
+
+    assert all("ma_kind" not in candidate for candidate in snapshot.candidates)
+    assert all("ma_kind" not in item for item in snapshot.payload["candidates"].items)

@@ -48,8 +48,13 @@ order and of the close MA (protocol v2 §4.5); a member without facts keeps the
 documents carry the facts only when set. The Stage 2 variant records
 `legacy_ma_prototype_members` (members with any missing fact) and the Panel
 summary shows it as `Legacy MA prototype members` (`UNKNOWN` for older results).
-Next: P2d (MA type/source in XLSX and Panel views), then P3+N3 import of v2 and
-2026-10 reports.
+P2d: selection and PerformanceDB workbooks add the display-only `MA type`
+column after `MA` (amendment in the
+[XLSX column contract](docs/specs/2026-10-07-performance-v2-xlsx-column-contract.md));
+legacy rows and pre-v12 databases give blank cells; aggregate workbooks
+exported without it stay importable. The Panel strategy card shows the MA
+type/source next to Close MA and each Open MA when stored.
+Next: P3+N3 import of v2 and 2026-10 reports.
 User decision 2026-10-12: one PerformanceDB per exchange with an
 `schema_info.exchange` marker (protocol v2 §4.1); the CSV Direct analysis DB
 (branch `feat/csv-direct-analysis`) must also record the exchange from the run

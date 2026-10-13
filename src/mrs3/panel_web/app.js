@@ -3400,12 +3400,13 @@ if (typeof globalThis !== 'undefined') globalThis.portfolioSelectionHelpers = po
       return;
     }
     const summary = document.createElement('p');
-    summary.textContent = [strategy.symbol, strategy.side, strategy.timeframe, `Close MA ${strategy.close_ma_len ?? '—'}`].filter(Boolean).join(' · ');
+    const maKind = (type, source) => (type || source ? ` ${type || '?'} ${source || '?'}` : '');
+    summary.textContent = [strategy.symbol, strategy.side, strategy.timeframe, `Close MA ${strategy.close_ma_len ?? '—'}${maKind(strategy.close_ma_type, strategy.close_ma_source)}`].filter(Boolean).join(' · ');
     performanceV2WindowStrategyDetails.append(summary);
     const orders = document.createElement('ul');
     for (const order of strategy.orders || []) {
       const item = document.createElement('li');
-      item.textContent = `Ордер ${order.order_id ?? '—'}: Open MA ${order.open_ma_len ?? '—'} · Shift ${order.shift_bp ?? '—'} bp · Multiplier ${performanceV2MetricText(order.open_multiplier)} · Lot x ${performanceV2MetricText(order.lot_x)}`;
+      item.textContent = `Ордер ${order.order_id ?? '—'}: Open MA ${order.open_ma_len ?? '—'}${maKind(order.open_ma_type, order.open_ma_source)} · Shift ${order.shift_bp ?? '—'} bp · Multiplier ${performanceV2MetricText(order.open_multiplier)} · Lot x ${performanceV2MetricText(order.lot_x)}`;
       orders.append(item);
     }
     if (orders.children.length) performanceV2WindowStrategyDetails.append(orders);
