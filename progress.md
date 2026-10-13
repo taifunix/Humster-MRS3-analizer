@@ -36,6 +36,12 @@ v11 database (16.9 GB, 49 125 strategies, 122 M equity rows) migrated in 45 s
 with identical row counts and empty new columns/tables. Broad suite: the only
 failures besides the 57 that already fail on clean HEAD are the two
 template-pinned finalist-retest tests.
+P2b is done in the working tree: the import records MA type/source of the
+close MA and every order (ADD writes them, REPLACE fills empty ones) and the
+v12 sizing facts (`my_fix_balance`, SHORT percentage/risk); a report whose
+known MA facts differ from the stored strategy or from its same-batch
+representative is rejected alone as `REJECTED:MA_SETTINGS_CHANGED` on the
+REPLACE, non-covering SKIPPED and tombstone paths.
 User decision 2026-10-12: one PerformanceDB per exchange with an
 `schema_info.exchange` marker (protocol v2 §4.1); the CSV Direct analysis DB
 (branch `feat/csv-direct-analysis`) must also record the exchange from the run

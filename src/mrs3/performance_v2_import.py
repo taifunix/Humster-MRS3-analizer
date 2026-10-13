@@ -7,6 +7,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, date, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP, localcontext
 import csv
+import itertools
 import json
 import math
 from pathlib import Path
@@ -555,6 +556,111 @@ def _phase8_sizing_facts(settings: Mapping[str, object]) -> tuple[object | None,
         decimal(basic, "risk_long"),
         decimal(basic, "max_balance"),
     )
+
+
+def _v12_sizing_facts(settings: Mapping[str, object]) -> tuple[Decimal | None, ...]:
+    """Schema-v12 sizing facts: fixed-lot base and the SHORT side percentage/risk."""
+    basic = settings.get("basic")
+    basic = basic if isinstance(basic, Mapping) else {}
+    return (
+        _phase8_decimal(basic.get("my_fix_balance")),
+        _phase8_decimal(basic.get("balance_percentage_short")),
+        _phase8_decimal(basic.get("risk_short")),
+    )
+
+
+_Facts = tuple[str | None, str | None]
+_OrderSettings = tuple[int, int, object]
+# Close MA facts plus, per opening order, (slot, executable settings, facts).
+# The slot is the stored order_id or the report's order id; the typed key ignores
+# order position, so orders are paired by their executable settings, not by slot.
+_MaFacts = tuple[_Facts, tuple[tuple[int, _OrderSettings, _Facts], ...]]
+_NO_FACTS: _Facts = (None, None)
+
+
+def _ma_text(value: object) -> str | None:
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def _order_settings(open_ma_len: object, shift_bp: object, lot_x: object) -> _OrderSettings:
+    return int(open_ma_len), int(shift_bp), _quantized_lot(lot_x)  # type: ignore[arg-type]
+
+
+def _report_ma_facts(settings: Mapping[str, object], entry: PreparedV2Entry) -> _MaFacts:
+    """Type and source of the close MA and of every opening order, from the report's own settings."""
+    basic = settings.get("basic")
+    strategy = basic.get("strategy") if isinstance(basic, Mapping) else None
+    block = settings.get(strategy) if isinstance(strategy, str) else None
+    suffix = "short" if str(entry.identity.side).strip().upper() == "SHORT" else "long"
+    close_facts: _Facts = _NO_FACTS
+    prototypes: dict[int, _Facts] = {}
+    if isinstance(block, Mapping):
+        close = block.get(f"ma_close_{suffix}")
+        if isinstance(close, Mapping):
+            close_facts = (_ma_text(close.get("type")), _ma_text(close.get("source")))
+        raw_orders = block.get(f"ma_{suffix}")
+        if isinstance(raw_orders, (list, tuple)):
+            for position, item in enumerate(raw_orders, start=1):
+                if isinstance(item, Mapping):
+                    order_id = item.get("id") if type(item.get("id")) is int else position
+                    prototypes[int(order_id)] = (_ma_text(item.get("type")), _ma_text(item.get("source")))
+    return close_facts, tuple(
+        (
+            int(order.order_id),
+            _order_settings(order.open_ma_len, order.shift_bp, order.lot_x),
+            prototypes.get(int(order.order_id), _NO_FACTS),
+        )
+        for order in entry.identity.orders
+    )
+
+
+def _stored_ma_facts(row: tuple[object, ...], orders: list[tuple[object, ...]]) -> _MaFacts:
+    close = (_ma_text(row[11]), _ma_text(row[12])) if len(row) > 12 else _NO_FACTS
+    return close, tuple(
+        (int(order[1]), _order_settings(order[2], order[4], order[5]), (_ma_text(order[9]), _ma_text(order[10])))
+        for order in orders
+        if len(order) > 10
+    )
+
+
+def _facts_differ(left: _Facts, right: _Facts) -> bool:
+    return any(a is not None and b is not None and a != b for a, b in zip(left, right))
+
+
+def _match_ma_facts(known: _MaFacts, incoming: _MaFacts) -> dict[int, _Facts] | None:
+    """Pair orders by executable settings; return known slot -> incoming facts, or None on conflict.
+
+    A fact conflicts only when known on both sides and different; empty (legacy)
+    facts never conflict. Orders with identical settings may pair in any order
+    that avoids a conflict.
+    """
+    known_close, known_orders = known
+    incoming_close, incoming_orders = incoming
+    if _facts_differ(known_close, incoming_close):
+        return None
+    known_groups: dict[_OrderSettings, list[tuple[int, _Facts]]] = {}
+    incoming_groups: dict[_OrderSettings, list[_Facts]] = {}
+    for slot, settings, facts in known_orders:
+        known_groups.setdefault(settings, []).append((slot, facts))
+    for _slot, settings, facts in incoming_orders:
+        incoming_groups.setdefault(settings, []).append(facts)
+    if {key: len(items) for key, items in known_groups.items()} != {
+        key: len(items) for key, items in incoming_groups.items()
+    }:
+        return None
+    pairs: dict[int, _Facts] = {}
+    for settings, known_items in known_groups.items():
+        for candidate in itertools.permutations(incoming_groups[settings]):
+            if not any(_facts_differ(facts, other) for (_slot, facts), other in zip(known_items, candidate)):
+                pairs.update({slot: other for (slot, _facts), other in zip(known_items, candidate)})
+                break
+        else:
+            return None
+    return pairs
+
+
+def _ma_facts_conflict(known: _MaFacts, incoming: _MaFacts) -> bool:
+    return _match_ma_facts(known, incoming) is None
 
 
 def _verify_child_counts(
@@ -1181,7 +1287,8 @@ def _load_existing(
         return {}, {}, {}
     strategy_sql = f"""select strategy_name, strategy_id, symbol, side, timeframe, close_ma_len,
                        order_count, analysis_run_id, candidate_identity, lifecycle_status,
-                       current_result_id from strategies where {' or '.join(clauses)}"""
+                       current_result_id, close_ma_type, close_ma_source
+                  from strategies where {' or '.join(clauses)}"""
     strategies = {str(row[0]): row for row in connection.execute(strategy_sql, strategy_args).fetchall()}
     ids = tuple(int(row[1]) for row in strategies.values())
     if not ids:
@@ -1190,7 +1297,7 @@ def _load_existing(
     orders: dict[int, list[tuple[object, ...]]] = {}
     for row in connection.execute(
         f"""select strategy_id, order_id, open_ma_len, open_multiplier, shift_bp, lot_x,
-                   analysis_run_id, plateau_id, base_point_trades
+                   analysis_run_id, plateau_id, base_point_trades, open_ma_type, open_ma_source
                from strategy_orders where strategy_id in ({id_placeholders})
                order by strategy_id, order_id""",
         list(ids),
@@ -1612,10 +1719,43 @@ def _publish(
                 )
             resolved[key] = ("REPLACE" if relation == "SUPERSET" else "SKIPPED", row)
 
+        def reject_ma_change(entry: PreparedV2Entry, row: tuple[object, ...] | None) -> None:
+            message = f"MA type/source of {entry.strategy_name!r} differs from the stored strategy or batch"
+            publication_failure_rows.append({
+                "strategy_id": None if row is None else int(row[1]),
+                "strategy_name": entry.strategy_name,
+                "symbol": entry.identity.symbol,
+                "reason": "MA_SETTINGS_CHANGED",
+                "error": message,
+            })
+            publication_failure_reasons[entry.strategy_name] = "MA_SETTINGS_CHANGED"
+
+        # Protocol v2 §4.4: an existing strategy's non-empty MA facts are checked on
+        # every resolution path (REPLACE, non-covering SKIPPED, tombstone SKIPPED).
+        incoming_ma = {index: _report_ma_facts(report.settings, entry) for index, entry, report in valid}
+        for key, (rep_index, entry, _report) in representatives.items():
+            action, row = resolved[key]
+            if action == "REJECTED" or row is None:
+                continue
+            stored = _stored_ma_facts(row, existing_orders.get(int(row[1]), []))
+            if _ma_facts_conflict(stored, incoming_ma[rep_index]):
+                reject_ma_change(entry, row)
+                resolved[key] = ("REJECTED", row)
+
         for index, entry, report in valid:
             key = _typed_key(entry)
             representative = representatives[key]
             action, old = resolved[key]
+            if index != representative[0]:
+                # Same-batch aliases must agree with the representative and the stored strategy.
+                stored = None if old is None else _stored_ma_facts(old, existing_orders.get(int(old[1]), []))
+                if _ma_facts_conflict(incoming_ma[representative[0]], incoming_ma[index]) or (
+                    stored is not None and _ma_facts_conflict(stored, incoming_ma[index])
+                ):
+                    reject_ma_change(entry, old)
+                    decisions.append(("REJECTED", entry, None, old, representative[1]))
+                    rejected += 1
+                    continue
             if action == "REJECTED":
                 if index == representative[0]:
                     decisions.append((action, entry, None, old, representative[1]))
@@ -1723,32 +1863,52 @@ def _publish(
                     f"wallet/equity timestamps are misaligned for {entry.strategy_name!r}"
                 )
             strategy_id: int
+            if decision == "ADD" and int(entry.identity.order_count) != len(entry.identity.orders):
+                raise PerformanceV2ImportError(
+                    f"typed order count mismatch for {entry.strategy_name!r}"
+                )
+            (close_type, close_source), order_ma = _report_ma_facts(report.settings, entry)
             if decision == "ADD":
-                if int(entry.identity.order_count) != len(entry.identity.orders):
-                    raise PerformanceV2ImportError(
-                        f"typed order count mismatch for {entry.strategy_name!r}"
-                    )
                 strategy_id = int(connection.execute(
                     """insert into strategies (strategy_name, symbol, side, timeframe, close_ma_len,
                        order_count, analysis_run_id, candidate_identity, lifecycle_status,
-                       created_at_utc, updated_at_utc) values (?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?)
+                       created_at_utc, updated_at_utc, close_ma_type, close_ma_source)
+                       values (?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?, ?, ?)
                        returning strategy_id""",
                     [entry.strategy_name, entry.identity.symbol, entry.identity.side, entry.identity.timeframe,
                      entry.identity.close_ma_len, entry.identity.order_count, entry.analysis_run_id,
-                     entry.candidate_identity, now, now],
+                     entry.candidate_identity, now, now, close_type, close_source],
                 ).fetchone()[0])
+                facts_by_slot = {slot: facts for slot, _settings, facts in order_ma}
                 for order in entry.identity.orders:
+                    open_type, open_source = facts_by_slot[int(order.order_id)]
                     connection.execute(
                         """insert into strategy_orders (strategy_id, order_id, open_ma_len, open_multiplier,
-                           shift_bp, lot_x, analysis_run_id, plateau_id, base_point_trades)
-                           values (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                           shift_bp, lot_x, analysis_run_id, plateau_id, base_point_trades,
+                           open_ma_type, open_ma_source)
+                           values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                         [strategy_id, order.order_id, order.open_ma_len, order.open_multiplier,
                          order.shift_bp, _quantized_lot(order.lot_x), entry.analysis_run_id,
-                         order.plateau_id, order.base_point_trades],
+                         order.plateau_id, order.base_point_trades, open_type, open_source],
                     )
             else:
                 strategy_id = int(old[1])  # type: ignore[index]
                 result_id = int(old[10])  # type: ignore[index]
+                # Fill empty (legacy) MA facts; non-empty facts were checked to match.
+                connection.execute(
+                    """update strategies set close_ma_type = coalesce(close_ma_type, ?),
+                       close_ma_source = coalesce(close_ma_source, ?) where strategy_id = ?""",
+                    [close_type, close_source, strategy_id],
+                )
+                stored_ma = _stored_ma_facts(old, existing_orders.get(strategy_id, []))  # type: ignore[arg-type]
+                paired = _match_ma_facts(stored_ma, ((close_type, close_source), order_ma)) or {}
+                for order_id, (open_type, open_source) in paired.items():
+                    connection.execute(
+                        """update strategy_orders set open_ma_type = coalesce(open_ma_type, ?),
+                           open_ma_source = coalesce(open_ma_source, ?)
+                           where strategy_id = ? and order_id = ?""",
+                        [open_type, open_source, strategy_id, order_id],
+                    )
                 # Keep the existing result identity for v4 databases, whose
                 # strategy_id uniqueness permits one current result per strategy.
             commission_contract = entry.commission_contract or prepared.commission_contract
@@ -1757,7 +1917,7 @@ def _publish(
             source_metadata = _optimizer_source_metadata_json(
                 report.settings, now, report_hash(entry)
             )
-            sizing_facts = _phase8_sizing_facts(report.settings)
+            sizing_facts = _phase8_sizing_facts(report.settings) + _v12_sizing_facts(report.settings)
             if decision == "ADD":
                 result_id = int(connection.execute(
                     """insert into strategy_results (strategy_id, report_start_utc, report_end_utc, exchange,
@@ -1767,8 +1927,9 @@ def _publish(
                        listing_date_source, effective_start_utc, effective_end_utc, warmup_hours,
                        excluded_trade_count, exclusion_reason, optimizer_source_metadata_json,
                        sizing_use_upnl, sizing_use_frozen_balance, sizing_use_fix,
-                       sizing_balance_percentage_long, sizing_risk_long, sizing_max_balance)
-                       values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) returning result_id""",
+                       sizing_balance_percentage_long, sizing_risk_long, sizing_max_balance,
+                       sizing_my_fix_balance, sizing_balance_percentage_short, sizing_risk_short)
+                       values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) returning result_id""",
                         [strategy_id, *ordered_values, source_metadata, *sizing_facts],
                 ).fetchone()[0])
                 connection.execute("update strategies set current_result_id = ?, updated_at_utc = ? where strategy_id = ?", [result_id, now, strategy_id])
@@ -1781,7 +1942,8 @@ def _publish(
                        listing_date_source = ?, effective_start_utc = ?, effective_end_utc = ?, warmup_hours = ?,
                        excluded_trade_count = ?, exclusion_reason = ?, optimizer_source_metadata_json = ?,
                        sizing_use_upnl = ?, sizing_use_frozen_balance = ?, sizing_use_fix = ?,
-                       sizing_balance_percentage_long = ?, sizing_risk_long = ?, sizing_max_balance = ?
+                       sizing_balance_percentage_long = ?, sizing_risk_long = ?, sizing_max_balance = ?,
+                       sizing_my_fix_balance = ?, sizing_balance_percentage_short = ?, sizing_risk_short = ?
                        where result_id = ?""",
                         [*ordered_values, source_metadata, *sizing_facts, result_id],
                 )
