@@ -12,7 +12,7 @@ from uuid import UUID, uuid4
 import duckdb
 
 from .config import PanelPathSettings, load_duckdb_import_settings, load_panel_path_settings
-from .exchange_profiles import PerformanceDatabaseError, load_performance_databases
+from .exchange_profiles import load_performance_databases, require_apart_from_default
 
 
 _SCHEMA_VERSION = "12"
@@ -135,9 +135,14 @@ class PerformanceV2Config:
 
 
 def load_performance_v2_config(
-    path: Path, *, v1_database_root: Path | None = None
+    path: Path, *, v1_database_root: Path | None = None, use_active_entry: bool = True,
 ) -> PerformanceV2Config:
-    """Load only the additive v2 namespace from its dedicated configuration."""
+    """Load only the additive v2 namespace from its dedicated configuration.
+
+    With `use_active_entry` the active `performance_databases` entry of
+    `config.local.json` replaces the database (P7 spec §3); without it the
+    default database of `config.performance.json` is returned.
+    """
     path = Path(path)
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
@@ -188,16 +193,8 @@ def load_performance_v2_config(
     database_root = path.parent / relative_root
     # P7 spec §3: the active entry of config.local.json replaces root, protocol and exchange.
     databases = load_performance_databases(path.with_name("config.local.json"))
-    if databases.items:
-        default_root = database_root.resolve()
-        for item in databases.items:
-            item_root = (path.parent / item.database_root).resolve()
-            if item_root != default_root and (item_root in default_root.parents or default_root in item_root.parents):
-                raise PerformanceDatabaseError(
-                    "PERFORMANCE_DATABASES_INVALID",
-                    f"performance_databases.items.{item.name}.database_root overlaps the default database root",
-                )
-    active = databases.active_entry()
+    require_apart_from_default(databases, path.parent, database_root)
+    active = databases.active_entry() if use_active_entry else None
     if active is not None:
         database_root = path.parent / active.database_root
         protocol, exchange = active.evaluation_protocol, active.exchange

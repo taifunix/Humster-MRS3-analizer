@@ -123,7 +123,20 @@ from .config import (
 )
 from .duckdb_import import ImportJobResult, ImportPreflight, ImportProgress, ImportRequest, SnapshotProgress, import_html_tree, preflight_html_import
 from .duckdb_source_schema import migrate_source_database
-from .exchange_profiles import ExchangeProfile, ExchangeProfileError, inside_project, load_exchange_profile, materialize_tester_template
+from .exchange_profiles import (
+    ExchangeProfile,
+    ExchangeProfileError,
+    PerformanceDatabaseError,
+    exchange_profile_names,
+    inside_project,
+    load_exchange_profile,
+    load_performance_databases,
+    materialize_tester_template,
+    parse_performance_databases,
+    relative_project_path,
+    require_apart_from_default,
+    save_performance_databases,
+)
 from .loader import load_listing_dates
 from .duckdb_direct import (
     CANONICAL_GRID_VERSION,
@@ -248,6 +261,7 @@ from .performance_v2_store import (
     PerformanceV2Config,
     PerformanceV2StoreError,
     PerformanceV2WriterLock,
+    database_identity,
     initialize_performance_v2,
     load_performance_v2_config,
     performance_v2_database_path,
@@ -1955,6 +1969,195 @@ class PanelController:
                 raise
             except (OSError, UnicodeDecodeError, json.JSONDecodeError, PerformanceV2SelectionError, ValueError) as error:
                 raise PerformanceV2ApiError("SELECTION_SETTINGS_INVALID", status=400) from error
+
+    _PERFORMANCE_DATABASE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+
+    def _local_config_path(self) -> Path:
+        return self.default_config.with_name("config.local.json")
+
+    def _performance_database_busy(self) -> bool:
+        """Unfinished jobs, open report collections or pending imports block a database switch (P7 spec §5)."""
+        for job in self._panel_jobs.list():
+            if job.get("state") not in TERMINAL:
+                return True
+            if job.get("kind") != "strategies.tester.collection":
+                continue
+            try:
+                runtime = self._panel_jobs.runtime(str(job.get("job_id")))
+            except PanelJobError:
+                continue
+            state = runtime.get("collection_state")
+            members = runtime.get("members")
+            current = [
+                member for member in members if isinstance(member, Mapping) and member.get("superseded") is not True
+            ] if isinstance(members, list) else []
+            if state == "VERIFIED" or (state == "OPEN" and current):
+                return True
+        return False
+
+    def _performance_database_row(
+        self, name: str | None, root: Path, protocol: str, exchange: str | None, active: bool, busy: bool = False,
+    ) -> dict[str, object]:
+        resolved = Path(root).resolve()
+        try:
+            relative = resolved.relative_to(self._local_config_path().parent.resolve()).as_posix()
+        except ValueError:
+            relative = resolved.as_posix()
+        database = resolved / "strategy_performance.duckdb"
+        row: dict[str, object] = {
+            "name": name, "database_root": relative, "evaluation_protocol": protocol, "exchange": exchange,
+            "active": active, "exists": database.is_file(), "size_bytes": None, "markers": None,
+        }
+        if not database.is_file():
+            return row
+        if busy or not self._performance_v2_writer_lock.acquire(blocking=False):
+            # A job or a Panel writer may be connecting: a second connection could make its connect fail.
+            try:
+                row["size_bytes"] = database.stat().st_size
+            except OSError:
+                pass
+            return row
+        try:
+            row["size_bytes"] = database.stat().st_size
+            if row["size_bytes"]:
+                with duckdb.connect(str(database), read_only=True) as connection:
+                    marker_protocol, marker_exchange = database_identity(connection)
+                    version = connection.execute(
+                        "select value from schema_info where key = 'schema_version'"
+                    ).fetchone()
+                row["markers"] = {
+                    "evaluation_protocol": marker_protocol, "exchange": marker_exchange,
+                    "schema_version": None if version is None else str(version[0]),
+                }
+        except (OSError, duckdb.Error, PerformanceV2StoreError):
+            # An open writer or a foreign file: the list stays readable without markers.
+            row["markers"] = None
+        finally:
+            self._performance_v2_writer_lock.release()
+        return row
+
+    def performance_databases_get(self) -> dict[str, object]:
+        """Registered PerformanceDBs and the default one (P7 spec §5)."""
+        local = self._local_config_path()
+        databases = load_performance_databases(local)
+        default = self._default_performance_v2_config()
+        busy = self._performance_database_busy()
+        rows = [self._performance_database_row(
+            None, default.database_root, default.evaluation_protocol, default.exchange, databases.active is None, busy,
+        )]
+        rows.extend(
+            self._performance_database_row(
+                item.name, local.parent / item.database_root, item.evaluation_protocol, item.exchange,
+                databases.active == item.name, busy,
+            )
+            for item in databases.items
+        )
+        return {
+            "active": databases.active, "items": rows, "exchanges": list(exchange_profile_names(local)),
+            "busy": busy,
+        }
+
+    def _performance_databases_section(self) -> dict[str, object]:
+        local = self._local_config_path()
+        try:
+            document = json.loads(local.read_text(encoding="utf-8")) if local.is_file() else {}
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise PerformanceDatabaseError("PERFORMANCE_DATABASES_INVALID", "config.local.json is unreadable") from error
+        section = document.get("performance_databases") if isinstance(document, dict) else None
+        if section is None:
+            return {"active": None, "items": {}}
+        if not isinstance(section, dict) or not isinstance(section.get("items", {}), dict):
+            raise PerformanceDatabaseError("PERFORMANCE_DATABASES_INVALID", "performance_databases is invalid")
+        return {"active": section.get("active"), "items": dict(section.get("items", {}))}
+
+    def performance_databases_activate(self, payload: Mapping[str, object]) -> dict[str, object]:
+        """Make an entry (or the default database, name None) active; only when nothing runs (P7 spec §5)."""
+        if not isinstance(payload, Mapping) or set(payload) != {"name"}:
+            raise PerformanceDatabaseError("INVALID_REQUEST", "activate needs exactly the field name")
+        name = payload["name"]
+        if name is not None and not isinstance(name, str):
+            raise PerformanceDatabaseError("INVALID_REQUEST", "name must be a string or null")
+        with self._lock, self._panel_jobs.lock:
+            section = self._performance_databases_section()
+            if name is not None and name not in section["items"]:  # type: ignore[operator]
+                raise PerformanceDatabaseError("PERFORMANCE_DATABASE_UNKNOWN", f"no database named {name}")
+            if self._performance_database_busy():
+                raise PerformanceDatabaseError("RESOURCE_BUSY", "finish or clear running jobs and report collections first")
+            section["active"] = name
+            save_performance_databases(self._local_config_path(), section)
+        return self.performance_databases_get()
+
+    def performance_databases_create(self, payload: Mapping[str, object]) -> dict[str, object]:
+        """Create an empty protocol v2 database for an exchange and register it (P7 spec §5)."""
+        if not isinstance(payload, Mapping) or set(payload) != {"name", "database_root", "exchange"}:
+            raise PerformanceDatabaseError("INVALID_REQUEST", "create needs name, database_root and exchange")
+        name, root_value, exchange = payload["name"], payload["database_root"], payload["exchange"]
+        if not isinstance(name, str) or not self._PERFORMANCE_DATABASE_NAME.fullmatch(name):
+            raise PerformanceDatabaseError("INVALID_REQUEST", "name allows letters, digits, '.', '_' and '-' (1-64)")
+        if not isinstance(exchange, str) or not exchange.strip():
+            raise PerformanceDatabaseError("INVALID_REQUEST", "exchange must be a non-empty string")
+        exchange = exchange.strip()
+        local = self._local_config_path()
+        try:
+            root = relative_project_path(root_value, "database_root")
+        except ValueError as error:
+            raise PerformanceDatabaseError("INVALID_REQUEST", str(error)) from None
+        if len(root.parts) < 2 or root.parts[0].casefold() != "data":
+            raise PerformanceDatabaseError("INVALID_REQUEST", "database_root must be a folder inside data/")
+        try:
+            load_exchange_profile(local, exchange)
+        except ExchangeProfileError as error:
+            raise PerformanceDatabaseError(error.code, error.message) from error
+        with self._lock:
+            section = self._performance_databases_section()
+            if any(str(key).casefold() == name.casefold() for key in section["items"]):  # type: ignore[union-attr]
+                raise PerformanceDatabaseError("PERFORMANCE_DATABASE_EXISTS", f"a database named {name} already exists")
+            section["items"][name] = {  # type: ignore[index]
+                "database_root": root.as_posix(), "evaluation_protocol": "v2", "exchange": exchange,
+            }
+            default = self._default_performance_v2_config()
+            # Validate the new section (paths, overlaps, default root) before anything is written.
+            require_apart_from_default(parse_performance_databases(section, local.parent), local.parent, default.database_root)
+            try:
+                target = inside_project(local.parent, root, "database_root")
+                data_root = inside_project(local.parent, Path("data"), "data")
+            except ValueError as error:
+                raise PerformanceDatabaseError("INVALID_REQUEST", str(error)) from None
+            if data_root not in target.parents:
+                raise PerformanceDatabaseError("INVALID_REQUEST", "database_root must be a folder inside data/")
+            if target == default.database_root.resolve():
+                raise PerformanceDatabaseError("INVALID_REQUEST", "database_root is the default database folder")
+            if target.exists() and (not target.is_dir() or any(target.iterdir())):
+                raise PerformanceDatabaseError("INVALID_REQUEST", "database_root must be a new or empty folder")
+            created = not target.exists()
+            try:
+                self._initialize_missing_performance_v2_target(
+                    replace(default, database_root=target, evaluation_protocol="v2", exchange=exchange),
+                )
+                save_performance_databases(local, section)
+            except (OSError, duckdb.Error, ValueError) as error:
+                # Leave no half-created database behind: a retry must find a new or empty folder again.
+                shutil.rmtree(target, ignore_errors=True)
+                if not created:
+                    target.mkdir(parents=True, exist_ok=True)
+                if isinstance(error, ValueError) and not isinstance(error, PerformanceV2StoreError):
+                    # For example the new root overlaps the v1 database root.
+                    raise PerformanceDatabaseError("PERFORMANCE_DATABASES_INVALID", str(error)) from error
+                raise PerformanceDatabaseError(
+                    "PERFORMANCE_DATABASE_CREATE_FAILED", "the database or config.local.json could not be written",
+                ) from error
+        return self.performance_databases_get()
+
+    def _default_performance_v2_config(self) -> PerformanceV2Config:
+        try:
+            return load_performance_v2_config(
+                self.default_config.with_name("config.performance.json"),
+                v1_database_root=self._panel_path("performance_db_root"), use_active_entry=False,
+            )
+        except PerformanceDatabaseError:
+            raise
+        except ValueError as error:
+            raise PerformanceDatabaseError("PERFORMANCE_DATABASES_INVALID", str(error)) from error
 
     def analysis_profile_get(self) -> dict[str, object]:
         with self._lock:
@@ -10201,6 +10404,17 @@ class _PanelHandler(BaseHTTPRequestHandler):
                 return
             self._json(200, result)
             return
+        if parsed.path == "/api/v2/settings/performance-databases":
+            try:
+                result = self.server.controller.performance_databases_get()
+            except PerformanceDatabaseError as error:
+                self._json(400, {"error": {"code": error.code, "message": error.message}})
+                return
+            except (OSError, ValueError):
+                self._json(400, {"error": {"code": "PERFORMANCE_DATABASES_INVALID", "message": "PerformanceDB settings are unavailable"}})
+                return
+            self._json(200, result)
+            return
         if parsed.path == "/api/v2/settings/analysis-profile":
             try:
                 result = self.server.controller.analysis_profile_get()
@@ -10603,7 +10817,7 @@ class _PanelHandler(BaseHTTPRequestHandler):
         portfolio_submission_route = bool(re.fullmatch(r"/api/v2/portfolio/campaigns/[^/]+/tester-submissions", endpoint))
         if equity_filter_endpoint:
             pass
-        elif bulk_retest_endpoint is None and endpoint != "/api/v2/strategies/performance-v2/selection-settings" and endpoint not in {"/api/start", "/api/browse", "/api/duckdb-import/settings", "/api/duckdb-import/preflight", "/api/duckdb-import/start", "/api/duckdb-import/cancel", "/api/duckdb-import/migrate", "/api/duckdb-direct/coverage", "/api/duckdb-direct/preflight", "/api/duckdb-direct/start", "/api/duckdb-direct/cancel", "/api/analysis/library", "/api/analysis/initialize", "/api/analysis/rerun", "/api/analysis/compare", "/api/analysis/export", "/api/analysis/shortlist", "/api/analysis/filter-export", "/api/analysis/strategies", "/api/source-v6/preflight", "/api/source-v6/start", "/api/source-v6/fresh/multiscope/start", "/api/source-v6/fresh/multiscope/analysis/start", "/api/source-v6/cancel", "/api/source-v6/merge", "/api/v2/panel/restart", "/api/v2/settings/validate", "/api/v2/settings/save", "/api/v2/settings/analysis-profile", "/api/v2/jobs", "/api/v2/strategies/tester/verify-inbox", "/api/v2/strategies/tester/report-collection/clear", "/api/v2/testing/local/fill", "/api/v2/testing/local/start", "/api/v2/testing/local/stop", "/api/v2/testing/screener/fill", "/api/v2/testing/screener/start", "/api/v2/testing/screener/stop", "/api/v2/testing/screener/evaluate", "/api/v2/testing/remote/check-paths", "/api/v2/testing/remote/prepare", "/api/v2/testing/remote/fill", "/api/v2/testing/remote/start", "/api/v2/source/local/import/preflight", "/api/v2/source/local/import/start", "/api/v2/source/local/merge/preflight", "/api/v2/source/local/merge/start", "/api/v2/source/local/cancel", "/api/v2/source/remote/start", "/api/v2/source/remote/cancel", "/api/v2/surfaces/preflight", "/api/v2/surfaces/select", "/api/v2/surfaces/publish", "/api/v2/surfaces/publish/start", "/api/v2/strategies/fresh/analyze", "/api/v2/strategies/fresh/generate", "/api/v2/strategies/fresh/runs", "/api/v2/strategies/fresh/shortlist", "/api/v2/strategies/fresh/open", "/api/v2/strategies/performance-v2/windows", "/api/v2/strategies/performance-v2/selection", "/api/v2/strategies/performance-v2/selection-preview", "/api/v2/strategies/performance-v2/selection-cache-status", "/api/v2/strategies/performance-v2/recalculate", "/api/v2/strategies/performance-v2/recalculate-all", "/api/v2/strategies/performance-v2/selection-review-import", "/api/v2/strategies/performance-v2/selection-user-fields-import", "/api/v2/strategies/performance-v2/retest-tags-import", "/api/v2/strategies/performance-v2/selection/aggregate-import", "/api/v2/strategies/performance-v2/retest/start", "/api/v2/strategies/performance-v2/retest/import"} and not portfolio_route and not performance_v2_maintenance_endpoint:
+        elif bulk_retest_endpoint is None and endpoint != "/api/v2/strategies/performance-v2/selection-settings" and endpoint not in {"/api/start", "/api/browse", "/api/duckdb-import/settings", "/api/duckdb-import/preflight", "/api/duckdb-import/start", "/api/duckdb-import/cancel", "/api/duckdb-import/migrate", "/api/duckdb-direct/coverage", "/api/duckdb-direct/preflight", "/api/duckdb-direct/start", "/api/duckdb-direct/cancel", "/api/analysis/library", "/api/analysis/initialize", "/api/analysis/rerun", "/api/analysis/compare", "/api/analysis/export", "/api/analysis/shortlist", "/api/analysis/filter-export", "/api/analysis/strategies", "/api/source-v6/preflight", "/api/source-v6/start", "/api/source-v6/fresh/multiscope/start", "/api/source-v6/fresh/multiscope/analysis/start", "/api/source-v6/cancel", "/api/source-v6/merge", "/api/v2/panel/restart", "/api/v2/settings/validate", "/api/v2/settings/save", "/api/v2/settings/analysis-profile", "/api/v2/settings/performance-databases/activate", "/api/v2/settings/performance-databases/create", "/api/v2/jobs", "/api/v2/strategies/tester/verify-inbox", "/api/v2/strategies/tester/report-collection/clear", "/api/v2/testing/local/fill", "/api/v2/testing/local/start", "/api/v2/testing/local/stop", "/api/v2/testing/screener/fill", "/api/v2/testing/screener/start", "/api/v2/testing/screener/stop", "/api/v2/testing/screener/evaluate", "/api/v2/testing/remote/check-paths", "/api/v2/testing/remote/prepare", "/api/v2/testing/remote/fill", "/api/v2/testing/remote/start", "/api/v2/source/local/import/preflight", "/api/v2/source/local/import/start", "/api/v2/source/local/merge/preflight", "/api/v2/source/local/merge/start", "/api/v2/source/local/cancel", "/api/v2/source/remote/start", "/api/v2/source/remote/cancel", "/api/v2/surfaces/preflight", "/api/v2/surfaces/select", "/api/v2/surfaces/publish", "/api/v2/surfaces/publish/start", "/api/v2/strategies/fresh/analyze", "/api/v2/strategies/fresh/generate", "/api/v2/strategies/fresh/runs", "/api/v2/strategies/fresh/shortlist", "/api/v2/strategies/fresh/open", "/api/v2/strategies/performance-v2/windows", "/api/v2/strategies/performance-v2/selection", "/api/v2/strategies/performance-v2/selection-preview", "/api/v2/strategies/performance-v2/selection-cache-status", "/api/v2/strategies/performance-v2/recalculate", "/api/v2/strategies/performance-v2/recalculate-all", "/api/v2/strategies/performance-v2/selection-review-import", "/api/v2/strategies/performance-v2/selection-user-fields-import", "/api/v2/strategies/performance-v2/retest-tags-import", "/api/v2/strategies/performance-v2/selection/aggregate-import", "/api/v2/strategies/performance-v2/retest/start", "/api/v2/strategies/performance-v2/retest/import"} and not portfolio_route and not performance_v2_maintenance_endpoint:
             self._json(404, {"error": "not found"})
             return
         if endpoint in {"/api/v2/strategies/performance-v2/selection-review-import", "/api/v2/strategies/performance-v2/selection-user-fields-import", "/api/v2/strategies/performance-v2/retest-tags-import", "/api/v2/strategies/performance-v2/selection/aggregate-import"}:
@@ -10804,6 +11018,10 @@ class _PanelHandler(BaseHTTPRequestHandler):
                 result = self.server.controller.panel_settings_save(document)
             elif endpoint == "/api/v2/settings/analysis-profile":
                 result = self.server.controller.analysis_profile_save(document)
+            elif endpoint == "/api/v2/settings/performance-databases/activate":
+                result = self.server.controller.performance_databases_activate(document)
+            elif endpoint == "/api/v2/settings/performance-databases/create":
+                result = self.server.controller.performance_databases_create(document)
             elif endpoint == "/api/browse":
                 kind = document.get("kind")
                 multiple = document.get("multiple", False)
@@ -10897,6 +11115,10 @@ class _PanelHandler(BaseHTTPRequestHandler):
             return
         except EvaluationProtocolError as error:
             self._json(409, {"error": {"code": error.code, "message": str(error)}})
+            return
+        except PerformanceDatabaseError as error:
+            status = 409 if error.code in {"RESOURCE_BUSY", "PERFORMANCE_DATABASE_EXISTS"} else 500 if error.code == "PERFORMANCE_DATABASE_CREATE_FAILED" else 400
+            self._json(status, {"error": {"code": error.code, "message": error.message}})
             return
         except FinalistRetestError as error:
             status = 400 if error.code in {"INVALID_REQUEST", "INVALID_TEST_RANGE"} else 409

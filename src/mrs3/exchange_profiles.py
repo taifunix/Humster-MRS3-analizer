@@ -122,7 +122,11 @@ def inside_project(root: Path, relative: Path, name: str) -> Path:
 
 
 def load_performance_databases(local_config: Path) -> PerformanceDatabases:
-    section = _local_config(local_config).get("performance_databases")
+    return parse_performance_databases(_local_config(local_config).get("performance_databases"), Path(local_config).parent)
+
+
+def parse_performance_databases(section: object, project: Path) -> PerformanceDatabases:
+    """Validate a `performance_databases` section of a project (P7 spec §3)."""
     if section is None:
         return PerformanceDatabases(None, ())
     if not isinstance(section, dict) or set(section).difference({"active", "items"}):
@@ -130,7 +134,6 @@ def load_performance_databases(local_config: Path) -> PerformanceDatabases:
     raw_items = section.get("items", {})
     if not isinstance(raw_items, dict):
         raise PerformanceDatabaseError("PERFORMANCE_DATABASES_INVALID", "performance_databases.items must be an object")
-    project = Path(local_config).parent
     items: list[PerformanceDatabaseEntry] = []
     resolved_roots: list[tuple[str, Path]] = []
     for name, raw in raw_items.items():
@@ -163,6 +166,43 @@ def load_performance_databases(local_config: Path) -> PerformanceDatabases:
     if active is not None and (not isinstance(active, str) or active not in raw_items):
         raise PerformanceDatabaseError("PERFORMANCE_DATABASE_UNKNOWN", "performance_databases.active names no entry")
     return PerformanceDatabases(active, tuple(items))
+
+
+def require_apart_from_default(databases: PerformanceDatabases, project: Path, default_root: Path) -> None:
+    """An entry may register the default database but not nest with its root (P7 spec §3)."""
+    default = Path(default_root).resolve()
+    for item in databases.items:
+        root = (Path(project) / item.database_root).resolve()
+        if root != default and (root in default.parents or default in root.parents):
+            raise PerformanceDatabaseError(
+                "PERFORMANCE_DATABASES_INVALID",
+                f"performance_databases.items.{item.name}.database_root overlaps the default database root",
+            )
+
+
+def save_performance_databases(local_config: Path, section: Mapping[str, object]) -> PerformanceDatabases:
+    """Validate and atomically write the `performance_databases` section; other sections are kept."""
+    path = Path(local_config)
+    document = _local_config(path)
+    parsed = parse_performance_databases(dict(section), path.parent)
+    document["performance_databases"] = json.loads(json.dumps(section))
+    payload = json.dumps(document, ensure_ascii=False, indent=2) + "\n"
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(payload, encoding="utf-8")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return parsed
+
+
+def exchange_profile_names(local_config: Path) -> tuple[str, ...]:
+    """Exchanges a new database can use: the profiles plus Bybit, which needs none."""
+    profiles = _local_config(local_config).get("exchange_profiles", {})
+    names = [key.strip() for key in profiles if isinstance(key, str) and key.strip()] if isinstance(profiles, dict) else []
+    if not any(name.casefold() == PROFILE_FREE_EXCHANGE for name in names):
+        names.append("Bybit")
+    return tuple(sorted(dict.fromkeys(names), key=str.casefold))
 
 
 def _tester_value(key: str, value: object) -> int | float:
@@ -280,9 +320,13 @@ __all__ = [
     "PerformanceDatabases",
     "STRATEGY_EXCHANGE_KEYS",
     "TESTER_KEYS",
+    "exchange_profile_names",
     "inside_project",
     "load_exchange_profile",
     "load_performance_databases",
     "materialize_tester_template",
+    "parse_performance_databases",
     "relative_project_path",
+    "require_apart_from_default",
+    "save_performance_databases",
 ]

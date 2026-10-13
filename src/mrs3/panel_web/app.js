@@ -816,7 +816,7 @@ if (typeof globalThis !== 'undefined') globalThis.portfolioSelectionHelpers = po
     const id = window.location.hash.slice(1) || 'testing';
     showScreen(id);
     if (id === 'portfolio') loadPortfolioScreen();
-    if (id === 'settings') { loadPortfolioSettings(); loadPerformanceV2SelectionSettings(); }
+    if (id === 'settings') { loadPortfolioSettings(); loadPerformanceV2SelectionSettings(); loadPerformanceDatabases(); }
   }
 
   links.forEach((link) => link.addEventListener('click', () => showScreen(link.dataset.screenLink, true)));
@@ -4516,6 +4516,70 @@ if (typeof globalThis !== 'undefined') globalThis.portfolioSelectionHelpers = po
     } catch (error) { if (researchedSettingsStatus) researchedSettingsStatus.textContent = `Не удалось загрузить настройки: ${error.message}`; }
   }
   document.querySelector('#performance-v2-selection-settings-reload')?.addEventListener('click', loadPerformanceV2SelectionSettings);
+  // PerformanceDB selection (P7 spec §5): list, switch and create one database per exchange.
+  const performanceDatabasesEndpoint = '/api/v2/settings/performance-databases';
+  const performanceDatabasesRows = document.querySelector('#performance-databases-rows');
+  const performanceDatabasesStatus = document.querySelector('#performance-databases-status');
+  const setPerformanceDatabasesStatus = (message) => { if (performanceDatabasesStatus) performanceDatabasesStatus.textContent = message; };
+  function renderPerformanceDatabases(data) {
+    if (!performanceDatabasesRows) return;
+    performanceDatabasesRows.replaceChildren();
+    for (const row of data.items || []) {
+      const line = document.createElement('tr');
+      const markers = row.markers
+        ? `${row.markers.evaluation_protocol} · ${row.markers.exchange || '—'} · схема ${row.markers.schema_version || '—'}`
+        : (row.exists ? 'недоступны' : 'файла ещё нет');
+      const cells = [row.name ?? 'по умолчанию', row.database_root, row.evaluation_protocol, row.exchange || '—', markers,
+        row.size_bytes === null || row.size_bytes === undefined ? '—' : formatBytes(row.size_bytes)];
+      for (const value of cells) { const cell = document.createElement('td'); cell.textContent = String(value); line.append(cell); }
+      const action = document.createElement('td');
+      if (row.active) action.textContent = 'активна';
+      else {
+        const button = document.createElement('button');
+        button.type = 'button'; button.className = 'button button-secondary'; button.textContent = 'Сделать активной';
+        button.disabled = !!data.busy;
+        button.addEventListener('click', () => activatePerformanceDatabase(row.name ?? null));
+        action.append(button);
+      }
+      line.append(action);
+      performanceDatabasesRows.append(line);
+    }
+    const exchange = document.querySelector('#performance-database-exchange');
+    if (exchange) {
+      const current = exchange.value;
+      exchange.replaceChildren(...(data.exchanges || []).map((name) => new Option(name, name)));
+      if (current && (data.exchanges || []).includes(current)) exchange.value = current;
+    }
+    setPerformanceDatabasesStatus(data.busy
+      ? 'Есть запущенные задания или открытый сбор отчётов: переключение недоступно.'
+      : `Активна: ${data.active ?? 'база по умолчанию'}.`);
+  }
+  async function loadPerformanceDatabases() {
+    if (!performanceDatabasesRows) return;
+    try { renderPerformanceDatabases(await requestJson(performanceDatabasesEndpoint)); }
+    catch (error) { setPerformanceDatabasesStatus(`Не удалось загрузить базы: ${error.message}`); }
+  }
+  async function activatePerformanceDatabase(name) {
+    try {
+      renderPerformanceDatabases(await remoteRequest(`${performanceDatabasesEndpoint}/activate`, { name }));
+      if (typeof loadPerformanceV2Catalog === 'function') await loadPerformanceV2Catalog();
+    } catch (error) {
+      setPerformanceDatabasesStatus(error.code === 'RESOURCE_BUSY'
+        ? 'Переключение недоступно: есть запущенные задания или открытый сбор отчётов.'
+        : `Не удалось переключить: ${error.message}`);
+    }
+  }
+  document.querySelector('#performance-databases-reload')?.addEventListener('click', loadPerformanceDatabases);
+  document.querySelector('#performance-database-create')?.addEventListener('click', async () => {
+    const value = (id) => document.querySelector(id)?.value.trim() || '';
+    try {
+      renderPerformanceDatabases(await remoteRequest(`${performanceDatabasesEndpoint}/create`, {
+        name: value('#performance-database-name'), database_root: value('#performance-database-root'),
+        exchange: value('#performance-database-exchange'),
+      }));
+      setPerformanceDatabasesStatus('База создана. Чтобы тестировать на ней, сделайте её активной.');
+    } catch (error) { setPerformanceDatabasesStatus(`Не удалось создать базу: ${error.message}`); }
+  });
   document.querySelector('#performance-v2-selection-settings-save')?.addEventListener('click', async () => {
     if (!researchedSettingsDigest) await loadPerformanceV2SelectionSettings();
     if (!researchedSettingsDigest) return;
