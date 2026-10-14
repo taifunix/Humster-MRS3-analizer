@@ -843,3 +843,13 @@ the expected 10 blank cells in the empty trailing row; AutoFilter is `A1:L93`.
 The focused suite passes 44 tests, `py_compile` and `git diff --check` pass, and
 independent Opus review returned `CODE_REVIEW_PASS`. Next step: normal daily
 execution uses the no-flag rotation path. Blockers: none.
+
+## Published-surface analysis catalog (2026-10-14)
+
+The "1. Analysis of published surface" picker now lists validated
+`*.analysis-v6.duckdb` files directly under the configured analysis root;
+nested folders are excluded. Verification: the catalog, fresh-strategy,
+shortlist and static-UI panel tests pass (267 tests) using
+`.venv\Scripts\python.exe -m pytest -q tests\test_panel_analysis_catalog.py tests\test_panel_fresh_strategies.py tests\test_panel_fresh_shortlist_v2.py tests\test_panel_static_ui.py`.
+The complete `test_panel*.py` sweep was stopped before completion. Next step:
+restart the Panel to load the updated catalog logic.

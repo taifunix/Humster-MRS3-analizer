@@ -3550,7 +3550,7 @@ class PanelController:
         }
 
     def analysis_catalog(self) -> dict[str, object]:
-        """List validated fresh analysis artifacts so an existing run can be reopened.
+        """List validated root-level fresh analysis artifacts for reopening.
 
         Mirrors `surface_catalog`: a file that does not validate is skipped
         rather than offered, because offering it would only fail on open.
@@ -3561,7 +3561,7 @@ class PanelController:
                 directory = directory.parent
             candidates = sorted(
                 (
-                    path for path in directory.rglob("*.analysis-v6.duckdb")
+                    path for path in directory.glob("*.analysis-v6.duckdb")
                     if path.is_file() and not path.is_symlink()
                 ),
                 key=lambda path: str(path).casefold(),

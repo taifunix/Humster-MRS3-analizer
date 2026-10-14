@@ -36,6 +36,8 @@ two-column `dates.xlsx` or the `bybit_tradfi_liquidity.xlsx` registry with a
 `Пары` sheet. Reload is read-only; Save atomically validates and writes
 `config.local.json`. The shared worker count changes processing speed for
 import, publication and analysis, but does not change calculated results.
+The "1. Analysis of published surface" picker lists valid analysis DBs only
+from the configured root folder; nested folders are not searched.
 
 ## Основные команды
 
