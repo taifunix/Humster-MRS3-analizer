@@ -148,6 +148,14 @@ exchange key in the analysis DB, background job); part B extends the MRS2 shift
 grid 5.5% → 7.5% (step 0.4%) with backward compatibility (effective grid =
 legacy grid plus the longest present extension prefix); seven user decisions
 listed in B3.
+Before part B changes the plateau logic (2026-10-14): a walk-forward study on
+the full Source v6 databases (remote machine, no surfaces or analysis DBs
+needed) collects facts on whether plateau-based selection predicts future
+PnL and drawdown better than alternatives (neighbourhood robustness, plateau
+centre, shift depth). The remote session delivers facts and a parquet export
+only; reconciliation with the local analysis DBs and final conclusions are
+done locally. Prompt:
+[plateau OOS study](docs/superpowers/plans/2026-10-14-plateau-oos-study-prompt.md).
 User decision 2026-10-12: one PerformanceDB per exchange with an
 `schema_info.exchange` marker (protocol v2 §4.1); the CSV Direct analysis DB
 (branch `feat/csv-direct-analysis`) must also record the exchange from the run
