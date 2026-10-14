@@ -156,6 +156,10 @@ centre, shift depth). The remote session delivers facts and a parquet export
 only; reconciliation with the local analysis DBs and final conclusions are
 done locally. Prompt:
 [plateau OOS study](docs/superpowers/plans/2026-10-14-plateau-oos-study-prompt.md).
+The remote study is running (2026-10-14). Start of the next local session:
+[local continuation plan](docs/superpowers/plans/2026-10-14-local-continuation-plan.md)
+— CSV Direct merge first; acceptance and reconciliation of the study export,
+conclusions, the 7.5% grid mechanics and plateau v4 follow in that order.
 User decision 2026-10-12: one PerformanceDB per exchange with an
 `schema_info.exchange` marker (protocol v2 §4.1); the CSV Direct analysis DB
 (branch `feat/csv-direct-analysis`) must also record the exchange from the run
