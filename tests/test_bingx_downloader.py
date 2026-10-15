@@ -457,3 +457,9 @@ def test_damaged_file_on_a_no_trade_day_is_removed(tmp_path: Path):
     _, _, missing = check_local_days(bot_root=tmp_path, pairs=["PANW"], start=saturday, end=saturday,
                                      client=FakeClient(empty_days={saturday}), now=NOW)
     assert missing == {}
+
+
+def test_client_retries_bingx_network_exception_code():
+    responses = [{"code": 109701, "msg": "network issue", "data": {}}, {"code": 0, "msg": "", "data": CONTRACTS}]
+    client = BingXClient(fetch_json=lambda url, headers: responses.pop(0), sleep=lambda _: None, request_delay_seconds=0)
+    assert client.contracts() == CONTRACTS

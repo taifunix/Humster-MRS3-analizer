@@ -33,8 +33,8 @@ MINUTE_MS = 60_000
 DAY_MS = 86_400_000
 # Daily data appears ~6 h after 00:00 UTC; 3 h margin on top (spec: «Доступность дневных данных»).
 AVAILABILITY_LAG = timedelta(hours=9)
-# BingX gateway codes that mean "retry later": rate limit, system busy, internal error.
-RETRYABLE_CODES = frozenset({100410, 100500, 109500})
+# BingX gateway codes that mean "retry later": rate limit, system busy, internal error, network exception.
+RETRYABLE_CODES = frozenset({100410, 100500, 109500, 109701})
 _BOM = b"\xef\xbb\xbf"
 _TICKER = re.compile(r"^[A-Z0-9]+$")
 
