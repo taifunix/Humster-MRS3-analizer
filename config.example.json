@@ -108,7 +108,7 @@
     "executable": "hb_c.exe",
     "base_url": "http://127.0.0.1:80",
     "port": 80,
-    "strategy_dir": "settings_strategy",
+    "strategy_dir": "tester/settings_strategy",
     "report_dir": "tester/report/my_test",
     "wizard_result": "tester/wizard_result.json",
     "wizard_progress": "tester/wizard_progress.json",
@@ -144,7 +144,7 @@
     "performance_db_root": "data/performanceDB",
     "workbooks_root": "data/workbooks",
     "tester_report_dir": "tester/report/my_test",
-    "tester_strategy_dir": "settings_strategy",
+    "tester_strategy_dir": "tester/settings_strategy",
     "tester_config": "config_tester.json"
   },
   "canonical_shifts_bp": [

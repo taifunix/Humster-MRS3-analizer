@@ -34,7 +34,7 @@ def test_panel_path_defaults_are_fixed_and_relative(tmp_path) -> None:
     assert settings.performance_db_root == Path("data/performanceDB")
     assert settings.workbooks_root == Path("data/workbooks")
     assert settings.tester_report_dir == Path("tester/report/my_test")
-    assert settings.tester_strategy_dir == Path("settings_strategy")
+    assert settings.tester_strategy_dir == Path("tester/settings_strategy")
     assert settings.tester_config == Path("config_tester.json")
     assert settings.surface_target_path == Path("data/surfaces")
 
@@ -108,7 +108,7 @@ def test_panel_path_defaults_match_tracked_examples() -> None:
         "performance_db_root": "data/performanceDB",
         "workbooks_root": "data/workbooks",
         "tester_report_dir": "tester/report/my_test",
-        "tester_strategy_dir": "settings_strategy",
+        "tester_strategy_dir": "tester/settings_strategy",
         "tester_config": "config_tester.json",
     }
     for filename in ("config.example.json", "config.local.json.example"):

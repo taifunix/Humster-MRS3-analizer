@@ -48,7 +48,7 @@ const context = {
   testerStop: { disabled: true }, testerJobId: 'job-1',
   testerCard: { querySelector: () => ({ className: '', textContent: '' }) },
   testerIsTerminal: (job) => ['COMMITTED', 'FAILED', 'CANCELLED'].includes(job.state),
-  collectionIsActive: () => false, collectionImportReady: () => false,
+  collectionIsActive: () => false, collectionModeSelected: () => false, collectionImportReady: () => false,
   normalImportAuthorized: false, authorizedTesterJobId: '',
   testerCollectionId: '', normalVerifyInFlight: false, collectionActionBusy: false, collectionActivePacks: 0,
   inboxVerifyV2: { disabled: true }, importStartV2: { disabled: true },
@@ -1660,13 +1660,17 @@ def test_single_mode_collection_launch_is_strict_boolean_and_status_is_server_ow
     assert "requestJson('/api/v2/jobs')" not in loader
 
 
-def test_collection_status_restores_checkbox_without_authorizing_import() -> None:
+def test_collection_status_does_not_change_next_launch_checkbox_or_authorize_import() -> None:
+    html = _read("index.html")
     js = _read("app.js")
-    loader = js.split("const loadTesterCollection", 1)[1].split("const setTesterControls", 1)[0]
 
     render_collection = js.split("const renderTesterCollection", 1)[1].split("const loadTesterCollection", 1)[0]
+    checkbox_initialization = js.split("const testerCollectReports", 1)[1].split("const testerCollectionStatus", 1)[0]
     assert "['OPEN', 'VERIFIED'].includes(state)" in render_collection
-    assert "testerCollectReports.checked =" in render_collection
+    checkbox = html.split('id="tester-collect-reports"', 1)[1].split(">", 1)[0]
+    assert "checked" not in checkbox
+    assert "testerCollectReports.checked = false;" in checkbox_initialization
+    assert "testerCollectReports.checked" not in render_collection
     assert "normalImportAuthorized = false;" in js.split("const loadTesterCollection", 1)[1]
     assert "authorizedTesterJobId = '';" in js.split("const loadTesterCollection", 1)[1]
     for field in ("total_registered_packs", "exact_committed_report_count", "active_packs", "failed_cancelled_packs"):
@@ -1678,7 +1682,9 @@ def test_collection_verify_and_import_use_exact_collection_id_and_gate_active_me
     verify = js.split("inboxVerifyV2?.addEventListener", 1)[1].split("importStartV2?.addEventListener", 1)[0]
     import_handler = js.split("importStartV2?.addEventListener", 1)[1].split("const recoverSplitJobs", 1)[0]
 
+    assert "const collectionModeSelected = () => testerCollectReports?.checked === true && collectionIsActive();" in js
     assert "collectionActivePacks > 0" in verify
+    assert "const collectionId = collectionModeSelected() ? testerCollectionId : '';" in verify
     assert "const verifyJobId = collectionId || testerJobId;" in verify
     assert "job_id: verifyJobId" in verify
     assert "authorizedTesterJobId = verifyJobId;" in verify
@@ -2599,13 +2605,87 @@ def test_normal_recovery_uses_created_date_and_suitable_job_priority() -> None:
     assert "['strategies.tester.start', 'strategies.tester.retry'].includes(job.kind) && job.retest !== true" in recovery
     assert "Number.isFinite(Date.parse(job.created_at_utc))" in recovery
     assert "['QUEUED', 'RUNNING', 'CANCELLING'].includes(job.state)" in recovery
-    assert "job.state === 'COMMITTED' && job.inbox_ready === true" in recovery
+    assert "job.state === 'COMMITTED'" in recovery
+    assert "job.state === 'COMMITTED' && job.inbox_ready === true" not in recovery
     assert "['FAILED', 'CANCELLED'].includes(job.state)" in recovery
     assert "Date.parse(b.created_at_utc) - Date.parse(a.created_at_utc)" in recovery
     assert "String(b.job_id).localeCompare(String(a.job_id))" in recovery
     assert "const tester = testerJobs[0];" in recovery
     assert ".reverse()" not in recovery
     assert "testerJobs.find((job) => !testerIsTerminal(job))" not in recovery
+
+
+def test_collection_choice_and_committed_unverified_recovery_behavior() -> None:
+    js = _read("app.js")
+    init_start = js.index("  const testerCollectReports =")
+    init_end = js.index("  const testerCollectionStatus", init_start)
+    selection_start = js.index("  const collectionIsActive =")
+    selection_end = js.index("  const refreshCollectionActionControls", selection_start)
+    change_start = js.index("  testerCollectReports?.addEventListener('change'")
+    change_end = js.index("  const renderTesterCollection", change_start)
+    recovery_start = js.index("  const recoverJobs = async () =>")
+    recovery_end = js.index("  const importStartV2", recovery_start)
+    recovery = js[recovery_start:recovery_end]
+    script = r"""
+const assert = require('node:assert/strict');
+const vm = require('node:vm');
+const checkbox = { checked: true, addEventListener: (_name, handler) => { checkbox.change = handler; } };
+const rendered = [];
+const requests = [];
+const context = {
+      assert,
+      rendered,
+      requests,
+  document: { querySelector: (selector) => selector === '#tester-collect-reports' ? checkbox : null },
+  testerCollectionId: 'collection-1', testerCollectionState: 'VERIFIED',
+  collectionCommittedPacks: 1, normalImportAuthorized: true, authorizedTesterJobId: 'old',
+  normalVerifyEpoch: 3, testerJobId: '', testerIsTerminal: (job) => ['COMMITTED', 'FAILED', 'CANCELLED'].includes(job.state),
+  requestJson: async (path) => { requests.push(path); return { jobs: [
+    { job_id: 'collection-job', kind: 'strategies.tester.collection', state: 'COMMITTED', inbox_ready: false, created_at_utc: '2026-10-15T11:00:00Z' },
+    { job_id: 'ordinary-unverified', kind: 'strategies.tester.start', state: 'COMMITTED', inbox_ready: false, created_at_utc: '2026-10-15T10:00:00Z' },
+  ] }; },
+  renderTester: (job) => rendered.push(job), pollTester: async () => {}, startTesterPolling: () => {},
+};
+vm.createContext(context);
+(async () => {
+await vm.runInContext(`let testerCollectionState = 'VERIFIED';
+let testerCollectionId = 'collection-1';
+let collectionCommittedPacks = 1;
+let normalImportAuthorized = true;
+let authorizedTesterJobId = 'old';
+let normalVerifyEpoch = 3;
+const refreshCollectionActionControls = () => {};
+${__INIT__}
+${__SELECT__}
+${__CHANGE__}
+${__RECOVERY__}
+(async () => {
+  assert.equal(testerCollectReports.checked, false);
+  assert.equal(collectionModeSelected(), false);
+  assert.equal(await recoverJobs(), undefined);
+  assert.equal(testerJobId, 'ordinary-unverified');
+  assert.equal(rendered[0].inbox_ready, false);
+  assert.equal(testerCollectReports.checked, false);
+  assert.equal(collectionModeSelected(), false);
+  assert.equal(JSON.stringify(requests), JSON.stringify(['/api/v2/jobs']));
+  testerCollectReports.checked = true;
+  assert.equal(collectionModeSelected(), true);
+  testerCollectReports.change();
+  assert.equal(normalImportAuthorized, false);
+  assert.equal(authorizedTesterJobId, '');
+  assert.equal(normalVerifyEpoch, 4);
+})()`, context);
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+"""
+    for placeholder, value in (
+        ("__INIT__", js[init_start:init_end]),
+        ("__SELECT__", js[selection_start:selection_end]),
+        ("__CHANGE__", js[change_start:change_end]),
+        ("__RECOVERY__", js[recovery_start:recovery_end]),
+    ):
+        script = script.replace("${" + placeholder + "}", value)
+    result = subprocess.run(["node", "-e", script], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
 
 
 def test_completed_single_mode_handoff_is_verifiable_before_target_cleanup() -> None:

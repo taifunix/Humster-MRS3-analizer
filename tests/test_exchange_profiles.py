@@ -118,6 +118,8 @@ def test_bingx_templates_differ_from_bybit_only_in_exchange_values() -> None:
     assert bingx == bybit
     bybit_tester = json.loads((base / "Bybit" / "mrs3-tester.json").read_text(encoding="utf-8"))
     bingx_tester = json.loads((base / "BingX" / "mrs3-tester.json").read_text(encoding="utf-8"))
+    assert bybit_tester.pop("maintenance_margin_rate") == 0.005
+    assert "maintenance_margin_rate" not in bingx_tester
     bybit_tester.update({"MakerFee": 0.00012, "TakerFee": 0.0003})
     assert bingx_tester == bybit_tester
 

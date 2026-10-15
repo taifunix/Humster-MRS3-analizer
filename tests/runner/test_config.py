@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+import subprocess
+from types import SimpleNamespace
 
 import pytest
 
 from mrs3.runner.config import RunnerConfig, RunnerConfigError, UnsafePathError, validate_report_directory
+from mrs3.runner.config import validate_strategy_directory
 
 
 def test_accepts_exact_my_test_under_configured_bot_root(tmp_path: Path) -> None:
@@ -82,6 +86,85 @@ def test_runner_config_resolves_paths_and_runtime_values(tmp_path: Path) -> None
     assert config.submission_delay_seconds == pytest.approx(0.2)
     assert config.request_timeout_seconds == pytest.approx(10)
     assert config.result_report_grace_seconds == pytest.approx(15)
+
+
+def test_runner_config_accepts_strategy_directory_under_tester(tmp_path: Path) -> None:
+    bot = tmp_path / "hamster"
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "tester_runner": {
+                    "bot_root": str(bot),
+                    "executable": "hb_c.exe",
+                    "base_url": "http://127.0.0.1:8087",
+                    "port": 8087,
+                    "strategy_dir": "tester/settings_strategy",
+                    "report_dir": "tester/report/my_test",
+                    "wizard_result": "tester/wizard_result.json",
+                    "wizard_progress": "tester/wizard_progress.json",
+                    "tester_config": "tester/tester_config.json",
+                    "inbox_root": str(tmp_path / "data" / "tester_inbox"),
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    config = RunnerConfig.from_json(config_path)
+
+    assert config.strategy_dir == (bot / "tester" / "settings_strategy").resolve()
+
+
+@pytest.mark.parametrize("linked_part", ("tester", "tester/settings_strategy"))
+def test_runner_config_rejects_linked_strategy_path_component(tmp_path: Path, monkeypatch, linked_part: str) -> None:
+    bot = tmp_path / "hamster"
+    (bot / "tester" / "settings_strategy").mkdir(parents=True)
+    linked_path = bot / linked_part
+    real_is_symlink = Path.is_symlink
+
+    def is_link(path: Path) -> bool:
+        return path == linked_path or real_is_symlink(path)
+
+    monkeypatch.setattr(Path, "is_symlink", is_link)
+
+    with pytest.raises(UnsafePathError, match="links"):
+        validate_strategy_directory(bot / "tester" / "settings_strategy", bot)
+
+
+def test_runner_config_rejects_strategy_junction_reparse_component(tmp_path: Path, monkeypatch) -> None:
+    bot = tmp_path / "hamster"
+    (bot / "tester" / "settings_strategy").mkdir(parents=True)
+    junction = bot / "tester"
+    real_stat = Path.stat
+
+    def stat_with_reparse(path: Path, *, follow_symlinks: bool = True):
+        if path == junction and not follow_symlinks:
+            return SimpleNamespace(st_mode=0o040000, st_file_attributes=0x400, st_reparse_tag=0xA0000003)
+        return real_stat(path, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(Path, "stat", stat_with_reparse)
+
+    with pytest.raises(UnsafePathError, match="links"):
+        validate_strategy_directory(bot / "tester" / "settings_strategy", bot)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows directory junction test")
+def test_runner_config_rejects_real_strategy_junction(tmp_path: Path) -> None:
+    bot = tmp_path / "hamster"
+    (bot / "tester").mkdir(parents=True)
+    legacy = bot / "settings_strategy"
+    legacy.mkdir()
+    link = bot / "tester" / "settings_strategy"
+    result = subprocess.run(
+        ["cmd.exe", "/d", "/c", "mklink", "/J", str(link), str(legacy)],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    with pytest.raises(UnsafePathError, match="links"):
+        validate_strategy_directory(link, bot)
 
 
 def test_runner_config_rejects_boolean_worker_count(tmp_path: Path) -> None:

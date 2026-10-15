@@ -2298,6 +2298,7 @@ if (typeof globalThis !== 'undefined') globalThis.portfolioSelectionHelpers = po
   const testerStartDate = document.querySelector('#tester-start-date');
   const testerEndDate = document.querySelector('#tester-end-date');
   const testerCollectReports = document.querySelector('#tester-collect-reports');
+  if (testerCollectReports) testerCollectReports.checked = false;
   const testerCollectionStatus = document.querySelector('#tester-collection-status');
   const testerCollectionClear = document.querySelector('#tester-collection-clear');
   let testerCollectionId = '';
@@ -2328,7 +2329,8 @@ if (typeof globalThis !== 'undefined') globalThis.portfolioSelectionHelpers = po
   }));
   const testerIsTerminal = (job) => ['COMMITTED', 'CANCELLED', 'FAILED'].includes(job.state);
   const collectionIsActive = () => Boolean(testerCollectionId) && ['OPEN', 'VERIFIED'].includes(testerCollectionState);
-  const collectionImportReady = () => collectionIsActive() && testerCollectionState === 'VERIFIED' && collectionCommittedPacks > 0;
+  const collectionModeSelected = () => testerCollectReports?.checked === true && collectionIsActive();
+  const collectionImportReady = () => collectionModeSelected() && testerCollectionState === 'VERIFIED' && collectionCommittedPacks > 0;
   const refreshCollectionActionControls = () => {
     if (testerStart) testerStart.disabled = collectionActionBusy || testerControlsBusy;
     if (testerRetry) testerRetry.disabled = collectionActionBusy || testerControlsBusy || !testerRetryable;
@@ -2337,9 +2339,9 @@ if (typeof globalThis !== 'undefined') globalThis.portfolioSelectionHelpers = po
       if (collectionActionBusy) inboxVerifyV2.disabled = true;
       else {
         const ordinaryReady = testerCommitted || testerVerifiable;
-        const collectionReady = collectionIsActive() && collectionCommittedPacks > 0;
+        const collectionReady = collectionModeSelected() && collectionCommittedPacks > 0;
         inboxVerifyV2.disabled = normalVerifyInFlight || Boolean(normalImportAuthorized && authorizedTesterJobId)
-          || (collectionIsActive() ? collectionActivePacks > 0 || !collectionReady : !ordinaryReady);
+          || (collectionModeSelected() ? collectionActivePacks > 0 || !collectionReady : !ordinaryReady);
       }
     }
     if (importStartV2) importStartV2.disabled = collectionActionBusy
@@ -2349,6 +2351,12 @@ if (typeof globalThis !== 'undefined') globalThis.portfolioSelectionHelpers = po
     collectionActionBusy = busy;
     refreshCollectionActionControls();
   };
+  testerCollectReports?.addEventListener('change', () => {
+    normalImportAuthorized = false;
+    authorizedTesterJobId = '';
+    normalVerifyEpoch += 1;
+    refreshCollectionActionControls();
+  });
   const renderTesterCollection = (collection = {}) => {
     const state = typeof collection.state === 'string' ? collection.state : 'EMPTY';
     const id = typeof collection.collection_id === 'string' ? collection.collection_id : '';
@@ -2358,7 +2366,6 @@ if (typeof globalThis !== 'undefined') globalThis.portfolioSelectionHelpers = po
     collectionActivePacks = Number.isSafeInteger(Number(collection.active_packs)) ? Number(collection.active_packs) : 0;
     collectionFailedPacks = Number.isSafeInteger(Number(collection.failed_cancelled_packs)) ? Number(collection.failed_cancelled_packs) : 0;
     collectionReportCount = Number.isSafeInteger(Number(collection.exact_committed_report_count)) ? Number(collection.exact_committed_report_count) : 0;
-    if (testerCollectReports) testerCollectReports.checked = collectionIsActive();
     if (testerCollectionStatus) {
       const details = [];
       if (collectionActivePacks > 0) details.push(`активных: ${collectionActivePacks}`);
@@ -2418,7 +2425,7 @@ if (typeof globalThis !== 'undefined') globalThis.portfolioSelectionHelpers = po
       normalImportAuthorized = false;
       authorizedTesterJobId = '';
     }
-    const importAllowed = normalImportAuthorized && authorizedTesterJobId === (collectionIsActive() ? testerCollectionId : testerJobId)
+    const importAllowed = normalImportAuthorized && authorizedTesterJobId === (collectionModeSelected() ? testerCollectionId : testerJobId)
       && (collectionImportReady() || ready);
     testerCommitted = committed;
     testerVerifiable = verifiable;
@@ -2432,9 +2439,9 @@ if (typeof globalThis !== 'undefined') globalThis.portfolioSelectionHelpers = po
     testerRetryable = singleMode && ['FAILED', 'CANCELLED'].includes(job.state) && job.job_id === testerJobId;
     setTesterControls(!testerIsTerminal(job));
     if (inboxVerifyV2) {
-      const collectionReady = collectionIsActive() && collectionCommittedPacks > 0;
+      const collectionReady = collectionModeSelected() && collectionCommittedPacks > 0;
       if (collectionActionBusy) inboxVerifyV2.disabled = true;
-      else if (!collectionIsActive()) inboxVerifyV2.disabled = !verifiable || importAllowed;
+      else if (!collectionModeSelected()) inboxVerifyV2.disabled = !verifiable || importAllowed;
       else inboxVerifyV2.disabled = importAllowed || normalVerifyInFlight || collectionActivePacks > 0 || !collectionReady;
     }
     if (importStartV2) importStartV2.disabled = collectionActionBusy || !importAllowed;
@@ -2556,7 +2563,7 @@ if (typeof globalThis !== 'undefined') globalThis.portfolioSelectionHelpers = po
         .filter((job) => Number.isFinite(Date.parse(job.created_at_utc)) && (
           ['QUEUED', 'RUNNING', 'CANCELLING'].includes(job.state)
           || ['FAILED', 'CANCELLED'].includes(job.state)
-          || (job.state === 'COMMITTED' && job.inbox_ready === true)
+          || job.state === 'COMMITTED'
         ))
         .sort((a, b) => Date.parse(b.created_at_utc) - Date.parse(a.created_at_utc)
           || String(b.job_id).localeCompare(String(a.job_id)));
@@ -2646,7 +2653,7 @@ if (typeof globalThis !== 'undefined') globalThis.portfolioSelectionHelpers = po
       normalImportInFlight = false;
       normalImportAuthorized = false;
       authorizedTesterJobId = '';
-      if (inboxVerifyV2) inboxVerifyV2.disabled = collectionIsActive()
+      if (inboxVerifyV2) inboxVerifyV2.disabled = collectionModeSelected()
         ? collectionActivePacks > 0 || collectionCommittedPacks <= 0
         : !testerCommitted;
       if (importStartV2) importStartV2.disabled = true;
@@ -2666,7 +2673,7 @@ if (typeof globalThis !== 'undefined') globalThis.portfolioSelectionHelpers = po
   };
   inboxVerifyV2?.addEventListener('click', async () => {
     if (collectionActionBusy) return;
-    const collectionId = collectionIsActive() ? testerCollectionId : '';
+    const collectionId = collectionModeSelected() ? testerCollectionId : '';
     const collectionReady = Boolean(collectionId) && collectionCommittedPacks > 0;
     if (!collectionId) {
       if (!testerJobId || !(testerCommitted || testerVerifiable) || normalVerifyInFlight) {
@@ -2697,8 +2704,8 @@ if (typeof globalThis !== 'undefined') globalThis.portfolioSelectionHelpers = po
         if (verified?.state !== 'VERIFIED' || verified?.collection_id !== collectionId || verified?.importable_collection_job_id !== collectionId) throw new Error('verified collection is not ready');
       } else if (verified?.state !== 'COMMITTED' || verified?.inbox_ready !== true) throw new Error('verified inbox is not ready');
       // Ordinary stale-check remains: verifyEpoch !== normalVerifyEpoch || verifyJobId !== testerJobId || !testerCommitted
-      if (verifyEpoch !== normalVerifyEpoch || verifyJobId !== (collectionIsActive() ? testerCollectionId : testerJobId)
-        || (collectionIsActive() ? !collectionReady : !(testerCommitted || testerVerifiable))
+      if (verifyEpoch !== normalVerifyEpoch || verifyJobId !== (collectionModeSelected() ? testerCollectionId : testerJobId)
+        || (collectionModeSelected() ? !collectionReady : !(testerCommitted || testerVerifiable))
         || (collectionActionLease && !collectionCoordinator.isCurrent(collectionActionLease))) return;
       const authorize = () => {
         normalImportAuthorized = true;

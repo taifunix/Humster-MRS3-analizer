@@ -1,12 +1,37 @@
 # MRS3 Current Status
 
-Last updated: 2026-10-13
+Last updated: 2026-10-15
 
 This file is a current-status snapshot, not a session log. Earlier progress notes remain in Git history; feature contracts and detailed evidence belong in the linked specs, reports, and plans.
 
 Use [PRD.md](PRD.md) for the feature registry and [docs/README.md](docs/README.md)
 for the documentation map. Read the linked contract only for the active task;
 do not treat this file as a replacement for a feature specification.
+
+## Local tester v2 strategy directory (2026-10-14)
+
+The local tester now stages Single Mode strategies in `tester/settings_strategy`
+and retains the exact legacy root-level directory as a supported config value.
+Focused verification of runner config, config defaults, report cleanup, and
+strategy staging passed: 10 tests passed, 183 deselected. An earlier broad
+Panel sweep was stopped before completion; the later report-profile suite
+covering the related Panel/protocol modules passed 594 tests with one Windows
+symlink-capability skip.
+
+The live Single Mode run used a 20-strategy manifest for 2026-09-13 through
+2026-10-13. Panel recorded `COMMITTED`, 20/20 verified reports, zero failed
+strategies, and no job error; the report collection is `VERIFIED` with 20
+reports. The read-only Performance v2 parser accepted all 20 as format
+`2026-10` / tester `2026/10/10`, with settings, Metric/Value tables, action
+tables, wallet series, and equity series. Across the collection there are 268
+action rows, 25,999 wallet samples, 25,999 equity samples, 2,000 summary metric
+cells, and 792 non-empty scalar analytics values. The separate analytics output, monthly and
+regime rows are absent; HTML scans found zero OHLC chart, position chart,
+position-statistics, or timing-section markers, and zero Monte Carlo mentions.
+No PerformanceDB import was launched. This is not a DD5 retest or a verdict on
+strategy quality. Next:
+decide whether to import the verified collection or run a separate DD5 retest.
+Blockers: none for the completed report-profile check.
 
 ## Next: PerformanceDB upgrade for the new tester report (2026-10-12)
 
@@ -853,3 +878,43 @@ shortlist and static-UI panel tests pass (267 tests) using
 `.venv\Scripts\python.exe -m pytest -q tests\test_panel_analysis_catalog.py tests\test_panel_fresh_strategies.py tests\test_panel_fresh_shortlist_v2.py tests\test_panel_static_ui.py`.
 The complete `test_panel*.py` sweep was stopped before completion. Next step:
 restart the Panel to load the updated catalog logic.
+
+## SINGLE_MODE collection launch checkbox and import integrity (2026-10-14)
+
+The report-collection checkbox now starts unchecked on Panel page load, and
+collection status refreshes no longer change the choice. The checkbox now also
+selects the target of the shared Verify/Import controls: unchecked uses the
+current ordinary tester job even when an older collection remains OPEN or
+VERIFIED. Reload recovery includes the newest COMMITTED ordinary tester job
+before inbox verification, so an explicit Verify remains available after a
+page refresh. Four focused static UI checks pass. The current ordinary
+20-strategy tester job is COMMITTED and awaits its ordinary inbox verification;
+the older 20-report collection remains VERIFIED but is not selected while the
+checkbox is off. No PerformanceDB import was launched by the agent. Next step:
+hard-refresh Panel and press Verify with the checkbox off.
+
+## Panel job journal locked-replacement fallback (2026-10-14)
+
+The failed SINGLE_MODE admission was rejected before tester startup because an
+external process kept the 14 MB `.panel-jobs.json` open without delete sharing.
+The lock remained after stopping Panel, while direct read/write access remained
+available. Atomic replacement remains primary and retains its bounded 10-attempt,
+0.45-second Windows retry. If that retry is exhausted for an existing writable
+journal, the registry saves and fsyncs the old journal to a recovery sidecar,
+then overwrites and verifies the completed payload in place. The complete
+sidecar is atomically published after storing both old and intended journal
+bytes and is directory-synced before the overwrite where supported. Startup and
+later saves preserve either complete payload, or restore old bytes after a
+partial overwrite; a missing journal is restored and an unreadable or malformed
+sidecar fails closed while preserving both files. Format-1 records with an
+intended digest remain readable. Directory entries are synced after atomic
+replacement and sidecar/staging-file changes where supported. Missing journals
+and failed direct writes remain fail-closed. Strategy paths now reject symlink
+and junction/reparse-point components, derive cleanup expectations from fixed
+allowed paths, and remove child reparse points without traversing targets. A
+real locked-journal save previously retained all 190 jobs. The seven changed
+config/runner/Single Mode/UI/template test modules pass 467 tests; one real
+symbolic-link test skips because this Windows account cannot create symlinks.
+Portable link checks and real Windows junction path/cleanup tests pass. No
+tester or PerformanceDB import was started by the agent. Next step: launch
+SINGLE_MODE from the refreshed Panel.

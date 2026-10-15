@@ -4,6 +4,7 @@
 **Date:** 2026-09-28
 **Governing dependency:** `docs/specs/2026-09-03-performance-v2-retest-workflow.md`
 **Commission exception:** [optional Performance v2 commission evidence](2026-09-30-performance-v2-optional-commission-evidence.md).
+**Journal persistence decisions:** [ADR-0073](../decisions/0073-panel-journal-locked-replacement-fallback.md), [ADR-0074](../decisions/0074-panel-journal-in-place-recovery.md).
 ## Goal
 
 Allow an operator to run several ordinary `SINGLE_MODE` tester batches, keep
@@ -32,6 +33,16 @@ The ordinary tester card adds:
 - checkbox `Объединять отчёты`;
 - collection status `N пачек · M отчётов`;
 - action `Очистить накопление`.
+
+The checkbox starts unchecked whenever the Panel page loads. Loading or
+refreshing collection status never changes this choice. It selects collection
+mode for the next tester launch and for the shared Verify/Import actions;
+unchecked Verify/Import always target the current ordinary tester job even
+when an older collection remains open or verified.
+
+On page reload, the ordinary tester card restores the newest terminal or active
+ordinary tester job, including a committed job whose inbox still needs the
+explicit Verify action.
 
 When the checkbox is selected, `Launch SINGLE_MODE tester` registers the new
 tester job in the active collection before its worker starts. An unchecked
@@ -132,9 +143,22 @@ rate. An absent rate persists as SQL `NULL`; HTML fees and PnL remain authoritat
     in `.panel-jobs.json`. If persistence fails, the in-memory admission is
     rolled back, the tester runner is not called, and the Panel returns an
     explicit persistence error. Bounded retries apply only to transient
-    Windows replace denials; exhausted retries remain fail-closed. Wrapping
-    Panel services preserve the machine-readable `JOB_PERSISTENCE_FAILED`
-    code and HTTP 503 status.
+    Windows replace denials, with a maximum wait of 0.45 seconds (10 attempts,
+    50 ms apart). If another process continuously denies replacement of an
+    existing journal but still permits writing it, the registry saves and
+    fsyncs the prior and intended payloads in a temporary sidecar before
+    atomically publishing it, then syncs the parent directory where supported
+    before overwriting the existing journal. It fsyncs and verifies the new
+    journal before removing the sidecar. Startup and each later save remove a
+    leftover sidecar if the journal matches either complete payload, or restore
+    the prior bytes if an interrupted overwrite changed them. A missing journal
+    is restored; an unreadable or invalid sidecar fails closed while preserving
+    both files. Parent-directory fsync follows atomic replacement and sidecar
+    changes where supported. See
+    [ADR-0074](../decisions/0074-panel-journal-in-place-recovery.md). If no
+    journal exists or direct overwrite fails, admission remains fail-closed.
+    Wrapping Panel services preserve the machine-readable
+    `JOB_PERSISTENCE_FAILED` code and HTTP 503 status.
 15. The Windows Panel launchers disable delayed expansion before handling
     paths. `start_panel.bat` prepends its checkout's `src` directory to
     `PYTHONPATH` without an empty path component and preserves existing entries.
@@ -163,6 +187,10 @@ rate. An absent rate persists as SQL `NULL`; HTML fees and PnL remain authoritat
 - A transient Windows journal replace denial that clears within the bounded
   retry window saves the job and proceeds through the ordinary SINGLE_MODE
   flow.
+- A transient Windows replace denial can clear within the 0.45-second retry
+  window and still save the job. A persistent no-delete-share lock
+  on an existing writable journal uses the fsynced in-place fallback; other
+  persistent failures remain fail-closed.
 - Starting Panel from any supported batch launcher imports the package from
   its checkout, even when `.venv` has an editable install for a different
   worktree; the launcher's working copy retains CRLF line endings.
