@@ -717,6 +717,29 @@ created through L. The filter preserves criteria outside the rewritten dates.
 Focused verification: 39 tests passed; `git diff --check` and `py_compile`
 passed; independent Opus `CODE_REVIEW_PASS`. No live workbook or network run
 was performed.
+## Bybit base-lot export: tester parquet, completeness, 10-day average (2026-10-16)
+
+The [base-lot export](docs/specs/2026-10-07-bybit-base-lot-export.md) now
+reads only the tester's `<SYMBOL><date>_1m.parquet` day files (CSV is no longer
+produced). A missing day is backfilled from the official Bybit trade archive
+and written in the tester's own parquet format (INT64/DOUBLE/INT32, REQUIRED,
+ZSTD, `hb.schema = candles_1m/1`) through `pyarrow`, a new dependency. Every
+run aligns the ten date columns with the run date and fills every blank or
+`ERROR:` cell of a pair listed by that date; numeric cells are kept. Layout:
+A pair, B listing, C `Среднее 10д, USDT` (floored mean of the numeric lots in
+D:M, recomputed on every saved run), D:M ten dates. A sheet with dates in C:L
+is moved one column right once (values, styles, widths without overlapping
+`<col>` ranges, filter criteria); foreign data in C1 or in M fails without
+replacing the workbook. ISO text date headers left by an Excel table are
+accepted and rewritten as dates.
+Verification: 132 focused tests passed (`test_calculate_bybit_base_lots`,
+`test_portfolio_minute_capacity`, `test_portfolio_minute_refinement`,
+`test_portfolio_position_sizing`); `git diff --check` clean; independent
+`CODE_REVIEW_PASS` after one fix (parquet column types are now validated). Live run on the
+local workbook: 546 lots for 2026-10-07..16, 91 pairs, 0 errors, 0 blank
+listed cells; a second run the same day is a byte-identical no-op. Open: one
+tester run on a day written by the export to confirm Parquet.Net reads it.
+
 ## Fresh shortlist Minimum Shift gate (2026-10-08)
 
 The fresh **Shortlist and READY JSON** flow has an optional

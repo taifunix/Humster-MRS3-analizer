@@ -4,6 +4,8 @@ import gzip
 from io import BytesIO
 from pathlib import Path
 
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 from mrs3.portfolio.minute_capacity import (
@@ -18,11 +20,28 @@ from mrs3.portfolio.minute_capacity import (
 HEADER = "timestamp,open,high,low,close,volume,buy_volume,sell_volume,trades\n"
 
 
+TESTER_SCHEMA = pa.schema(
+    [pa.field("timestamp", pa.int64(), nullable=False)]
+    + [pa.field(n, pa.float64(), nullable=False) for n in ("open", "high", "low", "close", "volume", "buy_volume", "sell_volume")]
+    + [pa.field("trades", pa.int32(), nullable=False)]
+)
+
+
 def write_day(root: Path, symbol: str, day: date, rows: list[str]) -> Path:
+    """The tester's day file: <SYMBOL><date>_1m.parquet with the tester's schema."""
     folder = root / symbol
     folder.mkdir(parents=True, exist_ok=True)
-    path = folder / f"{symbol}{day.isoformat()}_1m.csv"
-    path.write_text(HEADER + "".join(rows), encoding="utf-8", newline="")
+    path = folder / f"{symbol}{day.isoformat()}_1m.parquet"
+    values = [line.strip().split(",") for line in rows]
+    columns = {name: [] for name in TESTER_SCHEMA.names}
+    for v in values:
+        columns["timestamp"].append(int(v[0]))
+        for i, name in enumerate(TESTER_SCHEMA.names[1:8], 1):
+            columns[name].append(float(v[i]))
+        columns["trades"].append(int(v[8]))
+    with pq.ParquetWriter(path, TESTER_SCHEMA, compression="zstd", store_schema=False) as writer:
+        writer.write_table(pa.Table.from_pydict(columns, schema=TESTER_SCHEMA))
+        writer.add_key_value_metadata({"hb.schema": "candles_1m/1"})
     return path
 
 
@@ -31,20 +50,17 @@ def minute(day: date, offset: int, *, close="10", volume="10", buy="4", sell="6"
     return f"{stamp},{close},{close},{close},{close},{volume},{buy},{sell},{trades}\n"
 
 
-def test_existing_tester_csv_with_utf8_bom_is_accepted(tmp_path: Path):
+def test_csv_day_files_are_not_read(tmp_path: Path):
     day = date(2026, 9, 1)
     path = tmp_path / "BTCUSDT" / "BTCUSDT2026-09-01_1m.csv"
     path.parent.mkdir()
-    path.write_text(HEADER + minute(day, 0), encoding="utf-8-sig")
+    path.write_text(HEADER + minute(day, 0), encoding="utf-8")
 
-    result = calculate_minute_capacity(
-        tmp_path, "BTCUSDT", end_date=day, participation_pct=30,
-        round_down_usdt=50, weekend_start_utc="SATURDAY 00:00",
-        weekend_end_utc="MONDAY 00:00", publication_lag_hours=6,
-        now=datetime(2026, 9, 2, 12, tzinfo=timezone.utc),
-    )
-
-    assert result.status == "PRELIMINARY"
+    with pytest.raises(MinuteCapacityError, match="no valid daily minute file"):
+        calculate_minute_capacity(
+            tmp_path, "BTCUSDT", end_date=day, participation_pct=30,
+            now=datetime(2026, 9, 2, 12, tzinfo=timezone.utc),
+        )
 
 
 def test_capacity_uses_all_clock_minutes_and_default_weekday_window(tmp_path: Path):
@@ -110,7 +126,7 @@ def test_zero_trade_minutes_are_counted_but_missing_days_are_not(tmp_path: Path)
 
 
 def test_no_available_days_fails_closed(tmp_path: Path):
-    with pytest.raises(MinuteCapacityError, match="no valid daily CSV"):
+    with pytest.raises(MinuteCapacityError, match="no valid daily minute file"):
         calculate_minute_capacity(
             tmp_path,
             "ETHUSDT",
@@ -179,17 +195,31 @@ def test_injected_archive_backfill_aggregates_and_never_overwrites(tmp_path: Pat
         return archive_bytes(symbol, requested)
 
     first = backfill_missing_days(tmp_path, "BTCUSDT", (day,), fetch_day=fetch, enabled=True)
-    target = tmp_path / "BTCUSDT" / "BTCUSDT2026-09-13_1m.csv"
+    target = tmp_path / "BTCUSDT" / "BTCUSDT2026-09-13_1m.parquet"
     original = target.read_bytes()
     second = backfill_missing_days(tmp_path, "BTCUSDT", (day,), fetch_day=lambda *_: b"bad", enabled=True)
 
     assert first.created == (day,)
     assert second.existing == (day,)
     assert target.read_bytes() == original
-    rows = target.read_text(encoding="utf-8").splitlines()
-    assert rows[1].endswith(",5,2,3,2")
-    assert rows[2].endswith(",1,1,0,1")
+    assert not (tmp_path / "BTCUSDT" / "BTCUSDT2026-09-13_1m.csv").exists()
+    rows = pq.read_table(target).to_pylist()
+    assert [(r["volume"], r["buy_volume"], r["sell_volume"], r["trades"]) for r in rows] == [(5.0, 2.0, 3.0, 2), (1.0, 1.0, 0.0, 1)]
     assert len(calls) == 1
+
+
+def test_backfilled_parquet_matches_the_tester_day_format(tmp_path: Path):
+    day = date(2026, 9, 13)
+    backfill_missing_days(tmp_path, "BTCUSDT", (day,), fetch_day=archive_bytes, enabled=True)
+    path = tmp_path / "BTCUSDT" / "BTCUSDT2026-09-13_1m.parquet"
+    meta = pq.ParquetFile(path)
+    schema = meta.schema_arrow
+
+    assert schema.names == ["timestamp", "open", "high", "low", "close", "volume", "buy_volume", "sell_volume", "trades"]
+    assert [str(field.type) for field in schema] == ["int64"] + ["double"] * 7 + ["int32"]
+    assert all(not field.nullable for field in schema)
+    assert meta.metadata.metadata == {b"hb.schema": b"candles_1m/1"}
+    assert {meta.metadata.row_group(0).column(i).compression for i in range(9)} == {"ZSTD"}
 
 
 def test_disabled_backfill_only_reports_missing(tmp_path: Path):
@@ -289,7 +319,7 @@ def test_lot_model_requires_every_valid_file_and_positive_turnover(tmp_path: Pat
 
     for day in days:
         write_day(tmp_path, "XRPUSDT", day, [minute(day, 0)])
-    (tmp_path / "XRPUSDT" / f"XRPUSDT{days[3].isoformat()}_1m.csv").write_text("bad header\n", encoding="utf-8")
+    (tmp_path / "XRPUSDT" / f"XRPUSDT{days[3].isoformat()}_1m.parquet").write_bytes(b"not a parquet file")
     with pytest.raises(MinuteCapacityError, match="LIQUIDITY_MODEL_WINDOW_UNAVAILABLE"):
         calculate_minute_capacity(tmp_path, "XRPUSDT", lot_model=True, anchor_created_at=anchor)
 
@@ -308,3 +338,76 @@ def test_liquidity_window_uses_publication_lag_at_campaign_creation_boundary():
     anchor = datetime(2026, 9, 8, 6, 30, tzinfo=timezone.utc)
     assert resolve_liquidity_window(anchor, 6)[-1] == date(2026, 9, 7)
     assert resolve_liquidity_window(anchor, 7)[-1] == date(2026, 9, 6)
+
+
+def _lot_model_rows(day: date, first: date) -> list[str]:
+    if day != first:
+        return []
+    return [
+        minute(day, 0, close="1", volume="10", buy="5", sell="5"),
+        minute(day, 1, close="1", volume="20", buy="10", sell="10"),
+        minute(day, 16, close="1", volume="30", buy="15", sell="15"),
+        minute(day, 31, close="1", volume="40", buy="20", sell="20"),
+    ]
+
+
+def test_lot_model_reads_tester_parquet_days(tmp_path: Path):
+    anchor = datetime(2026, 9, 8, 8, tzinfo=timezone.utc)
+    days = resolve_liquidity_window(anchor, 6)
+    for day in days:
+        write_day(tmp_path, "BTCUSDT", day, _lot_model_rows(day, days[0]))
+
+    result = calculate_minute_capacity(tmp_path, "BTCUSDT", lot_model=True, anchor_created_at=anchor)
+
+    assert result.status == "READY"
+    assert result.lot_features.v25 == Decimal("17.5")
+    assert result.lot_features.active_15m_bins == 3
+    assert all(name.endswith("_1m.parquet") for name, _digest in result.lot_features.file_hashes)
+
+
+def test_inconsistent_parquet_day_fails_closed(tmp_path: Path):
+    anchor = datetime(2026, 9, 8, 8, tzinfo=timezone.utc)
+    days = resolve_liquidity_window(anchor, 6)
+    for day in days:
+        write_day(tmp_path, "BTCUSDT", day, [minute(day, 0, volume="10", buy="4", sell="5")])
+
+    with pytest.raises(MinuteCapacityError, match="LIQUIDITY_MODEL_WINDOW_UNAVAILABLE"):
+        calculate_minute_capacity(tmp_path, "BTCUSDT", lot_model=True, anchor_created_at=anchor)
+
+
+def test_backfill_counts_an_existing_parquet_day_and_writes_nothing(tmp_path: Path):
+    day = date(2026, 9, 13)
+    write_day(tmp_path, "BTCUSDT", day, [minute(day, 0)])
+    calls = []
+
+    result = backfill_missing_days(
+        tmp_path, "BTCUSDT", (day,), fetch_day=lambda *a: calls.append(a) or b"", enabled=True,
+    )
+
+    assert result.existing == (day,)
+    assert not calls
+    assert not (tmp_path / "BTCUSDT" / "BTCUSDT2026-09-13_1m.csv").exists()
+
+
+@pytest.mark.parametrize(
+    ("field", "arrow_type"),
+    [("timestamp", pa.float64()), ("timestamp", pa.timestamp("ms")), ("trades", pa.float64()), ("close", pa.string())],
+)
+def test_parquet_day_with_a_foreign_column_type_fails_closed(tmp_path: Path, field: str, arrow_type) -> None:
+    anchor = datetime(2026, 9, 8, 8, tzinfo=timezone.utc)
+    days = resolve_liquidity_window(anchor, 6)
+    for day in days:
+        write_day(tmp_path, "BTCUSDT", day, [minute(day, 0)])
+    path = tmp_path / "BTCUSDT" / f"BTCUSDT{days[2].isoformat()}_1m.parquet"
+    table = pq.read_table(path)
+    index = table.schema.get_field_index(field)
+    table = table.set_column(index, pa.field(field, arrow_type), table.column(field).cast(arrow_type))
+    pq.write_table(table, path)
+
+    with pytest.raises(MinuteCapacityError, match="LIQUIDITY_MODEL_WINDOW_UNAVAILABLE"):
+        calculate_minute_capacity(tmp_path, "BTCUSDT", lot_model=True, anchor_created_at=anchor)
+    with pytest.raises(MinuteCapacityError, match="column types"):
+        calculate_minute_capacity(
+            tmp_path, "BTCUSDT", end_date=days[2], participation_pct=30,
+            now=datetime(2026, 9, 30, tzinfo=timezone.utc),
+        )

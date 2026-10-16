@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
-from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN, localcontext
+from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_EVEN, localcontext
 import argparse
 from copy import copy
 import os
@@ -39,7 +39,10 @@ DEFAULT_ROUND_DOWN_USDT = Decimal("10")
 DEFAULT_PUBLICATION_LAG_HOURS = 6
 DEFAULT_WORKERS = 16
 HISTORY_DAYS = 10
-HISTORY_FIRST_COLUMN = 3
+AVERAGE_COLUMN = 3
+HISTORY_FIRST_COLUMN = 4
+PREVIOUS_HISTORY_FIRST_COLUMN = 3
+AVERAGE_HEADER = "Среднее 10д, USDT"
 LEGACY_ACTUALIZATION_HEADER = "\u0414\u0430\u0442\u0430 \u0430\u043a\u0442\u0443\u0430\u043b\u0438\u0437\u0430\u0446\u0438\u0438"
 LOT_NUMBER_FORMAT = "#,##0"
 FRACTIONAL_NUMBER_FORMAT = "#,##0.##########"
@@ -80,11 +83,20 @@ class ExportError:
     message: str
 
 
+_ISO_DATE = re.compile(r"\d{4}-\d{2}-\d{2}\Z", re.ASCII)
+
+
 def _date_header(value: object) -> date | None:
     if isinstance(value, datetime):
         return value.date()
     if isinstance(value, date):
         return value
+    # Excel tables store header cells as text; a strict ISO date is the same header.
+    if isinstance(value, str) and _ISO_DATE.match(value.strip()):
+        try:
+            return date.fromisoformat(value.strip())
+        except ValueError:
+            return None
     return None
 
 
@@ -104,8 +116,8 @@ def _calculation_anchor(target_date: date, publication_lag_hours: int) -> dateti
     return datetime.combine(target_date, time(), timezone.utc) + timedelta(hours=publication_lag_hours)
 
 
-def _history_columns(sheet) -> tuple[date, ...] | None:
-    headers = tuple(_date_header(sheet.cell(1, col).value) for col in range(HISTORY_FIRST_COLUMN, HISTORY_FIRST_COLUMN + HISTORY_DAYS))
+def _history_columns(sheet, first_column: int = HISTORY_FIRST_COLUMN) -> tuple[date, ...] | None:
+    headers = tuple(_date_header(sheet.cell(1, col).value) for col in range(first_column, first_column + HISTORY_DAYS))
     if not any(value is not None for value in headers):
         return None
     if any(value is None for value in headers) or tuple(sorted(headers)) != headers or len(set(headers)) != HISTORY_DAYS:
@@ -113,6 +125,103 @@ def _history_columns(sheet) -> tuple[date, ...] | None:
     if any((headers[index + 1] - headers[index]).days != 1 for index in range(HISTORY_DAYS - 1)):
         raise BaseLotExportError("Actual sheet date history must contain ten consecutive dates")
     return headers  # type: ignore[return-value]
+
+
+def _migrate_previous_layout(sheet) -> bool:
+    """Move a C:L date history (layout before the average column) one column right to D:M."""
+    # A date in C1 marks the previous layout; in the current one C1 is the average header.
+    if _date_header(sheet.cell(1, PREVIOUS_HISTORY_FIRST_COLUMN).value) is None:
+        return False
+    _history_columns(sheet, PREVIOUS_HISTORY_FIRST_COLUMN)
+    last = PREVIOUS_HISTORY_FIRST_COLUMN + HISTORY_DAYS - 1
+    if any(sheet.cell(row, last + 1).value is not None for row in range(1, sheet.max_row + 1)):
+        raise BaseLotExportError("cannot move the date history to D:M: column M contains existing data")
+    from openpyxl.utils.cell import range_boundaries
+
+    for row in range(1, sheet.max_row + 1):
+        for col in range(last, PREVIOUS_HISTORY_FIRST_COLUMN - 1, -1):
+            _copy_cell(sheet.cell(row, col), sheet.cell(row, col + 1))
+        average = sheet.cell(row, AVERAGE_COLUMN)
+        average.value = None
+        average.comment = None
+        average.fill = _CLEAR_FILL
+        average.number_format = LOT_NUMBER_FORMAT if row > 1 else "General"
+    _shift_column_dimensions(sheet, PREVIOUS_HISTORY_FIRST_COLUMN, last)
+    if sheet.auto_filter.ref:
+        min_col = range_boundaries(sheet.auto_filter.ref)[0]
+        for column_filter in sheet.auto_filter.filterColumn:
+            if PREVIOUS_HISTORY_FIRST_COLUMN <= min_col + column_filter.colId <= last:
+                column_filter.colId += 1
+    return True
+
+
+def _shift_column_dimensions(sheet, first: int, last: int) -> None:
+    """Move column widths of first..last one column right; first keeps its own width.
+
+    openpyxl keeps grouped <col min max> entries under the first letter, so every entry that
+    touches first..last+1 is split into single columns before shifting; ranges never overlap.
+    """
+    from openpyxl.utils.cell import column_index_from_string, get_column_letter
+    from openpyxl.worksheet.dimensions import ColumnDimension
+
+    per_column: dict[int, tuple] = {}
+    for key in list(sheet.column_dimensions.keys()):
+        dimension = sheet.column_dimensions[key]
+        low = dimension.min or column_index_from_string(key)
+        high = dimension.max or low
+        if high < first or low > last + 1:
+            continue
+        for column in range(low, high + 1):
+            per_column[column] = (dimension.width, dimension.customWidth, copy(dimension._style))
+        del sheet.column_dimensions[key]
+    shifted = dict(per_column)
+    for column in range(last, first - 1, -1):
+        if column in per_column:
+            shifted[column + 1] = per_column[column]
+    for column, (width, custom, style) in sorted(shifted.items()):
+        letter = get_column_letter(column)
+        dimension = ColumnDimension(sheet, index=letter, width=width, customWidth=custom)
+        dimension._style = style
+        sheet.column_dimensions[letter] = dimension
+
+
+def _check_average_column(sheet) -> None:
+    value = sheet.cell(1, AVERAGE_COLUMN).value
+    if value is not None and value != AVERAGE_HEADER:
+        raise BaseLotExportError(f"column C is reserved for the 10-day average; it holds {value!r}")
+
+
+def _average_lot(values: Iterable[object], step: Decimal) -> int | Decimal | None:
+    numbers = [Decimal(str(v)) for v in values if isinstance(v, (int, float, Decimal)) and not isinstance(v, bool)]
+    if not numbers:
+        return None
+    with localcontext() as context:
+        context.prec = 28
+        mean = sum(numbers, Decimal(0)) / Decimal(len(numbers))
+        floored = (mean / step).to_integral_value(rounding=ROUND_DOWN) * step
+    return int(floored) if floored == floored.to_integral_value() else floored
+
+
+def _expected_averages(sheet, symbol_rows: dict[str, tuple[int, ...]], step: Decimal) -> dict[int, object]:
+    return {
+        row: _average_lot((sheet.cell(row, col).value for col in range(HISTORY_FIRST_COLUMN, HISTORY_FIRST_COLUMN + HISTORY_DAYS)), step)
+        for rows in symbol_rows.values() for row in rows
+    }
+
+
+def _averages_stale(sheet, symbol_rows: dict[str, tuple[int, ...]], step: Decimal) -> bool:
+    if sheet.cell(1, AVERAGE_COLUMN).value != AVERAGE_HEADER:
+        return True
+    return any(sheet.cell(row, AVERAGE_COLUMN).value != value for row, value in _expected_averages(sheet, symbol_rows, step).items())
+
+
+def _write_averages(sheet, symbol_rows: dict[str, tuple[int, ...]], step: Decimal) -> None:
+    sheet.cell(1, AVERAGE_COLUMN).value = AVERAGE_HEADER
+    for row, value in _expected_averages(sheet, symbol_rows, step).items():
+        cell = sheet.cell(row, AVERAGE_COLUMN)
+        cell.value = value
+        cell.comment = None
+        cell.number_format = LOT_NUMBER_FORMAT
 
 
 def _copy_cell(source, target) -> None:
@@ -140,11 +249,25 @@ def _symbols_listed_by(sheet, symbols: tuple[str, ...], symbol_rows: dict[str, t
     return tuple(eligible)
 
 
+def _symbols_to_fill(sheet, symbols: tuple[str, ...], symbol_rows: dict[str, tuple[int, ...]], target_date: date, column: int) -> tuple[str, ...]:
+    """Pairs listed by the date whose cell in this date column holds no numeric lot (blank, ERROR or text)."""
+    listed = set(_symbols_listed_by(sheet, symbols, symbol_rows, target_date))
+    return tuple(
+        symbol for symbol, row_numbers in symbol_rows.items()
+        if symbol in listed and any(
+            isinstance(sheet.cell(row, column).value, bool)
+            or not isinstance(sheet.cell(row, column).value, (int, float, Decimal))
+            for row in row_numbers
+        )
+    )
+
+
 def _validate_legacy_history(sheet) -> None:
-    if sheet.cell(1, HISTORY_FIRST_COLUMN).value is None or sheet.cell(1, HISTORY_FIRST_COLUMN + 1).value != LEGACY_ACTUALIZATION_HEADER:
+    """Legacy layout: C = base lot, D = actualization date; the dates go to D:M and C becomes the average."""
+    if sheet.cell(1, AVERAGE_COLUMN).value is None or sheet.cell(1, AVERAGE_COLUMN + 1).value != LEGACY_ACTUALIZATION_HEADER:
         raise BaseLotExportError("Actual sheet is not in the recognized legacy base-lot layout")
-    if any(sheet.cell(row, col).value is not None for row in range(1, sheet.max_row + 1) for col in range(HISTORY_FIRST_COLUMN + 2, HISTORY_FIRST_COLUMN + HISTORY_DAYS)):
-        raise BaseLotExportError("cannot initialize date history: columns E:L contain existing data")
+    if any(sheet.cell(row, col).value is not None for row in range(1, sheet.max_row + 1) for col in range(AVERAGE_COLUMN + 2, HISTORY_FIRST_COLUMN + HISTORY_DAYS)):
+        raise BaseLotExportError("cannot initialize date history: columns E:M contain existing data")
 
 
 def _clear_output_filters(sheet, first_changed_col: int = HISTORY_FIRST_COLUMN, last_changed_col: int = HISTORY_FIRST_COLUMN + HISTORY_DAYS - 1) -> None:
@@ -166,8 +289,8 @@ def _clear_output_filters(sheet, first_changed_col: int = HISTORY_FIRST_COLUMN, 
 def _initialize_history(sheet, dates: tuple[date, ...]) -> None:
     _validate_legacy_history(sheet)
     last_row = sheet.max_row
-    template_style = copy(sheet.cell(1, HISTORY_FIRST_COLUMN)._style) if sheet.cell(1, HISTORY_FIRST_COLUMN).has_style else None
-    legacy_styles = [copy(sheet.cell(row, HISTORY_FIRST_COLUMN)._style) if sheet.cell(row, HISTORY_FIRST_COLUMN).has_style else None for row in range(2, last_row + 1)]
+    template_style = copy(sheet.cell(1, AVERAGE_COLUMN)._style) if sheet.cell(1, AVERAGE_COLUMN).has_style else None
+    legacy_styles = [copy(sheet.cell(row, AVERAGE_COLUMN)._style) if sheet.cell(row, AVERAGE_COLUMN).has_style else None for row in range(2, last_row + 1)]
     legacy_width = sheet.column_dimensions["C"].width
     for offset, target_date in enumerate(dates):
         col = HISTORY_FIRST_COLUMN + offset
@@ -186,7 +309,8 @@ def _initialize_history(sheet, dates: tuple[date, ...]) -> None:
         header.value = target_date
         header.comment = None
         header.number_format = "yyyy-mm-dd"
-    _clear_output_filters(sheet)
+    # C changes meaning (legacy base lot -> average), so its old criteria go too.
+    _clear_output_filters(sheet, AVERAGE_COLUMN)
 
 
 def _reset_history(
@@ -450,7 +574,10 @@ def run_export(
         if sheet_name not in workbook.sheetnames:
             raise BaseLotExportError(f"workbook is missing sheet {sheet_name!r}")
         sheet = workbook[sheet_name]
+        migrated = _migrate_previous_layout(sheet)
         history_dates = _history_columns(sheet)
+        if history_dates is not None:
+            _check_average_column(sheet)
         current_date_present = history_dates is not None and actualization_date in history_dates
         calculation_symbols: dict[date, tuple[str, ...]] = {}
         history_action = "initialize"
@@ -474,28 +601,10 @@ def run_export(
         elif current_date_present:
             for target_date in history_dates:
                 column = HISTORY_FIRST_COLUMN + history_dates.index(target_date)
-                eligible_symbols = set(_symbols_listed_by(sheet, symbols, symbol_rows, target_date))
-                needs_retry = tuple(
-                    symbol for symbol, row_numbers in symbol_rows.items()
-                    if symbol in eligible_symbols and any(
-                        isinstance(sheet.cell(row, column).value, str)
-                        and sheet.cell(row, column).value.startswith("ERROR:")
-                        for row in row_numbers
-                    )
-                )
-                if target_date == actualization_date:
-                    incomplete = tuple(
-                        symbol for symbol, row_numbers in symbol_rows.items()
-                        if symbol in eligible_symbols and any(
-                            not isinstance(sheet.cell(row, column).value, (int, float, Decimal))
-                            or isinstance(sheet.cell(row, column).value, bool)
-                            for row in row_numbers
-                        )
-                    )
-                    needs_retry = tuple(dict.fromkeys((*needs_retry, *incomplete)))
-                if needs_retry:
-                    calculation_symbols[target_date] = needs_retry
-            if not calculation_symbols:
+                needs_fill = _symbols_to_fill(sheet, symbols, symbol_rows, target_date, column)
+                if needs_fill:
+                    calculation_symbols[target_date] = needs_fill
+            if not calculation_symbols and not migrated and not _averages_stale(sheet, symbol_rows, step):
                 return ExportResult(workbook_path, 0, (), (), actualization_date, True)
             target_dates = history_dates
             history_action = "retry"
@@ -524,29 +633,15 @@ def run_export(
                             calculation_symbols[target_date] = _symbols_listed_by(sheet, symbols, symbol_rows, target_date)
                         else:
                             old_column = HISTORY_FIRST_COLUMN + history_dates.index(target_date)
-                            failed_symbols = tuple(
-                                symbol for symbol, row_numbers in symbol_rows.items()
-                                if symbol in _symbols_listed_by(sheet, (symbol,), symbol_rows, target_date) and any(
-                                    isinstance(sheet.cell(row, old_column).value, str)
-                                    and sheet.cell(row, old_column).value.startswith("ERROR:")
-                                    for row in row_numbers
-                                )
-                            )
-                            if failed_symbols:
-                                calculation_symbols[target_date] = failed_symbols
+                            needs_fill = _symbols_to_fill(sheet, symbols, symbol_rows, target_date, old_column)
+                            if needs_fill:
+                                calculation_symbols[target_date] = needs_fill
                 if history_action == "rotate":
                     for target_date in target_dates[:-1]:
                         old_column = HISTORY_FIRST_COLUMN + history_dates.index(target_date)
-                        failed_symbols = tuple(
-                            symbol for symbol, row_numbers in symbol_rows.items()
-                            if symbol in _symbols_listed_by(sheet, (symbol,), symbol_rows, target_date) and any(
-                                isinstance(sheet.cell(row, old_column).value, str)
-                                and sheet.cell(row, old_column).value.startswith("ERROR:")
-                                for row in row_numbers
-                            )
-                        )
-                        if failed_symbols:
-                            calculation_symbols[target_date] = failed_symbols
+                        needs_fill = _symbols_to_fill(sheet, symbols, symbol_rows, target_date, old_column)
+                        if needs_fill:
+                            calculation_symbols[target_date] = needs_fill
     finally:
         workbook.close()
 
@@ -597,6 +692,7 @@ def run_export(
         if sheet_name not in workbook.sheetnames:
             raise BaseLotExportError(f"workbook is missing sheet {sheet_name!r}")
         sheet = workbook[sheet_name]
+        _migrate_previous_layout(sheet)
         if history_action == "initialize":
             _initialize_history(sheet, target_dates)
         elif history_action == "rebuild":
@@ -633,6 +729,13 @@ def run_export(
                         cell.value = f"ERROR: {symbol}: {error_values[key]}"
                         cell.number_format = "General"
                         cell.fill = ERROR_FILL
+        for column in range(HISTORY_FIRST_COLUMN, HISTORY_FIRST_COLUMN + HISTORY_DAYS):
+            header = sheet.cell(1, column)
+            if isinstance(header.value, str) and _date_header(header.value) is not None:
+                header.value = _date_header(header.value)
+                header.number_format = "yyyy-mm-dd"
+        _write_averages(sheet, symbol_rows, step)
+        _clear_output_filters(sheet, 1, 0)  # empty range: keep every criterion, extend the filter over A:M and beyond
         _atomic_save_workbook(workbook, workbook_path)
     finally:
         workbook.close()
