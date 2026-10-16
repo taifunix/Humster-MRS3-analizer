@@ -201,7 +201,11 @@ is. Draft rules in the plan: READY v4, risk categories (training DD <= 2 /
 Pareto/legacy ranks, 20-day periodic MRS2 CSV runs merged per period in CSV
 Direct with a data repository journal. Separate 21-day periods scored as the
 mean of per-period scores were not worse than one window (section A12a).
-Test sets and results stay local, not committed. Next: remote handoff (merge
+Test sets and results stay local, not committed. Remote handoff prompt:
+[remote handoff](docs/superpowers/plans/2026-10-16-remote-handoff-bingx-parquet-source-v6-csv.md);
+the CSV Direct prototype stays on branch `feat/csv-direct-analysis` (pushed,
+not merged: 47 commits behind main, its ADR-0070 number is taken in main).
+Next: remote handoff (merge
 the BingX candle work, tester-format parquet packing, Source v6 -> period CSV
 generator with a check against real tester CSVs), threshold calibration, then
 the implementation specification. Out-of-time recheck around 2026-11-12.
