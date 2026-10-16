@@ -129,9 +129,24 @@ PURR 73 %, REGN 57 %, CLSK 56 %.
   while the close-MA price is < 0.3 % above the open-MA price),
   `replace_open_order` concerns partial fills only.
 
-Reference gate (all metrics), current best: XOM 93 %, REGN 87 %, SNOW 78 %;
-trades ±1: 89–99 %. Next step: trade-level diffs against tester HTML runs on
-several pairs/TF/shifts to finish the bar-start placement rules.
+Further rules from 108 tester HTML runs: a close (sell) order priced at or below
+the market is placed one tick above the last price; the post-only buy priced at
+or above the market rests one tick below it; orders are placed right after each
+fill (market = close of the fill candle); the price tick comes from the minute
+data (0.001 for RDW, PURR, CXMT — a fixed 0.01 was a bug).
+
+Reference gate on all 10 pairs (27 000 points), all metrics in tolerance:
+simulator v3 77.5 % (trades exact 80.4 %), Source v6 replay 80.3 %.
+
+### Chosen: hybrid engine
+
+Per point and period: if the Source v6 cycles in the period have no partial
+fills, the replay is used; otherwise the engine with more trades (Source v6 only
+loses trades). Result 85.1 % of points in tolerance (CXMT 97, XOM 94, LLY 94,
+SNOW 93, RDW 84, REGN 84, IONQ 79, CLSK 78, FLY 75, PURR 73 %); where both
+engines agree (34 % of points) 99–100 %. Periods outside Source v6 coverage use
+the simulator; the latest 20-day period is run by the real tester. The journal
+records the engine per period.
 
 ## Known limits
 

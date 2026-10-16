@@ -505,6 +505,8 @@ def simulate_mrs2(minutes: MinuteBars, start_ms: int, end_ms: int, *, timeframe:
         first_trade_ms = (int(first_real) // tf_ms + 1) * tf_ms
     elif start_rule == "bar":
         first_trade_ms = -(-start_ms // tf_ms) * tf_ms + (tf_ms if start_ms % tf_ms == 0 else 0)
+    elif start_rule.startswith("delay"):
+        first_trade_ms = start_ms + int(start_rule[5:]) * MINUTE_MS
     tradable = (ts > first_trade_ms if start_rule == "bar" else ts >= first_trade_ms) & (ts < end_ms)
     buy_hits = np.flatnonzero(tradable & (minutes.lows <= buy_now))
     sell_hits = np.flatnonzero(tradable & (minutes.highs >= sell_now))
@@ -623,3 +625,104 @@ def simulate_mrs2_v2(minutes: MinuteBars, start_ms: int, end_ms: int, *, timefra
         position = exit_index + 1
         last_exit_bar = active_bar[exit_index]
     return tuple(cycles)
+
+
+def simulate_mrs2_v3(minutes: MinuteBars, start_ms: int, end_ms: int, *, timeframe: str, open_len: int, open_mult: float,
+                     close_len: int, close_mult: float, tick: float, maker_fee: float = 0.00001,
+                     distance_filter: float = 0.3, first_minute: str = "old", bar_market: str = "prev_close",
+                     start_rule: str = "bar") -> tuple[Cycle, ...]:
+    """Sequential MRS2 LONG replay with the tester's placement rules.
+
+    Orders are placed at every TF bar start and right after each fill. A close (sell) order priced at or
+    below the market is placed one tick above the market; the post-only open (buy) order priced at or
+    above the market rests one tick below it. Limit fills happen at the order price on a later candle.
+    """
+    tf_ms = TIMEFRAME_MS[timeframe]
+    starts, ohlc4 = bar_ohlc4(minutes, tf_ms)
+    buy_bar = order_prices(ohlc4, open_len, open_mult, tick)
+    sell_bar = order_prices(ohlc4, close_len, close_mult, tick)
+    placed_ok = (sell_bar - buy_bar) / buy_bar * 100 >= distance_filter if distance_filter else np.ones(len(starts), bool)
+    ts = minutes.timestamps.tolist()
+    lows = minutes.lows.tolist()
+    highs = minutes.highs.tolist()
+    closes = minutes.closes.tolist()
+    opens = minutes.opens.tolist()
+    first_bar = int(starts[0])
+    buy_l = buy_bar.tolist()
+    sell_l = sell_bar.tolist()
+    ok_l = placed_ok.tolist()
+    half = tick / 2
+
+    def above(price: float, market: float) -> float:      # sell: at least one tick above the market
+        return price if price > market + half else round((market + tick) / tick) * tick
+
+    def below(price: float, market: float) -> float:      # post-only buy: at least one tick below the market
+        return price if price < market - half else round((market - tick) / tick) * tick
+
+    cycles = []
+    in_pos = False
+    order = None            # current order price (buy when flat, sell in position)
+    current_bar = None
+    market = None
+    entry_ms = entry_price = None
+    trade_from = (start_ms // tf_ms + 1) * tf_ms if start_rule == "bar" else start_ms
+    i0 = 0
+    while i0 < len(ts) and ts[i0] <= (trade_from if start_rule == "bar" else start_ms - 1):
+        market = closes[i0]
+        i0 += 1
+    for i in range(i0, len(ts)):
+        t = ts[i]
+        if t >= end_ms:
+            break
+        bar = (t - first_bar) // tf_ms
+        if bar != current_bar:
+            at_first_minute = t == first_bar + bar * tf_ms
+            ref = market if (bar_market == "prev_close" or market is None) else opens[i]
+            if current_bar is not None and at_first_minute and first_minute == "old" and order is not None:
+                # this candle still meets the previous order, the new one is placed after it
+                pass
+            new_order = order
+            if ok_l[bar] and ref is not None:
+                if in_pos:
+                    p = sell_l[bar]
+                    if p == p:
+                        new_order = above(p, ref)
+                else:
+                    p = buy_l[bar]
+                    if p == p:
+                        new_order = below(p, ref)
+            if not (current_bar is not None and at_first_minute and first_minute == "old"):
+                order = new_order
+                pending = None
+            else:
+                pending = new_order
+            current_bar = bar
+        else:
+            pending = None
+        filled = False
+        if order is not None:
+            if not in_pos and lows[i] <= order + 1e-9:
+                in_pos, entry_ms, entry_price, filled = True, t, order, True
+                p = sell_l[bar]
+                order = above(p, closes[i]) if p == p else None
+            elif in_pos and highs[i] >= order - 1e-9:
+                cycles.append(Cycle(entry_ms, entry_price, maker_fee, t, order, maker_fee))
+                in_pos, filled = False, True
+                p = buy_l[bar]
+                order = below(p, closes[i]) if p == p else None
+        if pending is not None and not filled:
+            order = pending
+        market = closes[i]
+    if in_pos:
+        cycles.append(Cycle(entry_ms, entry_price, maker_fee, None, None, None))
+    return tuple(cycles)
+
+
+def price_tick(minutes: MinuteBars) -> float:
+    """Price tick inferred from the decimals of the traded prices (Bybit price increment)."""
+    sample = np.concatenate([minutes.opens[:5000], minutes.closes[:5000], minutes.lows[:5000], minutes.highs[:5000]])
+    for decimals in range(0, 9):
+        scaled = sample * 10 ** decimals
+        if np.all(np.abs(scaled - np.round(scaled)) < 1e-6):
+            return 10.0 ** -decimals
+    return 1e-8
