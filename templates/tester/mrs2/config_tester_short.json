@@ -1,6 +1,7 @@
 {
   "name_comment": "my_test",
   "use_runs": false,
+  "single_mode": false,
   "InitialBalance": 100.0,
   "StartDate": "2026-07-15T00:00:00",
   "EndDate": "2026-08-07T00:00:00",
@@ -13,6 +14,12 @@
   "UpdateData": true,
   "save_tick_data": false,
   "LimitOrderVolumeCheck": true,
+  "maintenance_margin_rate": 0.005,
+  "order_trigger_fill_worst": false,
+  "order_limit_fill_plus_tick": false,
+  "order_market_delay": false,
+  "target_drawdown_open": 0.0,
+  "target_drawdown": 0.0,
   "shuffle_miner": false,
   "monte_carlo": 0,
   "monte_carlo_seed": 0,
@@ -97,19 +104,30 @@
       ]
     }
   ],
+  "reports_history": {
+    "pnl_without_top5": false,
+    "pnl_without_best_pair": false,
+    "ulcer_index": true,
+    "mc_max_dd_p95": false,
+    "mc_loss_probability": false,
+    "AnyEnabled": true
+  },
   "report": {
     "enable_html_report": true,
     "chart_ohlc_height": 550,
     "chart_balance_height": 550,
     "chart_position_height": 550,
-    "include_chart_ohlc": true,
+    "include_chart_ohlc": false,
     "include_chart_balance": true,
-    "include_chart_position": true,
-    "include_strategy_settings": true,
+    "include_chart_position": false,
+    "include_settings": true,
     "include_trades_table": true,
     "include_summary_table": true,
-    "include_monthly_returns_heatmap": true,
-    "include_position_stats": true,
+    "include_analytics": false,
+    "include_monthly_returns_heatmap": false,
+    "include_position_stats": false,
+    "analytics_monte_carlo": 0,
+    "analytics_monte_carlo_seed": 42,
     "enable_timing_logs": false
   },
   "report_optimizer": {

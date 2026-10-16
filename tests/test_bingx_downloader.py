@@ -7,13 +7,14 @@ import urllib.error
 
 import pytest
 
+import pyarrow.parquet as pq
+
 from mrs3.bingx_downloader import (
-    CSV_HEADER,
     BingXClient,
     BingXContract,
     BingXDownloadError,
     bingx_data_root,
-    day_csv_path,
+    day_file_path,
     download_pairs,
     last_available_day,
     load_account_keys,
@@ -21,8 +22,10 @@ from mrs3.bingx_downloader import (
     normalize_ticker,
     planned_days,
     resolve_contracts,
-    validate_day_csv,
+    validate_day_file,
+    write_day_file,
 )
+from mrs3.tester_candles import HEADER, encode_day
 
 PANW_LAUNCH_MS = int(datetime(2026, 6, 11, 10, 0, tzinfo=timezone.utc).timestamp() * 1000)
 NOW = datetime(2026, 10, 10, 12, 0, tzinfo=timezone.utc)
@@ -81,6 +84,16 @@ def _contract(ticker: str = "PANW") -> BingXContract:
     return resolve_contracts([ticker], CONTRACTS)[0][ticker]
 
 
+def _rows(path: Path) -> list[dict[str, object]]:
+    return pq.read_table(path).to_pylist()
+
+
+def _write_rows(path: Path, rows: list[dict[str, object]]) -> None:
+    """Write rows as a tester-format day file, bypassing the downloader's row checks."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(encode_day({name: [row[name] for row in rows] for name in HEADER}))
+
+
 def test_normalize_ticker_accepts_plain_and_usdt_forms():
     assert normalize_ticker("panw") == "PANW"
     assert normalize_ticker(" PANWUSDT ") == "PANW"
@@ -112,26 +125,31 @@ def test_planned_days_skip_pre_listing_days_and_unavailable_days():
     assert planned_days(date(2026, 10, 11), date(2026, 10, 12), PANW_LAUNCH_MS, date(2026, 10, 9)) == []
 
 
-def test_full_day_csv_matches_bybit_format(tmp_path: Path):
+def test_full_day_file_matches_tester_converter_format(tmp_path: Path):
     client = FakeClient()
     report = download_pairs(
         bot_root=tmp_path, pairs=["PANW"], start=date(2026, 10, 8), end=date(2026, 10, 8),
         client=client, now=NOW,
     )
-    path = day_csv_path(bingx_data_root(tmp_path), _contract(), date(2026, 10, 8))
-    assert path == tmp_path / "tester" / "data" / "bingx" / "NCSKPANW2USD-USDT" / "PANWUSDT2026-10-08_1m.csv"
-    raw = path.read_bytes()
-    assert raw.startswith(b"\xef\xbb\xbf")
-    assert b"\r\n" not in raw
-    lines = raw[3:].decode("utf-8").splitlines()
-    assert lines[0] == ",".join(CSV_HEADER)
-    assert len(lines) == 1441
-    first = lines[1].split(",")
-    assert first == [str(_day_ms(date(2026, 10, 8))), "419.51", "419.60", "419.30", "419.32", "2.98295", "0", "0", "0"]
-    assert int(lines[-1].split(",")[0]) == _day_ms(date(2026, 10, 8)) + 1439 * 60_000
+    path = day_file_path(bingx_data_root(tmp_path), _contract(), date(2026, 10, 8))
+    assert path == tmp_path / "tester" / "data" / "bingx" / "NCSKPANW2USD-USDT" / "PANWUSDT2026-10-08_1m.parquet"
+    parquet = pq.ParquetFile(path)
+    assert parquet.schema_arrow.names == list(HEADER)
+    assert not any(field.nullable for field in parquet.schema_arrow)
+    assert parquet.metadata.metadata == {b"hb.schema": b"candles_1m/1"}
+    group = parquet.metadata.row_group(0)
+    assert {group.column(index).compression for index in range(group.num_columns)} == {"ZSTD"}
+    rows = _rows(path)
+    assert len(rows) == 1440
+    # As the tester's converter turns the former CSV row "...,2.98295,0,0,0" into parquet.
+    assert rows[0] == {
+        "timestamp": _day_ms(date(2026, 10, 8)), "open": 419.51, "high": 419.60, "low": 419.30, "close": 419.32,
+        "volume": 2.98295, "buy_volume": 0.0, "sell_volume": 0.0, "trades": 0,
+    }
+    assert rows[-1]["timestamp"] == _day_ms(date(2026, 10, 8)) + 1439 * 60_000
     assert client.kline_calls == [("NCSKPANW2USD-USDT", _day_ms(date(2026, 10, 8)), _day_ms(date(2026, 10, 8)) + 86_399_999)]
     assert report.downloaded == 1 and report.errors == []
-    assert not list(path.parent.glob("*.tmp"))
+    assert sorted(item.name for item in path.parent.iterdir()) == ["PANWUSDT2026-10-08_1m.parquet"]  # no .tmp, no CSV
 
 
 def test_listing_day_is_complete_from_listing_minute(tmp_path: Path):
@@ -140,27 +158,43 @@ def test_listing_day_is_complete_from_listing_minute(tmp_path: Path):
         client=FakeClient(), now=NOW,
     )
     folder = bingx_data_root(tmp_path) / "NCSKPANW2USD-USDT"
-    assert sorted(item.name for item in folder.iterdir()) == ["PANWUSDT2026-06-11_1m.csv"]
-    path = folder / "PANWUSDT2026-06-11_1m.csv"
-    assert len(path.read_text(encoding="utf-8-sig").splitlines()) == 1 + 840
-    assert validate_day_csv(path, date(2026, 6, 11), PANW_LAUNCH_MS) is None
+    assert sorted(item.name for item in folder.iterdir()) == ["PANWUSDT2026-06-11_1m.parquet"]
+    path = folder / "PANWUSDT2026-06-11_1m.parquet"
+    assert len(_rows(path)) == 840
+    assert validate_day_file(path, date(2026, 6, 11), PANW_LAUNCH_MS) is None
 
 
 def test_minutes_without_trades_are_kept_as_gaps_like_bybit(tmp_path: Path):
-    # BingX omits a candle for a minute without trades; the CSV keeps the gap (no invented rows).
+    # BingX omits a candle for a minute without trades; the day file keeps the gap (no invented rows).
     report = download_pairs(
         bot_root=tmp_path, pairs=["PANW"], start=date(2026, 10, 8), end=date(2026, 10, 8),
         client=FakeClient(short_days={date(2026, 10, 8)}), now=NOW,
     )
     assert report.downloaded == 1 and report.errors == []
-    path = day_csv_path(bingx_data_root(tmp_path), _contract(), date(2026, 10, 8))
-    stamps = [int(line.split(",")[0]) for line in path.read_text(encoding="utf-8-sig").splitlines()[1:]]
+    path = day_file_path(bingx_data_root(tmp_path), _contract(), date(2026, 10, 8))
+    stamps = [row["timestamp"] for row in _rows(path)]
     assert len(stamps) == 1439
     assert _day_ms(date(2026, 10, 8)) + 5 * 60_000 not in stamps
-    assert validate_day_csv(path, date(2026, 10, 8), PANW_LAUNCH_MS) is None
+    assert validate_day_file(path, date(2026, 10, 8), PANW_LAUNCH_MS) is None
 
 
-def test_duplicate_candles_leave_no_csv(tmp_path: Path):
+def test_zero_volume_candles_are_kept_like_the_tester_converter(tmp_path: Path):
+    class ZeroVolume(FakeClient):
+        def klines(self, symbol, start_ms, end_ms):
+            candles = super().klines(symbol, start_ms, end_ms)
+            candles[0] = {**candles[0], "volume": "0"}
+            return candles
+
+    report = download_pairs(
+        bot_root=tmp_path, pairs=["PANW"], start=date(2026, 10, 8), end=date(2026, 10, 8),
+        client=ZeroVolume(), now=NOW,
+    )
+    assert report.downloaded == 1 and report.errors == []
+    rows = _rows(day_file_path(bingx_data_root(tmp_path), _contract(), date(2026, 10, 8)))
+    assert len(rows) == 1440 and rows[-1]["volume"] == 0.0
+
+
+def test_duplicate_candles_leave_no_file(tmp_path: Path):
     class Broken(FakeClient):
         def klines(self, symbol, start_ms, end_ms):
             candles = super().klines(symbol, start_ms, end_ms)
@@ -183,7 +217,7 @@ def test_day_without_trades_creates_no_file_and_is_rechecked_next_run(tmp_path: 
     assert (report.downloaded, report.no_trades, report.errors) == (2, 2, [])
     assert any("без сделок" in line and "2" in line for line in report.summary_lines())
     for day in weekend:
-        assert not day_csv_path(bingx_data_root(tmp_path), _contract(), day).exists()
+        assert not day_file_path(bingx_data_root(tmp_path), _contract(), day).exists()
 
     client = FakeClient()  # trades appeared on a re-check: the day is downloaded now
     again = download_pairs(bot_root=tmp_path, pairs=["PANW"], client=client, now=NOW, **days)
@@ -191,36 +225,41 @@ def test_day_without_trades_creates_no_file_and_is_rechecked_next_run(tmp_path: 
     assert sorted(call[1] for call in client.kline_calls) == sorted(_day_ms(day) for day in weekend)
 
 
-def test_header_only_file_is_never_valid(tmp_path: Path):
-    path = day_csv_path(bingx_data_root(tmp_path), _contract(), date(2026, 10, 8))
-    path.parent.mkdir(parents=True)
-    path.write_text(",".join(CSV_HEADER) + "\n", encoding="utf-8-sig")
-    assert validate_day_csv(path, date(2026, 10, 8), PANW_LAUNCH_MS) is not None
+def test_empty_or_csv_or_foreign_format_file_is_never_valid(tmp_path: Path):
+    path = day_file_path(bingx_data_root(tmp_path), _contract(), date(2026, 10, 8))
+    _write_rows(path, [])  # zero rows
+    assert validate_day_file(path, date(2026, 10, 8), PANW_LAUNCH_MS) is not None
+    path.write_text(",".join(HEADER) + "\n", encoding="utf-8-sig")  # a CSV under the parquet name
+    assert validate_day_file(path, date(2026, 10, 8), PANW_LAUNCH_MS) is not None
+    assert validate_day_file(path.with_name("absent_1m.parquet"), date(2026, 10, 8), PANW_LAUNCH_MS) is not None
 
 
 def test_validate_rejects_misaligned_or_out_of_day_timestamps(tmp_path: Path):
     download_pairs(bot_root=tmp_path, pairs=["PANW"], start=date(2026, 10, 8), end=date(2026, 10, 8), client=FakeClient(), now=NOW)
-    path = day_csv_path(bingx_data_root(tmp_path), _contract(), date(2026, 10, 8))
-    text = path.read_text(encoding="utf-8-sig")
-    first = str(_day_ms(date(2026, 10, 8)))
-    path.write_text(text.replace(first, str(int(first) + 1), 1), encoding="utf-8-sig")  # not on a minute
-    assert validate_day_csv(path, date(2026, 10, 8), PANW_LAUNCH_MS) is not None
-    path.write_text(text.replace(first, str(int(first) - 60_000), 1), encoding="utf-8-sig")  # previous day
-    assert validate_day_csv(path, date(2026, 10, 8), PANW_LAUNCH_MS) is not None
+    path = day_file_path(bingx_data_root(tmp_path), _contract(), date(2026, 10, 8))
+    rows = _rows(path)
+    _write_rows(path, [{**rows[0], "timestamp": rows[0]["timestamp"] + 1}] + rows[1:])  # not on a minute
+    assert validate_day_file(path, date(2026, 10, 8), PANW_LAUNCH_MS) is not None
+    _write_rows(path, [{**rows[0], "timestamp": rows[0]["timestamp"] - 60_000}] + rows[1:])  # previous day
+    assert validate_day_file(path, date(2026, 10, 8), PANW_LAUNCH_MS) is not None
+    _write_rows(path, rows[:2] + rows[1:])  # repeated minute
+    assert validate_day_file(path, date(2026, 10, 8), PANW_LAUNCH_MS) is not None
+    _write_rows(path, rows)
+    assert validate_day_file(path, date(2026, 10, 8), PANW_LAUNCH_MS) is None
 
 
 def test_incremental_skips_valid_and_redownloads_damaged_days(tmp_path: Path):
     days = dict(start=date(2026, 10, 6), end=date(2026, 10, 8))
     download_pairs(bot_root=tmp_path, pairs=["PANW"], client=FakeClient(), now=NOW, **days)
-    damaged = day_csv_path(bingx_data_root(tmp_path), _contract(), date(2026, 10, 7))
-    damaged.write_text(damaged.read_text(encoding="utf-8-sig").replace(",419.51,", ",,", 1), encoding="utf-8-sig")
-    assert validate_day_csv(damaged, date(2026, 10, 7), PANW_LAUNCH_MS) is not None
+    damaged = day_file_path(bingx_data_root(tmp_path), _contract(), date(2026, 10, 7))
+    damaged.write_bytes(damaged.read_bytes()[:-100])  # truncated
+    assert validate_day_file(damaged, date(2026, 10, 7), PANW_LAUNCH_MS) is not None
 
     client = FakeClient()
     report = download_pairs(bot_root=tmp_path, pairs=["PANW"], client=client, now=NOW, start=date(2026, 10, 6), end=date(2026, 10, 9))
     assert (report.downloaded, report.skipped_valid, report.redownloaded) == (1, 2, 1)
     assert [call[1] for call in client.kline_calls] == [_day_ms(date(2026, 10, 7)), _day_ms(date(2026, 10, 9))]
-    assert validate_day_csv(damaged, date(2026, 10, 7), PANW_LAUNCH_MS) is None
+    assert validate_day_file(damaged, date(2026, 10, 7), PANW_LAUNCH_MS) is None
 
 
 def test_overwrite_mode_redownloads_valid_days(tmp_path: Path):
@@ -241,19 +280,45 @@ def test_one_pair_error_does_not_stop_other_pairs(tmp_path: Path):
     )
     assert report.downloaded == 1
     assert {error.pair for error in report.errors} == {"PANW", "NOPE"}
-    assert day_csv_path(bingx_data_root(tmp_path), _contract("BABA"), date(2026, 10, 8)).is_file()
+    assert day_file_path(bingx_data_root(tmp_path), _contract("BABA"), date(2026, 10, 8)).is_file()
 
 
 def test_validate_rejects_bad_ohlc_and_nonzero_extra_columns(tmp_path: Path):
     download_pairs(bot_root=tmp_path, pairs=["PANW"], start=date(2026, 10, 8), end=date(2026, 10, 8), client=FakeClient(), now=NOW)
-    path = day_csv_path(bingx_data_root(tmp_path), _contract(), date(2026, 10, 8))
-    text = path.read_text(encoding="utf-8-sig")
-    path.write_text(text.replace(",0,0,0\n", ",0,0,1\n", 1), encoding="utf-8-sig")
-    assert validate_day_csv(path, date(2026, 10, 8), PANW_LAUNCH_MS) is not None
-    path.write_text(text.replace("419.60,419.30", "419.00,419.30", 1), encoding="utf-8-sig")
-    assert validate_day_csv(path, date(2026, 10, 8), PANW_LAUNCH_MS) is not None
-    path.write_text(text, encoding="utf-8")  # missing BOM
-    assert validate_day_csv(path, date(2026, 10, 8), PANW_LAUNCH_MS) is not None
+    path = day_file_path(bingx_data_root(tmp_path), _contract(), date(2026, 10, 8))
+    rows = _rows(path)
+    for change in ({"trades": 1}, {"buy_volume": 2.98295}, {"high": 419.0}, {"volume": -1.0}, {"open": float("nan")}):
+        _write_rows(path, [{**rows[0], **change}] + rows[1:])
+        assert validate_day_file(path, date(2026, 10, 8), PANW_LAUNCH_MS) is not None, change
+
+
+def test_legacy_csv_day_is_not_used_and_the_parquet_day_is_downloaded(tmp_path: Path):
+    parquet = day_file_path(bingx_data_root(tmp_path), _contract(), date(2026, 10, 8))
+    legacy = parquet.with_suffix(".csv")
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text(",".join(HEADER) + "\n", encoding="utf-8-sig")
+    report = download_pairs(bot_root=tmp_path, pairs=["PANW"], start=date(2026, 10, 8), end=date(2026, 10, 8),
+                            client=FakeClient(), now=NOW)
+    assert (report.downloaded, report.skipped_valid) == (1, 0)
+    assert validate_day_file(parquet, date(2026, 10, 8), PANW_LAUNCH_MS) is None
+    assert legacy.read_text(encoding="utf-8-sig") == ",".join(HEADER) + "\n"  # left alone
+
+
+def test_new_day_never_overwrites_a_file_that_appeared_meanwhile(tmp_path: Path):
+    day = date(2026, 10, 8)
+    path = day_file_path(bingx_data_root(tmp_path), _contract(), day)
+    rows = [[str(_day_ms(day) + index * 60_000), "1.5", "2", "1", "1.5", "3", "0", "0", "0"] for index in range(3)]
+    _write_rows(path, [{"timestamp": _day_ms(day), "open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0,
+                        "volume": 1.0, "buy_volume": 0.0, "sell_volume": 0.0, "trades": 0}])
+    before = path.read_bytes()
+    write_day_file(path, rows, day, PANW_LAUNCH_MS)  # a valid day is already there: kept as is
+    assert path.read_bytes() == before
+    _write_rows(path, [])
+    with pytest.raises(BingXDownloadError):
+        write_day_file(path, rows, day, PANW_LAUNCH_MS)  # an invalid day that appeared is an error, not overwritten
+    write_day_file(path, rows, day, PANW_LAUNCH_MS, replace=True)
+    assert [row["timestamp"] for row in _rows(path)] == [int(row[0]) for row in rows]
+    assert sorted(item.name for item in path.parent.iterdir()) == [path.name]
 
 
 def test_client_checks_code_and_retries_network_errors():
@@ -330,7 +395,7 @@ def test_manual_script_reads_config_block_and_reports_exit_code(tmp_path: Path, 
     assert main(["--config", str(config)], client=FakeClient()) == 1
     output = capsys.readouterr().out
     assert "скачано новых дней: 1" in output and "NOPE" in output
-    assert (tmp_path / "bot" / "tester" / "data" / "bingx" / "NCSKPANW2USD-USDT" / "PANWUSDT2026-10-08_1m.csv").is_file()
+    assert (tmp_path / "bot" / "tester" / "data" / "bingx" / "NCSKPANW2USD-USDT" / "PANWUSDT2026-10-08_1m.parquet").is_file()
 
     config.write_text(json.dumps({"tester_runner": {"bot_root": "bot"}, "bingx": {}}), encoding="utf-8")
     assert main(["--config", str(config)], client=FakeClient()) == 2
@@ -448,9 +513,8 @@ def test_damaged_file_on_a_no_trade_day_is_removed(tmp_path: Path):
     from mrs3.bingx_downloader import check_local_days
 
     saturday = date(2026, 10, 3)
-    path = day_csv_path(bingx_data_root(tmp_path), _contract(), saturday)
-    path.parent.mkdir(parents=True)
-    path.write_text(",".join(CSV_HEADER) + "\n", encoding="utf-8-sig")  # broken: header only
+    path = day_file_path(bingx_data_root(tmp_path), _contract(), saturday)
+    _write_rows(path, [])  # broken: no rows
     report = download_pairs(bot_root=tmp_path, pairs=["PANW"], start=saturday, end=saturday,
                             client=FakeClient(empty_days={saturday}), now=NOW)
     assert report.no_trades == 1 and report.errors == [] and not path.exists()
@@ -463,3 +527,19 @@ def test_client_retries_bingx_network_exception_code():
     responses = [{"code": 109701, "msg": "network issue", "data": {}}, {"code": 0, "msg": "", "data": CONTRACTS}]
     client = BingXClient(fetch_json=lambda url, headers: responses.pop(0), sleep=lambda _: None, request_delay_seconds=0)
     assert client.contracts() == CONTRACTS
+
+
+def test_temporary_file_is_removed_when_the_write_itself_fails(tmp_path: Path, monkeypatch):
+    import mrs3.bingx_downloader as downloader
+
+    day = date(2026, 10, 8)
+    path = day_file_path(bingx_data_root(tmp_path), _contract(), day)
+    rows = [[str(_day_ms(day)), "1.5", "2", "1", "1.5", "3", "0", "0", "0"]]
+
+    def disk_full(_descriptor):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(downloader.os, "fsync", disk_full)
+    with pytest.raises(OSError):
+        write_day_file(path, rows, day, PANW_LAUNCH_MS)
+    assert list(path.parent.iterdir()) == []

@@ -19,11 +19,52 @@ BingX/panel testing/base-lot/minute-capacity tests 205 passed; full suite
 same set except three timing-dependent Panel tests that pass or fail between
 reruns; no new failure comes from the merge.
 
-Open: the BingX downloader still writes `_1m.csv`; parquet packing for the new
-tester is part B of the
-[remote handoff](docs/superpowers/plans/2026-10-16-remote-handoff-bingx-parquet-source-v6-csv.md).
-BingX fees differ between RUNNER 01 BingX mode (0.0002/0.0005) and
-`templates/exchanges/BingX/mrs3-tester.json` (0.00012/0.0003) — to be confirmed.
+Both follow-ups are closed below in «BingX parquet day files (2026-10-16)».
+
+## BingX parquet day files (2026-10-16)
+
+Part B of the
+[remote handoff](docs/superpowers/plans/2026-10-16-remote-handoff-bingx-parquet-source-v6-csv.md),
+contract in the [BingX data downloader](docs/specs/2026-10-10-bingx-data-downloader.md)
+section «Формат дня (parquet тестера)».
+
+- The Panel `bot_root` is now the new tester installation (parquet only); the
+  former installation was renamed and keeps the original CSV. Its BingX archive
+  (197 pairs, 22 455 days) and Bybit archive (217 pairs, 12 239 days) were
+  copied and converted by the tester's own `hb_c.exe --convert-data`: 0 errors;
+  every converted day equals its CSV row by row (BingX 30 401 707 rows, Bybit
+  7 138 735 rows).
+- The converter is the format authority: BingX `buy_volume`, `sell_volume`,
+  `trades` stay `0` and zero-volume candles stay, exactly as in the former CSV
+  (MEXC, also without buy/sell, is converted the same way).
+- `src/mrs3/tester_candles.py` holds the one tester day format (REQUIRED, ZSTD,
+  only `hb.schema = candles_1m/1`); `portfolio/minute_capacity.py` and the
+  BingX downloader use it. The downloader writes and validates only
+  `_1m.parquet` (temporary file → read-back check → `os.link`, `os.replace`
+  only for a damaged day or overwrite mode).
+- Evidence: the downloader's encoding of every archived BingX CSV day equals the
+  tester-converted file in schema and values (22 455 of 22 455), and the
+  downloader's validator accepts all 22 455 tester files.
+- RUNNER 01 BingX fees are 0.00012/0.0003 (40% discount), as in
+  `templates/exchanges/BingX/mrs3-tester.json` (user decision 2026-10-16).
+- Verification: `.venv\Scripts\python.exe -m pytest -p no:cacheprovider tests/test_bingx_downloader.py tests/test_panel_bingx_mode.py tests/test_tester_candles.py tests/test_portfolio_minute_capacity.py tests/test_calculate_bybit_base_lots.py tests/test_panel_testing.py tests/test_build_bingx_screening_sheet.py tests/screener`.
+- Tester run on parquet (B4, 2026-10-16, current tester, `hb_c.exe --run-tester`
+  with the Panel config/strategy restored byte-identical afterwards): BingX
+  TSLL 2026-10-02..09 loaded 9 parquet days (11 521 bars); 0.7% shift gave 19
+  trades per point at 5m and 15m, identical with `LimitOrderVolumeCheck` on and
+  off (BingX zero buy/sell volume does not block fills).
+- The RUNNER 01 / SCREENER 01 MRS2 templates were still in the previous tester
+  schema; rendered as is, the current tester writes HTML the project parser
+  rejects (`metrics contain duplicate or empty keys`). They now follow
+  [MRS2 tester configs in the current format](docs/specs/2026-10-16-mrs2-tester-config-current-format.md)
+  (ADR-0072 core report profile + `reports_history` with `UlcerIndex`; BingX
+  render drops the Bybit-only `maintenance_margin_rate`). Live one-point
+  RUNNER 01 renders: BingX TSLL 23 trades, Bybit CLSK 34 trades; both reports
+  parse (legacy and 2026-10 parser modes), normalise to Source v6 fragments,
+  and the screener reads `reports_history*.csv` with `UlcerIndex`.
+- Verification: the command above plus `tests/test_panel.py tests/test_panel_static_ui.py`
+  — 629 passed, 1 failed (`test_static_panel_shell_contains_only_navigation_contract`,
+  the recorded pre-existing `previewToken` failure).
 
 ## BingX data downloader (2026-10-10)
 
@@ -78,7 +119,7 @@ creates no file and is not an error; it is re-checked at BingX on every
 top-up and before fill, never cached. Live check for 2026-07-24..27: 8 days
 saved, 8 no-trade days, fill check reports nothing missing.
 
-Open: moving the Panel to the newer tester installation is not decided yet.
+The Panel moved to the newer tester installation on 2026-10-16 (see above).
 Probe run 2026-10-11 confirmed the tester accepts missing day files: a
 SCREENER 01 BingX run on XLP (2026-07-22..10-10, 70 day files, 12 weekend days
 without files) produced 304 BingX reports with trades in every month and no

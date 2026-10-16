@@ -1388,3 +1388,37 @@ def test_local_testing_rejects_direct_linked_report_directory_before_cleanup(tmp
         )
 
     assert old_report.read_text(encoding="utf-8") == "keep"
+
+
+CURRENT_TESTER_KEYS = [
+    "name_comment", "use_runs", "single_mode", "InitialBalance", "StartDate", "EndDate", "WarmupDays", "MakerFee",
+    "TakerFee", "SlippagePercent", "FundingRate", "FundingIntervalHours", "UpdateData", "save_tick_data",
+    "LimitOrderVolumeCheck", "maintenance_margin_rate", "order_trigger_fill_worst", "order_limit_fill_plus_tick",
+    "order_market_delay", "target_drawdown_open", "target_drawdown", "shuffle_miner", "monte_carlo",
+    "monte_carlo_seed", "use_logger", "max_parallel_runs", "parameter_mining", "reports_history", "report",
+    "report_optimizer",
+]
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["config_tester_long.json", "config_tester_short.json", "config_tester_long_screen.json", "config_tester_short_screen.json"],
+)
+def test_mrs2_tester_templates_use_the_current_tester_format_and_core_report_profile(name: str) -> None:
+    # docs/specs/2026-10-16-mrs2-tester-config-current-format.md
+    document = json.loads((Path(__file__).parents[1] / "templates" / "tester" / "mrs2" / name).read_text(encoding="utf-8"))
+    assert list(document) == CURRENT_TESTER_KEYS
+    assert (document["single_mode"], document["maintenance_margin_rate"]) == (False, 0.005)
+    assert (document["order_trigger_fill_worst"], document["order_limit_fill_plus_tick"], document["order_market_delay"]) == (False,) * 3
+    assert (document["target_drawdown_open"], document["target_drawdown"]) == (0.0, 0.0)
+    assert document["report"] == {
+        "enable_html_report": True, "chart_ohlc_height": 550, "chart_balance_height": 550, "chart_position_height": 550,
+        "include_chart_ohlc": False, "include_chart_balance": True, "include_chart_position": False,
+        "include_settings": True, "include_trades_table": True, "include_summary_table": True,
+        "include_analytics": False, "include_monthly_returns_heatmap": False, "include_position_stats": False,
+        "analytics_monte_carlo": 0, "analytics_monte_carlo_seed": 42, "enable_timing_logs": False,
+    }
+    assert document["reports_history"] == {
+        "pnl_without_top5": False, "pnl_without_best_pair": False, "ulcer_index": True,
+        "mc_max_dd_p95": False, "mc_loss_probability": False, "AnyEnabled": True,
+    }

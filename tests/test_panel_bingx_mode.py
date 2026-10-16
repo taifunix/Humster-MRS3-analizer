@@ -29,7 +29,7 @@ def test_bingx_tester_config_uses_api_symbols_fees_and_no_update_data():
         render_tester_config(LONG_TEMPLATE, ("NCSKPANW2USD-USDT",), "2026-07-15", "2026-08-06", exchange="bingx")
     )
     assert _symbols(rendered) == ["NCSKPANW2USD-USDT"]
-    assert (rendered["MakerFee"], rendered["TakerFee"], rendered["UpdateData"]) == (0.0002, 0.0005, False)
+    assert (rendered["MakerFee"], rendered["TakerFee"], rendered["UpdateData"]) == (0.00012, 0.0003, False)
     assert rendered["StartDate"] == "2026-07-15T00:00:00"
 
     bybit = json.loads(render_tester_config(LONG_TEMPLATE, ("CXUSDT",), "2026-07-15", "2026-08-06"))
@@ -110,7 +110,7 @@ def test_panel_bingx_download_tops_up_from_one_day_before_start(tmp_path: Path):
     assert status["contracts"] == {"PANW": "NCSKPANW2USD-USDT", "BABA": "NCSKBABA2USD-USDT"}
     folder = config.bot_root / "tester" / "data" / "bingx" / "NCSKPANW2USD-USDT"
     assert sorted(path.name for path in folder.iterdir()) == [
-        "PANWUSDT2026-10-06_1m.csv", "PANWUSDT2026-10-07_1m.csv", "PANWUSDT2026-10-08_1m.csv",
+        "PANWUSDT2026-10-06_1m.parquet", "PANWUSDT2026-10-07_1m.parquet", "PANWUSDT2026-10-08_1m.parquet",
     ]
     assert str(config.bot_root) not in json.dumps(status)
 
@@ -224,3 +224,10 @@ def test_panel_bingx_fill_accepts_days_without_trades(tmp_path: Path):
     prepared = controller.local_testing_fill(payload)
     assert prepared["symbols"] == ["NCSKPANW2USD-USDT"]
     controller.local_testing_stop()
+
+
+def test_bingx_tester_config_omits_the_bybit_only_margin_rate():
+    rendered = json.loads(render_tester_config(LONG_TEMPLATE, ("NCSKPANW2USD-USDT",), "2026-07-15", "2026-08-06", exchange="bingx"))
+    assert "maintenance_margin_rate" not in rendered
+    bybit = json.loads(render_tester_config(LONG_TEMPLATE, ("CXUSDT",), "2026-07-15", "2026-08-06"))
+    assert bybit["maintenance_margin_rate"] == 0.005

@@ -1,7 +1,8 @@
-"""Download BingX 1m candles into daily Bybit-format CSV files for the tester.
+"""Download BingX 1m candles into the tester's daily parquet files.
 
 Contract: docs/specs/2026-10-10-bingx-data-downloader.md. Data lives in
-``<bot_root>/tester/data/bingx/<api_symbol>/<TICKER>USDT<YYYY-MM-DD>_1m.csv``.
+``<bot_root>/tester/data/bingx/<api_symbol>/<TICKER>USDT<YYYY-MM-DD>_1m.parquet``
+and matches what the tester's own converter makes of the former CSV day.
 """
 
 from __future__ import annotations
@@ -16,16 +17,18 @@ import json
 import os
 from pathlib import Path
 import re
+from tempfile import NamedTemporaryFile
 import time
 from typing import Callable, Iterable, Mapping, Sequence
 import urllib.error
 import urllib.parse
 import urllib.request
 
+from .tester_candles import HEADER, CandleDayError, encode_day, read_day
+
 BASE_URL = "https://open-api.bingx.com"
 CONTRACTS_PATH = "/openApi/swap/v2/quote/contracts"
 KLINES_PATH = "/openApi/swap/v3/quote/klines"
-CSV_HEADER = ("timestamp", "open", "high", "low", "close", "volume", "buy_volume", "sell_volume", "trades")
 DOWNLOAD_MODES = ("incremental", "overwrite")
 # BingX TradFi contracts: stocks/ETFs, indices, commodities (forex NCFX is excluded).
 TRADFI_SYMBOL_PREFIXES = ("NCSK", "NCSI", "NCCO")
@@ -35,7 +38,6 @@ DAY_MS = 86_400_000
 AVAILABILITY_LAG = timedelta(hours=9)
 # BingX gateway codes that mean "retry later": rate limit, system busy, internal error, network exception.
 RETRYABLE_CODES = frozenset({100410, 100500, 109500, 109701})
-_BOM = b"\xef\xbb\xbf"
 _TICKER = re.compile(r"^[A-Z0-9]+$")
 
 
@@ -331,11 +333,11 @@ def planned_days(start: date, end: date, launch_ms: int, last_available: date) -
     return [start + timedelta(days=offset) for offset in range((end - start).days + 1)] if start <= end else []
 
 
-def day_csv_path(data_root: Path, contract: BingXContract, day: date) -> Path:
-    return Path(data_root) / contract.api_symbol / f"{contract.file_ticker}{day.isoformat()}_1m.csv"
+def day_file_path(data_root: Path, contract: BingXContract, day: date) -> Path:
+    return Path(data_root) / contract.api_symbol / f"{contract.file_ticker}{day.isoformat()}_1m.parquet"
 
 
-# -- CSV --------------------------------------------------------------------
+# -- day files ----------------------------------------------------------------
 
 
 def _number(text: str) -> Decimal:
@@ -358,7 +360,7 @@ def _validate_rows(rows: Sequence[Sequence[str]], day: date, launch_ms: int) -> 
         return f"at most {expected} rows expected, got {len(rows)}"
     previous = first - MINUTE_MS
     for index, row in enumerate(rows):
-        if len(row) != len(CSV_HEADER):
+        if len(row) != len(HEADER):
             return f"row {index + 1} has {len(row)} columns"
         try:
             stamp = int(row[0])
@@ -375,26 +377,23 @@ def _validate_rows(rows: Sequence[Sequence[str]], day: date, launch_ms: int) -> 
     return None
 
 
-def validate_day_csv(path: Path, day: date, launch_ms: int) -> str | None:
+def _text(value: object) -> str:
+    if isinstance(value, float):
+        return "0" if value == 0 else repr(value)  # repr: the shortest decimal that round-trips the double
+    return str(value)
+
+
+def validate_day_file(path: Path, day: date, launch_ms: int) -> str | None:
     """Return None for a complete valid day file, otherwise the reason it is invalid."""
     try:
-        raw = Path(path).read_bytes()
+        table = read_day(Path(path).read_bytes())
     except OSError as error:
         return f"cannot read file: {error}"
-    if not raw.startswith(_BOM):
-        return "missing UTF-8 BOM"
-    try:
-        text = raw[len(_BOM):].decode("utf-8")
-    except UnicodeDecodeError:
-        return "not UTF-8"
-    if "\r" in text:
-        return "line endings must be LF"
-    lines = text.split("\n")
-    if lines and lines[-1] == "":
-        lines.pop()
-    if not lines or lines[0] != ",".join(CSV_HEADER):
-        return "invalid header"
-    return _validate_rows([line.split(",") for line in lines[1:]], day, launch_ms)
+    except CandleDayError as error:
+        return str(error)
+    columns = table.to_pydict()
+    rows = [[_text(columns[name][index]) for name in HEADER] for index in range(table.num_rows)]
+    return _validate_rows(rows, day, launch_ms)
 
 
 def _rows_from_klines(klines: Sequence[Mapping[str, object]], day: date) -> list[list[str]]:
@@ -409,23 +408,48 @@ def _rows_from_klines(klines: Sequence[Mapping[str, object]], day: date) -> list
     return rows
 
 
-def write_day_csv(path: Path, rows: Sequence[Sequence[str]], day: date, launch_ms: int) -> None:
-    """Write via a sibling ``.tmp`` file and replace the final CSV only after validation."""
+def _encode_rows(rows: Sequence[Sequence[str]]) -> bytes:
+    """BingX decimal strings -> nearest doubles, as the tester's converter parses the former CSV."""
+    columns: dict[str, list] = {name: [] for name in HEADER}
+    for row in rows:
+        columns["timestamp"].append(int(row[0]))
+        for name, value in zip(HEADER[1:8], row[1:8]):
+            columns[name].append(float(value))
+        columns["trades"].append(int(row[8]))
+    return encode_day(columns)
+
+
+def write_day_file(path: Path, rows: Sequence[Sequence[str]], day: date, launch_ms: int, *, replace: bool = False) -> None:
+    """Write a sibling temporary file, check it by reading it back, then publish it.
+
+    A new day is published with ``os.link``, so an existing file is never
+    overwritten (one that appeared meanwhile is accepted only if valid);
+    ``replace=True`` (a damaged day or overwrite mode) uses ``os.replace``.
+    """
     reason = _validate_rows(rows, day, launch_ms)
     if reason is not None:
         raise BingXDownloadError(f"incomplete or invalid day: {reason}")
+    data = _encode_rows(rows)
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + ".tmp")
-    body = "\n".join([",".join(CSV_HEADER), *(",".join(row) for row in rows)]) + "\n"
+    handle = NamedTemporaryFile(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False)
+    temporary = Path(handle.name)
     try:
-        with temporary.open("wb") as handle:
-            handle.write(_BOM + body.encode("utf-8"))
+        with handle:
+            handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
-        reason = validate_day_csv(temporary, day, launch_ms)
+        reason = validate_day_file(temporary, day, launch_ms)
         if reason is not None:
             raise BingXDownloadError(f"written file failed validation: {reason}")
-        os.replace(temporary, path)
+        if replace:
+            os.replace(temporary, path)
+            return
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            reason = validate_day_file(path, day, launch_ms)
+            if reason is not None:
+                raise BingXDownloadError(f"an invalid day file already exists: {reason}") from None
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -457,9 +481,9 @@ def check_local_days(
     for ticker, contract in resolved.items():
         days = []
         for day in planned_days(start, end, contract.launch_ms, last_day):
-            path = day_csv_path(data_root, contract, day)
+            path = day_file_path(data_root, contract, day)
             if path.exists():
-                if validate_day_csv(path, day, contract.launch_ms) is not None:
+                if validate_day_file(path, day, contract.launch_ms) is not None:
                     days.append(day)
                 continue
             # No file: fine only if BingX confirms the day had no trades (never cached).
@@ -482,7 +506,7 @@ def download_pairs(
     now: datetime | None = None,
     log: Callable[[str], None] = lambda _message: None,
 ) -> DownloadReport:
-    """Download or top up daily CSV files; one failing pair/day never stops the rest."""
+    """Download or top up daily parquet files; one failing pair/day never stops the rest."""
     if mode not in DOWNLOAD_MODES:
         raise BingXDownloadError("download mode must be incremental or overwrite")
     if start > end:
@@ -504,9 +528,10 @@ def download_pairs(
     last_day = last_available_day(now or datetime.now(timezone.utc))
     for ticker, contract in resolved.items():
         for day in planned_days(start, end, contract.launch_ms, last_day):
-            path = day_csv_path(data_root, contract, day)
-            damaged = path.exists() and validate_day_csv(path, day, contract.launch_ms) is not None
-            if path.exists() and not damaged and mode == "incremental":
+            path = day_file_path(data_root, contract, day)
+            exists = path.exists()
+            damaged = exists and validate_day_file(path, day, contract.launch_ms) is not None
+            if exists and not damaged and mode == "incremental":
                 report.skipped_valid += 1
                 continue
             try:
@@ -520,7 +545,7 @@ def download_pairs(
                     report.no_trades += 1
                     log(f"{ticker} {day.isoformat()}: no trades")
                     continue
-                write_day_csv(path, rows, day, contract.launch_ms)
+                write_day_file(path, rows, day, contract.launch_ms, replace=exists)
             except Exception as error:  # One failing day must never stop the remaining pairs/days.
                 report.errors.append(DownloadError(ticker, day, str(error) or type(error).__name__))
                 log(f"{ticker} {day.isoformat()}: {error}")

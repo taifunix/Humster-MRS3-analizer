@@ -9,7 +9,7 @@ from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_EVEN, loca
 import csv
 import gzip
 import hashlib
-from io import BytesIO, StringIO
+from io import StringIO
 import json
 import os
 from pathlib import Path
@@ -21,18 +21,12 @@ import httpx
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from ..tester_candles import HEADER, PARQUET_SCHEMA, encode_day
 
-HEADER = ("timestamp", "open", "high", "low", "close", "volume", "buy_volume", "sell_volume", "trades")
+
 DAY_MINUTES = 1_440
 WEEK_DAYS = 7
 DAY_MS = 86_400_000
-# The tester's day file: REQUIRED columns, ZSTD, only one key-value entry (no Arrow schema blob).
-PARQUET_SCHEMA = pa.schema(
-    [pa.field("timestamp", pa.int64(), nullable=False)]
-    + [pa.field(name, pa.float64(), nullable=False) for name in HEADER[1:8]]
-    + [pa.field("trades", pa.int32(), nullable=False)]
-)
-PARQUET_KEY_VALUE = {"hb.schema": "candles_1m/1"}
 _WEEKDAYS = {name: index for index, name in enumerate(("MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY", "SUNDAY"))}
 
 
@@ -149,12 +143,7 @@ def _to_parquet(csv_data: bytes) -> bytes:
         for name in HEADER[1:8]:
             columns[name].append(float(row[name]))
         columns["trades"].append(int(row["trades"]))
-    table = pa.Table.from_pydict(columns, schema=PARQUET_SCHEMA)
-    sink = BytesIO()
-    with pq.ParquetWriter(sink, PARQUET_SCHEMA, compression="zstd", store_schema=False) as writer:
-        writer.write_table(table)
-        writer.add_key_value_metadata(PARQUET_KEY_VALUE)
-    return sink.getvalue()
+    return encode_day(columns)
 
 
 def _day_start_ms(day: date) -> int:

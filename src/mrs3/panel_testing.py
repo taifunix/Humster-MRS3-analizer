@@ -44,7 +44,7 @@ _BINGX_SYMBOL = re.compile(r"^[A-Z0-9]{2,40}-USDT$")
 _SCREENER_USDT_SUFFIX = re.compile(r"USDT$")
 EXCHANGES = ("bybit", "bingx")
 # BingX mode: tester reads data only from tester/data/bingx and uses BingX fees.
-_BINGX_TESTER_SETTINGS = {"MakerFee": 0.0002, "TakerFee": 0.0005, "UpdateData": False}
+_BINGX_TESTER_SETTINGS = {"MakerFee": 0.00012, "TakerFee": 0.0003, "UpdateData": False}
 _BINGX_STRATEGY_EXCHANGE = {"name": "BingX", "account": "bingx"}
 
 
@@ -208,6 +208,7 @@ def render_tester_config(
         document["max_parallel_runs"] = max_parallel_runs
     if exchange == "bingx":
         document.update(_BINGX_TESTER_SETTINGS)
+        document.pop("maintenance_margin_rate", None)  # Bybit-only option; the BingX exchange template omits it
     symbol_entry["values"] = list(clean_symbols)
     return json.dumps(document, ensure_ascii=False, indent=2) + "\n"
 
