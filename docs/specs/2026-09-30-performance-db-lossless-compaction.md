@@ -121,9 +121,18 @@ Before comparison, the verifier requires matching `duckdb_columns` and
 collation, and generated-column metadata. Floating-point columns or
 unsupported metadata skip this SQL path and use the typed Python comparator.
 The fast path checks full row counts independently, rejects NULL
-`result_id`, then checks counts and exact differences for each of the existing
-128-result-id ranges. Range counts must sum to the full count. A range above
-20,000,000 rows fails closed. JSON progress is emitted after every checked
+`result_id`, then checks counts and exact differences for each contiguous
+`result_id` range. Ranges are sized by source rows (about 10,000,000 rows
+each; a single `result_id` above that forms its own range), not by a fixed
+number of IDs, because every range filter scans the unclustered source table
+again. The first and last bounds extend to the minimum and maximum
+`result_id` of both databases, so candidate-only IDs are always compared.
+(Amended 2026-10-12: the earlier 128-ID ranges made the first full-corpus
+rehearsal take about 90 s per range, 384 ranges for `strategy_equity`.)
+Range counts must sum to the full count. A range above 20,000,000 rows fails
+closed. Candidate construction copies `strategy_actions` and
+`strategy_equity` in the same row-sized ranges; other tables keep their
+existing ranges. JSON progress is emitted after every checked
 range. The same fast verifier is used when building a fresh compaction
 candidate; other tables continue to use the bounded typed Python comparison
 and prepared-payload check.
@@ -136,8 +145,9 @@ backup; an existing output is never replaced, and verification failures leave
 the candidate untouched.
 
 `--smoke-ranges N` performs a bounded diagnostic only: it checks catalog,
-markers, sequence state, column metadata, and at most the first N ranges from
-each large table. It skips whole-table counts and file hashing, reports
+markers, sequence state, column metadata, and at most the first N row-sized
+ranges (about 10,000,000 rows each) from each large table; the report counts
+the ranges actually checked. It skips whole-table counts and file hashing, reports
 `partial=true`, and never accepts an output path or publishes a hardlink. Use
 it to exercise the SQL comparison before committing to full verification; its
 result is not acceptance evidence for the complete candidate.

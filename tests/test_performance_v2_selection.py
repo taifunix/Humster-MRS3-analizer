@@ -37,6 +37,7 @@ from mrs3.performance_v2_selection import (
     selection_cache_missing_strategy_ids,
     selection_cache_status,
     selection_equity_facts_token,
+    selection_row_fill,
     write_selection_workbook,
     retest_cohort_request,
 )
@@ -604,6 +605,45 @@ def test_finalists_only_request_is_strict_boolean_and_preserves_legacy_hash() ->
     for invalid in ("true", "on", 1, None, ""):
         with pytest.raises(PerformanceV2SelectionError, match="INVALID_REQUEST"):
             parse_selection_request({**base, "finalists_only": invalid})
+
+
+def test_process_all_pairs_is_an_operation_flag_outside_the_canonical_request() -> None:
+    from mrs3.performance_v2_selection_review import canonical_contract
+
+    parse_operation = getattr(selection_module, "parse_selection_operation", None)
+    assert callable(parse_operation), "operation-only request parser is missing"
+    base = {"symbol": "BTCUSDT", "side": "LONG", "stages": []}
+
+    legacy_request, legacy_all_pairs = parse_operation(base)
+    false_request, false_all_pairs = parse_operation({**base, "process_all_pairs": False})
+    true_request, true_all_pairs = parse_operation({**base, "process_all_pairs": True})
+
+    assert not legacy_all_pairs and not false_all_pairs and true_all_pairs
+    assert canonical_contract(legacy_request, SelectionConfig()) == canonical_contract(false_request, SelectionConfig())
+    assert canonical_contract(legacy_request, SelectionConfig()) == canonical_contract(true_request, SelectionConfig())
+    with pytest.raises(PerformanceV2SelectionError, match="INVALID_REQUEST"):
+        parse_operation({**base, "unexpected": True})
+    with pytest.raises(PerformanceV2SelectionError, match="INVALID_REQUEST"):
+        parse_operation({**base, "process_all_pairs": "true"})
+    with pytest.raises(PerformanceV2SelectionError, match="INVALID_REQUEST"):
+        parse_selection_request({**base, "process_all_pairs": False})
+
+
+@pytest.mark.parametrize("status", ["FINALIST", "RESERVE"])
+def test_selection_cohort_requires_raw_manual_finalist_or_reserve(status: str) -> None:
+    admits = getattr(selection_module, "selection_cohort_admits", None)
+    assert callable(admits), "pure raw-manual cohort predicate is missing"
+
+    assert admits(finalists_only=True, raw_user_status=status, raw_user_status_origin="MANUAL")
+    assert not admits(finalists_only=True, raw_user_status=status, raw_user_status_origin="AUTOMATIC")
+    assert not admits(finalists_only=True, raw_user_status=status, raw_user_status_origin="EFFECTIVE")
+
+
+@pytest.mark.parametrize("status", [None, "", " ", "ANALOG", "FILTERED", "REJECTED", "UNKNOWN"])
+def test_selection_cohort_off_admits_every_stored_raw_status(status: str | None) -> None:
+    admits = getattr(selection_module, "selection_cohort_admits", None)
+    assert callable(admits), "pure raw-manual cohort predicate is missing"
+    assert admits(finalists_only=False, raw_user_status=status, raw_user_status_origin=None)
 
 
 def test_legacy_robust_request_json_stays_byte_identical() -> None:
@@ -1190,7 +1230,7 @@ def _candidate_db(tmp_path: Path) -> duckdb.DuckDBPyConnection:
     connection.execute("update strategies set current_result_id = ? where strategy_id = ?", [result_id, strategy_id])
     connection.execute("insert into analysis_plateaus values ('run', 'P1', 12, 34)")
     connection.execute(
-        """insert into strategy_orders values (?, 1, 7, .995, 125, 1, 'run', 'P1', 8)""",
+        """insert into strategy_orders (strategy_id, order_id, open_ma_len, open_multiplier, shift_bp, lot_x, analysis_run_id, plateau_id, base_point_trades) values (?, 1, 7, .995, 125, 1, 'run', 'P1', 8)""",
         [strategy_id],
     )
     connection.executemany(
@@ -1213,8 +1253,14 @@ def _candidate_db(tmp_path: Path) -> duckdb.DuckDBPyConnection:
     return connection
 
 
-def test_selection_equity_token_reads_v7_equity_cache(tmp_path: Path) -> None:
+@pytest.mark.parametrize("schema_version", [None, 10], ids=["v12", "v10"])
+def test_selection_equity_token_reads_cache_for_v10_and_v12(
+    tmp_path: Path, schema_version: int | None,
+) -> None:
     connection = _candidate_db(tmp_path)
+    assert connection.execute(
+        "select value from schema_info where key = 'schema_version'"
+    ).fetchone() == ("12",)
     request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
     queries: list[str] = []
 
@@ -1224,11 +1270,14 @@ def test_selection_equity_token_reads_v7_equity_cache(tmp_path: Path) -> None:
             return connection.execute(sql) if parameters is None else connection.execute(sql, parameters)
 
     try:
-        selection_equity_facts_token(CountingConnection(), request)
+        token = selection_equity_facts_token(
+            CountingConnection(), request, schema_version=schema_version,
+        )
     finally:
         connection.close()
 
     assert any("from equity_quality_metrics" in sql for sql in queries)
+    assert token[-1][2] is None
 
 
 def _clone_current_candidate(connection: duckdb.DuckDBPyConnection, name: str) -> tuple[int, int]:
@@ -4184,7 +4233,7 @@ def test_equity_workbook_appends_four_precise_columns_and_labels_method(tmp_path
     sheet = workbook["All candidates"]
     headers = [cell.value for cell in sheet[1]]
 
-    equity_start = headers.index("MA") + 1
+    equity_start = headers.index("Lot mode") + 1
     assert headers[equity_start:equity_start + 4] == ["Equity state", "Equity basis", "Equity DD, %", "Equity smoothness"]
     assert sheet.max_row == 3
     assert sheet.cell(2, headers.index("Equity DD, %") + 1).value == 12.3456789
@@ -4264,13 +4313,14 @@ def test_equity_regime_workbook_displays_rank_only_when_regime_is_enabled(tmp_pa
         {"id": "filter_equity_regime", "enabled": True, "scope": "pair_side"},
     ]})
     result = run_selection(pd.DataFrame([_selection_row("stalled", _equity_state="STALLED")]), request)
+    assert result.loc[0, "equity_regime_rank"] == "RESERVED"
     sheet = load_workbook(
         write_selection_workbook(result, tmp_path / "regime-rank.xlsx", request), data_only=True,
     )["All candidates"]
     headers = [cell.value for cell in sheet[1]]
 
     assert "Regime rank" in headers
-    assert sheet.cell(2, headers.index("Regime rank") + 1).value == "RESERVED"
+    assert sheet.cell(2, headers.index("Regime rank") + 1).value == "STALLED"
     assert not any(header in headers for header in (
         "Equity state", "Equity basis", "Equity DD, %", "Equity smoothness",
     ))
@@ -4327,9 +4377,9 @@ def test_equity_blocks_keep_a_stable_order_for_all_request_permutations(tmp_path
         assert current.index("Auto Status") < current.index(no_headers[-1])
         assert not removed_regime_columns.intersection(current)
     assert not any(column in no_headers for column in (*quality_block, *regime_block))
-    assert quality_headers[quality_headers.index("MA") + 1:quality_headers.index("MA") + 5] == quality_block
-    assert regime_headers[regime_headers.index("MA") + 1:regime_headers.index("MA") + 1 + len(regime_block)] == regime_block
-    assert both_headers[both_headers.index("MA") + 1:both_headers.index("MA") + 1 + len(quality_block)] == quality_block
+    assert quality_headers[quality_headers.index("Lot mode") + 1:quality_headers.index("Lot mode") + 5] == quality_block
+    assert regime_headers[regime_headers.index("Lot mode") + 1:regime_headers.index("Lot mode") + 1 + len(regime_block)] == regime_block
+    assert both_headers[both_headers.index("Lot mode") + 1:both_headers.index("Lot mode") + 1 + len(quality_block)] == quality_block
     regime_start = both_headers.index("Regime rank")
     assert both_headers[regime_start:regime_start + len(regime_block)] == regime_block
 
@@ -4590,8 +4640,8 @@ def test_workbook_keeps_all_candidates_and_ab_30d_columns(tmp_path: Path) -> Non
     assert "PointsALL" not in headers and "PointsMin" not in headers
     assert headers.index("CE") + 1 == headers.index("PF")
     shifts_start = headers.index("1 Shift")
-    assert headers[shifts_start:shifts_start + 6] == [
-        "1 Shift", "2 Shift", "3 Shift", "Lots", "Points", "MA",
+    assert headers[shifts_start:shifts_start + 8] == [
+        "1 Shift", "2 Shift", "3 Shift", "Lots", "Points", "MA", "MA type", "Lot mode",
     ]
     first_order_shift = headers.index("1 Shift") + 1
     assert {book["All candidates"].cell(row, first_order_shift).value for row in (2, 3)} == {0.3, 2.7}
@@ -4633,7 +4683,7 @@ def test_workbook_prefixes_applied_filter_reason_and_fills_rows(tmp_path: Path) 
     headers = [cell.value for cell in book["All candidates"][1]]
 
     assert book["All candidates"].cell(2, headers.index("Причина") + 1).value == "3. PARETO_DD5_CAPITAL"
-    assert book["All candidates"].cell(2, 1).fill.fgColor.rgb == "00F6DFDF"
+    assert book["All candidates"].cell(2, 1).fill.fgColor.rgb == "00D9EAD3"
     assert book["All candidates"].cell(3, 1).fill.fgColor.rgb == "00D9EAD3"
     assert book["Finalists"].cell(2, 1).fill.fgColor.rgb == "00D9EAD3"
 
@@ -5074,3 +5124,337 @@ def test_loader_uses_closed_cycles_for_b_gate_and_ignores_zero_and_commission(tm
     assert row["completed_profitable_cycle_count"] == 21
     assert row["completed_cycle_net_pnl"] == Decimal("26")
     assert row["top5_pnl"] == Decimal("14")
+
+
+def test_selection_row_fill_uses_exact_provenance_and_precedence() -> None:
+    enabled = (
+        "filter_equity_regime", "filter_min_shift", "pair_side_pnl_upper_half",
+        "structural_stage_1", "structural_stage_2", "pair_side_stage_3",
+    )
+    row = {
+        "prior_rejected": False,
+        "equity_regime_state": "STALLED",
+        "eliminated_by_filter_equity_regime": True,
+        "eliminated_by_filter_min_shift": True,
+        "eliminated_by_pair_side_pnl_upper_half": True,
+        "eliminated_by_structural_stage_1": False,
+        "eliminated_by_structural_stage_2": False,
+        "eliminated_by_pair_side_stage_3": False,
+    }
+    assert selection_row_fill(row, enabled_stage_ids=enabled) == "B7B7B7"
+    assert selection_row_fill({**row, "prior_rejected": True}, enabled_stage_ids=enabled) == "F4CCCC"
+    assert selection_row_fill(
+        {**row, "equity_regime_state": "GROWING", "eliminated_by_filter_equity_regime": False},
+        enabled_stage_ids=enabled,
+    ) == "CFE2F3"
+    assert selection_row_fill(
+        {**row, "equity_regime_state": "GROWING", "eliminated_by_filter_equity_regime": False,
+         "eliminated_by_filter_min_shift": False},
+        enabled_stage_ids=enabled,
+    ) == "FFF2CC"
+
+
+def test_selection_row_fill_requires_trace_for_non_rejected_colors() -> None:
+    assert selection_row_fill(
+        {"elimination_reason": "FILTER_MIN_SHIFT", "auto_status": "RESERVE"},
+        enabled_stage_ids=("filter_min_shift",),
+    ) == "D9EAD3"
+    outside_top_n = {
+        "eliminated_by_rank_robust_top_n": True,
+        "auto_status": "RESERVE", "final_rank": 3,
+        "elimination_reason": "RANK_ROBUST_TOP_N", "auto_analog_of_strategy_id": None,
+        "prior_rejected": False,
+    }
+    assert selection_row_fill(
+        outside_top_n, enabled_stage_ids=("rank_robust_top_n",), top_n=2,
+    ) == "EAF4E5"
+    assert selection_row_fill(
+        outside_top_n, enabled_stage_ids=("rank_robust_top_n",), top_n=None,
+    ) == "D9EAD3"
+
+
+def _fee_metric(return_pct: str | None, fees_pct: str | None, days: int = 30) -> WindowMetrics:
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    end = start + timedelta(days=days)
+    return WindowMetrics(
+        1, start, end, METRICS_VERSION, start, end, "AVAILABLE", None,
+        Decimal("1.1"), None if return_pct is None else Decimal(return_pct), None, None, Decimal("2"), None,
+        None if fees_pct is None else Decimal(fees_pct), None, 4, Decimal("100"),
+    )
+
+
+def test_fee_efficiency_uses_gross_profit_share_and_calendar_days() -> None:
+    metric = _fee_metric("6", "2", days=60)
+
+    share, per_30d = selection_module._fee_efficiency(metric, metric.requested_start_utc, metric.requested_end_utc)
+
+    assert share == Decimal("25")  # 2 / (6 + 2)
+    assert per_30d == Decimal("1")  # 2% over 60 days
+
+
+def test_fee_efficiency_blank_without_gross_profit_or_inputs() -> None:
+    loss = _fee_metric("-3", "1")
+    assert selection_module._fee_efficiency(loss, loss.requested_start_utc, loss.requested_end_utc)[0] is None
+    missing = _fee_metric("5", None)
+    assert selection_module._fee_efficiency(missing, missing.requested_start_utc, missing.requested_end_utc) == (None, None)
+    unavailable = WindowMetrics.unavailable(1, loss.requested_start_utc, loss.requested_end_utc, "NO_TRADES", METRICS_VERSION)
+    assert selection_module._fee_efficiency(unavailable, loss.requested_start_utc, loss.requested_end_utc) == (None, None)
+
+
+def test_workbook_shows_fee_efficiency_after_top5_share(tmp_path: Path) -> None:
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
+    result = run_selection(pd.DataFrame([
+        _selection_row("one", fees_share_pct=Decimal("25.4"), fees_per_30d_pct=Decimal("1.26")),
+    ]), request)
+
+    path = write_selection_workbook(result, tmp_path / "fees.xlsx", request)
+    headers = [cell.value for cell in load_workbook(path, data_only=True)["All candidates"][1]]
+    top5 = headers.index("Top 5 share, %")
+
+    assert headers[top5 + 1: top5 + 3] == ["Fees share, %", "Fees/30, %"]
+    assert "Fees share, %" in selection_module.SELECTION_LEGACY_HEADERS
+
+
+def test_rejection_reasons_use_the_earliest_rejecting_source(tmp_path: Path) -> None:
+    from mrs3.performance_v2_selection_review import rejection_reasons_by_strategy
+
+    connection = _candidate_db(tmp_path)
+    strategy_id, result_id = connection.execute("select strategy_id, current_result_id from strategies").fetchone()
+    connection.execute(
+        "insert into strategy_tags values (?, 'REJECTED', 'SELECTION_AB_DETERIORATION', 'run-2', ?)",
+        [strategy_id, datetime(2026, 10, 12, tzinfo=UTC)],
+    )
+    assert rejection_reasons_by_strategy(connection, [strategy_id]) == {strategy_id: "AB_DETERIORATION;REJECTED"}
+
+    connection.execute(
+        "insert into strategy_rejection_sources values (?, 'EQUITY_REGIME_FILTER', 'W28_DOWN', ?, 'run-1', 'v1', 'r', 'f', ?)",
+        [strategy_id, result_id, datetime(2026, 10, 9, tzinfo=UTC)],
+    )
+    assert rejection_reasons_by_strategy(connection, [strategy_id]) == {
+        strategy_id: "FILTER_EQUITY_REGIME;W28_DOWN;REJECTED"
+    }
+    assert rejection_reasons_by_strategy(connection, []) == {}
+
+
+def test_workbook_shows_rejecting_filter_for_rejected_rows(tmp_path: Path) -> None:
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "pareto_plateau_points_per_order", "enabled": True, "scope": "pair_side"},
+        {"id": "pareto_dd5_capital", "enabled": True, "scope": "pair_side"},
+    ]})
+    result = pd.DataFrame([
+        _selection_row("winner"), _selection_row("loser"), {**_selection_row("loser"), "strategy_id": 3, "strategy_name": "detailed"},
+    ])
+    result["finalist"] = [False, False, False]
+    result["elimination_reason"] = [
+        "EQUITY_REGIME_STALLED_RESERVE", "PARETO_DD5_CAPITAL", "AB_DETERIORATION;B_PNL30_FLOOR(b=-1)",
+    ]
+    reviews = {
+        1: {"user_status": "REJECTED", "rejection_reason": "AB_DETERIORATION;REJECTED"},
+        3: {"user_status": "REJECTED", "rejection_reason": "AB_DETERIORATION;REJECTED"},
+    }
+
+    book = load_workbook(write_selection_workbook(
+        result, tmp_path / "finalists.xlsx", request, {"workbook_schema_version": "2"}, reviews,
+    ), data_only=True)
+    sheet = book["All candidates"]
+    headers = [cell.value for cell in sheet[1]]
+    reasons = {
+        sheet.cell(row, headers.index("ID") + 1).value: sheet.cell(row, headers.index("Причина") + 1).value
+        for row in range(2, sheet.max_row + 1)
+    }
+
+    assert reasons[1] == "AB_DETERIORATION;REJECTED"
+    assert reasons[2].endswith("PARETO_DD5_CAPITAL")
+    assert reasons[3] == "AB_DETERIORATION;B_PNL30_FLOOR(b=-1)"
+
+
+def test_attach_rejection_reasons_prefers_stored_source_then_this_run(tmp_path: Path) -> None:
+    from mrs3.performance_v2_selection_review import attach_rejection_reasons, rejection_reason_label
+
+    connection = _candidate_db(tmp_path)
+    strategy_id = connection.execute("select strategy_id from strategies").fetchone()[0]
+    connection.execute(
+        "insert into strategy_tags values (?, 'REJECTED', 'SELECTION_LOT_VARIANT', 'run-1', ?)",
+        [strategy_id, datetime(2026, 10, 12, tzinfo=UTC)],
+    )
+    reviews = {
+        strategy_id: {"user_status": "REJECTED"},
+        9001: {"user_status": "REJECTED"},
+        9002: {"user_status": "RESERVE"},
+    }
+    attach_rejection_reasons(connection, reviews, {strategy_id: "AB_DETERIORATION;REJECTED",
+                                                   9001: rejection_reason_label("SELECTION_HARD_CUTOFF"),
+                                                   9002: "AB_DETERIORATION;REJECTED"})
+
+    assert reviews[strategy_id]["rejection_reason"] == "FILTER_LOT_VARIANT_REDUNDANCY;REJECTED"
+    assert reviews[9001]["rejection_reason"] == "FILTER_HARD_CUTOFFS;REJECTED"
+    assert rejection_reason_label("SELECTION_AUTOMATIC_REJECTION") == "AUTOMATIC_FILTER;REJECTED"
+    assert "rejection_reason" not in reviews[9002]
+
+
+@pytest.mark.parametrize(("close", "orders", "expected"), [
+    ((None, None), [(None, None), (None, None)], None),
+    (("SMA", "ohlc4"), [("SMA", "ohlc4"), ("SMA", "ohlc4")], "SMA ohlc4"),
+    (("SMA", "ohlc4"), [("SMA", "ohlc4"), ("EMA", "close")], "SMA ohlc4 / EMA close; Close SMA ohlc4"),
+    ((None, None), [("SMA", None), (None, None)], "SMA ? / —; Close —"),
+    (("SMA", "ohlc4"), [], "SMA ohlc4"),
+    (("SMA", None), [("SMA", None)], "SMA ?; Close SMA ?"),
+])
+def test_ma_kind_label_renders_xlsx_ma_type_text(close, orders, expected) -> None:
+    assert selection_module.ma_kind_label(close, orders) == expected
+
+
+def test_loader_and_workbook_show_ma_type_from_v12_facts(tmp_path: Path) -> None:
+    connection = _candidate_db(tmp_path)
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
+    try:
+        legacy = load_selection_candidates(connection, request).iloc[0]
+        connection.execute("update strategies set close_ma_type = 'SMA', close_ma_source = 'ohlc4'")
+        connection.execute("update strategy_orders set open_ma_type = 'SMA', open_ma_source = 'ohlc4'")
+        candidates = load_selection_candidates(connection, request)
+    finally:
+        connection.close()
+
+    assert legacy["ma_kind"] is None
+    assert candidates.iloc[0]["ma_kind"] == "SMA ohlc4"
+    path = write_selection_workbook(run_selection(candidates, request), tmp_path / "ma.xlsx", request)
+    sheet = load_workbook(path)["All candidates"]
+    headers = [cell.value for cell in sheet[1]]
+    assert headers[headers.index("MA") + 1] == "MA type"
+    assert sheet.cell(2, headers.index("MA type") + 1).value == "SMA ohlc4"
+
+
+def test_strategy_ma_kinds_is_empty_before_schema_v12(tmp_path: Path) -> None:
+    connection = duckdb.connect(str(tmp_path / "legacy.duckdb"))
+    try:
+        connection.execute("create table strategies (strategy_id bigint, close_ma_len integer)")
+        connection.execute("create table strategy_orders (strategy_id bigint, order_id integer)")
+        connection.execute("insert into strategies values (1, 3)")
+        assert selection_module.strategy_ma_kinds(connection, [1]) == {}
+    finally:
+        connection.close()
+
+
+def _make_fixed(connection: duckdb.DuckDBPyConnection, base: int = 50) -> None:
+    connection.execute(
+        f"""update strategy_results set sizing_use_upnl = false, sizing_use_frozen_balance = true,
+           sizing_use_fix = true, sizing_max_balance = 0, sizing_my_fix_balance = {base},
+           sizing_balance_percentage_long = 100, sizing_risk_long = 1"""
+    )
+
+
+def test_loader_rebases_fixed_report_totals_on_the_base(tmp_path: Path) -> None:
+    connection = _candidate_db(tmp_path)
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
+    try:
+        legacy = load_selection_candidates(connection, request).iloc[0]
+        _make_fixed(connection)
+        connection.execute("delete from window_metrics")
+        fixed = load_selection_candidates(connection, request).iloc[0]
+    finally:
+        connection.close()
+
+    # Fixture result: total_pnl 10, max_drawdown 5, max_drawdown_pct 5, initial balance 100.
+    assert (legacy["lot_mode"], legacy["lot_base"]) == ("DYNAMIC", None)
+    assert (legacy["max_drawdown_pct"], legacy["total_pnl_pct"], legacy["risk_scale"]) == (Decimal("5"), Decimal("10"), Decimal("1"))
+    assert (fixed["lot_mode"], fixed["lot_base"]) == ("FIXED", Decimal("50"))
+    assert (fixed["max_drawdown_pct"], fixed["total_pnl_pct"]) == (Decimal("10"), Decimal("20"))
+    assert fixed["risk_scale"] == Decimal("0.5")
+    path = write_selection_workbook(run_selection(pd.DataFrame([fixed]), request), tmp_path / "lot.xlsx", request)
+    sheet = load_workbook(path)["All candidates"]
+    headers = [cell.value for cell in sheet[1]]
+    assert headers[headers.index("MA type") + 1] == "Lot mode"
+    assert sheet.cell(2, headers.index("Lot mode") + 1).value == "FIXED"
+
+
+def test_lot_variants_compare_only_within_one_lot_mode_and_base() -> None:
+    def variants(equal_mode: str, income_mode: str, income_base: int = 100) -> pd.DataFrame:
+        def base(mode: str, value: int) -> dict[str, object]:
+            return {"lot_mode": mode, "lot_base": Decimal(value) if mode == "FIXED" else None}
+
+        equal = _lot_variant_row(
+            "equal", 1, lots=("1", "1"), initial_balance=100, max_drawdown_pct=Decimal("10"),
+            pnl_30d_pct=Decimal("30"), ab_return_b_30d_pct=Decimal("4"), **base(equal_mode, 100),
+        )
+        income = _lot_variant_row(
+            "income", 2, lots=("0.5", "1.5"), initial_balance=100, max_drawdown_pct=Decimal("10"),
+            pnl_30d_pct=Decimal("40"), ab_return_b_30d_pct=Decimal("5"), **base(income_mode, income_base),
+        )
+        return pd.DataFrame([equal, income])
+
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
+        {"id": "filter_lot_variant_redundancy", "enabled": True, "scope": "pair_side_timeframe"},
+    ]})
+
+    fixed = run_selection(variants("FIXED", "FIXED"), request).set_index("strategy_name")
+    assert not fixed.loc["equal", "finalist"] and fixed.loc["income", "finalist"]
+    for frame in (variants("DYNAMIC", "FIXED"), variants("FIXED", "FIXED", income_base=200)):
+        result = run_selection(frame, request)
+        assert not result["eliminated_by_filter_lot_variant_redundancy"].any()
+
+
+def _record_fixed_bases(monkeypatch: pytest.MonkeyPatch) -> dict[str, list[object]]:
+    seen: dict[str, list[object]] = {"window": [], "quality": [], "regime": []}
+    for name, key in (("_calculate", "window"), ("calculate_equity_quality_facts", "quality"),
+                      ("calculate_equity_regime_facts", "regime")):
+        original = getattr(selection_module, name)
+
+        def spy(*args, _original=original, _key=key, **kwargs):
+            seen[_key].append(kwargs.get("fixed_base"))
+            return _original(*args, **kwargs)
+
+        monkeypatch.setattr(selection_module, name, spy)
+    return seen
+
+
+_EQUITY_STAGES = [
+    {"id": "filter_equity_regime", "enabled": True, "scope": "pair_side"},
+    {"id": "rank_robust_top_n", "enabled": True, "scope": "pair_side", "top_n": 1, "method": "equity_quality_v1"},
+]
+
+
+def test_cache_warm_job_passes_the_fixed_base(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    connection = _candidate_db(tmp_path)
+    _make_fixed(connection)
+    connection.close()
+    seen = _record_fixed_bases(monkeypatch)
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": _EQUITY_STAGES})
+
+    prepare_selection_window_cache(
+        tmp_path / "strategy_performance.duckdb", request, SelectionConfig(), workers=1, include_equity=True,
+    )
+
+    assert seen["window"] and set(seen["window"]) == {Decimal("50")}
+    assert seen["quality"] and set(seen["quality"]) == {Decimal("50")}
+    assert seen["regime"] and set(seen["regime"]) == {Decimal("50")}
+
+
+def test_in_memory_equity_facts_pass_the_fixed_base(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    connection = _candidate_db(tmp_path)
+    _make_fixed(connection)
+    seen = _record_fixed_bases(monkeypatch)
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": _EQUITY_STAGES})
+    try:
+        candidate = load_selection_candidates(connection, request).iloc[0]
+    finally:
+        connection.close()
+
+    assert seen["quality"] and set(seen["quality"]) == {Decimal("50")}
+    assert seen["regime"] and set(seen["regime"]) == {Decimal("50")}
+
+
+def test_fixed_pnl_without_best_trade_pct_uses_the_base(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    connection = _candidate_db(tmp_path)
+    _make_fixed(connection)
+    result_id = connection.execute("select result_id from strategy_results").fetchone()[0]
+    monkeypatch.setattr(selection_module, "_completed_cycle_facts", lambda *_args, **_kwargs: {
+        result_id: {"completed_cycles_reliable": True, "pnl_without_best_trade": Decimal("5")},
+    })
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
+    try:
+        candidate = load_selection_candidates(connection, request).iloc[0]
+    finally:
+        connection.close()
+
+    # 5 USDT over B = 50, not over the initial balance of 100.
+    assert candidate["pnl_without_best_trade_pct"] == Decimal("10")

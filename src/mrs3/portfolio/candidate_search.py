@@ -15,6 +15,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 from mrs3._portfolio_process_worker import _ProcessBatchEvaluator
 
+from ..performance_v2_sizing import member_fixed_base
 from .config import RANKING_METRICS
 
 
@@ -553,7 +554,9 @@ def _default_pretest_evaluator(members: Sequence[Mapping[str, Any]], *, campaign
             tested = None
             if orders:
                 lot_sum = sum((_pretest_decimal(item.get("lot_x"), "lot_x", default=Decimal(0)) or Decimal(0) for item in orders if isinstance(item, Mapping)), Decimal(0))
-                tested = (initial or 0) * lot_sum
+                # A FIXED member was tested on its constant base B (protocol v2 §4.5).
+                fixed_base = member_fixed_base(member)
+                tested = (fixed_base if fixed_base is not None else (initial or 0)) * lot_sum
             if tested is None:
                 tested = member.get("tested_size_usdt")
             actual = member.get("actual_size_usdt", member.get("position_size_usdt"))

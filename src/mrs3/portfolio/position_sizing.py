@@ -11,6 +11,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping, Sequence
 
+from ..performance_v2_sizing import member_fixed_base
 from .liquidity import Instrument, LiquidityError, ReferenceSnapshot
 from .minute_capacity import CapacityWindow, MinuteCapacityResult, MinuteLiquidityFeatures, resolve_liquidity_window
 from .pretest_proxy import ProxyMetrics, compute_proxy_metrics
@@ -617,7 +618,9 @@ def _member_path(row: Mapping[str, Any]) -> tuple[Any, Decimal, Decimal]:
     tested = None
     if orders:
         lot_sum = sum((_decimal(item.get("lot_x"), "lot_x", positive=True) for item in orders if isinstance(item, Mapping)), Decimal(0))
-        tested = _decimal(initial, "initial_balance", positive=True) * lot_sum
+        # A FIXED result was tested on its constant base B (protocol v2 §4.5).
+        fixed_base = member_fixed_base(row)
+        tested = (fixed_base if fixed_base is not None else _decimal(initial, "initial_balance", positive=True)) * lot_sum
     if tested is None:
         tested = row.get("tested_size_usdt")
     return path, _decimal(initial, "initial_balance", positive=True), _decimal(tested, "tested_size_usdt", positive=True)
@@ -749,7 +752,7 @@ def size_composition(
                 orders = row.get("strategy_orders", row.get("orders", row.get("opening_orders", ())))
                 total_lot = sum((_decimal(item.get("lot_x"), "lot_x", positive=True) for item in orders if isinstance(item, Mapping)), Decimal(0))
                 composition_sizing_digest = _digest({"basis": "PRETEST_COMPOSITION_SHARED_CAP", "symbol": row.get("symbol"), "strategy_id": row.get("strategy_id"), "quantity": value["quantity"], "actual_size_usdt": actual, "k": k, "capacity": capacities[str(row["symbol"])]})
-                row.update({"actual_size_usdt": actual, "position_size_usdt": actual, "quantity": value["quantity"], "planned_leverage": leverage, "opening_allocations": tuple({"order_id": item.get("order_id"), "lot_x": item.get("lot_x"), "target_notional_usdt": actual * _decimal(item.get("lot_x"), "lot_x", positive=True) / total_lot} for item in orders), "tested_size_usdt": _member_path(row)[2], "tested_size_basis": "SOURCE_INITIAL_BALANCE_X_OPENING_LOT", "composition_sizing_digest": composition_sizing_digest, "sizing_basis": "PRETEST_COMPOSITION_SHARED_CAP"})
+                row.update({"actual_size_usdt": actual, "position_size_usdt": actual, "quantity": value["quantity"], "planned_leverage": leverage, "opening_allocations": tuple({"order_id": item.get("order_id"), "lot_x": item.get("lot_x"), "target_notional_usdt": actual * _decimal(item.get("lot_x"), "lot_x", positive=True) / total_lot} for item in orders), "tested_size_usdt": _member_path(row)[2], "tested_size_basis": "FIXED_BASE_X_OPENING_LOT" if member_fixed_base(row) is not None else "SOURCE_INITIAL_BALANCE_X_OPENING_LOT", "composition_sizing_digest": composition_sizing_digest, "sizing_basis": "PRETEST_COMPOSITION_SHARED_CAP"})
                 sized.append(_freeze(row))
             sizes = tuple(value["actual_size_usdt"] for value in values)
             return tuple(sized), _combine_proxy(selected, sizes, campaign_equity=campaign), sum((value["actual_size_usdt"] for value in values), Decimal(0))

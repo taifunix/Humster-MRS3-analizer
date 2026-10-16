@@ -936,7 +936,10 @@ def test_replace_preserves_user_finalist_status_rank_and_comment(tmp_path: Path)
             [now],
         )
         connection.execute(
-            "insert into selection_review_imports values ('review-1', 'selection-1', 'd', ?, 1)", [now]
+            "insert into selection_review_imports "
+            "(review_import_id, selection_run_id, workbook_sha256, imported_at_utc, row_count) "
+            "values ('review-1', 'selection-1', 'd', ?, 1)",
+            [now],
         )
         connection.execute(
             "insert into selection_review_rows values ('review-1', ?, 'FINALIST', 1, null, 'keep this')",
@@ -1680,13 +1683,14 @@ def test_replace_readback_query_counts_cover_scalar_and_chunk_boundaries(
         test_end=None,
         inbox_snapshot_sha256=None,
     )
-    reports = tuple(SimpleNamespace(excluded_trade_count=0) for _ in names)
+    reports = tuple(SimpleNamespace(excluded_trade_count=0, settings={}) for _ in names)
     if strict_mismatch:
         reports = reports[:-1]
     monkeypatch.setattr(import_module, "read_performance_v2_inbox", lambda *args, **kwargs: prepared)
     monkeypatch.setattr(import_module, "create_v2_parser_staging", lambda *args, **kwargs: None)
     monkeypatch.setattr(import_module, "_parse_reports", lambda *args, **kwargs: reports)
     monkeypatch.setattr(import_module, "_validate_report", lambda *args, **kwargs: None)
+    monkeypatch.setattr(import_module, "_identity_rejection", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         import_module,
         "_prepare_listing_ranges",
@@ -2210,9 +2214,12 @@ def test_import_migrates_existing_v4_target_before_current_schema_gate(tmp_path:
 
     assert result.status == "COMMITTED"
     with duckdb.connect(str(target), read_only=True) as connection:
+        from mrs3.performance_v2_store import require_performance_v2_readable
+
+        assert require_performance_v2_readable(connection) == 12
         assert connection.execute(
             "select value from schema_info where key = 'schema_version'"
-        ).fetchone() == ("9",)
+        ).fetchone() == ("12",)
 
 
 def test_bare_duckdb_target_is_not_initialized_by_import(tmp_path: Path) -> None:
@@ -2742,6 +2749,7 @@ def test_replace_batches_child_deletes_for_admitted_results(tmp_path: Path, admi
     child_tables = (
         "strategy_actions", "strategy_equity", "window_metrics",
         "equity_quality_metrics", "optimizer_prepared_inputs",
+        "strategy_report_metrics", "strategy_report_regimes", "strategy_report_monthly",
     )
     order_by = {
         "strategy_actions": "action_index",
@@ -2749,6 +2757,9 @@ def test_replace_batches_child_deletes_for_admitted_results(tmp_path: Path, admi
         "window_metrics": "requested_start_utc, requested_end_utc, metrics_version",
         "equity_quality_metrics": "algo_version",
         "optimizer_prepared_inputs": "result_id",
+        "strategy_report_metrics": "result_id",
+        "strategy_report_regimes": "regime",
+        "strategy_report_monthly": "month",
     }
     with duckdb.connect(str(target), read_only=True) as connection:
         ids = dict(connection.execute(
@@ -2845,7 +2856,7 @@ def test_replace_batches_child_deletes_for_admitted_results(tmp_path: Path, admi
         raw.close()
 
     assert (imported, skipped, rejected) == (admitted_count, 0, 3 - admitted_count)
-    assert len(recording.delete_sql) == 5
+    assert len(recording.delete_sql) == len(child_tables)
     assert [
         sql.casefold().split("delete from ", 1)[1].split(None, 1)[0]
         for sql in recording.delete_sql
@@ -3540,3 +3551,480 @@ def test_same_batch_incomparable_typed_intervals_roll_back(tmp_path: Path) -> No
         import_performance_v2(request)
     with duckdb.connect(str(performance_v2_database_path(request.config)), read_only=True) as connection:
         assert connection.execute("select count(*) from strategies").fetchone() == (0,)
+
+
+def test_import_refuses_a_database_bound_to_another_exchange_before_writing(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path, initialize_db=False)
+    target = performance_v2_database_path(request.config)
+    target.parent.mkdir(parents=True)
+    with duckdb.connect(str(target)) as connection:
+        initialize_performance_v2(connection, exchange="OKX")
+    before = target.read_bytes()
+
+    with pytest.raises(PerformanceV2ImportError, match="EXCHANGE_MISMATCH"):
+        import_performance_v2(request)
+
+    assert target.read_bytes() == before
+
+
+def _report_with_ma(open_source: str | None, *, close_source: str = "ohlc4", fixed_lot: bool = True) -> bytes:
+    text = FIXTURE.read_text(encoding="utf-8")
+    if open_source is not None:
+        text = text.replace('{"id":1,"len":7,', f'{{"id":1,"type":"SMA","source":"{open_source}","len":7,')
+        text = text.replace('"ma_close_long":{"len":3,', f'"ma_close_long":{{"type":"SMA","source":"{close_source}","len":3,')
+    if fixed_lot:
+        text = text.replace(
+            '"use_short":false}',
+            '"use_short":false,"my_fix_balance":10000,"balance_percentage_short":100,"risk_short":1}',
+        )
+    return text.encode("utf-8")
+
+
+def _write_named_report(request: PerformanceV2ImportRequest, name: str, data: bytes) -> None:
+    (request.report_root / f"{name}.html").write_bytes(data)
+    manifest_path = request.inbox / "inbox_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    for entry in manifest["entries"]:
+        if entry["strategy_name"] == name:
+            entry["source_report_sha256"] = sha256(data).hexdigest()
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+
+def _ma_facts(target: Path) -> tuple[tuple[object, ...], ...]:
+    with duckdb.connect(str(target), read_only=True) as connection:
+        return tuple(connection.execute(
+            """select s.close_ma_type, s.close_ma_source, o.order_id, o.open_ma_type, o.open_ma_source
+                 from strategies s join strategy_orders o using (strategy_id) order by s.strategy_id, o.order_id"""
+        ).fetchall())
+
+
+def test_import_records_ma_facts_and_v12_sizing(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path)
+    _write_named_report(request, "alpha", _report_with_ma("ohlc4"))
+
+    assert import_performance_v2(request).imported_count == 1
+
+    target = performance_v2_database_path(request.config)
+    assert _ma_facts(target) == (("SMA", "ohlc4", 1, "SMA", "ohlc4"),)
+    with duckdb.connect(str(target), read_only=True) as connection:
+        assert connection.execute(
+            "select sizing_my_fix_balance, sizing_balance_percentage_short, sizing_risk_short from strategy_results"
+        ).fetchone() == (Decimal("10000"), Decimal("100"), Decimal("1"))
+
+
+def test_import_rejects_changed_ma_on_skipped_and_replace_paths(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path)
+    _write_named_report(request, "alpha", _report_with_ma("ohlc4"))
+    assert import_performance_v2(request).imported_count == 1
+    target = performance_v2_database_path(request.config)
+    with duckdb.connect(str(target), read_only=True) as connection:
+        strategy_id, result_id = connection.execute("select strategy_id, current_result_id from strategies").fetchone()
+
+    _write_named_report(request, "alpha", _report_with_ma("open"))
+    skipped_path = import_performance_v2(request)
+    replace_path = import_performance_v2(PerformanceV2ImportRequest(
+        request.inbox, request.report_root, request.config,
+        mode="REPLACE", replacement_strategy_ids={"alpha": strategy_id},
+        listing_dates_path=request.listing_dates_path,
+    ))
+
+    for result in (skipped_path, replace_path):
+        assert (result.imported_count, result.rejected_count) == (0, 1)
+    assert _ma_facts(target) == (("SMA", "ohlc4", 1, "SMA", "ohlc4"),)
+    with duckdb.connect(str(target), read_only=True) as connection:
+        assert connection.execute("select current_result_id from strategies").fetchone() == (result_id,)
+        statuses = {row[0] for row in connection.execute("select status from import_files").fetchall()}
+    assert "REJECTED:MA_SETTINGS_CHANGED" in statuses
+
+
+def test_replace_fills_legacy_ma_facts(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path)
+    assert import_performance_v2(request).imported_count == 1
+    target = performance_v2_database_path(request.config)
+    assert _ma_facts(target) == ((None, None, 1, None, None),)
+    with duckdb.connect(str(target), read_only=True) as connection:
+        strategy_id = connection.execute("select strategy_id from strategies").fetchone()[0]
+
+    _write_named_report(request, "alpha", _report_with_ma("ohlc4"))
+    replaced = import_performance_v2(PerformanceV2ImportRequest(
+        request.inbox, request.report_root, request.config,
+        mode="REPLACE", replacement_strategy_ids={"alpha": strategy_id},
+        listing_dates_path=request.listing_dates_path,
+    ))
+
+    assert replaced.imported_count == 1
+    assert _ma_facts(target) == (("SMA", "ohlc4", 1, "SMA", "ohlc4"),)
+
+
+def test_same_batch_alias_with_different_ma_is_rejected(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path, names=("alpha", "beta"))
+    strategy_path = request.inbox / "strategies" / "beta.json"
+    strategy = json.loads(strategy_path.read_text(encoding="utf-8"))
+    strategy["mrs3"]["ma_close_long"]["len"] = 3  # type: ignore[index]
+    strategy["mrs3"]["ma_close_short"]["len"] = 3  # type: ignore[index]
+    strategy_bytes = json.dumps(strategy, separators=(",", ":")).encode()
+    strategy_path.write_bytes(strategy_bytes)
+    manifest_path = request.inbox / "inbox_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    beta = manifest["entries"][1]
+    beta["source_strategy_sha256"] = sha256(strategy_bytes).hexdigest()
+    beta["strategy_version_id"] = _canonical_strategy_hash(strategy)
+    manifest["v6_provenance"]["strategy_json_sha256"]["beta.json"] = beta["strategy_version_id"]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    _write_named_report(request, "alpha", _report_with_ma("ohlc4"))
+    _write_named_report(request, "beta", _report_with_ma("open"))
+
+    result = import_performance_v2(request)
+
+    assert (result.imported_count, result.skipped_count, result.rejected_count) == (1, 0, 1)
+    assert _ma_facts(performance_v2_database_path(request.config)) == (("SMA", "ohlc4", 1, "SMA", "ohlc4"),)
+
+
+def test_import_rejects_changed_ma_against_a_tombstone(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path)
+    _write_named_report(request, "alpha", _report_with_ma("ohlc4"))
+    assert import_performance_v2(request).imported_count == 1
+    target = performance_v2_database_path(request.config)
+    with duckdb.connect(str(target)) as connection:
+        connection.execute("update strategies set lifecycle_status = 'DISCARDED'")
+
+    _write_named_report(request, "alpha", _report_with_ma("ohlc4"))
+    same = import_performance_v2(request)
+    _write_named_report(request, "alpha", _report_with_ma("open"))
+    changed = import_performance_v2(request)
+
+    assert (same.skipped_count, same.rejected_count) == (1, 0)
+    assert (changed.skipped_count, changed.rejected_count) == (0, 1)
+
+
+def _report_with_orders(prototypes: list[tuple[int, str, str]], *, close: tuple[str, str] = ("SMA", "ohlc4"),
+                        wider: bool = False) -> bytes:
+    text = FIXTURE.read_text(encoding="utf-8")
+    ma_long = json.dumps([
+        {"id": order_id, "type": ma_type, "source": source, "len": 7, "multiplier": 0.995, "lot_x": 1}
+        for order_id, ma_type, source in prototypes
+    ], separators=(",", ":"))
+    text = text.replace('"ma_long":[{"id":1,"len":7,"multiplier":0.995,"lot_x":1}]', f'"ma_long":{ma_long}')
+    text = text.replace('"ma_close_long":{"len":3,', f'"ma_close_long":{{"type":"{close[0]}","source":"{close[1]}","len":3,')
+    if wider:
+        text = text.replace("2026-01-01 - 2026-01-09", "2025-12-20 - 2026-01-10")
+    return text.encode("utf-8")
+
+
+def _reverse_strategy_orders(request: PerformanceV2ImportRequest, name: str = "alpha") -> None:
+    strategy_path = request.inbox / "strategies" / f"{name}.json"
+    strategy = json.loads(strategy_path.read_text(encoding="utf-8"))
+    orders = list(reversed(strategy["mrs3"]["ma_long"]))  # type: ignore[index]
+    for order_id, order in enumerate(orders, start=1):
+        order["id"] = order_id
+    strategy["mrs3"]["ma_long"] = orders  # type: ignore[index]
+    strategy_bytes = json.dumps(strategy, separators=(",", ":")).encode()
+    strategy_path.write_bytes(strategy_bytes)
+    manifest_path = request.inbox / "inbox_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    for entry in manifest["entries"]:
+        if entry["strategy_name"] == name:
+            entry["source_strategy_sha256"] = sha256(strategy_bytes).hexdigest()
+            entry["strategy_version_id"] = _canonical_strategy_hash(strategy)
+            manifest["v6_provenance"]["strategy_json_sha256"][f"{name}.json"] = entry["strategy_version_id"]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+
+def _facts_by_len(target: Path) -> dict[int, tuple[object, object]]:
+    with duckdb.connect(str(target), read_only=True) as connection:
+        return {int(row[0]): (row[1], row[2]) for row in connection.execute(
+            "select open_ma_len, open_ma_type, open_ma_source from strategy_orders"
+        ).fetchall()}
+
+
+def test_ma_facts_follow_order_settings_not_order_position(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path, orders=2)
+    # Strategy order 1 has open MA 7, order 2 has open MA 8.
+    _write_named_report(request, "alpha", _report_with_orders([(1, "SMA", "open"), (2, "EMA", "close")]))
+    assert import_performance_v2(request).imported_count == 1
+    target = performance_v2_database_path(request.config)
+    assert _facts_by_len(target) == {7: ("SMA", "open"), 8: ("EMA", "close")}
+
+    _reverse_strategy_orders(request)  # now order 1 is MA 8 and order 2 is MA 7
+    _write_named_report(request, "alpha", _report_with_orders([(1, "EMA", "close"), (2, "SMA", "open")]))
+    same = import_performance_v2(request)
+    _write_named_report(request, "alpha", _report_with_orders([(1, "SMA", "open"), (2, "EMA", "close")]))
+    swapped = import_performance_v2(request)
+
+    assert (same.skipped_count, same.rejected_count) == (1, 0)
+    assert (swapped.skipped_count, swapped.rejected_count) == (0, 1)
+    assert _facts_by_len(target) == {7: ("SMA", "open"), 8: ("EMA", "close")}
+
+
+def test_auto_replace_fills_legacy_facts_by_order_settings(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path, orders=2)
+    assert import_performance_v2(request).imported_count == 1
+    target = performance_v2_database_path(request.config)
+    assert _facts_by_len(target) == {7: (None, None), 8: (None, None)}
+
+    _reverse_strategy_orders(request)
+    _write_named_report(request, "alpha", _report_with_orders([(1, "EMA", "close"), (2, "SMA", "open")], wider=True))
+    result = import_performance_v2(request)
+
+    assert (result.imported_count, result.rejected_count) == (1, 0)
+    assert _facts_by_len(target) == {7: ("SMA", "open"), 8: ("EMA", "close")}
+
+
+def test_close_ma_change_alone_is_rejected(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path)
+    _write_named_report(request, "alpha", _report_with_orders([(1, "SMA", "ohlc4")], close=("SMA", "ohlc4")))
+    assert import_performance_v2(request).imported_count == 1
+
+    _write_named_report(request, "alpha", _report_with_orders([(1, "SMA", "ohlc4")], close=("SMA", "close")))
+    result = import_performance_v2(request)
+
+    assert (result.skipped_count, result.rejected_count) == (0, 1)
+
+
+FIXTURE_2026_10 = Path(__file__).parent / "fixtures" / "performance" / "report_2026_10.html"
+
+
+def _report_2026_10(*, protocol_v2: bool = False, exchange: str = "Bybit") -> bytes:
+    text = FIXTURE_2026_10.read_text(encoding="utf-8")
+    # The real 2026-10 statistics table carries these core labels (new-format spec §5.7).
+    text = text.replace(
+        "<tr><td>Total fees</td><td>0.1</td></tr>",
+        "<tr><td>Total fees</td><td>0.1</td></tr>"
+        "<tr><td>Max Drawdown, USDT</td><td>1.5</td></tr>"
+        "<tr><td>Max Drawdown, %</td><td>1.5</td></tr>"
+        "<tr><td>Fills (reduce / close)</td><td>1</td></tr>",
+        1,
+    )
+    text = text.replace('"exchange":{"name":"Bybit",', f'"exchange":{{"name":"{exchange}",', 1)
+    if protocol_v2:
+        text = _protocol_v2_settings(text)
+    return text.encode("utf-8")
+
+
+def _protocol_v2_settings(text: str, *, close_facts: bool = True) -> str:
+    text = text.replace('"use_upnl":true}', '"use_upnl":false,"use_frozen_balance":true}', 1)
+    text = text.replace(
+        '"use_short":false}',
+        '"use_short":false,"use_fix":true,"my_fix_balance":10000,"balance_percentage_long":100,'
+        '"risk_long":1,"max_balance":0}',
+        1,
+    )
+    text = text.replace('{"id":1,"len":7,', '{"id":1,"type":"SMA","source":"ohlc4","len":7,', 1)
+    if close_facts:
+        text = text.replace('"ma_close_long":{"len":3,', '"ma_close_long":{"type":"SMA","source":"ohlc4","len":3,', 1)
+    return text
+
+
+def _import_statuses(target: Path) -> set[str]:
+    with duckdb.connect(str(target), read_only=True) as connection:
+        return {row[0] for row in connection.execute("select status from import_files").fetchall()}
+
+
+def test_import_writes_2026_10_core_and_report_analytics(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path)
+    _write_named_report(request, "alpha", _report_2026_10())
+
+    assert import_performance_v2(request).imported_count == 1
+
+    target = performance_v2_database_path(request.config)
+    with duckdb.connect(str(target), read_only=True) as connection:
+        result_id, tester_version, report_format, max_drawdown, total_trades = connection.execute(
+            "select result_id, tester_version, report_format, max_drawdown, total_trades from strategy_results"
+        ).fetchone()
+        metrics = connection.execute(
+            "select trades_full_exit, win_trades from strategy_report_metrics where result_id = ?", [result_id]
+        ).fetchone()
+        regimes = connection.execute("select count(*) from strategy_report_regimes where result_id = ?", [result_id]).fetchone()[0]
+        monthly = connection.execute("select month, return_pct from strategy_report_monthly").fetchall()
+    assert (tester_version, report_format) == ("2026/10/10", "2026-10")
+    assert (max_drawdown, total_trades) == (Decimal("1.5"), 1)
+    assert metrics == (1, 1)
+    assert regimes == 2
+    assert monthly == [(date(2026, 1, 1), 0.99)]
+
+
+def test_legacy_report_records_format_without_analytics(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path)
+
+    assert import_performance_v2(request).imported_count == 1
+
+    with duckdb.connect(str(performance_v2_database_path(request.config)), read_only=True) as connection:
+        assert connection.execute("select tester_version, report_format from strategy_results").fetchall() == [(None, "legacy")]
+        assert sum(
+            connection.execute(f"select count(*) from {table}").fetchone()[0]
+            for table in ("strategy_report_metrics", "strategy_report_regimes", "strategy_report_monthly")
+        ) == 0
+
+
+def test_replace_rewrites_report_analytics_atomically(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path)
+    _write_named_report(request, "alpha", _report_2026_10())
+    assert import_performance_v2(request).imported_count == 1
+    target = performance_v2_database_path(request.config)
+    with duckdb.connect(str(target), read_only=True) as connection:
+        strategy_id, result_id = connection.execute("select strategy_id, current_result_id from strategies").fetchone()
+    replace_request = PerformanceV2ImportRequest(
+        request.inbox, request.report_root, request.config,
+        mode="REPLACE", replacement_strategy_ids={"alpha": strategy_id},
+        listing_dates_path=request.listing_dates_path,
+    )
+
+    assert import_performance_v2(replace_request).imported_count == 1
+    with duckdb.connect(str(target), read_only=True) as connection:
+        assert connection.execute("select count(*) from strategy_report_metrics where result_id = ?", [result_id]).fetchone() == (1,)
+        assert connection.execute("select count(*) from strategy_report_regimes").fetchone() == (2,)
+
+    _write_named_report(request, "alpha", FIXTURE.read_bytes())
+    assert import_performance_v2(replace_request).imported_count == 1
+    with duckdb.connect(str(target), read_only=True) as connection:
+        assert connection.execute("select report_format from strategy_results").fetchall() == [("legacy",)]
+        assert connection.execute("select count(*) from strategy_report_metrics").fetchone() == (0,)
+        assert connection.execute("select count(*) from strategy_report_monthly").fetchone() == (0,)
+
+
+def test_v1_database_rejects_a_protocol_v2_report_alone(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path, names=("alpha", "beta"))
+    _write_named_report(request, "alpha", _report_2026_10(protocol_v2=True))
+
+    result = import_performance_v2(request)
+
+    assert (result.imported_count, result.rejected_count) == (1, 1)
+    assert "REJECTED:EVALUATION_PROTOCOL_MISMATCH" in _import_statuses(performance_v2_database_path(request.config))
+
+
+def _v2_request(tmp_path: Path, names: tuple[str, ...]) -> PerformanceV2ImportRequest:
+    request, _ = _request(tmp_path, names=names, initialize_db=False)
+    config = replace(request.config, evaluation_protocol="v2", exchange="Bybit")
+    request = PerformanceV2ImportRequest(
+        request.inbox, request.report_root, config, listing_dates_path=request.listing_dates_path,
+    )
+    target = performance_v2_database_path(config)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with duckdb.connect(str(target)) as connection:
+        initialize_performance_v2(connection, evaluation_protocol="v2", exchange="Bybit")
+    return request
+
+
+def test_v2_database_accepts_v2_and_rejects_others_one_by_one(tmp_path: Path) -> None:
+    names = ("alpha", "beta", "gamma", "delta", "epsilon")
+    request = _v2_request(tmp_path, names)
+    incomplete = _protocol_v2_settings(FIXTURE.read_text(encoding="utf-8"), close_facts=False).encode("utf-8")
+    _write_named_report(request, "alpha", _report_2026_10(protocol_v2=True, exchange="bybit "))
+    _write_named_report(request, "beta", incomplete)
+    _write_named_report(request, "gamma", FIXTURE.read_bytes())
+    _write_named_report(request, "delta", _report_2026_10(protocol_v2=True, exchange="OKX"))
+    _write_named_report(request, "epsilon", _report_2026_10(protocol_v2=True, exchange=""))
+
+    result = import_performance_v2(request)
+
+    assert (result.imported_count, result.rejected_count) == (1, 4)
+    target = performance_v2_database_path(request.config)
+    assert _import_statuses(target) >= {
+        "REJECTED:PROTOCOL_V2_INCOMPLETE", "REJECTED:EVALUATION_PROTOCOL_MISMATCH", "REJECTED:EXCHANGE_MISMATCH",
+    }
+    with duckdb.connect(str(target), read_only=True) as connection:
+        assert connection.execute("select s.strategy_name, r.sizing_use_upnl, r.sizing_use_fix from strategies s join strategy_results r on r.result_id = s.current_result_id").fetchall() == [("alpha", False, True)]
+        rows = connection.execute("select status from import_files").fetchall()
+    assert sum(1 for (status,) in rows if status == "REJECTED:EXCHANGE_MISMATCH") == 2
+
+
+def test_report_evaluation_protocol_names_unmet_v2_fields() -> None:
+    from mrs3.performance_v2_import import report_evaluation_protocol
+
+    assert report_evaluation_protocol({"exchange": {"use_upnl": True}}) == ("v1", ())
+    long_v2 = {
+        "exchange": {"use_upnl": False, "use_frozen_balance": True},
+        "basic": {"strategy": "mrs3", "use_long": True, "use_short": False, "use_fix": True,
+                  "my_fix_balance": 10000, "balance_percentage_long": 100, "risk_long": 1, "max_balance": 0},
+        "mrs3": {"ma_long": [{"type": "SMA", "source": "ohlc4"}], "ma_close_long": {"type": "SMA", "source": "ohlc4"}},
+    }
+    assert report_evaluation_protocol(long_v2, "LONG") == ("v2", ())
+    assert report_evaluation_protocol(long_v2, "SHORT")[1] == ("basic.use_long/use_short",)
+    protocol, unmet = report_evaluation_protocol({
+        "exchange": {"use_upnl": False, "use_frozen_balance": True},
+        "basic": {"strategy": "mrs3", "use_long": False, "use_short": True, "use_fix": True,
+                  "my_fix_balance": 10000, "balance_percentage_short": 50, "risk_short": 1, "max_balance": 0},
+        "mrs3": {"ma_short": [{"type": "SMA", "source": "ohlc4"}, {"type": "SMA"}],
+                 "ma_close_short": {"type": "SMA", "source": "ohlc4"}},
+    })
+    assert (protocol, unmet) == ("v2", ("basic.balance_percentage_short", "ma_short.type/source"))
+
+
+def test_trimmed_2026_10_report_uses_recomputed_core_and_drops_analytics(tmp_path: Path) -> None:
+    request, _ = _request(tmp_path)
+    prepared = read_performance_v2_inbox(request.inbox, request.report_root)
+    parsed = parse_current_performance_v2_html(_report_2026_10(), request.config)
+    assert parsed.report_format == "2026-10" and parsed.analytics is not None
+    actions = (
+        replace(parsed.actions[0], timestamp_utc=datetime(2026, 1, 2, tzinfo=timezone.utc), fee=Decimal("0.5"), balance=Decimal("999.5")),
+        replace(parsed.actions[1], timestamp_utc=datetime(2026, 1, 7, tzinfo=timezone.utc), fee=Decimal("0.5"), pnl=Decimal("10"), balance=Decimal("1009")),
+        replace(parsed.actions[0], timestamp_utc=datetime(2026, 1, 8, tzinfo=timezone.utc), fee=Decimal("1"), balance=Decimal("1008")),
+        replace(parsed.actions[1], timestamp_utc=datetime(2026, 1, 9, tzinfo=timezone.utc), fee=Decimal("1"), pnl=Decimal("4"), balance=Decimal("1011")),
+    )
+    metrics = dict(parsed.metrics)
+    metrics["Report range"] = "2026-01-01 - 2026-01-10"
+    parsed = replace(parsed, metrics=metrics, actions=actions, wallet_series=(), equity_series=())
+
+    result, failure = import_module._warmup_report(
+        prepared.entries[0], parsed, {"ONUSDT": datetime(2026, 1, 3, tzinfo=timezone.utc)}
+    )
+
+    assert failure is None and result is not None
+    assert result.analytics is None and result.report_format == "2026-10"
+    values = import_module._result_values(
+        prepared.entries[0], result, prepared.commission_contract, datetime.now(timezone.utc)
+    )
+    assert values["total_trades"] == 1
+    assert values["max_drawdown"] is None
+
+
+def test_legacy_report_keeps_max_drawdown_label_mapping() -> None:
+    parsed = parse_current_performance_v2_html(FIXTURE.read_bytes(), PerformanceV2Config(Path("unused")))
+    metrics = dict(parsed.metrics, **{"Max Drawdown": "2", "Max Drawdown, USDT": "9", "Fills (reduce / close)": "7"})
+
+    values = import_module._result_values(
+        SimpleNamespace(exchange_name="Bybit"), replace(parsed, metrics=metrics), {}, datetime.now(timezone.utc),
+    )
+
+    assert parsed.report_format == "legacy"
+    assert (values["max_drawdown"], values["total_trades"]) == (Decimal("2"), 1)
+
+
+def test_v2_report_missing_facts_for_a_stored_order_is_incomplete(tmp_path: Path) -> None:
+    request = _v2_request(tmp_path, ("alpha",))
+    text = _report_2026_10(protocol_v2=True).decode("utf-8").replace('{"id":1,"type"', '{"id":2,"type"', 1)
+    _write_named_report(request, "alpha", text.encode("utf-8"))
+
+    result = import_module.import_performance_v2(request)
+
+    assert (result.imported_count, result.rejected_count) == (0, 1)
+    assert _import_statuses(performance_v2_database_path(request.config)) == {"REJECTED:PROTOCOL_V2_INCOMPLETE"}
+
+
+def test_failed_replace_keeps_old_core_and_analytics(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    request, _ = _request(tmp_path)
+    _write_named_report(request, "alpha", _report_2026_10())
+    assert import_performance_v2(request).imported_count == 1
+    target = performance_v2_database_path(request.config)
+
+    def snapshot() -> tuple[object, ...]:
+        with duckdb.connect(str(target), read_only=True) as connection:
+            return tuple(
+                connection.execute(f"select * from {table} order by all").fetchall()
+                for table in ("strategy_results", "strategy_report_metrics", "strategy_report_regimes", "strategy_report_monthly")
+            )
+
+    before = snapshot()
+    with duckdb.connect(str(target), read_only=True) as connection:
+        strategy_id = connection.execute("select strategy_id from strategies").fetchone()[0]
+    _write_named_report(request, "alpha", FIXTURE.read_bytes())
+    monkeypatch.setattr(import_module, "_verify_child_counts", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("injected")))
+
+    with pytest.raises(PerformanceV2ImportError):
+        import_performance_v2(PerformanceV2ImportRequest(
+            request.inbox, request.report_root, request.config,
+            mode="REPLACE", replacement_strategy_ids={"alpha": strategy_id},
+            listing_dates_path=request.listing_dates_path,
+        ))
+
+    assert snapshot() == before

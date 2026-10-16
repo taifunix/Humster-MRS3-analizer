@@ -307,9 +307,16 @@ def _grid_values(
     return times, values
 
 
-def _window(days: int, end: datetime, values: list[Decimal]) -> EquityRegimeWindowFacts:
+def _relative_logs(values: list[Decimal], fixed_base: Decimal | None) -> list[Decimal]:
+    # FIXED (protocol v2 §4.6): ln Ẽ = (E - E0) / B instead of ln(E / E0).
+    if fixed_base is not None:
+        return [(value - values[0]) / fixed_base for value in values]
+    return [value.ln() - values[0].ln() for value in values]
+
+
+def _window(days: int, end: datetime, values: list[Decimal], fixed_base: Decimal | None = None) -> EquityRegimeWindowFacts:
     elapsed = Decimal(days)
-    logs = [value.ln() - values[0].ln() for value in values]
+    logs = _relative_logs(values, fixed_base)
     xs = [Decimal(index) / Decimal(4) for index in range(len(values))]
     n = Decimal(len(values))
     xbar = sum(xs, ZERO) / n
@@ -324,7 +331,7 @@ def _window(days: int, end: datetime, values: list[Decimal]) -> EquityRegimeWind
     )
 
 
-def _pre28(points: list[_Point], left: datetime) -> EquityRegimeWindowFacts | None:
+def _pre28(points: list[_Point], left: datetime, fixed_base: Decimal | None = None) -> EquityRegimeWindowFacts | None:
     first = points[0].timestamp_utc
     elapsed = left - first
     elapsed_days = Decimal(elapsed.days * 86400 + elapsed.seconds) / Decimal(86400)
@@ -335,7 +342,7 @@ def _pre28(points: list[_Point], left: datetime) -> EquityRegimeWindowFacts | No
     if grid is None:
         return None
     times, values = grid
-    logs = [value.ln() - values[0].ln() for value in values]
+    logs = _relative_logs(values, fixed_base)
     xs = []
     for stamp in times:
         elapsed = stamp - first
@@ -359,6 +366,8 @@ def calculate_equity_regime_facts(
     report_start_utc: datetime,
     report_end_utc: datetime,
     samples: Iterable[EquityRegimeSample],
+    *,
+    fixed_base: Decimal | None = None,
 ) -> EquityRegimeFacts:
     """Calculate all regime facts from one ordered, independent result."""
     start = _utc(report_start_utc)
@@ -423,10 +432,10 @@ def calculate_equity_regime_facts(
     with localcontext(_METRIC_CONTEXT):
         values14 = values28[56:]
         values7 = values28[84:]
-        w28 = _window(28, end, values28)
-        w14 = _window(14, end, values14)
-        w7 = _window(7, end, values7)
-        pre = _pre28(points, left28)
+        w28 = _window(28, end, values28, fixed_base)
+        w14 = _window(14, end, values14, fixed_base)
+        w7 = _window(7, end, values7, fixed_base)
+        pre = _pre28(points, left28, fixed_base)
 
         hwm = points[0].equity
         hwm_time = points[0].timestamp_utc
@@ -451,7 +460,10 @@ def calculate_equity_regime_facts(
                     stage_counts[2] += 1
                     stage_event_times[2].append(point.timestamp_utc)
                     stage_event_values[2].append(hwm)
-            drawdowns.append((point.timestamp_utc, Decimal(100) * (ONE - point.equity / hwm)))
+            drawdowns.append((
+                point.timestamp_utc,
+                Decimal(100) * ((hwm - point.equity) / fixed_base if fixed_base is not None else ONE - point.equity / hwm),
+            ))
             for boundary in (left28, left14, left7, end):
                 if point.timestamp_utc <= boundary:
                     hwm_values[boundary] = (hwm, hwm_time)
@@ -547,8 +559,12 @@ def classify_equity_regime(
     report_start_utc: datetime,
     report_end_utc: datetime,
     samples: Iterable[EquityRegimeSample],
+    *,
+    fixed_base: Decimal | None = None,
 ) -> EquityRegimeAssessment:
-    return assess_equity_regime(calculate_equity_regime_facts(result_id, report_start_utc, report_end_utc, samples))
+    return assess_equity_regime(calculate_equity_regime_facts(
+        result_id, report_start_utc, report_end_utc, samples, fixed_base=fixed_base,
+    ))
 
 
 __all__ = [

@@ -116,11 +116,17 @@ def _database(tmp_path: Path) -> Path:
             )
             for strategy_id in (2, 3):
                 connection.execute(
-                    "insert into selection_results values (?, ?, ?, 'FILTERED', null, null, null, null, null, false, '{}')",
+                    """insert into selection_results (
+                           selection_run_id, strategy_id, result_id_at_selection, auto_status,
+                           auto_score, auto_rank, auto_reason, analog_group_key,
+                           auto_analog_of_strategy_id, prior_rejected, stage_trace_json
+                       ) values (?, ?, ?, 'FILTERED', null, null, null, null, null, false, '{}')""",
                     [run_id, strategy_id, strategy_id],
                 )
             connection.execute(
-                "insert into selection_review_imports values (?, ?, ?, ?, 2)",
+                "insert into selection_review_imports "
+                "(review_import_id, selection_run_id, workbook_sha256, imported_at_utc, row_count) "
+                "values (?, ?, ?, ?, 2)",
                 [review_id, run_id, review_id, f"2026-09-0{number} 01:00:00+00"],
             )
             connection.execute(
@@ -132,6 +138,26 @@ def _database(tmp_path: Path) -> Path:
                 [review_id, reserve_status],
             )
     return database
+
+
+def test_prune_preview_accepts_exact_v10_schema_without_migrating(tmp_path: Path) -> None:
+    from tests.test_performance_v2_store import _prepare_v10_migration_fixture
+    from mrs3.performance_v2_store import _require_v10_catalog
+
+    database = tmp_path / "v10.duckdb"
+    with duckdb.connect(str(database)) as connection:
+        _prepare_v10_migration_fixture(connection)
+        _require_v10_catalog(connection)
+
+    result = prune_performance_v2(database, apply=False)
+
+    assert result["mode"] == "preview"
+    assert result["counts"]["strategies"] == 0
+    with duckdb.connect(str(database), read_only=True) as connection:
+        _require_v10_catalog(connection)
+        assert connection.execute(
+            "select value from schema_info where key = 'schema_version'"
+        ).fetchone()[0] == "10"
 
 
 def test_prune_child_tables_cover_initialized_fk_graph(tmp_path: Path) -> None:
@@ -180,6 +206,9 @@ def test_apply_backups_and_deletes_only_old_unprotected_strategy(tmp_path: Path)
         assert connection.execute("select count(*) from strategies").fetchone() == (4,)
         assert connection.execute("select count(*) from optimizer_prepared_inputs").fetchone() == (4,)
     assert result["counts"] == {
+        "strategy_report_metrics": 0,
+        "strategy_report_regimes": 0,
+        "strategy_report_monthly": 0,
         "equity_quality_metrics": 2,
         "window_metrics": 2,
         "strategy_actions": 2,
@@ -324,3 +353,21 @@ def test_cli_reports_a_missing_config_as_an_argument_error(
 
     assert error.value.code == 2
     assert "invalid config.performance.json" in capsys.readouterr().err
+
+
+def test_apply_deletes_report_analytics_before_results(tmp_path: Path) -> None:
+    database = _database(tmp_path)
+    with duckdb.connect(str(database)) as connection:
+        result_ids = [row[0] for row in connection.execute("select result_id from strategy_results").fetchall()]
+        for result_id in result_ids:
+            connection.execute("insert into strategy_report_metrics (result_id, gross_profit_usdt) values (?, 1.0)", [result_id])
+            connection.execute("insert into strategy_report_regimes values (?, 'TREND', 1, 1.0, 1.0, 100.0, 100.0)", [result_id])
+            connection.execute("insert into strategy_report_monthly values (?, '2026-08-01', 1.0)", [result_id])
+
+    result = prune_performance_v2(database, CUTOFF, apply=True)
+
+    assert result["counts"]["strategy_report_metrics"] == result["counts"]["strategy_results"] == 2
+    with duckdb.connect(str(database), read_only=True) as connection:
+        remaining = {row[0] for row in connection.execute("select result_id from strategy_results").fetchall()}
+        for table in ("strategy_report_metrics", "strategy_report_regimes", "strategy_report_monthly"):
+            assert {row[0] for row in connection.execute(f"select result_id from {table}").fetchall()} == remaining

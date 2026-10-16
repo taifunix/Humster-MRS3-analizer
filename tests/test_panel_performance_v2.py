@@ -19,6 +19,8 @@ import pandas as pd
 from openpyxl import Workbook, load_workbook
 import pytest
 
+from tests._protocol_v2 import use_protocol_v2_target
+
 import mrs3.panel as panel_module
 import mrs3.panel_jobs as panel_jobs_module
 from mrs3.panel_jobs import PanelJobRegistry
@@ -175,7 +177,49 @@ def test_normalization_30d_is_additive_to_window_document() -> None:
     }
 
 
-def _db(tmp_path: Path) -> tuple[duckdb.DuckDBPyConnection, int]:
+def _initialize_v11(connection: duckdb.DuckDBPyConnection) -> None:
+    """Create a schema-v11 database: the current initializer stops before the v12 migration.
+
+    DuckDB cannot drop columns from FK-referenced tables, so legacy-catalog
+    fixtures start from v11 instead of downgrading a v12 database.
+    """
+    import mrs3.performance_v2_store as store
+
+    migrate, require = store._migrate_schema_v11_to_v12, store.require_performance_v2
+    store._migrate_schema_v11_to_v12 = lambda _connection: None
+    store.require_performance_v2 = store._require_v11_catalog
+    try:
+        store.initialize_performance_v2(connection)
+    finally:
+        store._migrate_schema_v11_to_v12, store.require_performance_v2 = migrate, require
+
+
+def _rebuild_as_v11(database: Path) -> None:
+    """Copy a Panel-migrated v12 fixture into a fresh v11 database with the same markers and rows."""
+    from mrs3.performance_v2_compact import TABLES
+
+    rebuilt = database.with_name(f"{database.stem}.v11-rebuild.duckdb")
+    with duckdb.connect(str(rebuilt)) as target:
+        _initialize_v11(target)
+        origin = database.as_posix().replace("'", "''")
+        target.execute(f"attach '{origin}' as origin (read_only)")
+        target.execute("delete from main.schema_info")
+        target.execute("insert into main.schema_info select * from origin.main.schema_info")
+        target.execute("update main.schema_info set value = '11' where key = 'schema_version'")
+        for table in TABLES:
+            columns = [row[0] for row in target.execute(
+                "select column_name from information_schema.columns where table_catalog = current_database() "
+                "and table_schema = 'main' and table_name = ? order by ordinal_position", [table],
+            ).fetchall()]
+            if columns:
+                names = ", ".join(columns)
+                target.execute(f"insert into main.{table} ({names}) select {names} from origin.main.{table}")
+        target.execute("detach origin")
+    database.unlink()
+    rebuilt.rename(database)
+
+
+def _db(tmp_path: Path, *, legacy_v11: bool = False) -> tuple[duckdb.DuckDBPyConnection, int]:
     tmp_path.mkdir(parents=True, exist_ok=True)
     target = (tmp_path / "strategy_performance.duckdb").resolve()
     known_production_targets = {
@@ -186,7 +230,10 @@ def _db(tmp_path: Path) -> tuple[duckdb.DuckDBPyConnection, int]:
     assert target not in known_production_targets, "known production PerformanceDB paths are forbidden"
     assert not target.is_relative_to(Path(__file__).resolve().parents[1]), "repository databases are read-only"
     connection = duckdb.connect(str(target))
-    initialize_performance_v2(connection)
+    if legacy_v11:
+        _initialize_v11(connection)
+    else:
+        initialize_performance_v2(connection)
     now = datetime(2026, 1, 1, tzinfo=UTC)
     strategy_id = connection.execute(
         """insert into strategies (strategy_name, symbol, side, timeframe, close_ma_len,
@@ -793,7 +840,7 @@ def test_v2_panel_first_import_bootstrap_initializes_empty_and_preserves_foreign
         with duckdb.connect(str(target), read_only=True) as connection:
             assert connection.execute(
                 "select value from schema_info where key = 'schema_version'"
-            ).fetchone() == ("10",)
+            ).fetchone() == ("12",)
     else:
         assert target.read_bytes() == existing
 
@@ -1890,8 +1937,8 @@ def test_j4_missing_tester_still_publishes_terminal_import(tmp_path):
     assert registry.get(import_id)["state"] == "FAILED"
 
 
-def _controller_for_windows(tmp_path: Path) -> tuple[PanelController, Path, int]:
-    connection, result_id = _db(tmp_path / "data")
+def _controller_for_windows(tmp_path: Path, *, legacy_v11: bool = False) -> tuple[PanelController, Path, int]:
+    connection, result_id = _db(tmp_path / "data", legacy_v11=legacy_v11)
     connection.close()
     config = tmp_path / "config.local.json"
     config.write_text(json.dumps({"panel_paths": {"performance_db_root": "v1"}}), encoding="utf-8")
@@ -1901,17 +1948,65 @@ def _controller_for_windows(tmp_path: Path) -> tuple[PanelController, Path, int]
     return PanelController(tmp_path, config), tmp_path / "data" / "strategy_performance.duckdb", result_id
 
 
+def _remove_v11_catalog_additions(connection: duckdb.DuckDBPyConnection) -> None:
+    connection.execute("drop index selection_review_imports_aggregate_run_uq")
+    connection.execute("drop index selection_review_imports_run_imported_idx")
+    connection.execute("drop table selection_aggregate_imports")
+    connection.execute("drop table selection_publication_runs")
+    connection.execute("drop table selection_publications")
+    connection.execute(
+        "create temp table __selection_review_rows_before_v11 as "
+        "select * from selection_review_rows"
+    )
+    connection.execute("drop table selection_review_rows")
+    connection.execute("alter table selection_review_imports drop column aggregate_import_id")
+    connection.execute(
+        """create table selection_review_rows (
+            review_import_id VARCHAR NOT NULL REFERENCES selection_review_imports(review_import_id),
+            strategy_id BIGINT NOT NULL,
+            user_status VARCHAR NOT NULL CHECK (
+                user_status IN ('FINALIST', 'RESERVE', 'ANALOG', 'FILTERED', 'REJECTED')
+            ),
+            user_rank INTEGER CHECK (user_rank IS NULL OR user_rank > 0),
+            user_analog_of_strategy_id BIGINT,
+            comment VARCHAR,
+            PRIMARY KEY (review_import_id, strategy_id)
+        )"""
+    )
+    connection.execute(
+        """insert into selection_review_rows (
+            review_import_id, strategy_id, user_status, user_rank,
+            user_analog_of_strategy_id, comment
+        ) select review_import_id, strategy_id, user_status, user_rank,
+            user_analog_of_strategy_id, comment
+        from __selection_review_rows_before_v11"""
+    )
+    connection.execute("drop table __selection_review_rows_before_v11")
+    connection.execute(
+        "create index selection_review_imports_run_imported_idx "
+        "on selection_review_imports(selection_run_id, imported_at_utc)"
+    )
+
+
 def _make_v5_catalog(connection: duckdb.DuckDBPyConnection) -> None:
+    from mrs3.performance_v2_store import _require_v5_catalog
+
+    _remove_v11_catalog_additions(connection)
     connection.execute("drop table strategy_rejection_sources")
     connection.execute("alter table selection_results drop column equity_regime_json")
     connection.execute("drop table equity_quality_metrics")
     connection.execute("update schema_info set value = '5' where key = 'schema_version'")
+    _require_v5_catalog(connection)
 
 
 def _make_v8_catalog(connection: duckdb.DuckDBPyConnection) -> None:
+    from mrs3.performance_v2_store import _require_v8_catalog
+
+    _remove_v11_catalog_additions(connection)
     connection.execute("drop table strategy_rejection_sources")
     connection.execute("alter table selection_results drop column equity_regime_json")
     connection.execute("update schema_info set value = '8' where key = 'schema_version'")
+    _require_v8_catalog(connection)
 
 
 def _http_server(controller: PanelController):
@@ -2912,6 +3007,7 @@ def test_finalist_retest_replays_only_exact_cohort_and_config(tmp_path: Path, mo
     import mrs3.panel as panel_module
 
     controller = PanelController(tmp_path, tmp_path / "config.local.json")
+    target = use_protocol_v2_target(monkeypatch)
     database = tmp_path / "performance.duckdb"
     database.touch()
     listing = tmp_path / "dates.xlsx"
@@ -2934,10 +3030,11 @@ def test_finalist_retest_replays_only_exact_cohort_and_config(tmp_path: Path, mo
         def list(self): return [{"kind": "strategies.performance.v2.finalist-retest", "job_id": "old", "state": "COMMITTED"}]
         def runtime(self, _job_id):
             return {"scope": "FINALIST", "test_start": "2025-01-01", "test_end": "2026-09-07",
-                    "cohort_sha256": self.old_cohort, "config_sha256": panel_module.finalist_retest_config_digest({"LONG": str(template)}),
-                    "outcomes_finalized": True, "successful_replacements": [{"strategy_id": 1}]}
+                    "cohort_sha256": self.old_cohort, "config_sha256": panel_module.finalist_retest_config_digest({"LONG": str(template)}, evaluation=target),
+                    "outcomes_finalized": True, "successful_replacements": [{"strategy_id": 1}],
+                    **controller._protocol_v2_runtime(target)}
 
-    monkeypatch.setattr(controller, "_retest_listing_context", lambda: (listing, Path("dates.xlsx")))
+    monkeypatch.setattr(controller, "_retest_listing_context", lambda: (listing, Path("dates.xlsx"), None))
     monkeypatch.setattr(controller, "_performance_v2_config", lambda: SimpleNamespace(strategy_root=tmp_path / "Output" / "strategies"))
     monkeypatch.setattr(controller, "_workflow_defaults", lambda: {"strategy_templates": {"LONG": str(template)}})
     monkeypatch.setattr(controller, "_bulk_retest_range", lambda *_args: ("2025-01-01", "2026-09-07"))
@@ -2952,14 +3049,14 @@ def test_finalist_retest_replays_only_exact_cohort_and_config(tmp_path: Path, mo
     monkeypatch.setattr(panel_module.duckdb, "connect", lambda *_args, **_kwargs: Connection())
     monkeypatch.setattr(panel_module, "freeze_finalist_cohort", lambda *_args, **_kwargs: cohort)
     monkeypatch.setattr(panel_module, "build_finalist_retest_manifest", lambda *_args, **_kwargs: SimpleNamespace(
-        cohort=cohort, config_sha256=panel_module.finalist_retest_config_digest({"LONG": str(template)}),
+        cohort=cohort, config_sha256=panel_module.finalist_retest_config_digest({"LONG": str(template)}, evaluation=target),
         manifest_path=manifest, run_id="new-run",
     ))
 
     controller._panel_jobs = Jobs("old-cohort")  # type: ignore[assignment]
     started: dict[str, object] = {}
     monkeypatch.setattr(controller, "_single_mode_strategy_test", lambda: SimpleNamespace(start=lambda *_args, **kwargs: started.update(kwargs)))
-    assert controller.strategies_performance_v2_finalist_retest_start({"clear_reports": True, "initial_balance": "2500.5"})["job_id"] == "new"
+    assert controller.strategies_performance_v2_finalist_retest_start({"clear_reports": True})["job_id"] == "new"
     assert captured["runtime"]["cohort_members"] == [{"strategy_id": 1, "effective_start": "2026-01-01T00:00:00Z"}]
     snapshot = captured["runtime"]["equity_filter_snapshot"]
     assert snapshot["schema_version"] == 1
@@ -2971,9 +3068,9 @@ def test_finalist_retest_replays_only_exact_cohort_and_config(tmp_path: Path, mo
     assert snapshot["regime_policy_sha256"]
     captured["submit"]("new")
     assert captured["request"]["clear_reports"] is True
-    assert captured["request"]["initial_balance"] == 2500.5
     assert started["clear_reports"] is True
-    assert started["initial_balance"] == 2500.5
+    # Protocol v2 §4.3: the retest runs on the base of its template, no start balance.
+    assert "initial_balance" not in started
     controller._panel_jobs = Jobs("new-cohort")  # type: ignore[assignment]
     assert controller.strategies_performance_v2_finalist_retest_start({}) == {"job_id": "old", "replayed": True}
 
@@ -4356,7 +4453,7 @@ def test_selection_memo_reloads_filter_only_candidates_for_rank_only_request(
 
 
 def test_recalculate_requires_offline_migration_for_existing_v8_database(tmp_path: Path) -> None:
-    controller, database, _ = _controller_for_windows(tmp_path)
+    controller, database, _ = _controller_for_windows(tmp_path, legacy_v11=True)
     with duckdb.connect(str(database)) as connection:
         _make_v8_catalog(connection)
     before_file = (sha256(database.read_bytes()).hexdigest(), database.stat().st_mtime_ns)
@@ -4387,26 +4484,61 @@ def test_panel_schema_preflight_initializes_an_empty_new_database(tmp_path: Path
     with duckdb.connect(str(database), read_only=True) as connection:
         assert connection.execute(
             "select value from schema_info where key = 'schema_version'"
-        ).fetchone() == ("10",)
+        ).fetchone() == ("12",)
         assert connection.execute(
             "select count(*) from information_schema.tables where table_name = 'strategy_rejection_sources'"
         ).fetchone() == (1,)
 
 
-def test_panel_schema_preflight_migrates_v9_to_v10(tmp_path: Path) -> None:
+def test_panel_schema_preflight_migrates_v9_to_v11(tmp_path: Path) -> None:
     controller, database, _ = _controller_for_windows(tmp_path)
+    from tests.test_performance_v2_store import _initialize_v9_fixture
+
+    database.unlink()
     with duckdb.connect(str(database)) as connection:
-        connection.execute("alter table selection_review_rows alter column user_status set not null")
-        connection.execute("update schema_info set value = '9' where key = 'schema_version'")
+        _initialize_v9_fixture(connection)
 
     controller._ensure_performance_v2_schema(database)
 
     with duckdb.connect(str(database), read_only=True) as connection:
-        assert connection.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("10",)
+        assert connection.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("12",)
         assert connection.execute(
             "select is_nullable from information_schema.columns "
             "where table_name = 'selection_review_rows' and column_name = 'user_status'"
         ).fetchone() == ("YES",)
+
+
+def test_panel_schema_preflight_migrates_exact_v10_catalog_to_v11(tmp_path: Path) -> None:
+    controller, database, _ = _controller_for_windows(tmp_path)
+    from tests.test_performance_v2_store import _prepare_v10_migration_fixture
+
+    database.unlink()
+    with duckdb.connect(str(database)) as connection:
+        _prepare_v10_migration_fixture(connection)
+
+    controller._ensure_performance_v2_schema(database)
+
+    with duckdb.connect(str(database), read_only=True) as connection:
+        assert connection.execute(
+            "select value from schema_info where key = 'schema_version'"
+        ).fetchone() == ("12",)
+
+
+def test_panel_read_only_catalog_opens_exact_v10_without_migrating(tmp_path: Path) -> None:
+    controller, database, _ = _controller_for_windows(tmp_path)
+    from tests.test_performance_v2_store import _prepare_v10_migration_fixture
+    from mrs3.performance_v2_store import _require_v10_catalog
+
+    database.unlink()
+    with duckdb.connect(str(database)) as connection:
+        _prepare_v10_migration_fixture(connection)
+
+    catalog = controller.performance_v2_catalog()
+
+    assert catalog["strategies"] == []
+    assert catalog["selection_pairs_with_runs"] == []
+    with duckdb.connect(str(database), read_only=True) as connection:
+        _require_v10_catalog(connection)
 
 
 def test_panel_schema_preflight_maps_corrupt_database_to_schema_invalid(tmp_path: Path) -> None:
@@ -4529,8 +4661,9 @@ def test_equity_rank_readiness_is_gated_only_by_enabled_rank(
 def test_equity_rank_cache_status_maps_v5_upgrade_and_keeps_disabled_method_legacy(
     tmp_path: Path,
 ) -> None:
-    controller, database, _ = _controller_for_windows(tmp_path)
+    controller, database, _ = _controller_for_windows(tmp_path, legacy_v11=True)
     controller.strategies_performance_v2_recalculate({"symbol": "BTCUSDT", "side": "LONG"})
+    _rebuild_as_v11(database)
     with duckdb.connect(str(database)) as connection:
         _make_v5_catalog(connection)
 
@@ -4558,7 +4691,7 @@ def test_equity_rank_cache_status_maps_v5_upgrade_and_keeps_disabled_method_lega
 
 
 def test_equity_rank_v5_upgrade_error_precedes_empty_cohort_readiness(tmp_path: Path) -> None:
-    controller, database, _ = _controller_for_windows(tmp_path)
+    controller, database, _ = _controller_for_windows(tmp_path, legacy_v11=True)
     with duckdb.connect(str(database)) as connection:
         _make_v5_catalog(connection)
     payload = {"symbol": "NO_CANDIDATES", "side": "LONG", "stages": [
@@ -4636,9 +4769,10 @@ def test_selection_preview_reuses_candidates_until_recalculation(tmp_path: Path,
 
 
 def test_performance_v2_catalog_and_cache_status_do_not_upgrade_v5_on_read(tmp_path: Path) -> None:
-    controller, database, _ = _controller_for_windows(tmp_path)
+    controller, database, _ = _controller_for_windows(tmp_path, legacy_v11=True)
     payload = {"symbol": "BTCUSDT", "side": "LONG", "stages": []}
     controller.strategies_performance_v2_recalculate(payload)
+    _rebuild_as_v11(database)
     with duckdb.connect(str(database)) as connection:
         _make_v5_catalog(connection)
 
@@ -4960,20 +5094,27 @@ def test_selection_recalculate_passes_only_missing_strategy_ids(tmp_path: Path, 
     assert calls and calls[0][0][-1] == (17, 23) and calls[0][1] == {"include_equity_regime": True}
 
 
-def test_valid_v10_schema_check_does_not_open_writer_with_reader_present(tmp_path: Path) -> None:
+def test_valid_v11_schema_check_does_not_open_writer_with_reader_present(tmp_path: Path, monkeypatch) -> None:
     controller, database, _ = _controller_for_windows(tmp_path)
+    original_connect = duckdb.connect
+
+    def reject_writer(*args, **kwargs):
+        if not kwargs.get("read_only", False):
+            raise AssertionError("v11 schema preflight attempted a writer open")
+        return original_connect(*args, **kwargs)
 
     with duckdb.connect(str(database), read_only=True) as reader:
-        assert reader.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("10",)
+        assert reader.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("12",)
+        monkeypatch.setattr(panel_module.duckdb, "connect", reject_writer)
         controller._ensure_performance_v2_schema(database)
 
 
-def test_cached_v10_schema_check_skips_reopen_with_reader_present(tmp_path: Path, monkeypatch) -> None:
+def test_cached_v11_schema_check_skips_reopen_with_reader_present(tmp_path: Path, monkeypatch) -> None:
     controller, database, _ = _controller_for_windows(tmp_path)
     controller._ensure_performance_v2_schema(database)
 
     with duckdb.connect(str(database), read_only=True) as reader:
-        assert reader.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("10",)
+        assert reader.execute("select value from schema_info where key = 'schema_version'").fetchone() == ("12",)
 
         def unexpected_reopen(*_args, **_kwargs):
             raise AssertionError("schema cache hit reopened the database")
@@ -4982,7 +5123,7 @@ def test_cached_v10_schema_check_skips_reopen_with_reader_present(tmp_path: Path
         controller._ensure_performance_v2_schema(database)
 
 
-def test_v10_schema_check_rejects_malformed_catalog(tmp_path: Path) -> None:
+def test_v11_schema_check_rejects_malformed_catalog(tmp_path: Path) -> None:
     controller, database, _ = _controller_for_windows(tmp_path)
     with duckdb.connect(str(database)) as connection:
         connection.execute("drop table strategy_rejection_sources")
@@ -4994,7 +5135,7 @@ def test_v10_schema_check_rejects_malformed_catalog(tmp_path: Path) -> None:
     assert raised.value.status == 500
 
 
-def test_v10_schema_check_repairs_missing_window_column(tmp_path: Path) -> None:
+def test_v11_schema_check_repairs_missing_window_column(tmp_path: Path) -> None:
     controller, database, _ = _controller_for_windows(tmp_path)
     with duckdb.connect(str(database)) as connection:
         connection.execute("alter table window_metrics drop column holding_seconds")
@@ -5227,9 +5368,10 @@ def test_recalculate_runs_real_window_workers_under_controller_lock(
 def test_selection_recalculate_maps_equity_cache_errors_to_typed_api_errors(
     tmp_path: Path, monkeypatch, schema: str, code: str, status: int,
 ) -> None:
-    controller, database, _ = _controller_for_windows(tmp_path)
+    controller, database, _ = _controller_for_windows(tmp_path, legacy_v11=True)
     if schema == "v5":
         controller.strategies_performance_v2_recalculate({"symbol": "BTCUSDT", "side": "LONG"})
+        _rebuild_as_v11(database)
         with duckdb.connect(str(database)) as connection:
             _make_v5_catalog(connection)
     else:
@@ -5815,3 +5957,113 @@ def test_v2_current_result_switch_does_not_reuse_r1_window_cache(tmp_path: Path)
     assert r2["result_id"] == r2_id != r1_id
     assert r2["window_a"]["availability_status"] == "AVAILABLE"
     assert r2["window_a"]["return_pct"] == "25.000000000000"
+
+
+def test_panel_creates_bound_database_and_refuses_a_different_exchange(tmp_path: Path) -> None:
+    controller, database, _ = _controller_for_windows(tmp_path)
+    database.unlink()
+    database.write_bytes(b"")
+    (tmp_path / "config.performance.json").write_text(json.dumps({"unified_performance_v2": {
+        "database_root": "data", "evaluation_protocol": "v2", "exchange": "Bybit"}}), encoding="utf-8")
+
+    controller._ensure_performance_v2_schema(database)
+
+    with duckdb.connect(str(database), read_only=True) as connection:
+        assert dict(connection.execute(
+            "select key, value from schema_info where key in ('schema_version', 'evaluation_protocol', 'exchange')"
+        ).fetchall()) == {"schema_version": "12", "evaluation_protocol": "v2", "exchange": "Bybit"}
+
+    (tmp_path / "config.performance.json").write_text(json.dumps({"unified_performance_v2": {
+        "database_root": "data", "evaluation_protocol": "v2", "exchange": "OKX"}}), encoding="utf-8")
+    restarted = PanelController(tmp_path, tmp_path / "config.local.json")
+    with pytest.raises(PerformanceV2ApiError) as raised:
+        restarted._ensure_performance_v2_schema(database)
+    assert (raised.value.code, raised.value.status) == ("EXCHANGE_MISMATCH", 409)
+
+
+def test_panel_rechecks_identity_when_only_the_configuration_changes(tmp_path: Path) -> None:
+    controller, database, _ = _controller_for_windows(tmp_path)
+    database.unlink()
+    database.write_bytes(b"")
+    config_path = tmp_path / "config.performance.json"
+    config_path.write_text(json.dumps({"unified_performance_v2": {
+        "database_root": "data", "evaluation_protocol": "v2", "exchange": "Bybit"}}), encoding="utf-8")
+    controller._ensure_performance_v2_schema(database)
+    controller._ensure_performance_v2_schema(database)  # cached
+
+    config_path.write_text(json.dumps({"unified_performance_v2": {"database_root": "data"}}), encoding="utf-8")
+    with pytest.raises(PerformanceV2ApiError) as raised:
+        controller._ensure_performance_v2_schema(database)
+    assert (raised.value.code, raised.value.status) == ("EVALUATION_PROTOCOL_MISMATCH", 409)
+
+
+def test_panel_refuses_mismatching_v11_database_without_migrating_it(tmp_path: Path) -> None:
+    controller, database, _ = _controller_for_windows(tmp_path, legacy_v11=True)
+    (tmp_path / "config.performance.json").write_text(json.dumps({"unified_performance_v2": {
+        "database_root": "data", "evaluation_protocol": "v2", "exchange": "Bybit"}}), encoding="utf-8")
+
+    with pytest.raises(PerformanceV2ApiError) as raised:
+        controller._ensure_performance_v2_schema(database)
+
+    assert raised.value.code == "EVALUATION_PROTOCOL_MISMATCH"
+    with duckdb.connect(str(database), read_only=True) as connection:
+        assert connection.execute(
+            "select value from schema_info where key = 'schema_version'"
+        ).fetchone() == ("11",)
+
+
+def test_v2_catalog_adds_ma_facts_only_when_set(tmp_path: Path) -> None:
+    connection, _ = _db(tmp_path)
+    legacy = performance_v2_catalog(connection)
+    assert all(
+        "close_ma_type" not in strategy and all("open_ma_type" not in order for order in strategy["orders"])
+        for strategy in legacy["strategies"]
+    )
+
+    connection.execute("update strategies set close_ma_type = 'SMA', close_ma_source = 'ohlc4'")
+    connection.execute("update strategy_orders set open_ma_source = 'close'")
+    strategy = performance_v2_catalog(connection)["strategies"][0]
+
+    assert (strategy["close_ma_type"], strategy["close_ma_source"]) == ("SMA", "ohlc4")
+    assert all(order["open_ma_source"] == "close" and "open_ma_type" not in order for order in strategy["orders"])
+
+
+def test_v2_catalog_shows_lot_mode_only_for_fixed_results(tmp_path: Path) -> None:
+    connection, _ = _db(tmp_path)
+    assert all("lot_mode" not in strategy for strategy in performance_v2_catalog(connection)["strategies"])
+
+    connection.execute(
+        """update strategy_results set sizing_use_upnl = false, sizing_use_frozen_balance = true,
+           sizing_use_fix = true, sizing_max_balance = 0, sizing_my_fix_balance = 10000,
+           sizing_balance_percentage_long = 100, sizing_risk_long = 1"""
+    )
+    strategy = performance_v2_catalog(connection)["strategies"][0]
+
+    assert strategy["lot_mode"] == "FIXED"
+    assert Decimal(str(strategy["lot_base"])) == Decimal("10000")
+
+
+def test_performance_v2_export_shows_fixed_drawdown_on_the_base(tmp_path: Path) -> None:
+    controller, database, result_id = _controller_for_windows(tmp_path)
+    with duckdb.connect(str(database)) as connection:
+        strategy_id = connection.execute("select strategy_id from strategies where strategy_name = 'alpha'").fetchone()[0]
+        connection.execute(
+            "insert into strategy_tags (strategy_id, tag, source, source_ref, updated_at_utc) values (?, 'RETEST', 'TEST', 'fixture', now())",
+            [strategy_id],
+        )
+        connection.execute(
+            """update strategy_results set max_drawdown = 5, max_drawdown_pct = 4, sizing_use_upnl = false,
+               sizing_use_frozen_balance = true, sizing_use_fix = true, sizing_max_balance = 0,
+               sizing_my_fix_balance = 50, sizing_balance_percentage_long = 100, sizing_risk_long = 1
+               where result_id = ?""",
+            [result_id],
+        )
+    controller.strategies_performance_v2_recalculate({"symbol": "BTCUSDT", "side": "LONG"})
+
+    _, payload = controller.strategies_performance_v2_export(panel_module.parse_performance_v2_export_query("retest=1"))
+    sheet = load_workbook(BytesIO(payload), data_only=False)["All candidates"]
+    headers = {cell.value: cell.column for cell in sheet[1]}
+
+    # 5 USDT over B = 50 is 10%, not the report's peak-relative 4%.
+    assert Decimal(str(sheet.cell(2, headers["DD"]).value)) == Decimal("10")
+    assert sheet.cell(2, headers["Lot mode"]).value == "FIXED"

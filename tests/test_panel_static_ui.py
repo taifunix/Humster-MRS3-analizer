@@ -3,6 +3,8 @@ from pathlib import Path
 import re
 import subprocess
 
+import pytest
+
 
 PANEL_WEB = Path(__file__).parents[1] / "src" / "mrs3" / "panel_web"
 
@@ -46,7 +48,7 @@ const context = {
   testerStop: { disabled: true }, testerJobId: 'job-1',
   testerCard: { querySelector: () => ({ className: '', textContent: '' }) },
   testerIsTerminal: (job) => ['COMMITTED', 'FAILED', 'CANCELLED'].includes(job.state),
-  collectionIsActive: () => false, collectionImportReady: () => false,
+  collectionIsActive: () => false, collectionModeSelected: () => false, collectionImportReady: () => false,
   normalImportAuthorized: false, authorizedTesterJobId: '',
   testerCollectionId: '', normalVerifyInFlight: false, collectionActionBusy: false, collectionActivePacks: 0,
   inboxVerifyV2: { disabled: true }, importStartV2: { disabled: true },
@@ -79,6 +81,13 @@ def test_researched_filters_have_fixed_order_and_editable_settings() -> None:
     assert 'id="performance-v2-selection-settings"' in html
     assert '/api/v2/strategies/performance-v2/selection-settings' in js
     assert "'pair_side_stage_3'" in js
+    legacy = html.split('id="performance-v2-selection-legacy-filters"', 1)[1].split('</details>', 1)[0]
+    assert "Legacy filters 11" in legacy
+    assert legacy.count('data-selection-stage=') == 17
+    assert '.selection-stage-legacy-details' in css
+    assert 'const stages = orderedSelectionStages();' in js
+    assert 'target.parentElement !== stage.parentElement' in js
+    assert 'target.parentElement.insertBefore(stage' in js
     defaults = js.split("const defaultEnabledSelectionStages = new Set([", 1)[1].split("]);", 1)[0]
     enabled = set(re.findall(r"'([^']+)'", defaults))
     stage_bodies = re.findall(r'<li class="selection-stage[^>]*" data-selection-stage="([^"]+)">(.*?)</li>', html, re.S)
@@ -741,8 +750,8 @@ def test_performance_v2_maintenance_card_starts_with_catalog_and_requires_previe
     assert 'id="performance-v2-maintenance-full"' in card
     assert 'id="performance-v2-maintenance-confirm"' in card
     assert 'id="performance-v2-maintenance-rejected-warning"' in card
-    assert "Тот же отчёт будет пропущен дедупликацией" in card
-    assert "отчёт с более узким периодом" in card
+    assert "компактная запись остаётся только для дедупликации" in card
+    assert "Равный, более узкий и более широкий отчёт с тем же типизированным ключом будет пропущен" in card
     assert 'id="performance-v2-maintenance-progress" class="progress-block"' in card
     assert 'id="performance-v2-maintenance-status" class="card-status" role="status"' in card
     assert "grid-template-columns: repeat(4, minmax(0, 1fr))" in css
@@ -753,7 +762,7 @@ def test_performance_v2_maintenance_card_starts_with_catalog_and_requires_previe
     assert "body: JSON.stringify({ operation, symbols })" in js
     assert "body: JSON.stringify({ token: previewToken })" in js
     assert "Удалено стратегий ${maintenanceCount(deletedStrategies)} из ${maintenanceCount(strategyTotal)}" in js
-    assert "Обработано стратегий ${maintenanceCount(strategyTotal)} из ${maintenanceCount(strategyTotal)}" in js
+    assert "Архивировано стратегий ${maintenanceCount(strategyTotal)} из ${maintenanceCount(strategyTotal)}" in js
     assert "удалено ${maintenanceCount(deleted)} из ${maintenanceCount(total)} строк выбранных пар" in js
     assert "`${strategyProgress}; удалено ${maintenanceCount(deleted)} из ${maintenanceCount(total)} строк выбранных пар`" in js
     assert "job.global_journal_counts || {}" in js
@@ -1251,7 +1260,9 @@ def test_fixed_five_stage_prefix_has_equity_off_and_no_scope_or_move_controls() 
         re.S,
     )
     assert "fixedSelectionPrefix.has(target.dataset.selectionStage)" in js
-    assert "fixedSelectionPrefix.has(stage.previousElementSibling?.dataset.selectionStage)" in js
+    assert "selectionPreviewOrder.querySelectorAll('[data-selection-stage]')" in js
+    assert "const sameParent = (candidate) => candidate?.parentElement === stage.parentElement;" in js
+    assert "target.parentElement !== stage.parentElement" in js
 
     fixed = re.search(r"const fixedSelectionPrefix = new Set\(\[(.*?)\]\);", js, re.S)
     default = re.search(r"const defaultSelectionStageOrder = \[(.*?)\];", js, re.S)
@@ -1509,19 +1520,19 @@ def test_tester_dates_and_local_ranges_are_sent_only_on_tester_start() -> None:
     assert "testerEndDate?.value" in tester_handler
     assert "start_date: startDate" in tester_handler
     assert "end_date: endDate" in tester_handler
-    assert "tester-initial-balance" in js
-    assert "initial_balance: initialBalance" in tester_handler
+    # Protocol v2 §4.3: the tester runs on the base of its template.
+    assert "initial_balance" not in tester_handler
     for marker in ("shortlist", "analyze", "generate"):
         assert f"tester-range-{marker}" not in js
 
 
-def test_each_single_mode_card_sends_its_initial_balance_only_to_its_start_route() -> None:
+def test_mrs3_cards_have_no_start_balance_field() -> None:
     js = _read("app.js")
 
-    assert "performance-v2-finalist-retest-initial-balance" in js
-    assert "performance-v2-retest-initial-balance" in js
-    assert "payload.initial_balance = finalistInitialBalance" in js
-    assert "initial_balance: retestInitialBalance" in js
+    # Protocol v2 §4.3: the start-balance field is removed from the three MRS3 flows.
+    for marker in ("tester-initial-balance", "performance-v2-finalist-retest-initial-balance",
+                   "performance-v2-retest-initial-balance", "initial_balance"):
+        assert marker not in js
 
 
 def test_tester_card_exposes_single_mode_and_hides_fast_controls() -> None:
@@ -1649,13 +1660,17 @@ def test_single_mode_collection_launch_is_strict_boolean_and_status_is_server_ow
     assert "requestJson('/api/v2/jobs')" not in loader
 
 
-def test_collection_status_restores_checkbox_without_authorizing_import() -> None:
+def test_collection_status_does_not_change_next_launch_checkbox_or_authorize_import() -> None:
+    html = _read("index.html")
     js = _read("app.js")
-    loader = js.split("const loadTesterCollection", 1)[1].split("const setTesterControls", 1)[0]
 
     render_collection = js.split("const renderTesterCollection", 1)[1].split("const loadTesterCollection", 1)[0]
+    checkbox_initialization = js.split("const testerCollectReports", 1)[1].split("const testerCollectionStatus", 1)[0]
     assert "['OPEN', 'VERIFIED'].includes(state)" in render_collection
-    assert "testerCollectReports.checked =" in render_collection
+    checkbox = html.split('id="tester-collect-reports"', 1)[1].split(">", 1)[0]
+    assert "checked" not in checkbox
+    assert "testerCollectReports.checked = false;" in checkbox_initialization
+    assert "testerCollectReports.checked" not in render_collection
     assert "normalImportAuthorized = false;" in js.split("const loadTesterCollection", 1)[1]
     assert "authorizedTesterJobId = '';" in js.split("const loadTesterCollection", 1)[1]
     for field in ("total_registered_packs", "exact_committed_report_count", "active_packs", "failed_cancelled_packs"):
@@ -1667,7 +1682,9 @@ def test_collection_verify_and_import_use_exact_collection_id_and_gate_active_me
     verify = js.split("inboxVerifyV2?.addEventListener", 1)[1].split("importStartV2?.addEventListener", 1)[0]
     import_handler = js.split("importStartV2?.addEventListener", 1)[1].split("const recoverSplitJobs", 1)[0]
 
+    assert "const collectionModeSelected = () => testerCollectReports?.checked === true && collectionIsActive();" in js
     assert "collectionActivePacks > 0" in verify
+    assert "const collectionId = collectionModeSelected() ? testerCollectionId : '';" in verify
     assert "const verifyJobId = collectionId || testerJobId;" in verify
     assert "job_id: verifyJobId" in verify
     assert "authorizedTesterJobId = verifyJobId;" in verify
@@ -2588,13 +2605,87 @@ def test_normal_recovery_uses_created_date_and_suitable_job_priority() -> None:
     assert "['strategies.tester.start', 'strategies.tester.retry'].includes(job.kind) && job.retest !== true" in recovery
     assert "Number.isFinite(Date.parse(job.created_at_utc))" in recovery
     assert "['QUEUED', 'RUNNING', 'CANCELLING'].includes(job.state)" in recovery
-    assert "job.state === 'COMMITTED' && job.inbox_ready === true" in recovery
+    assert "job.state === 'COMMITTED'" in recovery
+    assert "job.state === 'COMMITTED' && job.inbox_ready === true" not in recovery
     assert "['FAILED', 'CANCELLED'].includes(job.state)" in recovery
     assert "Date.parse(b.created_at_utc) - Date.parse(a.created_at_utc)" in recovery
     assert "String(b.job_id).localeCompare(String(a.job_id))" in recovery
     assert "const tester = testerJobs[0];" in recovery
     assert ".reverse()" not in recovery
     assert "testerJobs.find((job) => !testerIsTerminal(job))" not in recovery
+
+
+def test_collection_choice_and_committed_unverified_recovery_behavior() -> None:
+    js = _read("app.js")
+    init_start = js.index("  const testerCollectReports =")
+    init_end = js.index("  const testerCollectionStatus", init_start)
+    selection_start = js.index("  const collectionIsActive =")
+    selection_end = js.index("  const refreshCollectionActionControls", selection_start)
+    change_start = js.index("  testerCollectReports?.addEventListener('change'")
+    change_end = js.index("  const renderTesterCollection", change_start)
+    recovery_start = js.index("  const recoverJobs = async () =>")
+    recovery_end = js.index("  const importStartV2", recovery_start)
+    recovery = js[recovery_start:recovery_end]
+    script = r"""
+const assert = require('node:assert/strict');
+const vm = require('node:vm');
+const checkbox = { checked: true, addEventListener: (_name, handler) => { checkbox.change = handler; } };
+const rendered = [];
+const requests = [];
+const context = {
+      assert,
+      rendered,
+      requests,
+  document: { querySelector: (selector) => selector === '#tester-collect-reports' ? checkbox : null },
+  testerCollectionId: 'collection-1', testerCollectionState: 'VERIFIED',
+  collectionCommittedPacks: 1, normalImportAuthorized: true, authorizedTesterJobId: 'old',
+  normalVerifyEpoch: 3, testerJobId: '', testerIsTerminal: (job) => ['COMMITTED', 'FAILED', 'CANCELLED'].includes(job.state),
+  requestJson: async (path) => { requests.push(path); return { jobs: [
+    { job_id: 'collection-job', kind: 'strategies.tester.collection', state: 'COMMITTED', inbox_ready: false, created_at_utc: '2026-10-15T11:00:00Z' },
+    { job_id: 'ordinary-unverified', kind: 'strategies.tester.start', state: 'COMMITTED', inbox_ready: false, created_at_utc: '2026-10-15T10:00:00Z' },
+  ] }; },
+  renderTester: (job) => rendered.push(job), pollTester: async () => {}, startTesterPolling: () => {},
+};
+vm.createContext(context);
+(async () => {
+await vm.runInContext(`let testerCollectionState = 'VERIFIED';
+let testerCollectionId = 'collection-1';
+let collectionCommittedPacks = 1;
+let normalImportAuthorized = true;
+let authorizedTesterJobId = 'old';
+let normalVerifyEpoch = 3;
+const refreshCollectionActionControls = () => {};
+${__INIT__}
+${__SELECT__}
+${__CHANGE__}
+${__RECOVERY__}
+(async () => {
+  assert.equal(testerCollectReports.checked, false);
+  assert.equal(collectionModeSelected(), false);
+  assert.equal(await recoverJobs(), undefined);
+  assert.equal(testerJobId, 'ordinary-unverified');
+  assert.equal(rendered[0].inbox_ready, false);
+  assert.equal(testerCollectReports.checked, false);
+  assert.equal(collectionModeSelected(), false);
+  assert.equal(JSON.stringify(requests), JSON.stringify(['/api/v2/jobs']));
+  testerCollectReports.checked = true;
+  assert.equal(collectionModeSelected(), true);
+  testerCollectReports.change();
+  assert.equal(normalImportAuthorized, false);
+  assert.equal(authorizedTesterJobId, '');
+  assert.equal(normalVerifyEpoch, 4);
+})()`, context);
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+"""
+    for placeholder, value in (
+        ("__INIT__", js[init_start:init_end]),
+        ("__SELECT__", js[selection_start:selection_end]),
+        ("__CHANGE__", js[change_start:change_end]),
+        ("__RECOVERY__", js[recovery_start:recovery_end]),
+    ):
+        script = script.replace("${" + placeholder + "}", value)
+    result = subprocess.run(["node", "-e", script], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
 
 
 def test_completed_single_mode_handoff_is_verifiable_before_target_cleanup() -> None:
@@ -3103,7 +3194,7 @@ def test_portfolio_pair_selection_preserves_per_row_limits() -> None:
     assert ".filter((row) => row.pair && (row.finalistLong > 0 || row.finalistShort > 0))" in js
     assert "Нет пар с финалистами LONG или SHORT." in portfolio
     assert "copyPortfolioMaximum" not in portfolio
-    assert "pairInfo.append(label, count); pairCell.append(pairInfo)" in portfolio
+    assert "pairInfo.append(label, count); pairCell.append(pairInfo); tableRow.append(pairCell, historyCell)" in portfolio
     assert "row.selected = selected.checked; updateControls();" in portfolio
     assert "portfolioSafeInteger(profile.candidates, 1) && Number(profile.candidates) <= 50" in portfolio
 
@@ -3205,8 +3296,8 @@ def test_portfolio_stage2_confirmation_and_batch_progress_use_server_job() -> No
     assert "job.stage?.name" in stage2
     assert "window.confirm" in submit
     assert "state.job.campaign_id" in submit
-    assert "state.job.executables_count" in submit
-    assert "JSON.stringify({ confirmed: true, campaign_id: campaignId })" in submit
+    assert "state.stage2Selected.has(id)" in submit
+    assert "JSON.stringify({ confirmed: true, campaign_id: campaignId, candidate_ids: selectedIds })" in submit
     assert "tester-submissions" in submit
     assert "if (!confirmed)" in submit
     assert submit.index("stage2Submit.disabled = true") < submit.index("window.confirm")
@@ -3650,7 +3741,7 @@ const checks = {
 };
 if (Object.values(checks).some((value) => !value)) process.exit(1);
 """
-    completed = subprocess.run(("node", "-e", script), capture_output=True, text=True)
+    completed = subprocess.run(("node", "-"), input=script, capture_output=True, text=True, encoding="utf-8")
     assert completed.returncode == 0, completed.stderr or completed.stdout
 
 
@@ -3776,6 +3867,32 @@ def test_portfolio_duplicate_or_busy_recovers_and_keeps_campaign_frozen() -> Non
     assert "PORTFOLIO_JOB_BUSY" in portfolio
 
 
+def test_portfolio_terminal_job_remains_visible_without_freezing_stage1_form() -> None:
+    js = _read("app.js")
+    portfolio = js.split("function loadPortfolioScreen", 1)[1].split("function loadPortfolioSettings", 1)[0]
+    recover = portfolio.split("const recoverPortfolioJob", 1)[1].split("const refreshPortfolio", 1)[0]
+    poll = portfolio.split("const pollPortfolioJob", 1)[1].split("const startPortfolioPolling", 1)[0]
+
+    assert "setLocked(!terminal(candidate))" in recover
+    assert "if (terminal(state.job)) setLocked(false)" in recover
+    assert "else setLocked(false)" in poll
+    assert "newButton.disabled = preparationState === 'PREPARING' || !jobTerminal" in portfolio
+
+
+def test_portfolio_form_shows_live_combination_count_and_selection_mode() -> None:
+    html = _read("index.html")
+    js = _read("app.js")
+    portfolio = js.split("function loadPortfolioScreen", 1)[1].split("function loadPortfolioSettings", 1)[0]
+    controls = portfolio.split("const updateControls", 1)[1].split("const renderJournal", 1)[0]
+
+    assert 'id="portfolio-combination-count"' in html
+    assert "portfolioCombinationCount(launch.selectedPairs)" in controls
+    assert "Number.isSafeInteger(value) && value > 0" in portfolio
+    assert "portfolioCombinationFactor(row.long, row.finalistLong)" in portfolio
+    assert "MILP-фронтир по уровням банка" in controls
+    assert "#portfolio-combination-count" in controls
+
+
 def test_portfolio_overall_progress_does_not_claim_unknown_stage_is_known() -> None:
     js = _read("app.js")
     portfolio = js.split("function loadPortfolioScreen", 1)[1].split("function loadPortfolioSettings", 1)[0]
@@ -3833,3 +3950,136 @@ def test_portfolio_settings_has_editable_risk_controls_and_scoped_alignment() ->
     assert 'class="field-grid portfolio-settings-field-grid"' in html
     assert ".portfolio-settings-field-grid { align-items: start; }" in css
     assert ".portfolio-settings-field-grid .field-group > label" in css
+
+
+def _run_selection_helpers(script: str, tmp_path: Path) -> dict:
+    import shutil
+
+    node = shutil.which("node") or shutil.which("node", path=r"C:\Program Files\nodejs")
+    if node is None:
+        pytest.skip("node is not available")
+    js = _read("app.js")
+    start = js.index("/* portfolio-selection-helpers:start */")
+    end = js.index("/* portfolio-selection-helpers:end */")
+    source = tmp_path / "selection.js"
+    source.write_text(js[start:end] + "\n" + script, encoding="utf-8")
+    completed = subprocess.run((node, str(source)), capture_output=True, text=True, encoding="utf-8")
+    assert completed.returncode == 0, completed.stderr
+    return json.loads(completed.stdout)
+
+
+def test_portfolio_selection_summary_uses_rank_cutoff_history_and_estimates_runtime(tmp_path: Path) -> None:
+    result = _run_selection_helpers("""
+const h = portfolioSelectionHelpers;
+const history = {
+  'AAAUSDT|LONG': [{rank: 1, start: '2026-09-01', end: '2026-09-30'}, {rank: 2, start: '2026-09-10', end: '2026-09-25'}],
+  'BBBUSDT|SHORT': [{rank: 1, start: '2026-09-05', end: '2026-10-05'}],
+};
+const rows = [
+  {pair: 'AAAUSDT', long: 1, short: 0, finalistLong: 2, finalistShort: 0},
+  {pair: 'BBBUSDT', long: 0, short: 3, finalistLong: 0, finalistShort: 1},
+];
+const pairA = h.pairWindow(rows[0], history);
+const pairA2 = h.pairWindow({...rows[0], long: 2}, history);
+const summary = h.summary(rows, history, [{candidates: 10}]);
+const big = h.summary(Array.from({length: 61}, (_, i) => ({pair: `P${i}`, long: 2, short: 0, finalistLong: 2, finalistShort: 0})), {}, [{candidates: 10}]);
+console.log(JSON.stringify({pairA, pairA2, summary, label: h.label(summary.window), big: big.etaSeconds, empty: h.summary([], history, []), fractional: h.summary([{...rows[0], long: 1.5}], history, [])}));
+""", tmp_path)
+
+    assert result["pairA"]["days"] == 29
+    assert result["pairA2"]["days"] == 15
+    assert result["summary"]["pairs"] == 2
+    assert result["summary"]["finalists"] == 2
+    assert result["summary"]["window"]["days"] == 25
+    assert result["label"] == "≈ 25 д · 05.09–30.09"
+    assert 600 <= result["big"] <= 1800
+    assert result["empty"]["pairs"] == 0 and result["empty"]["window"] is None
+    assert result["fractional"]["finalists"] == 0
+
+
+def test_portfolio_pairs_show_history_and_selection_summary() -> None:
+    html = _read("index.html")
+    js = _read("app.js")
+    portfolio = js.split("function loadPortfolioScreen", 1)[1].split("function loadPortfolioSettings", 1)[0]
+    controls = portfolio.split("const updateControls", 1)[1].split("const renderJournal", 1)[0]
+
+    assert 'id="portfolio-selection-summary"' in html
+    assert "data-portfolio-history" in portfolio
+    assert "portfolioSelectionHelpers.summary(" in controls
+    assert "state.readiness?.finalist_history" in controls
+    assert "Выбрано пар:" in controls
+    assert "совместная история" in controls
+
+
+def test_portfolio_pair_sorting_finalist_limit_and_history_label_parts(tmp_path: Path) -> None:
+    result = _run_selection_helpers("""
+const h = portfolioSelectionHelpers;
+const history = {
+  'BBBUSDT|LONG': [{rank: 1, start: '2026-09-01', end: '2026-09-30'}],
+  'AAAUSDT|LONG': [{rank: 1, start: '2026-09-20', end: '2026-09-30'}],
+  'CCCUSDT|SHORT': [{rank: 1, start: null, end: null}],
+};
+const rows = [
+  {pair: 'BBBUSDT', long: 1, short: 0, finalistLong: 3, finalistShort: 0},
+  {pair: 'CCCUSDT', long: 0, short: 1, finalistLong: 1, finalistShort: 1},
+  {pair: 'AAAUSDT', long: 1, short: 0, finalistLong: 1, finalistShort: 0},
+];
+const names = (items) => items.map((row) => row.pair);
+console.log(JSON.stringify({
+  alpha: names(h.sortRows(rows, history, 'alpha')),
+  historyOrder: names(h.sortRows(rows, history, 'history')),
+  finalists: names(h.sortRows(rows, history, 'finalists')),
+  untouched: names(rows),
+  limited: rows.map((row) => h.limitRow(row, 2)),
+  parts: h.labelParts(h.pairWindow(rows[0], history)),
+  none: h.labelParts(null),
+}));
+""", tmp_path)
+
+    assert result["alpha"] == ["AAAUSDT", "BBBUSDT", "CCCUSDT"]
+    assert result["historyOrder"] == ["AAAUSDT", "BBBUSDT", "CCCUSDT"]
+    assert result["finalists"] == ["BBBUSDT", "CCCUSDT", "AAAUSDT"]
+    assert result["untouched"] == ["BBBUSDT", "CCCUSDT", "AAAUSDT"]
+    assert result["limited"] == [
+        {"long": 2, "short": 0, "selected": True},
+        {"long": 1, "short": 1, "selected": True},
+        {"long": 1, "short": 0, "selected": True},
+    ]
+    assert result["parts"] == {"days": "≈ 29 д", "range": "01.09–30.09"}
+    assert result["none"] is None
+
+
+def test_portfolio_pair_table_has_history_column_n_finalists_and_sort_controls() -> None:
+    html = _read("index.html")
+    js = _read("app.js")
+    portfolio = js.split("function loadPortfolioScreen", 1)[1].split("function loadPortfolioSettings", 1)[0]
+
+    assert '<th scope="col">История</th>' in html
+    actions = html.split('class="portfolio-pair-actions"', 1)[1].split("</div>", 1)[0]
+    assert actions.index('id="portfolio-select-all"') < actions.index('id="portfolio-select-n"') < actions.index('id="portfolio-select-maximum"')
+    assert 'id="portfolio-select-n-value"' in actions
+    assert 'id="portfolio-pair-sort"' in html
+    for value in ('value="history"', 'value="alpha"', 'value="finalists"'):
+        assert value in html
+    assert "portfolioSelectionHelpers.sortRows(" in portfolio
+    assert "portfolioSelectionHelpers.limitRow(" in portfolio
+    assert "'История: '" not in portfolio and "`История: " not in portfolio
+    assert "document.createElement('strong')" in portfolio
+
+
+def test_portfolio_stage2_lists_candidates_with_checkboxes_and_sends_selection() -> None:
+    html = _read("index.html")
+    js = _read("app.js")
+    portfolio = js.split("function loadPortfolioScreen", 1)[1].split("function loadPortfolioSettings", 1)[0]
+
+    assert 'id="portfolio-stage2-candidates"' in html
+    assert ">Отправить на тест</button>" in html
+    assert "state.stage2Candidates = Array.isArray(result.candidates)" in portfolio
+    assert "candidate_ids: selectedIds" in portfolio
+    assert "state.stage2Selected.size > 0" in portfolio
+    # Rows render only for their own Campaign and re-render on every candidate refresh.
+    assert "state.stage2Campaign === state.job?.campaign_id ? state.stage2Candidates : []" in portfolio
+    assert "state.stage2Version += 1" in portfolio
+    assert "host.dataset.token === token" in portfolio
+    new_calculation = portfolio.split("newButton?.addEventListener('click'", 1)[1].split(chr(10), 1)[0]
+    assert "state.stage2Candidates = []" in new_calculation and "state.stage2Selected = new Set()" in new_calculation

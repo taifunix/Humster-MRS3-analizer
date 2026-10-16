@@ -640,3 +640,88 @@ def test_second_lazy_writer_insert_failure_rolls_back_all_prepared_rows(tmp_path
 
     with real_connect(str(database), read_only=True) as connection:
         assert connection.execute("select count(*) from optimizer_prepared_inputs").fetchone() == (0,)
+
+
+def _fixed_source(side: str = "LONG", **overrides) -> OptimizerSourceInput:
+    suffix = side.lower()
+    values: dict[str, object] = {
+        "side": side, "sizing_use_upnl": False, "sizing_use_fix": True, "sizing_my_fix_balance": Decimal("500"),
+        f"sizing_balance_percentage_{suffix}": Decimal("100"), f"sizing_risk_{suffix}": Decimal("1"),
+    }
+    if side == "SHORT":
+        values.update(sizing_balance_percentage_long=None, sizing_risk_long=None)
+    values.update(overrides)
+    return _source(**values)
+
+
+@pytest.mark.parametrize("side", ("LONG", "SHORT"))
+def test_fixed_sources_are_available_and_normalised_by_the_base(side: str) -> None:
+    source = _fixed_source(side)
+
+    assert prepared_availability(source).available
+    cycles = optimizer_module._cycle_records(source)
+    # Opening balance 1000 (balance 1000 + fee 1), closing 1010: PnL 9 over B = 500.
+    assert [cycle["normalized_pnl"] for cycle in cycles] == [Decimal("9") / Decimal("500")]
+    assert cycles[0]["source_basis"] == Decimal("500.000000000000")
+
+
+def test_dynamic_cycle_normalisation_is_unchanged() -> None:
+    cycles = optimizer_module._cycle_records(_source())
+    assert [cycle["normalized_pnl"] for cycle in cycles] == [(Decimal("1010") - Decimal("1001")) / Decimal("1001")]
+    assert "sizing_my_fix_balance" not in _source().to_document()["sizing"]
+
+
+@pytest.mark.parametrize(("overrides", "reason"), [
+    ({"sizing_my_fix_balance": None}, "MISSING_TYPED_FACTS"),
+    ({"sizing_risk_long": None}, "MISSING_TYPED_FACTS"),
+    ({"sizing_use_frozen_balance": False}, "UNSUPPORTED_SIZING"),
+    ({"sizing_balance_percentage_long": Decimal("50")}, "UNSUPPORTED_SIZING"),
+    ({"sizing_max_balance": Decimal("10")}, "UNSUPPORTED_SIZING"),
+])
+def test_fixed_sources_require_their_own_facts(overrides: dict[str, object], reason: str) -> None:
+    assert prepared_availability(_fixed_source(**overrides)).reason == reason
+
+
+def test_fixed_short_tolerates_null_inactive_side_facts() -> None:
+    source = _fixed_source("SHORT", sizing_balance_percentage_long=None, sizing_risk_long=None)
+    assert prepared_availability(source).available
+    assert source.to_document()["sizing"]["sizing_balance_percentage_long"] is None
+
+
+def test_stored_fixed_result_is_recomputed_after_an_unsupported_cache(tmp_path) -> None:
+    from dataclasses import replace
+
+    from tests.test_performance_v2_selection import _candidate_db
+
+    connection = _candidate_db(tmp_path)
+    result_id = int(connection.execute("select current_result_id from strategies").fetchone()[0])
+    connection.execute(
+        """update strategy_results set sizing_use_upnl = false, sizing_use_frozen_balance = true,
+           sizing_use_fix = true, sizing_balance_percentage_long = 100, sizing_risk_long = 1,
+           sizing_max_balance = 0, sizing_my_fix_balance = 50 where result_id = ?""",
+        [result_id],
+    )
+    connection.execute("update strategy_actions set price = 10, cost = 10 where result_id = ?", [result_id])
+    source = optimizer_module._source_rows(connection, [result_id])[0]
+    # Before P5 the document had no v12 facts, and the row was cached as UNSUPPORTED_SIZING.
+    old_digest = source_digest(replace(
+        source, sizing_my_fix_balance=None, sizing_balance_percentage_short=None, sizing_risk_short=None,
+    ))
+    connection.execute(
+        """insert into optimizer_prepared_inputs (result_id, preparation_version, source_digest,
+           availability_status, unavailable_reason, prepared_json, prepared_at_utc)
+           values (?, ?, ?, 'UNAVAILABLE', 'UNSUPPORTED_SIZING', null, now())""",
+        [result_id, optimizer_module.PREPARATION_VERSION, old_digest],
+    )
+    database = tmp_path / "strategy_performance.duckdb"
+    connection.close()
+
+    built = prepare_current_optimizer_inputs(str(database), [result_id])
+
+    assert built[0].availability.available
+    assert built[0].source.sizing_my_fix_balance == Decimal("50")
+    closed = [cycle for cycle in built[0].prepared.cycles if cycle["source_basis"] is not None]  # type: ignore[union-attr]
+    # The closed cycle books 110 - 100 over B = 50.
+    assert [(cycle["source_basis"], cycle["normalized_pnl"]) for cycle in closed] == [(Decimal("50"), Decimal("0.2"))]
+    readback = read_prepared_optimizer_inputs(str(database), [result_id])
+    assert readback[0].prepared is not None and readback[0].availability.available

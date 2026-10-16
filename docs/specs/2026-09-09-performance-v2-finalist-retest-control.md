@@ -5,7 +5,8 @@
 **Зависимости:**
 [Performance DB v2 CHECK & RETEST](2026-09-03-performance-v2-retest-workflow.md),
 [Selection review import](2026-09-02-performance-v2-selection-review-import.md),
-[ADR-0022](../decisions/0022-performance-v2-selection-review-ledger.md)
+[ADR-0022](../decisions/0022-performance-v2-selection-review-ledger.md),
+[ADR-0064](../decisions/0064-performance-v2-finalist-retest-review-reconciliation.md)
 
 ## Цель
 
@@ -142,6 +143,20 @@ score и причины являются подсказкой и immutable audit
 - импорт неизменённого workbook не повышает и не понижает стратегии по
   автоматической рекомендации.
 
+При обратном импорте статусов для каждой группы `(Pair, Direction)` прежние
+effective `FINALIST` согласуются с новым review: `FINALIST` сохраняется только
+при новом непустом `User Rank`; явный `REJECTED` сохраняется независимо от
+остаточного значения `User Rank` в workbook, а входящий ранг игнорируется и
+сохраняется как пустой; прочие прежние финалисты становятся `RESERVE` без
+ранга. Остаточный ранг у `REJECTED` не участвует в проверке уникальности.
+Это правило применяется также к прежнему финалисту, отсутствующему в новом
+листе `Candidates`, например после ошибки его ретеста. Новые строки review для
+таких ID добавляются в тот же append-only ledger и ту же атомарную транзакцию.
+Статусы стратегий, которые не были прежними финалистами этой группы,
+сохраняются из workbook без изменений. Для отсутствующего ID сохраняется
+последний комментарий; факты стратегий, результатов и автоматические решения
+не меняются.
+
 ## Один общий XLSX
 
 Control workbook содержит все строки выбранного scope ровно один раз и минимум
@@ -229,7 +244,7 @@ Panel показывает frozen cohort count, даты, прогресс, чи
 ## Non-goals
 
 - отдельная база или сохранение копий каждого результата ретеста;
-- автоматическое изменение `User Status/User Rank`;
+- автоматическое назначение `User Status/User Rank` по `Auto Status/Auto Rank`;
 - глобальный rank между разными Pair + Direction;
 - автоматический запуск Portfolio Optimizer после review import;
 - изменение формул существующего selection pipeline;
@@ -249,8 +264,12 @@ Panel показывает frozen cohort count, даты, прогресс, чи
   sibling сохраняет его прежний current result.
 - Общий workbook содержит несколько Pair + Direction без дубликатов и допускает
   повтор rank 1 между группами, но отклоняет повтор rank внутри группы.
-- `Auto Status/Auto Rank` нельзя изменить; `User Status` сохраняется, а
-  `User Rank` после массового ретеста пуст.
+- `Auto Status/Auto Rank` нельзя изменить; export после массового ретеста
+  оставляет старый `User Rank` пустым. При обратном импорте предыдущий
+  `FINALIST` сохраняется только с новым рангом; явный `REJECTED` сохраняется
+  даже если workbook содержит старый ранг, который будет проигнорирован и
+  очищен; остальные предыдущие финалисты становятся `RESERVE` без ранга,
+  включая ID, отсутствующие в новом `Candidates`.
 - Post-retest ranking получает только успешно импортированные Strategy ID
   выбранного bulk-retest job. Дополнительная `ACTIVE` стратегия с той же Pair +
   Direction и заведомо лучшими метриками не меняет ranks, statuses, stage counts

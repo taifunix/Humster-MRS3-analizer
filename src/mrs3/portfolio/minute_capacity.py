@@ -1,4 +1,4 @@
-"""Coarse full-position capacity from the tester's sparse Bybit minute CSVs."""
+"""Coarse full-position capacity from the tester's sparse Bybit minute parquet day files."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_EVEN, loca
 import csv
 import gzip
 import hashlib
-from io import StringIO
+from io import BytesIO, StringIO
 import json
 import os
 from pathlib import Path
@@ -18,12 +18,21 @@ from types import MappingProxyType
 from typing import Callable, Iterable, Mapping
 
 import httpx
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 
 HEADER = ("timestamp", "open", "high", "low", "close", "volume", "buy_volume", "sell_volume", "trades")
 DAY_MINUTES = 1_440
 WEEK_DAYS = 7
 DAY_MS = 86_400_000
+# The tester's day file: REQUIRED columns, ZSTD, only one key-value entry (no Arrow schema blob).
+PARQUET_SCHEMA = pa.schema(
+    [pa.field("timestamp", pa.int64(), nullable=False)]
+    + [pa.field(name, pa.float64(), nullable=False) for name in HEADER[1:8]]
+    + [pa.field("trades", pa.int32(), nullable=False)]
+)
+PARQUET_KEY_VALUE = {"hb.schema": "candles_1m/1"}
 _WEEKDAYS = {name: index for index, name in enumerate(("MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY", "SUNDAY"))}
 
 
@@ -101,7 +110,51 @@ def _symbol(value: str) -> str:
 
 
 def _day_path(root: Path, symbol: str, day: date) -> Path:
-    return root / symbol / f"{symbol}{day.isoformat()}_1m.csv"
+    """The tester's day file; backfilled days are written in the same parquet format."""
+    return root / symbol / f"{symbol}{day.isoformat()}_1m.parquet"
+
+
+def _existing_day_path(root: Path, symbol: str, day: date) -> Path | None:
+    path = _day_path(root, symbol, day)
+    return path if path.is_file() else None
+
+
+def _parquet_rows(data: bytes, path: Path) -> list[dict[str, str]]:
+    try:
+        table = pq.read_table(pa.BufferReader(data))
+    except (pa.ArrowException, OSError) as error:
+        raise MinuteCapacityError(f"cannot read minute parquet: {path}") from error
+    if tuple(table.column_names) != HEADER:
+        raise MinuteCapacityError(f"invalid minute parquet columns: {path}")
+    if [field.type for field in table.schema] != [field.type for field in PARQUET_SCHEMA]:
+        raise MinuteCapacityError(f"invalid minute parquet column types: {path}")
+    columns = table.to_pydict()
+    rows = []
+    for index in range(table.num_rows):
+        row = {}
+        for name in HEADER:
+            value = columns[name][index]
+            # repr() of a float is its shortest round-trip decimal, so the exact Decimal checks hold.
+            row[name] = None if value is None else (repr(value) if isinstance(value, float) else str(value))
+        rows.append(row)
+    return rows
+
+
+def _to_parquet(csv_data: bytes) -> bytes:
+    """Encode one day aggregated from the trade archive in the tester's parquet format."""
+    reader = csv.DictReader(StringIO(csv_data.decode("utf-8")))
+    columns: dict[str, list] = {name: [] for name in HEADER}
+    for row in reader:
+        columns["timestamp"].append(int(row["timestamp"]))
+        for name in HEADER[1:8]:
+            columns[name].append(float(row[name]))
+        columns["trades"].append(int(row["trades"]))
+    table = pa.Table.from_pydict(columns, schema=PARQUET_SCHEMA)
+    sink = BytesIO()
+    with pq.ParquetWriter(sink, PARQUET_SCHEMA, compression="zstd", store_schema=False) as writer:
+        writer.write_table(table)
+        writer.add_key_value_metadata(PARQUET_KEY_VALUE)
+    return sink.getvalue()
 
 
 def _day_start_ms(day: date) -> int:
@@ -109,51 +162,37 @@ def _day_start_ms(day: date) -> int:
 
 
 def _read_day_bytes(data: bytes, path: Path, day: date) -> tuple[tuple[int, Decimal], ...]:
-    try:
-        reader = csv.DictReader(StringIO(data.decode("utf-8-sig"), newline=""))
-        if tuple(reader.fieldnames or ()) != HEADER:
-            raise MinuteCapacityError(f"invalid minute CSV header: {path}")
-        values: list[tuple[int, Decimal]] = []
-        previous = -1
-        start = _day_start_ms(day)
-        for number, row in enumerate(reader, 2):
-            if set(row) != set(HEADER) or None in row or any(value is None for value in row.values()):
-                raise MinuteCapacityError(f"invalid minute CSV row {number}: {path}")
-            try:
-                stamp = int(row["timestamp"])
-                trades = int(row["trades"])
-            except (TypeError, ValueError) as error:
-                raise MinuteCapacityError(f"invalid minute CSV integer row {number}: {path}") from error
-            if str(stamp) != row["timestamp"] or str(trades) != row["trades"] or trades <= 0:
-                raise MinuteCapacityError(f"invalid minute CSV integer row {number}: {path}")
-            if stamp % 60_000 or not start <= stamp < start + DAY_MS or stamp <= previous:
-                raise MinuteCapacityError(f"minute timestamps are not unique, ordered, aligned and in-day: {path}")
-            previous = stamp
-            prices = [_decimal(row[key], key, positive=True) for key in ("open", "high", "low", "close")]
-            volume = _decimal(row["volume"], "volume", nonnegative=True)
-            buy = _decimal(row["buy_volume"], "buy_volume", nonnegative=True)
-            sell = _decimal(row["sell_volume"], "sell_volume", nonnegative=True)
-            if volume != buy + sell or prices[1] < max(prices[0], prices[2], prices[3]) or prices[2] > min(prices[0], prices[1], prices[3]):
-                raise MinuteCapacityError(f"inconsistent minute CSV row {number}: {path}")
-            with localcontext() as context:
-                context.prec = 28
-                context.rounding = ROUND_HALF_EVEN
-                turnover = prices[3] * volume
-            values.append((stamp, turnover))
-        return tuple(values)
-    except MinuteCapacityError:
-        raise
-    except (UnicodeError, csv.Error) as error:
-        raise MinuteCapacityError(f"cannot read minute CSV: {path}") from error
+    values: list[tuple[int, Decimal]] = []
+    previous = -1
+    start = _day_start_ms(day)
+    for number, row in enumerate(_parquet_rows(data, path), 1):
+        if set(row) != set(HEADER) or any(value is None for value in row.values()):
+            raise MinuteCapacityError(f"invalid minute row {number}: {path}")
+        stamp, trades = int(row["timestamp"]), int(row["trades"])
+        if trades <= 0:
+            raise MinuteCapacityError(f"invalid minute trade count row {number}: {path}")
+        if stamp % 60_000 or not start <= stamp < start + DAY_MS or stamp <= previous:
+            raise MinuteCapacityError(f"minute timestamps are not unique, ordered, aligned and in-day: {path}")
+        previous = stamp
+        prices = [_decimal(row[key], key, positive=True) for key in ("open", "high", "low", "close")]
+        volume = _decimal(row["volume"], "volume", nonnegative=True)
+        buy = _decimal(row["buy_volume"], "buy_volume", nonnegative=True)
+        sell = _decimal(row["sell_volume"], "sell_volume", nonnegative=True)
+        if volume != buy + sell or prices[1] < max(prices[0], prices[2], prices[3]) or prices[2] > min(prices[0], prices[1], prices[3]):
+            raise MinuteCapacityError(f"inconsistent minute row {number}: {path}")
+        with localcontext() as context:
+            context.prec = 28
+            context.rounding = ROUND_HALF_EVEN
+            turnover = prices[3] * volume
+        values.append((stamp, turnover))
+    return tuple(values)
 
 
 def _read_day(path: Path, symbol: str, day: date) -> tuple[tuple[int, Decimal], ...]:
     try:
         return _read_day_bytes(path.read_bytes(), path, day)
-    except MinuteCapacityError:
-        raise
     except OSError as error:
-        raise MinuteCapacityError(f"cannot read minute CSV: {path}") from error
+        raise MinuteCapacityError(f"cannot read minute day file: {path}") from error
 
 
 def _week_minute(value: str) -> int:
@@ -242,7 +281,9 @@ def _lot_model_capacity(
     source_files: list[str] = []
     try:
         for day_offset, day in enumerate(days):
-            path = _day_path(root, symbol, day)
+            path = _existing_day_path(root, symbol, day)
+            if path is None:
+                raise MinuteCapacityError(f"no minute file for {symbol} {day.isoformat()}")
             data = path.read_bytes()
             rows = _read_day_bytes(data, path, day)
             name = path.name
@@ -340,14 +381,14 @@ def calculate_minute_capacity(
     missing: list[date] = []
     sources: list[str] = []
     for day in requested:
-        path = _day_path(root, symbol, day)
-        if not path.is_file():
+        path = _existing_day_path(root, symbol, day)
+        if path is None:
             missing.append(day)
             continue
         present.append((day, _read_day(path, symbol, day)))
         sources.append(str(path.resolve()))
     if not present:
-        raise MinuteCapacityError("no valid daily CSV is available for the requested window")
+        raise MinuteCapacityError("no valid daily minute file is available for the requested window")
     calendar = _window(present, Decimal(participation_pct), step, weekend=None)
     weekdays = _window(present, Decimal(participation_pct), step, weekend=weekend)
     payload = {
@@ -451,9 +492,9 @@ def backfill_missing_days(
     existing: list[date] = []
     missing: list[date] = []
     for day in days:
-        target = _day_path(root, symbol, day)
-        if target.is_file():
-            _read_day(target, symbol, day)
+        present = _existing_day_path(root, symbol, day)
+        if present is not None:
+            _read_day(present, symbol, day)
             existing.append(day)
         else:
             missing.append(day)
@@ -468,7 +509,7 @@ def backfill_missing_days(
         last: Exception | None = None
         for _ in range(attempts):
             try:
-                rendered = _aggregate_archive(fetch_day(symbol, day), symbol, day)
+                rendered = _to_parquet(_aggregate_archive(fetch_day(symbol, day), symbol, day))
                 with NamedTemporaryFile(dir=target.parent, prefix=f".{target.name}.", suffix=".tmp", delete=False) as stream:
                     temporary = Path(stream.name)
                     stream.write(rendered)

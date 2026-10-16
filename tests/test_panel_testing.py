@@ -29,7 +29,7 @@ def test_canonical_strategy_templates_are_tracked_by_mode() -> None:
     expected = {
         "templates/strategies/source-v6-mrs2/long.json": ("mrs2", True, False),
         "templates/strategies/source-v6-mrs2/short.json": ("mrs2", False, True),
-        "templates/strategies/retest-mrs3/base.json": ("mrs3", True, False),
+        "templates/exchanges/Bybit/mrs3-strategy.json": ("mrs3", True, False),
     }
 
     for relative, contract in expected.items():
@@ -112,7 +112,7 @@ def test_canonical_mrs2_templates_are_strict_and_render_worker_count() -> None:
                 "1,039", "1,043", "1,047", "1,051", "1,055",
             ]
 
-    mrs3 = root / "templates" / "tester" / "mrs3" / "config_tester.json"
+    mrs3 = root / "templates" / "exchanges" / "Bybit" / "mrs3-tester.json"
     document = json.loads(mrs3.read_text(encoding="utf-8"))
     assert isinstance(document, dict)
     assert document["parameter_mining"] == []
@@ -596,8 +596,24 @@ def test_local_testing_fill_prebuilt_does_not_render_or_run_tester(
     service.stop()
 
 
+def test_local_testing_fill_prebuilt_accepts_update_data_true(tmp_path: Path) -> None:
+    config = _runner_config(tmp_path)
+    document = json.loads(_prebuilt_config())
+    document["UpdateData"] = True
+    service = LocalTestingService(
+        config,
+        Path(__file__).parents[1],
+        stop_bot=lambda _config: None,
+        client_factory=lambda _config: (_ for _ in ()).throw(AssertionError("tester run")),
+    )
+
+    service.fill_prebuilt(tester_config_json=json.dumps(document), strategy_jsons=_prebuilt_strategies())
+    assert json.loads(config.tester_config.read_text(encoding="utf-8"))["UpdateData"] is True
+    service.stop()
+
+
 @pytest.mark.parametrize("field,value", [
-    ("single_mode", True), ("UpdateData", True), ("use_runs", True), ("parameter_mining", [{"name": "x"}]),
+    ("single_mode", True), ("UpdateData", "yes"), ("use_runs", True), ("parameter_mining", [{"name": "x"}]),
 ])
 def test_local_testing_fill_prebuilt_rejects_tester_flags_before_stop(
     tmp_path: Path, field: str, value: object

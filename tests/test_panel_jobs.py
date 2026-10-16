@@ -2,6 +2,7 @@ from datetime import datetime
 from copy import deepcopy
 import json
 import threading
+from pathlib import Path
 import mrs3.panel_jobs as panel_jobs_module
 
 import pytest
@@ -736,6 +737,437 @@ def test_registry_retries_transient_windows_replace_denial(tmp_path, monkeypatch
     assert PanelJobRegistry(path, recover_on_load=False).get(job["job_id"])["state"] == "QUEUED"
 
 
+def test_registry_retries_windows_replace_denial_beyond_short_window(tmp_path, monkeypatch):
+    path = tmp_path / "jobs.json"
+    registry = PanelJobRegistry(path)
+    real_replace = panel_jobs_module.os.replace
+    attempts = 0
+    delays = []
+
+    def fail_several_times(source, destination):
+        nonlocal attempts
+        attempts += 1
+        if attempts <= 6:
+            error = PermissionError(13, "access denied", str(destination))
+            error.winerror = 5
+            raise error
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(panel_jobs_module.os, "replace", fail_several_times)
+    monkeypatch.setattr(panel_jobs_module.time, "sleep", delays.append)
+
+    job = registry.submit("strategies.tester.start", {}, "retry-long-access-denied", ("strategies.tester",))
+
+    assert attempts == 7
+    assert delays == [0.05] * 6
+    assert PanelJobRegistry(path, recover_on_load=False).get(job["job_id"])["state"] == "QUEUED"
+
+
+def test_registry_syncs_parent_after_atomic_journal_replace(tmp_path, monkeypatch):
+    path = tmp_path / "jobs.json"
+    synced = []
+    monkeypatch.setattr(panel_jobs_module, "_fsync_directory", lambda directory: synced.append(directory))
+
+    PanelJobRegistry(path).submit("testing.local", {}, "sync-directory")
+
+    assert synced == [path.parent]
+
+
+def test_registry_syncs_sidecar_directory_before_overwrite_and_after_removal(tmp_path, monkeypatch):
+    path = tmp_path / "jobs.json"
+    registry = PanelJobRegistry(path)
+    registry.submit("testing.local", {}, "existing-job", job_id="existing")
+    events = []
+    backup = path.with_name(path.name + ".recovery")
+    real_open = Path.open
+    real_rename = panel_jobs_module.os.rename
+
+    def tracked_open(file_path, mode="r", *args, **kwargs):
+        if file_path == path and mode == "r+b":
+            events.append("journal")
+        return real_open(file_path, mode, *args, **kwargs)
+
+    def tracked_rename(source, destination):
+        if Path(destination) == backup:
+            events.append("sidecar")
+        return real_rename(source, destination)
+
+    monkeypatch.setattr(Path, "open", tracked_open)
+    monkeypatch.setattr(panel_jobs_module.os, "rename", tracked_rename)
+    monkeypatch.setattr(panel_jobs_module, "_fsync_directory", lambda _directory: events.append("sync"))
+    monkeypatch.setattr(panel_jobs_module.os, "replace", lambda *_args: _deny_journal_replace(path))
+    monkeypatch.setattr(panel_jobs_module.time, "sleep", lambda _delay: None)
+
+    registry.submit("testing.local", {}, "locked-existing-journal")
+
+    assert events == ["sidecar", "sync", "journal", "sync", "sync"]
+
+
+@pytest.mark.parametrize("failed_sync", (2, 3))
+def test_registry_keeps_fallback_commit_when_post_write_directory_sync_fails(tmp_path, monkeypatch, failed_sync):
+    path = tmp_path / "jobs.json"
+    registry = PanelJobRegistry(path)
+    original = registry.submit("testing.local", {}, "existing", job_id="existing")
+    attempts = 0
+
+    def fail_post_write_sync(_directory):
+        nonlocal attempts
+        attempts += 1
+        if attempts == failed_sync:
+            raise OSError("injected post-write directory sync failure")
+
+    monkeypatch.setattr(panel_jobs_module, "_fsync_directory", fail_post_write_sync)
+    monkeypatch.setattr(panel_jobs_module.os, "replace", lambda *_args: _deny_journal_replace(path))
+    monkeypatch.setattr(panel_jobs_module.time, "sleep", lambda _delay: None)
+
+    committed = registry.submit("testing.local", {}, "locked-new-job", job_id="new")
+    recovered = PanelJobRegistry(path, recover_on_load=False)
+
+    assert attempts == 3
+    assert recovered.get(original["job_id"])["state"] == "QUEUED"
+    assert recovered.get(committed["job_id"])["state"] == "QUEUED"
+    assert {entry.name for entry in tmp_path.iterdir()} == {path.name}
+
+
+def test_registry_overwrites_existing_journal_when_windows_keeps_replacement_locked(tmp_path, monkeypatch):
+    path = tmp_path / "jobs.json"
+    registry = PanelJobRegistry(path)
+    registry.submit("testing.local", {}, "existing-job", ("existing",), job_id="existing")
+    attempts = 0
+    delays = []
+
+    def keep_replace_locked(_source, destination):
+        nonlocal attempts
+        attempts += 1
+        error = PermissionError(13, "access denied", str(destination))
+        error.winerror = 5
+        raise error
+
+    monkeypatch.setattr(panel_jobs_module.os, "replace", keep_replace_locked)
+    monkeypatch.setattr(panel_jobs_module.time, "sleep", delays.append)
+
+    job = registry.submit("strategies.tester.start", {}, "locked-existing-journal", ("strategies.tester",))
+
+    restored = PanelJobRegistry(path, recover_on_load=False)
+    assert attempts == panel_jobs_module._WINDOWS_REPLACE_RETRIES
+    assert delays == [0.05] * (panel_jobs_module._WINDOWS_REPLACE_RETRIES - 1)
+    assert restored.get("existing")["state"] == "QUEUED"
+    assert restored.get(job["job_id"])["state"] == "QUEUED"
+    assert not path.with_name(path.name + ".recovery").exists()
+    assert {entry.name for entry in tmp_path.iterdir()} == {path.name}
+
+
+def test_registry_restores_original_journal_after_partial_in_place_write(tmp_path, monkeypatch):
+    path = tmp_path / "jobs.json"
+    registry = PanelJobRegistry(path)
+    previous = registry.submit("testing.local", {}, "existing", job_id="existing")
+    previous_bytes = path.read_bytes()
+    monkeypatch.setattr(panel_jobs_module.os, "replace", lambda *_args: _deny_journal_replace(path))
+    monkeypatch.setattr(panel_jobs_module.time, "sleep", lambda _delay: None)
+
+    real_open = Path.open
+    fail_once = True
+
+    class PartialWrite:
+        def __init__(self, handle):
+            self.handle = handle
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return self.handle.__exit__(*args)
+
+        def write(self, value):
+            nonlocal fail_once
+            if fail_once:
+                fail_once = False
+                self.handle.write(value[:10])
+                self.handle.flush()
+                raise OSError("injected partial journal write")
+            return self.handle.write(value)
+
+        def __getattr__(self, name):
+            return getattr(self.handle, name)
+
+    def fail_one_partial_write(file_path, mode="r", *args, **kwargs):
+        if file_path == path and mode == "r+b":
+            return PartialWrite(real_open(file_path, mode, *args, **kwargs))
+        return real_open(file_path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", fail_one_partial_write)
+
+    with pytest.raises(PanelJobError, match="JOB_PERSISTENCE_FAILED"):
+        registry.submit("strategies.tester.start", {}, "partial-write", ("strategies.tester",))
+
+    assert path.read_bytes() == previous_bytes
+    assert PanelJobRegistry(path, recover_on_load=False).get(previous["job_id"])["state"] == "QUEUED"
+    assert not path.with_name(path.name + ".recovery").exists()
+
+
+def test_registry_recovers_journal_from_backup_after_interrupted_overwrite(tmp_path):
+    path = tmp_path / "jobs.json"
+    registry = PanelJobRegistry(path, recover_on_load=False)
+    job = registry.submit("testing.local", {}, "restart-recovery", job_id="recover-me")
+    previous = path.read_bytes()
+    backup = path.with_name(path.name + ".recovery")
+    backup.write_bytes(panel_jobs_module._encode_journal_recovery(previous, b'{"expected":true}'))
+    path.write_bytes(b'{"partial":true}')
+
+    recovered = PanelJobRegistry(path, recover_on_load=False)
+
+    assert recovered.get(job["job_id"])["state"] == "QUEUED"
+    assert path.read_bytes() == previous
+    assert not backup.exists()
+
+
+def test_registry_restores_previous_payload_when_journal_is_missing(tmp_path):
+    path = tmp_path / "jobs.json"
+    registry = PanelJobRegistry(path)
+    job = registry.submit("testing.local", {}, "existing", job_id="existing")
+    previous = path.read_bytes()
+    backup = path.with_name(path.name + ".recovery")
+    backup.write_bytes(panel_jobs_module._encode_journal_recovery(previous, b'{"expected":true}'))
+    path.unlink()
+
+    recovered = PanelJobRegistry(path, recover_on_load=False)
+
+    assert recovered.get(job["job_id"])["state"] == "QUEUED"
+    assert path.read_bytes() == previous
+    assert not backup.exists()
+
+
+@pytest.mark.parametrize("payload", (b"", b'{"format":2,', b'{"format":99}'))
+def test_registry_fails_closed_and_preserves_files_for_invalid_recovery_sidecar(tmp_path, payload):
+    path = tmp_path / "jobs.json"
+    registry = PanelJobRegistry(path)
+    registry.submit("testing.local", {}, "existing", job_id="existing")
+    previous = path.read_bytes()
+    backup = path.with_name(path.name + ".recovery")
+    backup.write_bytes(payload)
+
+    with pytest.raises(PanelJobError, match="preserve the journal and recovery sidecar"):
+        PanelJobRegistry(path, recover_on_load=False)
+
+    assert path.read_bytes() == previous
+    assert backup.read_bytes() == payload
+
+
+def test_registry_reads_legacy_recovery_sidecar_with_intended_digest(tmp_path):
+    path = tmp_path / "jobs.json"
+    registry = PanelJobRegistry(path)
+    previous_job = registry.submit("testing.local", {}, "existing", job_id="existing")
+    previous = path.read_bytes()
+    committed = registry.submit("testing.local", {}, "intended", job_id="intended")
+    intended = path.read_bytes()
+    backup = path.with_name(path.name + ".recovery")
+    backup.write_text(json.dumps({
+        "format": 1,
+        "previous": panel_jobs_module.base64.b64encode(previous).decode("ascii"),
+        "intended_sha256": panel_jobs_module.hashlib.sha256(intended).hexdigest(),
+    }), encoding="utf-8")
+
+    recovered = PanelJobRegistry(path, recover_on_load=False)
+
+    assert recovered.get(previous_job["job_id"])["state"] == "QUEUED"
+    assert recovered.get(committed["job_id"])["state"] == "QUEUED"
+    assert path.read_bytes() == intended
+    assert not backup.exists()
+
+
+def test_registry_fails_actionably_on_legacy_recovery_sidecar_without_digest(tmp_path):
+    path = tmp_path / "jobs.json"
+    registry = PanelJobRegistry(path)
+    registry.submit("testing.local", {}, "existing", job_id="existing")
+    previous = path.read_bytes()
+    backup = path.with_name(path.name + ".recovery")
+    backup.write_text(json.dumps({
+        "format": 1,
+        "previous": panel_jobs_module.base64.b64encode(previous).decode("ascii"),
+    }), encoding="utf-8")
+
+    with pytest.raises(PanelJobError, match="preserve the journal and recovery sidecar"):
+        PanelJobRegistry(path, recover_on_load=False)
+
+    assert path.read_bytes() == previous
+    assert backup.exists()
+
+
+def test_registry_keeps_invalid_recovery_sidecar_if_journal_cannot_be_read(tmp_path, monkeypatch):
+    path = tmp_path / "jobs.json"
+    registry = PanelJobRegistry(path)
+    registry.submit("testing.local", {}, "existing", job_id="existing")
+    previous = path.read_bytes()
+    backup = path.with_name(path.name + ".recovery")
+    backup.write_bytes(panel_jobs_module._encode_journal_recovery(previous, b'{"expected":true}'))
+    real_read_bytes = Path.read_bytes
+
+    def deny_journal_read(file_path: Path) -> bytes:
+        if file_path == path:
+            raise PermissionError("injected journal read denial")
+        return real_read_bytes(file_path)
+
+    monkeypatch.setattr(Path, "read_bytes", deny_journal_read)
+
+    with pytest.raises(PanelJobError, match="preserve the journal and recovery sidecar"):
+        PanelJobRegistry(path, recover_on_load=False)
+
+    monkeypatch.setattr(Path, "read_bytes", real_read_bytes)
+    assert path.read_bytes() == previous
+    assert backup.exists()
+
+
+def test_registry_preserves_verified_journal_when_recovery_sidecar_remains(tmp_path):
+    path = tmp_path / "jobs.json"
+    registry = PanelJobRegistry(path)
+    previous = registry.submit("testing.local", {}, "existing", job_id="existing")
+    previous_bytes = path.read_bytes()
+    committed = registry.submit("testing.local", {}, "completed-write", job_id="committed")
+    intended_bytes = path.read_bytes()
+    backup = path.with_name(path.name + ".recovery")
+    backup.write_bytes(panel_jobs_module._encode_journal_recovery(previous_bytes, intended_bytes))
+
+    recovered = PanelJobRegistry(path, recover_on_load=False)
+
+    assert recovered.get(previous["job_id"])["state"] == "QUEUED"
+    assert recovered.get(committed["job_id"])["state"] == "QUEUED"
+    assert path.read_bytes() == intended_bytes
+    assert not backup.exists()
+
+
+def test_registry_keeps_committed_fallback_if_sidecar_cannot_be_removed(tmp_path, monkeypatch):
+    path = tmp_path / "jobs.json"
+    registry = PanelJobRegistry(path)
+    original = registry.submit("testing.local", {}, "existing", job_id="existing")
+    backup = path.with_name(path.name + ".recovery")
+    real_unlink = Path.unlink
+    monkeypatch.setattr(panel_jobs_module.os, "replace", lambda *_args: _deny_journal_replace(path))
+    monkeypatch.setattr(panel_jobs_module.time, "sleep", lambda _delay: None)
+
+    def deny_backup_unlink(file_path: Path, *args, **kwargs):
+        if file_path == backup:
+            raise PermissionError("injected recovery sidecar unlink denial")
+        return real_unlink(file_path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", deny_backup_unlink)
+    committed = registry.submit("testing.local", {}, "locked-new-job", job_id="new")
+    assert backup.exists()
+    monkeypatch.setattr(Path, "unlink", real_unlink)
+
+    recovered = PanelJobRegistry(path, recover_on_load=False)
+
+    assert recovered.get(original["job_id"])["state"] == "QUEUED"
+    assert recovered.get(committed["job_id"])["state"] == "QUEUED"
+    assert not backup.exists()
+
+
+def test_registry_wraps_existing_journal_write_denial_and_keeps_old_contents(tmp_path, monkeypatch):
+    path = tmp_path / "jobs.json"
+    registry = PanelJobRegistry(path)
+    previous = registry.submit("testing.local", {}, "existing", job_id="existing")
+    previous_bytes = path.read_bytes()
+    monkeypatch.setattr(panel_jobs_module.os, "replace", lambda *_args: _deny_journal_replace(path))
+    monkeypatch.setattr(panel_jobs_module.time, "sleep", lambda _delay: None)
+    real_open = Path.open
+
+    def deny_existing_journal_write(file_path, mode="r", *args, **kwargs):
+        if file_path == path and mode == "r+b":
+            raise PermissionError("injected journal write denial")
+        return real_open(file_path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", deny_existing_journal_write)
+
+    with pytest.raises(PanelJobError, match="JOB_PERSISTENCE_FAILED"):
+        registry.submit("strategies.tester.start", {}, "write-denied", ("strategies.tester",))
+
+    assert path.read_bytes() == previous_bytes
+    assert not path.with_name(path.name + ".recovery").exists()
+    assert PanelJobRegistry(path, recover_on_load=False).get(previous["job_id"])["state"] == "QUEUED"
+
+
+def test_registry_clears_stale_recovery_before_later_atomic_save(tmp_path, monkeypatch):
+    path = tmp_path / "jobs.json"
+    registry = PanelJobRegistry(path)
+    original = registry.submit("testing.local", {}, "original", job_id="original")
+    real_replace = panel_jobs_module.os.replace
+    recovery = _leave_stale_journal_recovery(path, registry, monkeypatch)
+    real_open = Path.open
+    monkeypatch.setattr(Path, "open", real_open)
+    monkeypatch.setattr(panel_jobs_module.os, "replace", real_replace)
+
+    later = registry.submit("testing.local", {}, "later-atomic-save", job_id="later")
+    restored = PanelJobRegistry(path, recover_on_load=False)
+
+    assert restored.get(original["job_id"])["state"] == "QUEUED"
+    assert restored.get(later["job_id"])["state"] == "QUEUED"
+    assert not recovery.exists()
+
+
+def test_registry_recovers_stale_sidecar_before_second_locked_fallback(tmp_path, monkeypatch):
+    path = tmp_path / "jobs.json"
+    registry = PanelJobRegistry(path)
+    original = registry.submit("testing.local", {}, "original", job_id="original")
+    recovery = _leave_stale_journal_recovery(path, registry, monkeypatch)
+    real_open = Path.open
+    monkeypatch.setattr(Path, "open", real_open)
+
+    later = registry.submit("testing.local", {}, "later-locked-save", job_id="later")
+    restored = PanelJobRegistry(path, recover_on_load=False)
+
+    assert restored.get(original["job_id"])["state"] == "QUEUED"
+    assert restored.get(later["job_id"])["state"] == "QUEUED"
+    assert not recovery.exists()
+
+
+def _deny_journal_replace(path: Path) -> None:
+    error = PermissionError(13, "access denied", str(path))
+    error.winerror = 5
+    raise error
+
+
+def _leave_stale_journal_recovery(path: Path, registry: PanelJobRegistry, monkeypatch) -> Path:
+    real_open = Path.open
+    recovery = path.with_name(path.name + ".recovery")
+    open_calls = 0
+    monkeypatch.setattr(panel_jobs_module.os, "replace", lambda *_args: _deny_journal_replace(path))
+    monkeypatch.setattr(panel_jobs_module.time, "sleep", lambda _delay: None)
+
+    class PartialWrite:
+        def __init__(self, handle):
+            self.handle = handle
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return self.handle.__exit__(*args)
+
+        def write(self, value):
+            self.handle.write(value[:10])
+            self.handle.flush()
+            raise OSError("injected partial journal write")
+
+        def __getattr__(self, name):
+            return getattr(self.handle, name)
+
+    def fail_write_and_rollback(file_path, mode="r", *args, **kwargs):
+        nonlocal open_calls
+        if file_path == path and mode == "r+b":
+            open_calls += 1
+            if open_calls == 1:
+                return PartialWrite(real_open(file_path, mode, *args, **kwargs))
+            if open_calls == 2:
+                raise PermissionError("injected restore denial")
+        return real_open(file_path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", fail_write_and_rollback)
+    with pytest.raises(PanelJobError, match="JOB_PERSISTENCE_FAILED"):
+        registry.submit("testing.local", {}, "failed-fallback", job_id="failed")
+    assert recovery.exists()
+    monkeypatch.setattr(Path, "open", real_open)
+    return recovery
+
+
 def test_registry_failed_submit_does_not_reserve_resource_in_memory(tmp_path, monkeypatch):
     path = tmp_path / "jobs.json"
     registry = PanelJobRegistry(path)
@@ -752,3 +1184,55 @@ def test_registry_failed_submit_does_not_reserve_resource_in_memory(tmp_path, mo
 
     assert registry.list() == []
     assert not path.exists()
+
+
+class _NotSerializable:
+    """A frozen Campaign stand-in that fails if anything tries to JSON-serialize it."""
+
+
+def test_registry_keeps_snapshotted_campaign_by_reference_and_out_of_the_journal(tmp_path):
+    path = tmp_path / "jobs.json"
+    registry = PanelJobRegistry(path)
+    job = registry.submit("portfolio.stage1", {}, "campaign-reference", job_id="stage1")
+    registry.reserve_runtime("stage1", "campaign_snapshot", {"campaign_id": "c1", "state": "available"})
+    registry.reserve_runtime("stage1", "campaign", {"campaign_id": "c1"})
+    frozen = _NotSerializable()
+    registry.jobs["stage1"]["runtime"]["campaign"] = frozen
+
+    runtime = registry.runtime("stage1")
+    assert runtime["campaign"] is frozen
+    runtime["optimizer_progress"] = {"completed": 1}
+    registry.transition("stage1", "RUNNING")
+    registry.sync("stage1", {"state": "RUNNING"}, runtime=runtime)
+
+    assert registry.runtime("stage1")["campaign"] is frozen
+    assert registry.runtime("stage1")["optimizer_progress"] == {"completed": 1}
+    persisted = json.loads(path.read_text(encoding="utf-8"))
+    assert "campaign" not in persisted["stage1"]["runtime"]
+    assert persisted["stage1"]["runtime"]["campaign_snapshot"]["campaign_id"] == "c1"
+
+
+def test_registry_runtime_copies_are_independent_except_the_frozen_campaign(tmp_path):
+    registry = PanelJobRegistry(tmp_path / "jobs.json")
+    registry.submit("portfolio.stage1", {}, "campaign-copy", job_id="stage1")
+    registry.reserve_runtime("stage1", "journal", [{"code": "A"}])
+    registry.reserve_runtime("stage1", "campaign", {"campaign_id": "legacy"})
+
+    first = registry.runtime("stage1")
+    first["journal"].append({"code": "B"})
+
+    assert registry.runtime("stage1")["journal"] == [{"code": "A"}]
+    # Without a snapshot descriptor the legacy embedded Campaign is still persisted.
+    persisted = json.loads((tmp_path / "jobs.json").read_text(encoding="utf-8"))
+    assert persisted["stage1"]["runtime"]["campaign"] == {"campaign_id": "legacy"}
+
+
+def test_registry_failed_serialization_leaves_no_temporary_file(tmp_path):
+    registry = PanelJobRegistry(tmp_path / "jobs.json")
+    registry.submit("testing.local", {}, "bad-payload", job_id="bad")
+    registry.jobs["bad"]["runtime"] = {"private": _NotSerializable()}
+
+    with pytest.raises(TypeError):
+        registry._save()
+
+    assert sorted(item.name for item in tmp_path.iterdir()) == ["jobs.json"]

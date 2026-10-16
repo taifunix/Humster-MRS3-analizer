@@ -21,7 +21,7 @@ from mrs3.panel_performance_v2 import (
     export_performance_v2,
     parse_performance_v2_export_query,
 )
-from mrs3.performance_v2_store import initialize_performance_v2
+from mrs3.performance_v2_store import initialize_performance_v2, require_performance_v2_readable
 from mrs3.performance_v2_equity_cache import current_equity_source_metadata, upsert_equity_quality_facts_checked
 from mrs3.performance_v2_equity_quality import EquitySample, calculate_equity_quality_facts
 from mrs3.performance_v2_windows import METRICS_VERSION
@@ -32,10 +32,15 @@ import mrs3.performance_v2_selection as selection_module
 UTC = timezone.utc
 
 
-def _export_database(path: Path) -> tuple[Path, int]:
+def _export_database(path: Path, *, schema_version: int = 11) -> tuple[Path, int]:
     now = datetime(2026, 1, 1, tzinfo=UTC)
     with duckdb.connect(str(path)) as connection:
-        initialize_performance_v2(connection)
+        if schema_version == 10:
+            from tests.test_performance_v2_store import _prepare_v10_migration_fixture
+
+            _prepare_v10_migration_fixture(connection)
+        else:
+            initialize_performance_v2(connection)
         strategy_id = connection.execute(
             """insert into strategies (
                    strategy_name, symbol, side, timeframe, close_ma_len, order_count,
@@ -89,7 +94,9 @@ def _export_database(path: Path) -> tuple[Path, int]:
             [strategy_id, result_id],
         )
         connection.execute(
-            "insert into selection_review_imports values ('review-1', 'run-1', ?, ?, 1)",
+            "insert into selection_review_imports "
+            "(review_import_id, selection_run_id, workbook_sha256, imported_at_utc, row_count) "
+            "values ('review-1', 'run-1', ?, ?, 1)",
             ["d" * 64, now],
         )
         connection.execute(
@@ -140,11 +147,13 @@ def test_performance_v2_export_rejects_unknown_query_parameter(tmp_path: Path) -
         thread.join(timeout=2)
 
 
-@pytest.mark.parametrize("schema_version", [5, 8])
-def test_read_only_export_accepts_v5_and_v8_without_schema_or_review_changes(
+@pytest.mark.parametrize("schema_version", [5, 8, 10])
+def test_read_only_export_accepts_legacy_schema_without_schema_or_review_changes(
     tmp_path: Path, schema_version: int,
 ) -> None:
-    database, strategy_id = _export_database(tmp_path / "strategy_performance.duckdb")
+    database, strategy_id = _export_database(
+        tmp_path / "strategy_performance.duckdb", schema_version=10,
+    )
     selection = PerformanceV2ExportSelection(all_active=True)
     fixed_now = datetime(2026, 1, 2, tzinfo=UTC)
 
@@ -153,11 +162,25 @@ def test_read_only_export_accepts_v5_and_v8_without_schema_or_review_changes(
     v6_headers = [cell.value for cell in v6_sheet[1]]
 
     with duckdb.connect(str(database)) as connection:
-        connection.execute("drop table strategy_rejection_sources")
-        connection.execute("alter table selection_results drop column equity_regime_json")
+        if schema_version < 9:
+            connection.execute("drop table strategy_rejection_sources")
+            connection.execute("alter table selection_results drop column equity_regime_json")
         if schema_version == 5:
             connection.execute("drop table equity_quality_metrics")
         connection.execute("update schema_info set value = ? where key = 'schema_version'", [str(schema_version)])
+        assert require_performance_v2_readable(connection) == schema_version
+        assert connection.execute(
+            "select count(*) from information_schema.tables where table_schema = 'main' "
+            "and table_name in ('selection_publications', 'selection_publication_runs', 'selection_aggregate_imports')"
+        ).fetchone() == (0,)
+        assert connection.execute(
+            "select count(*) from information_schema.columns where table_schema = 'main' "
+            "and table_name = 'selection_review_imports' and column_name = 'aggregate_import_id'"
+        ).fetchone() == (0,)
+        assert connection.execute(
+            "select count(*) from duckdb_indexes() where schema_name = 'main' "
+            "and index_name = 'selection_review_imports_aggregate_run_uq'"
+        ).fetchone() == (0,)
         connection.execute(
             "insert into strategy_tags values (?, 'REJECTED', 'TEST', 'legacy-schema', current_timestamp)",
             [strategy_id],

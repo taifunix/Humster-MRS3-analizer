@@ -29,14 +29,19 @@ def _controller(tmp_path: Path):
 
 
 def test_the_catalog_lists_a_committed_analysis(tmp_path: Path) -> None:
-    """The screen needs the same catalog affordance surfaces already have."""
+    """The screen lists valid analyses in the root, not nested directories."""
     directory = tmp_path / "analysis"
     directory.mkdir()
     analysis_id, _surface = _make_analysis(directory / "run.analysis-v6.duckdb")
+    nested = directory / "OLD"
+    nested.mkdir()
+    nested_analysis_id, _surface = _make_analysis(nested / "hidden.analysis-v6.duckdb", legacy=True)
 
     result = _controller(tmp_path).analysis_catalog()
 
     assert [item["name"] for item in result["analyses"]] == ["run.analysis-v6.duckdb"]
+    assert nested_analysis_id not in {item["analysis_run_id"] for item in result["analyses"]}
+    assert all("/" not in item["analysis_ref"] for item in result["analyses"])
     entry = result["analyses"][0]
     assert entry["analysis_run_id"] == analysis_id
     assert entry["scopes"] == 1

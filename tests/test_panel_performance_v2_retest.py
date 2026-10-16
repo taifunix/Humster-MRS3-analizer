@@ -16,6 +16,10 @@ from openpyxl import Workbook, load_workbook
 from io import BytesIO
 import pytest
 
+from mrs3.evaluation_protocol import EvaluationTarget
+
+from tests._protocol_v2 import use_protocol_v2_target
+
 import mrs3.panel as panel_module
 from mrs3.panel import PerformanceV2ApiError, PanelController, _control_score, create_panel_server
 from mrs3.performance_v2_store import initialize_performance_v2
@@ -466,7 +470,7 @@ def test_current_control_export_import_keeps_multiple_pair_side_groups_local(tmp
 
         decisions = effective_selection_decisions(connection)
     assert decisions[1][:2] == ("REJECTED", None)
-    assert decisions[eth_id][:2] == ("RESERVE", 1)
+    assert decisions[eth_id][:2] == ("RESERVE", None)
 
 
 def test_retest_status_is_db_authoritative_and_defaults_from_current_result(tmp_path: Path) -> None:
@@ -704,6 +708,7 @@ def test_retest_start_rejects_invalid_or_mixed_date_contract(tmp_path: Path, pay
 
 def test_retest_start_uses_native_single_mode_and_keeps_database_read_only(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     controller = _controller(tmp_path)
+    use_protocol_v2_target(monkeypatch)
     database = tmp_path / "performance-v2" / "strategy_performance.duckdb"
     before = database.read_bytes()
     outside_inbox = tmp_path / "outside-inbox"
@@ -721,10 +726,10 @@ def test_retest_start_uses_native_single_mode_and_keeps_database_read_only(tmp_p
     batch = RetestBatch("batch-1", tmp_path / "output" / "strategies", tmp_path / "output" / "strategy_manifest.json", 1)
     seen: dict[str, object] = {}
 
-    monkeypatch.setattr(panel_module, "build_retest_manifest", lambda *args: batch)
+    monkeypatch.setattr(panel_module, "build_retest_manifest", lambda *args, **_kwargs: batch)
 
     class FakeTester:
-        def start(self, manifest_path, *, analysis_run_id, start_date, end_date, job_id):
+        def start(self, manifest_path, *, analysis_run_id, start_date, end_date, job_id, tester_config_template=None):
             seen.update(locals())
             return {"job_id": job_id, "state": "RUNNING", "phase": "RUNNING"}
 
@@ -769,6 +774,7 @@ def test_retest_start_reuses_oldest_valid_inbox_when_newest_is_missing_reports(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     controller = _controller(tmp_path)
+    use_protocol_v2_target(monkeypatch)
     report_dir = tmp_path / "bot" / "tester" / "report" / "my_test"
     strategy_dir = tmp_path / "Output" / "strategies"
     report_dir.mkdir(parents=True)
@@ -799,6 +805,7 @@ def test_retest_start_reuses_oldest_valid_inbox_when_newest_is_missing_reports(
             "test_start": "2026-01-01",
             "test_end": "2026-01-09",
             "listing_dates_path": "input/dates.xlsx",
+            **PanelController._protocol_v2_runtime(_TARGET),
         },
     )
     newer_inbox = tmp_path / "inbox" / "newer-invalid"
@@ -819,7 +826,7 @@ def test_retest_start_reuses_oldest_valid_inbox_when_newest_is_missing_reports(
     controller._panel_jobs.sync(
         "newer-invalid",
         {"state": "COMMITTED", "phase": "COMMITTED", "inbox_ready": True},
-        runtime={"retest": True, "inbox_path": str(newer_inbox)},
+        runtime={"retest": True, "inbox_path": str(newer_inbox), **PanelController._protocol_v2_runtime(_TARGET)},
     )
 
     # The journal sorts object keys when persisting, so recovery must use the
@@ -1365,7 +1372,7 @@ def test_reusable_retest_job_checks_persisted_import_state(
     controller._panel_jobs.sync(tester_job_id, {"state": "COMMITTED"}, runtime=runtime)
     monkeypatch.setattr(controller, "_validate_metadata_inbox", lambda _inbox: None)
 
-    result = controller._reusable_retest_job()
+    result = controller._reusable_retest_job(_TARGET)
 
     assert (result is not None) is reusable
     if reusable:
@@ -1382,7 +1389,7 @@ def test_reusable_retest_job_rejects_inbox_root_itself(tmp_path: Path, monkeypat
     controller._panel_jobs.sync(tester_job_id, {"state": "COMMITTED"}, runtime=runtime)
     monkeypatch.setattr(controller, "_validate_metadata_inbox", lambda _inbox: None)
 
-    assert controller._reusable_retest_job() is None
+    assert controller._reusable_retest_job(_TARGET) is None
 
 
 def test_reusable_retest_job_uses_creation_order_after_registry_restore(
@@ -1397,7 +1404,7 @@ def test_reusable_retest_job_uses_creation_order_after_registry_restore(
     restored = PanelController(tmp_path, tmp_path / "config.local.json")
     monkeypatch.setattr(restored, "_validate_metadata_inbox", lambda _inbox: None)
 
-    result = restored._reusable_retest_job()
+    result = restored._reusable_retest_job(_TARGET)
 
     assert "created_at_utc" not in restored._panel_jobs.get(old_job_id)
     assert result["job_id"] == new_job_id
@@ -1430,7 +1437,7 @@ def test_reusable_retest_job_blocks_reverse_committed_import_link(
     )
     monkeypatch.setattr(controller, "_validate_metadata_inbox", lambda _inbox: None)
 
-    assert controller._reusable_retest_job() is None
+    assert controller._reusable_retest_job(_TARGET) is None
 
 
 @pytest.mark.parametrize("kind", ["tester", "import"])
@@ -1450,10 +1457,16 @@ def test_reusable_retest_job_blocks_active_retest_jobs(
         controller._panel_jobs.transition(job_id, "CANCELLING")
     monkeypatch.setattr(controller, "_validate_metadata_inbox", lambda _inbox: None)
 
-    assert controller._reusable_retest_job() is None
+    assert controller._reusable_retest_job(_TARGET) is None
 
 
-def _committed_retest_job(controller: PanelController, tmp_path: Path, *, state: str = "COMMITTED", job_id: str = "retest-job") -> str:
+_TARGET = EvaluationTarget(Decimal("10000"), "Bybit")
+
+
+def _committed_retest_job(
+    controller: PanelController, tmp_path: Path, *, state: str = "COMMITTED", job_id: str = "retest-job",
+    marker: dict[str, object] | None = None,
+) -> str:
     inbox = tmp_path / "inbox" / job_id
     inbox.mkdir(parents=True)
     (inbox / "inbox_manifest.json").write_text(
@@ -1469,6 +1482,7 @@ def _committed_retest_job(controller: PanelController, tmp_path: Path, *, state:
         runtime={
             "retest": True, "inbox_path": str(inbox), "test_start": "2026-01-01",
             "test_end": "2026-01-09", "listing_dates_path": "input/dates.xlsx",
+            **(PanelController._protocol_v2_runtime(_TARGET) if marker is None else marker),
         },
     )
     return job_id
@@ -1514,6 +1528,8 @@ def test_retest_import_requires_committed_inbox_and_builds_mapping_on_server(tmp
 
 def test_retest_import_injects_current_server_listing_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     controller = _controller(tmp_path)
+    # The job was rendered for _TARGET; the import checks it against the active database (P7 spec §4).
+    monkeypatch.setattr(PanelController, "_evaluation_target", lambda _self: _TARGET)
     tester_job_id = _committed_retest_job(controller, tmp_path, job_id="tester-server-listing")
     runtime = controller._panel_jobs.runtime(tester_job_id)
     monkeypatch.setattr(controller, "_retest_mapping", lambda _job_id: ({"alpha": 1}, runtime))
@@ -2066,3 +2082,12 @@ def test_later_listing_date_is_valid_warmup_input(tmp_path: Path) -> None:
     database = tmp_path / "performance-v2" / "strategy_performance.duckdb"
     with duckdb.connect(str(database), read_only=True) as connection:
         controller._validate_retest_listing(connection, tmp_path / "input" / "dates.xlsx", "2026-01-01")
+
+
+@pytest.mark.parametrize("marker", [{}, {"evaluation_protocol": "v2", "evaluation_base": "10000", "evaluation_exchange": "BingX"}])
+def test_reusable_retest_job_skips_jobs_of_another_protocol_target(tmp_path: Path, marker: dict[str, object]) -> None:
+    controller = _controller(tmp_path)
+    _committed_retest_job(controller, tmp_path, job_id="pre-p6", marker=marker)
+
+    # Protocol v2 §7a: a RETEST inbox rendered before P6 or for another exchange is not reused.
+    assert controller._reusable_retest_job(_TARGET) is None

@@ -1,7 +1,14 @@
 @echo off
-setlocal
+setlocal DisableDelayedExpansion
 cd /d "%~dp0.."
 set PYTHONUTF8=1
+for %%I in ("%~dp0..\src") do set "_MRS3_PANEL_SRC=%%~fI"
+if defined PYTHONPATH (
+  set "PYTHONPATH=%_MRS3_PANEL_SRC%;%PYTHONPATH%"
+) else (
+  set "PYTHONPATH=%_MRS3_PANEL_SRC%"
+)
+set "_MRS3_PANEL_SRC="
 if "%MRS3_PANEL_PORT%"=="" set "MRS3_PANEL_PORT=8765"
 
 if not exist ".venv\Scripts\python.exe" (

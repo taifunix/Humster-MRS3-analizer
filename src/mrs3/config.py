@@ -62,7 +62,7 @@ class PanelPathSettings:
     performance_db_root: Path = Path("data/performanceDB")
     workbooks_root: Path = Path("data/workbooks")
     tester_report_dir: Path = Path("tester/report/my_test")
-    tester_strategy_dir: Path = Path("settings_strategy")
+    tester_strategy_dir: Path = Path("tester/settings_strategy")
     tester_config: Path = Path("config_tester.json")
     surface_target_path: Path = Path("data/surfaces")
 

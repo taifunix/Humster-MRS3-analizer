@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import hashlib
+import itertools
 import json
 from http.client import HTTPConnection
 import os
@@ -22,6 +23,7 @@ import duckdb
 
 import mrs3.panel as panel_module
 from mrs3.panel import PanelController, create_panel_server
+import mrs3.panel_portfolio as pp
 from mrs3.panel_portfolio import (
     PORTFOLIO_SNAPSHOT_UNSERIALIZABLE,
     PortfolioPanelError,
@@ -41,7 +43,7 @@ from mrs3.panel_portfolio import (
 from mrs3.panel_jobs import PanelJobError, PanelJobRegistry
 from mrs3.config import DuckDBImportSettings
 from mrs3.performance_v2_store import PerformanceV2StoreError
-from mrs3.performance_v2_optimizer import OptimizerIntegrityError
+from mrs3.performance_v2_optimizer import OptimizerIntegrityError, PREPARATION_VERSION
 from mrs3.portfolio.config import WEIGHTED_SEARCH_DEFAULTS, PortfolioConfigError, migrate_portfolio_config_document
 from mrs3.portfolio.adapter import (
     CAMPAIGN_CONTRACT_VERSION,
@@ -191,7 +193,7 @@ def _stage2_batch_service(tmp_path: Path, candidates: tuple[dict, ...]) -> tuple
 
 
 def _wait_stage1(service: PortfolioPanelService, result: dict) -> dict:
-    deadline = time.monotonic() + 3
+    deadline = time.monotonic() + 30
     while time.monotonic() < deadline and service.job(result["job_id"])["status"] in {"QUEUED", "RUNNING"}:
         time.sleep(0.01)
     return service.job(result["job_id"])
@@ -237,7 +239,7 @@ def test_panel_freeze_emits_weighted_contract_without_legacy_stage1(monkeypatch:
 def test_panel_freeze_carries_dedicated_weighted_template_and_digest(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     path = tmp_path / "portfolio_optimizer.local.json"
     digest = _write_config(path)
-    template_path = Path(__file__).parents[1] / "templates" / "strategies" / "portfolio-weighted-mrs" / "base.json"
+    template_path = Path(__file__).parents[1] / "templates" / "exchanges" / "Bybit" / "portfolio-strategy.json"
     expected_template = json.loads(template_path.read_text(encoding="utf-8"))
     expected_digest = hashlib.sha256(template_path.read_bytes()).hexdigest()
 
@@ -265,7 +267,7 @@ def test_panel_freeze_carries_dedicated_weighted_template_and_digest(monkeypatch
 def test_panel_freeze_keeps_template_snapshot_after_file_changes(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     path = tmp_path / "portfolio_optimizer.local.json"
     digest = _write_config(path)
-    source_path = Path(__file__).parents[1] / "templates" / "strategies" / "portfolio-weighted-mrs" / "base.json"
+    source_path = Path(__file__).parents[1] / "templates" / "exchanges" / "Bybit" / "portfolio-strategy.json"
     template_path = tmp_path / "base.json"
     template_path.write_bytes(source_path.read_bytes())
     monkeypatch.setattr("mrs3.panel_portfolio._WEIGHTED_TEMPLATE_PATH", template_path)
@@ -922,6 +924,7 @@ def test_readiness_reports_exact_config_digest(tmp_path: Path) -> None:
     assert readiness["config_digest"] == digest
     assert readiness["schema_version"] == 3
     assert readiness["policy_version"] == "portfolio_optimizer_research_risk_v1"
+    assert readiness["combination_limit"] == json.loads(path.read_text(encoding="utf-8"))["search"]["max_enumerated_combinations"]
     assert "search" not in readiness
 
 
@@ -959,6 +962,112 @@ def test_readiness_requests_metadata_only_finalists(tmp_path: Path) -> None:
     assert readiness["available_pairs"] == ["BTCUSDT|LONG"]
     assert len(calls) == 1
     assert calls[0][-1] is False
+
+
+def test_readiness_blocks_stage1_when_metadata_reader_returns_no_finalists(tmp_path: Path) -> None:
+    path = tmp_path / "portfolio_optimizer.local.json"
+    _write_config(path)
+    with duckdb.connect(str(tmp_path / "performance.duckdb")) as connection:
+        connection.execute("create table selection_runs(symbol varchar, side varchar)")
+        connection.execute("insert into selection_runs values ('BTCUSDT', 'LONG')")
+    service = PortfolioPanelService(tmp_path, path, finalists_reader=lambda *_args: ())
+
+    readiness = service.readiness()
+
+    assert readiness["preparation"] == {"state": "READY", "required": 0, "ready": 0}
+    assert readiness["stage1"]["enabled"] is False
+    assert readiness["stage1"]["blockers"] == ["NO_FINALISTS"]
+
+
+def test_readiness_uses_lightweight_preparation_metadata_without_strict_artifact_audit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "portfolio_optimizer.local.json"
+    _write_config(path)
+    database = tmp_path / "performance.duckdb"
+    with duckdb.connect(str(database)):
+        pass
+    service = PortfolioPanelService(tmp_path, path)
+    monkeypatch.setattr(
+        service,
+        "_current_finalist_metadata",
+        lambda *_args, **_kwargs: (database, ["BTCUSDT|LONG"], {"BTCUSDT|LONG": 1}, (11,)),
+    )
+    monkeypatch.setattr(
+        service,
+        "_prepared_finalists_metadata_state",
+        lambda *_args, **_kwargs: {"state": "READY", "required": 1, "ready": 1},
+        raising=False,
+    )
+    monkeypatch.setattr(
+        service,
+        "_prepared_finalists_state",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("strict audit must not run in readiness")),
+    )
+
+    readiness = service.readiness()
+
+    assert readiness["preparation"] == {"state": "READY", "required": 1, "ready": 1}
+    assert readiness["stage1"]["enabled"] is True
+
+
+def test_prepared_finalists_metadata_state_does_not_decode_prepared_payload(tmp_path: Path) -> None:
+    database = tmp_path / "performance.duckdb"
+    with duckdb.connect(str(database)) as connection:
+        connection.execute(
+            """create table optimizer_prepared_inputs(
+                   result_id bigint,
+                   preparation_version varchar,
+                   availability_status varchar,
+                   unavailable_reason varchar,
+                   prepared_json varchar
+               )"""
+        )
+        connection.execute(
+            "insert into optimizer_prepared_inputs values (?, ?, 'AVAILABLE', null, 'not-json')",
+            [11, PREPARATION_VERSION],
+        )
+
+    state = PortfolioPanelService._prepared_finalists_metadata_state(database, (11,))
+
+    assert state == {"state": "READY", "required": 1, "ready": 1}
+
+
+def test_prepared_finalists_metadata_state_reports_missing_and_stale_rows(tmp_path: Path) -> None:
+    database = tmp_path / "performance.duckdb"
+    with duckdb.connect(str(database)) as connection:
+        connection.execute(
+            """create table optimizer_prepared_inputs(
+                   result_id bigint,
+                   preparation_version varchar,
+                   availability_status varchar,
+                   unavailable_reason varchar,
+                   prepared_json varchar
+               )"""
+        )
+        connection.execute(
+            "insert into optimizer_prepared_inputs values (11, 'old', 'AVAILABLE', null, '{}')"
+        )
+        connection.execute(
+            "insert into optimizer_prepared_inputs values (?, ?, 'UNAVAILABLE', 'MISSING_ACTIONS', null)",
+            [13, PREPARATION_VERSION],
+        )
+
+    assert PortfolioPanelService._prepared_finalists_metadata_state(database, (11, 12)) == {
+        "state": "NEEDS_PREPARATION",
+        "required": 2,
+        "ready": 0,
+    }
+    assert PortfolioPanelService._prepared_finalists_metadata_state(database, (11,)) == {
+        "state": "ERROR",
+        "required": 1,
+        "ready": 0,
+    }
+    assert PortfolioPanelService._prepared_finalists_metadata_state(database, (13,)) == {
+        "state": "ERROR",
+        "required": 1,
+        "ready": 0,
+    }
 
 
 def test_active_campaign_conflict_is_reported_before_source_snapshot(tmp_path: Path) -> None:
@@ -2713,6 +2822,10 @@ def test_stage2_route_rejects_non_successful_campaign_before_job_submit(
         {"confirmed": False, "campaign_id": "campaign"},
         {"confirmed": True, "campaign_id": "other"},
         {"confirmed": True, "campaign_id": "campaign", "extra": True},
+        {"confirmed": True, "campaign_id": "campaign", "candidate_ids": []},
+        {"confirmed": True, "campaign_id": "campaign", "candidate_ids": ["a" * 64, "a" * 64]},
+        {"confirmed": True, "campaign_id": "campaign", "candidate_ids": ["not-a-digest"]},
+        {"confirmed": True, "campaign_id": "campaign", "candidate_ids": "a" * 64},
     ),
 )
 def test_stage2_route_rejects_invalid_confirmation_before_campaign_lookup(tmp_path: Path, payload: dict) -> None:
@@ -3490,17 +3603,23 @@ def test_stage2_baseline_preparation_uses_first_persisted_candidate_and_exact_pa
     assert prepared["pretest_period"] == {"start_utc": "2026-01-01T00:00:00Z", "end_utc": "2026-01-15T00:00:00Z"}
 
     config = json.loads(prepared["tester_config_json"])
-    template = json.loads((Path(__file__).parents[1] / "templates/tester/mrs3/config_tester.json").read_text(encoding="utf-8"))
-    expected_config = {**template, "name_comment": "a" * 64, "StartDate": "2026-01-01", "EndDate": "2026-01-14", "InitialBalance": 10000, "single_mode": False, "UpdateData": False}
+    template = json.loads((Path(__file__).parents[1] / "templates/exchanges/Bybit/portfolio-tester.json").read_text(encoding="utf-8"))
+    expected_config = {**template, "name_comment": "a" * 64, "StartDate": "2026-01-01", "EndDate": "2026-01-14", "InitialBalance": 10000, "single_mode": False, "UpdateData": True}
     assert config == expected_config
     assert type(config["InitialBalance"]) is int
     assert config["use_runs"] is False
     assert config["parameter_mining"] == []
     assert prepared["tester_config_json"].endswith("\n")
+    # Pinned bytes: MRS3 evaluation-template changes must never reach Stage 2 (ADR-0070).
+    assert hashlib.sha256(prepared["tester_config_json"].encode("utf-8")).hexdigest() == (
+        "22274250c5b752c78ea6b2c25f67f5230b5ef19424b80bc4e0f3b7491170d5fa"
+    )
     for payload in payloads:
         name = payload["strategy"]["name"]
-        expected = json.dumps(payload["strategy"], ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n"
+        # Tester rendering: template key order, two-space indent, tester rounding.
+        expected = pp._tester_strategy_json(payload["strategy"], pp._load_weighted_template()[0])
         assert prepared["strategy_jsons"][name] == expected
+        assert json.loads(expected) == json.loads(json.dumps(payload["strategy"]))
     assert prepared["receipt"]["candidate_order"] == 0
     assert prepared["receipt"]["profile"] == "BALANCED"
     assert prepared["receipt"]["member_identities"] == [
@@ -3809,6 +3928,9 @@ def test_stage2_baseline_preparation_loads_restart_without_stage1_recomputation(
     assert prepared["candidate_id"] == "f" * 64
 
 
+_FAKE_TESTER_RUNS = itertools.count(1)
+
+
 class _FakeStage2Tester:
     def __init__(
         self,
@@ -3840,7 +3962,7 @@ class _FakeStage2Tester:
             wizard_result=root / "wizard-result.json",
             report_dir=root / "tester" / "report" / "my_test",
             poll_interval_seconds=0.001,
-            stall_timeout_seconds=0.05,
+            stall_timeout_seconds=1.0,
             report_stability_polls=1,
             metric_tolerance=Decimal("0.01"),
         )
@@ -3928,7 +4050,11 @@ class _FakeStage2Tester:
                     if self.report_as_directory:
                         report.mkdir()
                     else:
-                        report.write_text("<html>fresh report</html>", encoding="utf-8")
+                        # Unique per start like a real run; the coarse Windows file clock can stamp
+                        # an immediate write before the precise start time, so stamp it explicitly.
+                        report.write_text(f"<html>fresh report {next(_FAKE_TESTER_RUNS)}</html>", encoding="utf-8")
+                        stamp = time.time_ns() + 1_000_000
+                        os.utime(report, ns=(stamp, stamp))
                     if self.extra_report:
                         (report.parent / "second.html").write_text("<html>second</html>", encoding="utf-8")
                 if self.delayed_report:
@@ -3938,7 +4064,7 @@ class _FakeStage2Tester:
                 else:
                     write_report()
             self.config.wizard_result.write_text(json.dumps([{
-                "runId": f"portfolio-run-{self.current_candidate_id[0]}",
+                "runId": f"portfolio-run-{self.current_candidate_id[0]}-{next(_FAKE_TESTER_RUNS)}",
                 "strategies": list(self.result_names if self.result_names is not None else self.current_names),
                 "stats": self.result_stats,
                 "chartUrl": f"/tester-report/{self.current_candidate_id}/portfolio.html",
@@ -4652,6 +4778,7 @@ def test_weighted_summary_enriches_identity_only_members_from_payload_facts() ->
             "required_bank_usdt": Decimal("200"),
             "B_sat_settings_usdt": Decimal("400"),
             "historical_bank_usdt": Decimal("150"),
+            "own_history_dd_bank_usdt": Decimal("190"),
             "B_risk_usdt": Decimal("180"),
             "B_margin_usdt": Decimal("120"),
             "I_all_usdt": Decimal("40"),
@@ -4662,8 +4789,12 @@ def test_weighted_summary_enriches_identity_only_members_from_payload_facts() ->
     }
 
     summary = PortfolioPanelService._summary(campaign, (), (), (variant,), ())
+    counted = PortfolioPanelService._summary(campaign, (), (), ({**variant, "legacy_ma_prototype_members": 1},), ())
 
+    assert summary["Legacy MA prototype members"] == "UNKNOWN"
+    assert counted["Legacy MA prototype members"] == 1
     assert summary["Historical bank USDT"] == Decimal("150")
+    assert summary["Own-history DD bank USDT"] == Decimal("190")
     assert summary["Stress bank P95 USDT"] == Decimal("180")
     assert summary["IM all USDT"] == Decimal("40")
     assert summary["CDaR peak80 %"] == Decimal("2.5")
@@ -5350,3 +5481,338 @@ def test_http_results_partial_runtime_is_typed(tmp_path: Path) -> None:
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
+
+
+def test_combination_limit_count_is_visible_in_failed_campaign_status(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    adapter_result = SimpleNamespace(
+        status="FAIL",
+        variants=(),
+        blockers=("COMBINATION_LIMIT_EXCEEDED",),
+        excluded=(),
+        warnings=(),
+        diagnostics={"combination_count": 6, "combination_limit": 5},
+    )
+    monkeypatch.setattr(
+        "mrs3.portfolio.adapter.run_portfolio_adapter",
+        lambda *_args, **_kwargs: adapter_result,
+    )
+    config = tmp_path / "portfolio_optimizer.local.json"
+    digest = _write_config(config)
+    service = PortfolioPanelService(
+        tmp_path,
+        config,
+        finalists_reader=lambda *_: [_finalist()],
+    )
+    service.variant_generator = service._package_variant_generator
+    result = service.submit_campaign({
+        "pairs": [{"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0}],
+        "profiles": [{"profile_id": "BALANCED", "bank_available_usdt": "10000", "max_candidates": 1}],
+        "expected_config_digest": digest,
+    })
+
+    job = _wait_stage1(service, result)
+    diagnostic = service.registry.runtime(result["job_id"])["diagnostics"][0]["message"]
+
+    assert job["status"] == "FAILED"
+    assert "COMBINATION_LIMIT_EXCEEDED" in diagnostic
+    assert "COMBINATIONS=6" in diagnostic
+    assert "LIMIT=5" in diagnostic
+
+
+def test_finalist_history_reports_day_aligned_periods_per_pair_side_in_rank_order(tmp_path: Path) -> None:
+    database = tmp_path / "history.duckdb"
+    with duckdb.connect(str(database)) as connection:
+        connection.execute(
+            "create table strategy_results (result_id bigint, report_start_utc timestamptz, report_end_utc timestamptz,"
+            " effective_start_utc timestamptz, effective_end_utc timestamptz)"
+        )
+        connection.execute(
+            "insert into strategy_results values"
+            " (1, '2026-09-01 05:00:00+00', '2026-09-30 12:00:00+00', '2026-09-03 00:00:00+00', '2026-09-29 18:00:00+00'),"
+            " (2, '2026-09-10 00:00:00+00', '2026-10-05 00:00:00+00', null, null),"
+            " (3, '2026-08-01 00:00:00+00', '2026-08-31 00:00:00+00', '2026-08-05 00:00:00+00', null)"
+        )
+    rows = (
+        {"symbol": "AAAUSDT", "side": "LONG", "result_id": 2, "user_rank": 2},
+        {"symbol": "AAAUSDT", "side": "LONG", "result_id": 1, "user_rank": 1},
+        {"symbol": "BBBUSDT", "side": "SHORT", "result_id": 3, "user_rank": None},
+        {"symbol": "BBBUSDT", "side": "SHORT", "result_id": 99, "user_rank": 1},
+    )
+
+    history = PortfolioPanelService._finalist_history(database, rows)
+
+    assert history == {
+        "AAAUSDT|LONG": [
+            {"rank": 1, "start": "2026-09-03", "end": "2026-09-29"},
+            {"rank": 2, "start": "2026-09-10", "end": "2026-10-05"},
+        ],
+        # A finalist without a usable period keeps its rank slot; an incomplete
+        # effective pair falls back to the whole report range.
+        "BBBUSDT|SHORT": [
+            {"rank": 1, "start": None, "end": None},
+            {"rank": None, "start": "2026-08-01", "end": "2026-08-31"},
+        ],
+    }
+
+
+def test_readiness_exposes_finalist_history_without_blocking_on_history_errors(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = tmp_path / "portfolio_optimizer.local.json"
+    _write_config(path)
+    database = tmp_path / "performance.duckdb"
+    with duckdb.connect(str(database)):
+        pass
+    service = PortfolioPanelService(tmp_path, path)
+
+    def metadata(_document, *, require_result_ids=False, rows_out=None):
+        if rows_out is not None:
+            rows_out.append({"symbol": "BTCUSDT", "side": "LONG", "result_id": 11, "user_rank": 1})
+        return database, ["BTCUSDT|LONG"], {"BTCUSDT|LONG": 1}, (11,)
+
+    monkeypatch.setattr(service, "_current_finalist_metadata", metadata)
+    monkeypatch.setattr(service, "_prepared_finalists_metadata_state", lambda *_args, **_kwargs: {"state": "READY", "required": 1, "ready": 1})
+    monkeypatch.setattr(PortfolioPanelService, "_finalist_history", staticmethod(lambda _database, rows: {"BTCUSDT|LONG": [{"rank": 1, "start": "2026-09-01", "end": "2026-09-21"}]}))
+
+    assert service.readiness()["finalist_history"] == {"BTCUSDT|LONG": [{"rank": 1, "start": "2026-09-01", "end": "2026-09-21"}]}
+
+    def broken(_database, _rows):
+        raise duckdb.Error("history unavailable")
+
+    monkeypatch.setattr(PortfolioPanelService, "_finalist_history", staticmethod(broken))
+    readiness = service.readiness()
+    assert readiness["finalist_history"] == {}
+    assert readiness["stage1"]["enabled"] is True
+
+
+
+def test_results_list_every_committed_candidate_for_stage2_selection(tmp_path: Path) -> None:
+    candidates = _stage2_batch_candidates()
+    service, stage1 = _stage2_batch_service(tmp_path, candidates)
+
+    rows = service.results(stage1["campaign_id"])["candidates"]
+
+    assert [row["candidate_id"] for row in rows] == [candidate["candidate_id"] for candidate in candidates]
+    assert [row["order"] for row in rows] == [0, 1, 2]
+    assert rows[0]["profile"] == candidates[0]["profile"]
+    assert rows[0]["positions"] == 2
+    assert rows[0]["required_bank_usdt"] == "10000"
+    assert set(rows[0]) >= {"p30_usdt_30d", "historical_bank_usdt", "margin_bank_usdt", "cdar80_usdt", "max_drawdown_pct"}
+
+
+def test_stage2_runs_only_the_selected_candidates_in_artifact_order(tmp_path: Path) -> None:
+    candidates = _stage2_batch_candidates()
+    service, stage1 = _stage2_batch_service(tmp_path, candidates)
+    fake = _FakeStage2Tester(tmp_path, ("PORTFOLIO_BTCUSDT_7_11", "PORTFOLIO_ETHUSDT_8_12"))
+    service._local_testing_service_provider = lambda: fake
+    selected = [candidates[2]["candidate_id"], candidates[0]["candidate_id"]]
+
+    submitted = service.submit_tester_submission(
+        stage1["campaign_id"], {"confirmed": True, "campaign_id": stage1["campaign_id"], "candidate_ids": selected},
+    )
+    job = _wait_stage1(service, submitted)
+
+    assert job["status"] == "SUCCEEDED"
+    assert [item["candidate_id"] for item in job["results"]] == [candidates[0]["candidate_id"], candidates[2]["candidate_id"]]
+    assert job["batch"]["total"] == 2
+    again = service.submit_tester_submission(
+        stage1["campaign_id"], {"confirmed": True, "campaign_id": stage1["campaign_id"], "candidate_ids": list(reversed(selected))},
+    )
+    assert again["job_id"] == submitted["job_id"]
+    other = service.submit_tester_submission(
+        stage1["campaign_id"], {"confirmed": True, "campaign_id": stage1["campaign_id"], "candidate_ids": [candidates[1]["candidate_id"]]},
+    )
+    assert other["job_id"] != submitted["job_id"]
+    assert [item["candidate_id"] for item in _wait_stage1(service, other)["results"]] == [candidates[1]["candidate_id"]]
+
+
+def test_stage2_rejects_a_selected_candidate_outside_the_artifact(tmp_path: Path) -> None:
+    service, stage1 = _stage2_batch_service(tmp_path, _stage2_batch_candidates())
+    with pytest.raises(PortfolioPanelError) as error:
+        service.submit_tester_submission(
+            stage1["campaign_id"], {"confirmed": True, "campaign_id": stage1["campaign_id"], "candidate_ids": ["f" * 64]},
+        )
+    assert error.value.code == "PORTFOLIO_STAGE2_SELECTION_INVALID"
+
+
+def test_stage2_subset_progress_counts_positions_within_the_batch(tmp_path: Path) -> None:
+    candidates = _stage2_batch_candidates()
+    service, stage1 = _stage2_batch_service(tmp_path, candidates)
+    service._local_testing_service_provider = lambda: _FakeStage2Tester(tmp_path, ("PORTFOLIO_BTCUSDT_7_11", "PORTFOLIO_ETHUSDT_8_12"))
+
+    submitted = service.submit_tester_submission(
+        stage1["campaign_id"], {"confirmed": True, "campaign_id": stage1["campaign_id"], "candidate_ids": [candidates[2]["candidate_id"]]},
+    )
+    job = _wait_stage1(service, submitted)
+
+    assert job["batch"] == {"current_index": 0, "total": 1, "completed": 1}
+
+
+def test_stage2_identical_selection_reruns_after_a_failed_batch_without_rebuilding_a_live_one(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    candidates = _stage2_batch_candidates()
+    service, stage1 = _stage2_batch_service(tmp_path, candidates)
+    service._local_testing_service_provider = lambda: _FakeStage2Tester(tmp_path, ("PORTFOLIO_BTCUSDT_7_11", "PORTFOLIO_ETHUSDT_8_12"))
+    body = {"confirmed": True, "campaign_id": stage1["campaign_id"], "candidate_ids": [candidates[0]["candidate_id"]]}
+    first = service.submit_tester_submission(stage1["campaign_id"], body)
+    _wait_stage1(service, first)
+
+    monkeypatch.setattr(service, "_prepare_stage2_batch", lambda *_args: pytest.fail("existing batch must short-circuit"))
+    assert service.submit_tester_submission(stage1["campaign_id"], body)["job_id"] == first["job_id"]
+    monkeypatch.undo()
+
+    service._local_testing_service_provider = lambda: _FakeStage2Tester(tmp_path, ("PORTFOLIO_BTCUSDT_7_11", "PORTFOLIO_ETHUSDT_8_12"))
+    job = service.registry.jobs[first["job_id"]]
+    job["state"] = "FAILED"
+    rerun = service.submit_tester_submission(stage1["campaign_id"], body)
+    assert rerun["job_id"] != first["job_id"]
+    rerun_job = _wait_stage1(service, rerun)
+    assert rerun_job["status"] == "SUCCEEDED", rerun_job.get("diagnostics")
+
+
+def _tester_strategy_candidate(lots_long: tuple, *, balance: str = "55.333888888888886", exchange: str = "Bybit") -> dict:
+    first = _stage2_payload("BTCUSDT", "LONG", name="PORTFOLIO_BTCUSDT_7_11")
+    second = _stage2_payload("ETHUSDT", "SHORT", name="PORTFOLIO_ETHUSDT_8_12")
+    for payload in (first, second):
+        strategy = payload["strategy"]
+        strategy["basic"]["balance_percentage_long"] = float(balance) if payload is first else 0
+        strategy["basic"]["balance_percentage_short"] = 0 if payload is first else 12.0000001
+        strategy.setdefault("exchange", {})["name"] = exchange
+        strategy["mrs3"] = {
+            "ma_long": [{"value": None, "lot_x": lot, "id": index + 1, "side": "buy"} for index, lot in enumerate(lots_long)],
+            "notification": True,
+            "allow_close_by_market_order": False,
+        }
+    return _weighted_executable_candidate((first, second), candidate_id="c" * 64, identity="c" * 64)
+
+
+def test_stage2_strategy_json_is_indented_in_template_key_order() -> None:
+    material = _stage2_material(_tester_strategy_candidate((0.5, 0.5)))
+    raw = material["strategy_jsons"]["PORTFOLIO_BTCUSDT_7_11"]
+    template, _digest = pp._load_weighted_template()
+
+    assert raw.startswith("{\n  \"") and raw.endswith("}\n")
+    strategy = json.loads(raw)
+    template_keys = [key for key in template if key in strategy]
+    assert list(strategy)[:len(template_keys)] == template_keys
+    assert list(strategy["basic"]) == [key for key in template["basic"] if key in strategy["basic"]] + [
+        key for key in strategy["basic"] if key not in template["basic"]
+    ]
+    assert list(strategy["mrs3"])[:2] == ["allow_close_by_market_order", "ma_long"]
+    assert list(strategy["mrs3"]["ma_long"][0]) == ["id", "side", "lot_x", "value"]
+    tester = material["tester_config_json"]
+    assert tester.startswith("{\n  \"") and list(json.loads(tester))[:3] == ["name_comment", "use_runs", "single_mode"]
+
+
+def test_stage2_strategy_rounds_balance_up_and_lot_x_to_cents_with_remainder_on_last_order() -> None:
+    material = _stage2_material(_tester_strategy_candidate((0.333, 0.333, 0.334)))
+    long_strategy = json.loads(material["strategy_jsons"]["PORTFOLIO_BTCUSDT_7_11"])
+    short_strategy = json.loads(material["strategy_jsons"]["PORTFOLIO_ETHUSDT_8_12"])
+
+    assert long_strategy["basic"]["balance_percentage_long"] == 56
+    assert long_strategy["basic"]["balance_percentage_short"] == 0
+    assert short_strategy["basic"]["balance_percentage_short"] == 13
+    assert [order["lot_x"] for order in long_strategy["mrs3"]["ma_long"]] == [0.33, 0.33, 0.34]
+
+    skewed = json.loads(_stage2_material(_tester_strategy_candidate((0.125, 0.125, 0.756)))["strategy_jsons"]["PORTFOLIO_BTCUSDT_7_11"])
+    lots = [order["lot_x"] for order in skewed["mrs3"]["ma_long"]]
+    assert lots[:2] == [0.13, 0.13]
+    assert round(sum(lots), 2) == 1.01 and lots[-1] == 0.75
+
+
+def test_stage2_strategy_lot_x_rounding_refuses_a_non_positive_last_order() -> None:
+    for lots in ((0.015, 0.015, 0.001), (0.015, 0.015, 0.0)):
+        with pytest.raises(ValueError, match="lot_x"):
+            _stage2_material(_tester_strategy_candidate(lots))
+
+
+def test_stage2_tester_maker_fee_is_zero_for_bybit_only() -> None:
+    bybit = json.loads(_stage2_material(_tester_strategy_candidate((0.5, 0.5)))["tester_config_json"])
+    other = json.loads(_stage2_material(_tester_strategy_candidate((0.5, 0.5), exchange="Binance"))["tester_config_json"])
+
+    assert bybit["MakerFee"] == 0
+    assert other["MakerFee"] == json.loads(pp.portfolio_stage2_tester_config_template().read_text(encoding="utf-8"))["MakerFee"]
+
+
+def test_stage2_tester_config_comes_only_from_its_own_template(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from mrs3.panel_testing import mrs3_tester_config_template, portfolio_stage2_tester_config_template
+
+    stage2_path = portfolio_stage2_tester_config_template()
+    assert stage2_path != mrs3_tester_config_template()
+    assert stage2_path.name == "portfolio-tester.json" and stage2_path.parent.name == "Bybit"
+    assert not hasattr(pp, "mrs3_tester_config_template")
+    # Stage 2 keeps the liquidity-aware fill model of the trading test (ADR-0070).
+    assert json.loads(stage2_path.read_text(encoding="utf-8"))["LimitOrderVolumeCheck"] is True
+
+    sentinel = json.loads(stage2_path.read_text(encoding="utf-8"))
+    sentinel["SlippagePercent"] = 0.123
+    custom = tmp_path / "config_tester.json"
+    custom.write_text(json.dumps(sentinel), encoding="utf-8")
+    monkeypatch.setattr(pp, "portfolio_stage2_tester_config_template", lambda *_args, **_kwargs: custom)
+
+    config = json.loads(_stage2_material(_tester_strategy_candidate((0.5, 0.5)))["tester_config_json"])
+
+    assert config["SlippagePercent"] == 0.123
+
+
+def test_stage2_tester_config_updates_data_and_keeps_report_settings_only_in_report() -> None:
+    config = json.loads(_stage2_material(_tester_strategy_candidate((0.5, 0.5)))["tester_config_json"])
+
+    assert config["UpdateData"] is True
+    assert set(config) & set(config["report"]) == set()
+    assert config["report"]["enable_html_report"] is True
+
+
+def _marked_performance_db(path: Path, exchange: str) -> None:
+    from mrs3.performance_v2_store import initialize_performance_v2
+
+    with duckdb.connect(str(path)) as connection:
+        initialize_performance_v2(connection, evaluation_protocol="v2", exchange=exchange)
+
+
+def test_stage1_is_blocked_for_a_database_of_another_exchange(tmp_path: Path) -> None:
+    """P7 spec §2: optimizer margin and liquidity data exist only for Bybit."""
+    from mrs3.panel_portfolio import _require_exchange_data
+
+    path = tmp_path / "portfolio_optimizer.local.json"
+    _write_config(path)
+    _marked_performance_db(tmp_path / "performance.duckdb", "BingX")
+    service = PortfolioPanelService(tmp_path, path, finalists_reader=lambda *_: pytest.fail("finalists must not be read"))
+
+    readiness = service.readiness()
+
+    assert "EXCHANGE_DATA_UNAVAILABLE" in readiness["stage1"]["blockers"]
+    assert "NO_FINALISTS" not in readiness["stage1"]["blockers"]
+    with pytest.raises(PortfolioPanelError) as error:
+        _require_exchange_data(tmp_path / "performance.duckdb")
+    assert (error.value.code, error.value.status) == ("EXCHANGE_DATA_UNAVAILABLE", 422)
+    document = json.loads(path.read_text(encoding="utf-8"))
+    # Finalist preparation and campaign submit refuse before reading finalists.
+    with pytest.raises(PortfolioPanelError) as error:
+        service._current_finalist_metadata(document)
+    assert error.value.code == "EXCHANGE_DATA_UNAVAILABLE"
+    with pytest.raises(PortfolioPanelError) as error:
+        service._snapshot_finalists(document, {"pairs": []})
+    assert error.value.code == "EXCHANGE_DATA_UNAVAILABLE"
+
+
+def test_an_unreadable_database_is_a_typed_refusal(tmp_path: Path) -> None:
+    from mrs3.panel_portfolio import _require_exchange_data
+
+    broken = tmp_path / "broken.duckdb"
+    broken.write_bytes(b"not a duckdb file")
+
+    with pytest.raises(PortfolioPanelError) as error:
+        _require_exchange_data(broken)
+    assert (error.value.code, error.value.status) == ("PERFORMANCE_DB_UNAVAILABLE", 422)
+
+
+def test_bybit_and_unmarked_databases_keep_stage1(tmp_path: Path) -> None:
+    from mrs3.panel_portfolio import _require_exchange_data
+
+    _marked_performance_db(tmp_path / "bybit.duckdb", "Bybit")
+    with duckdb.connect(str(tmp_path / "plain.duckdb")) as connection:
+        connection.execute("create table selection_runs(symbol varchar, side varchar)")
+
+    _require_exchange_data(tmp_path / "bybit.duckdb")
+    _require_exchange_data(tmp_path / "plain.duckdb")

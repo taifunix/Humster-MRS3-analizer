@@ -1,4 +1,4 @@
-"""Read-only planning and serialized deletes for schema-v10 PerformanceDB."""
+"""Read-only planning and serialized deletes for schema-v12 PerformanceDB."""
 
 from __future__ import annotations
 
@@ -13,9 +13,15 @@ from .performance_v2_selection_review import effective_selection_decisions
 from .performance_v2_store import require_performance_v2
 
 
+# Report analytics of the 2026-10 tester format, one or more rows per result.
+_REPORT_TABLES = ("strategy_report_metrics", "strategy_report_regimes", "strategy_report_monthly")
+_RESULT_SCOPED_TABLES = frozenset({
+    "strategy_actions", "strategy_equity", "window_metrics", "optimizer_prepared_inputs",
+    "equity_quality_metrics", *_REPORT_TABLES,
+})
 _PAIR_TABLES = (
     "strategies", "strategy_orders", "strategy_results", "strategy_actions",
-    "strategy_equity", "window_metrics", "optimizer_prepared_inputs",
+    "strategy_equity", "window_metrics", "optimizer_prepared_inputs", *_REPORT_TABLES,
     "equity_quality_metrics", "strategy_tags", "strategy_rejection_sources",
     "selection_runs", "selection_results", "selection_review_imports",
     "selection_review_rows", "analysis_plateaus",
@@ -29,9 +35,14 @@ _PAIR_TABLES = (
 _REJECTED_RETAINED_TABLES = frozenset({"strategies", "strategy_orders", "strategy_results"})
 _REJECTED_TABLES = (
     "selection_review_rows", "selection_results",
-    "strategy_actions", "strategy_equity", "window_metrics",
+    "strategy_actions", "strategy_equity", "window_metrics", *_REPORT_TABLES,
     "optimizer_prepared_inputs", "equity_quality_metrics",
     "strategy_tags", "strategy_rejection_sources",
+)
+_REPORT_TABLE_IDENTITY = (
+    ("strategy_report_metrics", "facts.result_id"),
+    ("strategy_report_regimes", "facts.result_id, facts.regime"),
+    ("strategy_report_monthly", "facts.result_id, facts.month"),
 )
 _GLOBAL_JOURNAL_TABLES = frozenset({"import_files", "import_runs"})
 _PRESERVED_METADATA_TABLES = frozenset({"schema_info"})
@@ -40,6 +51,9 @@ _SCHEMA_TABLE_CLASSES = {
     "pair-scoped": _PAIR_TABLES,
     "global-journal": ("import_files", "import_runs"),
     "preserved-metadata": ("schema_info",),
+    "publication-lineage": (
+        "selection_publications", "selection_publication_runs", "selection_aggregate_imports",
+    ),
 }
 _OPERATION_TABLES = {
     "rejected": _REJECTED_TABLES,
@@ -52,7 +66,7 @@ class PerformanceV2MaintenanceError(ValueError):
 
 
 class PerformanceV2MaintenanceSchemaError(PerformanceV2MaintenanceError):
-    """The database does not match the classified schema-v10 contract."""
+    """The database does not match the classified schema-v12 contract."""
 
 
 def set_query_workers(connection: duckdb.DuckDBPyConnection, workers: int) -> int:
@@ -64,12 +78,12 @@ def set_query_workers(connection: duckdb.DuckDBPyConnection, workers: int) -> in
     return capped
 
 
-def _classify_schema_v10_tables(connection: duckdb.DuckDBPyConnection) -> None:
+def _classify_schema_v11_tables(connection: duckdb.DuckDBPyConnection) -> None:
     classified: dict[str, str] = {}
     for category, tables in _SCHEMA_TABLE_CLASSES.items():
         for table in tables:
             if table in classified:
-                raise PerformanceV2MaintenanceSchemaError(f"schema v10 table is classified more than once: {table}")
+                raise PerformanceV2MaintenanceSchemaError(f"schema v12 table is classified more than once: {table}")
             classified[table] = category
     actual = {
         str(row[0])
@@ -83,24 +97,24 @@ def _classify_schema_v10_tables(connection: duckdb.DuckDBPyConnection) -> None:
     unclassified = sorted(actual - set(classified))
     if unclassified:
         raise PerformanceV2MaintenanceSchemaError(
-            "unclassified schema v10 table(s): " + ", ".join(unclassified)
+            "unclassified schema v12 table(s): " + ", ".join(unclassified)
         )
     missing = sorted(set(classified) - actual)
     if missing:
         raise PerformanceV2MaintenanceSchemaError(
-            "missing classified schema v10 table(s): " + ", ".join(missing)
+            "missing classified schema v12 table(s): " + ", ".join(missing)
         )
 
 
-def _require_schema_v10(connection: duckdb.DuckDBPyConnection) -> None:
+def _require_schema_v11(connection: duckdb.DuckDBPyConnection) -> None:
     try:
         row = connection.execute("select value from schema_info where key = 'schema_version'").fetchone()
     except Exception as error:
         raise PerformanceV2MaintenanceSchemaError(str(error)) from error
     version = None if row is None else row[0]
-    if str(version) != "10":
-        raise PerformanceV2MaintenanceSchemaError(f"maintenance requires PerformanceDB schema v10; found {version}")
-    _classify_schema_v10_tables(connection)
+    if str(version) != "12":
+        raise PerformanceV2MaintenanceSchemaError(f"maintenance requires PerformanceDB schema v12; found {version}")
+    _classify_schema_v11_tables(connection)
     try:
         require_performance_v2(connection)
     except Exception as error:
@@ -118,6 +132,10 @@ def _audit_reachability(connection: duckdb.DuckDBPyConnection) -> None:
         ("window_metrics", "select count(*) from window_metrics rows left join strategy_results using (result_id) where strategy_results.result_id is null"),
         ("optimizer_prepared_inputs", "select count(*) from optimizer_prepared_inputs rows left join strategy_results using (result_id) where strategy_results.result_id is null"),
         ("equity_quality_metrics", "select count(*) from equity_quality_metrics rows left join strategy_results using (result_id) where strategy_results.result_id is null"),
+        *(
+            (table, f"select count(*) from {table} rows left join strategy_results using (result_id) where strategy_results.result_id is null")
+            for table in _REPORT_TABLES
+        ),
         ("selection_results", "select count(*) from selection_results rows left join selection_runs using (selection_run_id) left join strategies using (strategy_id) where selection_runs.selection_run_id is null or strategies.strategy_id is null"),
         ("selection_review_imports", "select count(*) from selection_review_imports rows left join selection_runs using (selection_run_id) where selection_runs.selection_run_id is null"),
         ("selection_review_rows", "select count(*) from selection_review_rows rows left join selection_review_imports using (review_import_id) left join strategies using (strategy_id) where selection_review_imports.review_import_id is null or strategies.strategy_id is null"),
@@ -193,7 +211,7 @@ def _audit_pair_ownership(
 
 
 def _catalog_symbols(connection: duckdb.DuckDBPyConnection) -> list[str]:
-    _require_schema_v10(connection)
+    _require_schema_v11(connection)
     rows = connection.execute(
         "select symbol from strategies union select symbol from selection_runs order by symbol"
     ).fetchall()
@@ -589,6 +607,13 @@ def create_preview(
                   from equity_quality_metrics facts join strategy_results results using (result_id)
                   join strategies using (strategy_id)
                  where results.strategy_id in (select unnest(?::bigint[]))"""),
+            *(
+                (table, f"""select strategies.symbol, {key}
+                      from {table} facts join strategy_results results using (result_id)
+                      join strategies using (strategy_id)
+                     where results.strategy_id in (select unnest(?::bigint[]))""")
+                for table, key in _REPORT_TABLE_IDENTITY
+            ),
             ("strategy_tags", """select strategies.symbol, tags.strategy_id, tags.tag
                   from strategy_tags tags join strategies using (strategy_id)
                  where tags.strategy_id in (select unnest(?::bigint[]))"""),
@@ -613,6 +638,10 @@ def create_preview(
             ("window_metrics", f"select strategies.symbol, facts.result_id, facts.requested_start_utc, facts.requested_end_utc, facts.metrics_version from window_metrics facts join strategy_results results using (result_id) join strategies using (strategy_id) where strategies.{selected_sql}", False),
             ("optimizer_prepared_inputs", f"select strategies.symbol, facts.result_id from optimizer_prepared_inputs facts join strategy_results results using (result_id) join strategies using (strategy_id) where strategies.{selected_sql}", False),
             ("equity_quality_metrics", f"select strategies.symbol, facts.result_id, facts.algo_version from equity_quality_metrics facts join strategy_results results using (result_id) join strategies using (strategy_id) where strategies.{selected_sql}", False),
+            *(
+                (table, f"select strategies.symbol, {key} from {table} facts join strategy_results results using (result_id) join strategies using (strategy_id) where strategies.{selected_sql}", False)
+                for table, key in _REPORT_TABLE_IDENTITY
+            ),
             ("strategy_tags", f"select strategies.symbol, tags.strategy_id, tags.tag from strategy_tags tags join strategies using (strategy_id) where strategies.{selected_sql}", False),
             ("strategy_rejection_sources", f"select strategies.symbol, sources.strategy_id, sources.source_kind, sources.reason_code from strategy_rejection_sources sources join strategies using (strategy_id) where strategies.{selected_sql}", False),
             ("selection_runs", "select symbol, selection_run_id from selection_runs where " + selected_sql, False),
@@ -779,7 +808,7 @@ def _target_predicate(table: str, targets: Mapping[str, object]) -> tuple[str, l
         return f"strategy_id in ({strategy_source})", strategy_params
     if table == "strategy_results":
         return f"strategy_id in ({strategy_source})", strategy_params
-    if table in {"strategy_actions", "strategy_equity", "window_metrics", "optimizer_prepared_inputs", "equity_quality_metrics"}:
+    if table in _RESULT_SCOPED_TABLES:
         return (
             f"result_id in (select result_id from strategy_results where strategy_id in ({strategy_source}) "
             f"union all select current_result_id from strategies where strategy_id in ({strategy_source}))",
@@ -896,7 +925,7 @@ def _count_by_symbol(connection: duckdb.DuckDBPyConnection, table: str, targets:
         source, alias, symbol = f"{table} child join strategies using (strategy_id)", "strategies", "symbol"
     elif table == "strategy_results":
         source, alias, symbol = "strategy_results child join strategies using (strategy_id)", "strategies", "symbol"
-    elif table in {"strategy_actions", "strategy_equity", "window_metrics", "optimizer_prepared_inputs", "equity_quality_metrics"}:
+    elif table in _RESULT_SCOPED_TABLES:
         source = f"{table} child join strategy_results using (result_id) join strategies using (strategy_id)"
         alias, symbol = "strategies", "symbol"
     elif table == "selection_runs":
@@ -930,7 +959,7 @@ def _delete_specs(preview: Mapping[str, object]) -> tuple[str, ...]:
         "strategy_rejection_sources",
         "selection_review_rows", "selection_review_imports", "selection_results",
         "strategy_actions", "strategy_equity", "optimizer_prepared_inputs", "window_metrics",
-        "equity_quality_metrics", "strategy_results", "strategy_tags",
+        "equity_quality_metrics", *_REPORT_TABLES, "strategy_results", "strategy_tags",
         "strategy_orders", "analysis_plateaus", "import_files", "import_runs",
         "selection_runs", "strategies",
     )
@@ -1056,7 +1085,10 @@ def apply_preview(
                                   sizing_use_fix = null,
                                   sizing_balance_percentage_long = null,
                                   sizing_risk_long = null,
-                                  sizing_max_balance = null
+                                  sizing_max_balance = null,
+                                  sizing_my_fix_balance = null,
+                                  sizing_balance_percentage_short = null,
+                                  sizing_risk_short = null
                             where strategy_id in (select unnest(?::BIGINT[]))""",
                         [archive_ids],
                     )

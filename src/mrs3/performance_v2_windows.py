@@ -11,6 +11,8 @@ from typing import Any, Sequence
 
 import duckdb
 
+from .performance_v2_sizing import load_fixed_lot_base
+
 from .performance_v2_equity_quality import EquitySample
 
 
@@ -414,7 +416,9 @@ def _calculate(
     ordered_source: bool = False,
     initial_balance: Decimal | None = None,
     legacy_equity_boundaries: bool = False,
+    fixed_base: Decimal | None = None,
 ) -> WindowMetrics:
+    """Window metrics; `fixed_base` B switches a FIXED result to base-relative formulas (protocol v2 §4.6)."""
     if end < report_start or start > report_end or end < start:
         return WindowMetrics.unavailable(result_id, start, end, "OUT_OF_RANGE", version)
 
@@ -505,7 +509,18 @@ def _calculate(
 
         baseline = baseline_balance
         final = endpoint_balance
-        if baseline == 0:
+        included_indices = {item.index for trip in trips for item in (*trip.entries, *trip.realisations)}
+        if fixed_base is not None:
+            # FIXED: the window log-return is ΔW / B; the balance offset cancels in ΔW.
+            days = Decimal(str((effective_end - baseline_time).total_seconds())) / Decimal("86400")
+            log_return = (final - baseline) / fixed_base
+            growth = log_return.exp()
+            return_pct = (growth - 1) * 100
+            daily_log = log_return / days if days > 0 else None
+            daily_growth = (daily_log.exp() - 1) * 100 if daily_log is not None else None
+            fees_pct = sum((item.fee for item in scoped_actions if item.index in included_indices), Decimal(0)) / fixed_base * 100
+            return_dd = None
+        elif baseline == 0:
             growth = return_pct = daily_log = daily_growth = return_dd = fees_pct = None
         else:
             growth = final / baseline
@@ -513,7 +528,6 @@ def _calculate(
             days = Decimal(str((effective_end - baseline_time).total_seconds())) / Decimal("86400")
             daily_log = growth.ln() / days if growth > 0 and days > 0 else None
             daily_growth = (daily_log.exp() - 1) * 100 if daily_log is not None else None
-            included_indices = {item.index for trip in trips for item in (*trip.entries, *trip.realisations)}
             fees_pct = sum((item.fee for item in scoped_actions if item.index in included_indices), Decimal(0)) / baseline * 100
             return_dd = None
 
@@ -528,7 +542,10 @@ def _calculate(
             for sample in observed:
                 equity_value = sample.equity + balance_offset
                 peak = max(peak, equity_value)
-                if peak > 0:
+                if fixed_base is not None:
+                    # FIXED: linear drawdown d = (peak - E) / B.
+                    max_drawdown_pct = max(max_drawdown_pct, (peak - equity_value) / fixed_base * 100)
+                elif peak > 0:
                     max_drawdown_pct = max(max_drawdown_pct, (peak - equity_value) / peak * 100)
             if max_drawdown_pct != 0 and return_pct is not None:
                 return_dd = return_pct / max_drawdown_pct
@@ -734,6 +751,7 @@ def _get_or_calculate_window(
     metrics = _calculate(
         result_id, start, end, version, *source,
         initial_balance=initial_balance, ordered_source=True,
+        fixed_base=load_fixed_lot_base(connection, result_id),
     )
     _persist(connection, metrics)
     persisted = _cached(connection, result_id, start, end, version)

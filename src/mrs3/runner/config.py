@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 import json
 from pathlib import Path
+import stat
 from urllib.parse import urlparse
 
 
@@ -13,6 +14,27 @@ class RunnerConfigError(ValueError):
 
 class UnsafePathError(RunnerConfigError):
     """Raised before a destructive operation can target an unexpected path."""
+
+
+_FILE_ATTRIBUTE_REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+
+
+def _is_link_or_junction(path: Path) -> bool:
+    if path.is_symlink():
+        return True
+    is_junction = getattr(path, "is_junction", None)
+    if is_junction is not None and is_junction():
+        return True
+    try:
+        info = path.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return bool(
+        getattr(info, "st_file_attributes", 0) & _FILE_ATTRIBUTE_REPARSE_POINT
+        or getattr(info, "st_reparse_tag", 0)
+    )
 
 
 def _resolve_inside(path: Path, root: Path, label: str) -> Path:
@@ -46,7 +68,7 @@ def _path_contains_link(path: Path, root: Path) -> bool:
     current = root
     for part in relative.parts:
         current = current / part
-        if current.is_symlink() or getattr(current, "is_junction", lambda: False)():
+        if _is_link_or_junction(current):
             return True
     return False
 
@@ -64,11 +86,19 @@ def validate_report_directory(path: Path, bot_root: Path) -> Path:
 
 
 def validate_strategy_directory(path: Path, bot_root: Path) -> Path:
-    resolved = _resolve_inside(path, bot_root, "strategy_dir")
-    expected = (bot_root.resolve() / "settings_strategy").resolve()
-    if resolved != expected:
+    root = bot_root.resolve()
+    candidate = path if path.is_absolute() else root / path
+    if _path_contains_link(candidate, root):
+        raise UnsafePathError("strategy_dir must not contain links")
+    resolved = _resolve_inside(candidate, root, "strategy_dir")
+    expected = (
+        root / "tester" / "settings_strategy",
+        root / "settings_strategy",
+    )
+    if resolved not in expected:
         raise UnsafePathError(
-            f"strategy_dir must be the exact bot_root/settings_strategy directory: {expected}"
+            "strategy_dir must be the exact bot_root/tester/settings_strategy "
+            "or legacy bot_root/settings_strategy directory"
         )
     return resolved
 

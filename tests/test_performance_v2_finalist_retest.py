@@ -27,6 +27,7 @@ from mrs3.performance_v2_finalist_retest import (
     FinalistRetestError,
     import_combined_control_workbook,
     finalist_retest_config_digest,
+    current_effective_finalist_members,
     _control_reason,
 )
 from mrs3.performance_v2_store import initialize_performance_v2
@@ -34,12 +35,32 @@ from mrs3.performance_v2_selection import (
     SELECTION_REASON_ALIASES, SelectionRequest, parse_selection_request, write_selection_workbook,
 )
 import duckdb
+
+from mrs3.evaluation_protocol import EvaluationTarget
 from mrs3.panel_testing import render_strategy
 from mrs3.panel_fast_strategy_test import LocalSingleModeStrategyTestService
 from mrs3.panel_strategy_batch import validate_strategy_manifest
 
 
 PORTFOLIO_ARITHMETIC_FIXTURE = Path(__file__).parent / "fixtures" / "portfolio" / "source_sizing_arithmetic.json"
+
+
+@pytest.mark.parametrize("version", [10, 11])
+def test_current_effective_finalist_control_reader_accepts_v10_and_v11(version: int) -> None:
+    from tests.test_performance_v2_store import _prepare_v10_migration_fixture
+    from mrs3.performance_v2_store import _require_v10_catalog
+
+    with duckdb.connect(":memory:") as connection:
+        if version == 10:
+            _prepare_v10_migration_fixture(connection)
+            _require_v10_catalog(connection)
+            assert connection.execute(
+                "select count(*) from information_schema.tables where table_schema = 'main' "
+                "and table_name in ('selection_publications', 'selection_publication_runs', 'selection_aggregate_imports')"
+            ).fetchone() == (0,)
+        else:
+            initialize_performance_v2(connection)
+        assert current_effective_finalist_members(connection) == ()
 
 
 def test_selection_reason_aliases_are_shared_and_reversible() -> None:
@@ -107,8 +128,8 @@ def test_bulk_control_candidate_workbook_uses_regime_column_contract() -> None:
 
 def test_weighted_template_only_changes_name_and_mrs_priority() -> None:
     root = Path(__file__).resolve().parents[1]
-    original_text = (root / "templates/strategies/retest-mrs3/base.json").read_text(encoding="utf-8")
-    weighted_text = (root / "templates/strategies/portfolio-weighted-mrs/base.json").read_text(encoding="utf-8")
+    original_text = (root / "templates/exchanges/Bybit/mrs3-strategy.json").read_text(encoding="utf-8")
+    weighted_text = (root / "templates/exchanges/Bybit/portfolio-strategy.json").read_text(encoding="utf-8")
     original = json.loads(original_text)
     weighted = json.loads(weighted_text)
 
@@ -134,9 +155,18 @@ def test_weighted_template_only_changes_name_and_mrs_priority() -> None:
 
     assert not set(keys(weighted)).intersection({"open_positions_limiter", "k", "size_composition_vector"})
 
+    # Protocol v2 (§4.2, §9): the retest template moved to the fixed lot and ohlc4,
+    # the weighted Stage 2 template keeps the legacy DYNAMIC prototype.
+    assert original["exchange"]["use_upnl"] is False and original["basic"]["use_fix"] is True
     normalized = deepcopy(original)
     normalized["name"] = weighted["name"]
     normalized["mrs"] = weighted["mrs"]
+    normalized["exchange"]["use_upnl"] = weighted["exchange"]["use_upnl"]
+    for field in ("use_fix", "my_fix_balance", "more_data"):
+        normalized["basic"][field] = weighted["basic"][field]
+    for key in ("ma_long", "ma_short"):
+        for entry, legacy in zip(normalized["mrs3"][key], weighted["mrs3"][key], strict=True):
+            entry["source"] = legacy["source"]
     assert weighted == normalized
 
     original_filename, rendered_original = render_strategy(original_text, "ONUSDT", "LONG")
@@ -208,7 +238,7 @@ def test_freeze_uses_effective_user_status_and_listing_warmup_without_writes() -
         initialize_performance_v2(connection)
         now = datetime(2026, 1, 1, tzinfo=UTC)
         connection.execute(
-            """insert into strategies values
+            """insert into strategies (strategy_id, strategy_name, symbol, side, timeframe, close_ma_len, order_count, analysis_run_id, candidate_identity, lifecycle_status, current_result_id, created_at_utc, updated_at_utc) values
             (1, 'final', 'BTCUSDT', 'LONG', '1h', 5, 1, 'run', 'candidate-1', 'ACTIVE', 11, ?, ?),
             (2, 'reserve', 'ETHUSDT', 'SHORT', '4h', 7, 1, 'run', 'candidate-2', 'ACTIVE', 12, ?, ?),
             (3, 'filtered', 'SOLUSDT', 'LONG', '1h', 5, 1, 'run', 'candidate-3', 'ACTIVE', 13, ?, ?)""",
@@ -250,7 +280,8 @@ def test_freeze_uses_effective_user_status_and_listing_warmup_without_writes() -
         )
         connection.execute(
             """insert into selection_review_imports
-            values ('review-2', 'run-2', ?, ?, 1)""",
+               (review_import_id, selection_run_id, workbook_sha256, imported_at_utc, row_count)
+               values ('review-2', 'run-2', ?, ?, 1)""",
             ["d" * 64, now],
         )
         connection.execute(
@@ -258,6 +289,7 @@ def test_freeze_uses_effective_user_status_and_listing_warmup_without_writes() -
         )
         connection.execute(
             """insert into selection_review_imports
+               (review_import_id, selection_run_id, workbook_sha256, imported_at_utc, row_count)
                values ('review-1', 'run-1', ?, ?, 1)""",
             ["e" * 64, now],
         )
@@ -293,7 +325,7 @@ def test_manifest_has_one_common_period_and_native_strategy_provenance(tmp_path)
         initialize_performance_v2(connection)
         now = datetime(2026, 1, 1, tzinfo=UTC)
         connection.execute(
-            "insert into strategies values (1, 'final', 'BTCUSDT', 'LONG', '1h', 5, 1, 'run', 'candidate', 'ACTIVE', 11, ?, ?)",
+            "insert into strategies (strategy_id, strategy_name, symbol, side, timeframe, close_ma_len, order_count, analysis_run_id, candidate_identity, lifecycle_status, current_result_id, created_at_utc, updated_at_utc) values (1, 'final', 'BTCUSDT', 'LONG', '1h', 5, 1, 'run', 'candidate', 'ACTIVE', 11, ?, ?)",
             [now, now],
         )
         connection.execute(
@@ -317,6 +349,7 @@ def test_manifest_has_one_common_period_and_native_strategy_provenance(tmp_path)
         )
         connection.execute(
             """insert into selection_review_imports
+               (review_import_id, selection_run_id, workbook_sha256, imported_at_utc, row_count)
                values ('review-1', 'selection-1', ?, ?, 1)""",
             ["d" * 64, now],
         )
@@ -325,12 +358,13 @@ def test_manifest_has_one_common_period_and_native_strategy_provenance(tmp_path)
         )
         batch = build_finalist_retest_manifest(
             connection,
-            {"LONG": Path("templates/strategies/retest-mrs3/base.json")},
+            {"LONG": Path(__file__).resolve().parents[1] / "templates/exchanges/Bybit/mrs3-strategy.json"},
             tmp_path / "output",
             test_start="2026-01-01",
             test_end="2026-06-01",
             listing_dates={"BTCUSDT": date(2025, 12, 1)},
             job_id="bulk-1",
+            evaluation=EvaluationTarget(Decimal("10000"), "Bybit"),
         )
 
     manifest = json.loads(batch.manifest_path.read_text(encoding="utf-8"))
@@ -350,10 +384,12 @@ def test_manifest_has_one_common_period_and_native_strategy_provenance(tmp_path)
     assert LocalSingleModeStrategyTestService._require_diagnostics(validated, ("final",)) == manifest["candidate_diagnostics"]
     strategy = json.loads((batch.strategies_path / "final.json").read_text(encoding="utf-8"))
     assert strategy["name"] == "final"
-    assert strategy["basic"]["use_fix"] is False
-    assert strategy["exchange"]["use_upnl"] is True
+    # Protocol v2: fixed lot on the base of the MRS3 tester template, the active exchange.
+    assert strategy["basic"]["use_fix"] is True
+    assert strategy["exchange"]["use_upnl"] is False
     assert strategy["exchange"]["use_frozen_balance"] is True
-    assert strategy["basic"]["my_fix_balance"] == 1000.0
+    assert strategy["basic"]["my_fix_balance"] == 10000.0
+    assert strategy["exchange"]["name"] == "Bybit"
 
 
 def test_import_outcomes_replace_successful_member_and_isolate_failure() -> None:
@@ -361,7 +397,7 @@ def test_import_outcomes_replace_successful_member_and_isolate_failure() -> None
         initialize_performance_v2(connection)
         now = datetime(2026, 1, 1, tzinfo=UTC)
         connection.execute(
-            """insert into strategies values
+            """insert into strategies (strategy_id, strategy_name, symbol, side, timeframe, close_ma_len, order_count, analysis_run_id, candidate_identity, lifecycle_status, current_result_id, created_at_utc, updated_at_utc) values
             (1, 'one', 'BTCUSDT', 'LONG', '1h', 5, 1, 'run', 'one', 'ACTIVE', 11, ?, ?),
             (2, 'two', 'BTCUSDT', 'LONG', '1h', 5, 1, 'run', 'two', 'ACTIVE', 12, ?, ?)""",
             [now, now, now, now],
@@ -467,7 +503,7 @@ def test_combined_control_import_is_atomic_and_idempotent() -> None:
         initialize_performance_v2(connection)
         now = datetime(2026, 1, 1, tzinfo=UTC)
         connection.execute(
-            "insert into strategies values (1, 'one', 'BTCUSDT', 'LONG', '1h', 5, 1, 'run', 'one', 'ACTIVE', 11, ?, ?)",
+            "insert into strategies (strategy_id, strategy_name, symbol, side, timeframe, close_ma_len, order_count, analysis_run_id, candidate_identity, lifecycle_status, current_result_id, created_at_utc, updated_at_utc) values (1, 'one', 'BTCUSDT', 'LONG', '1h', 5, 1, 'run', 'one', 'ACTIVE', 11, ?, ?)",
             [now, now],
         )
         connection.execute(
@@ -476,6 +512,55 @@ def test_combined_control_import_is_atomic_and_idempotent() -> None:
         )
         connection.execute("insert into selection_runs values ('sel', (select value from schema_info where key='database_instance_id'), 'BTCUSDT', 'LONG', 'v1', '{}', ?, '{}', ?, 1, 1, 1, 20, ?, ?)", ["a" * 64, "b" * 64, "c" * 64, now])
         connection.execute("insert into selection_results (selection_run_id, strategy_id, result_id_at_selection, auto_status, auto_rank, prior_rejected, stage_trace_json) values ('sel', 1, 11, 'FINALIST', 1, false, '{}')")
+        connection.execute(
+            "insert into strategies (strategy_id, strategy_name, symbol, side, timeframe, close_ma_len, order_count, analysis_run_id, candidate_identity, lifecycle_status, current_result_id, created_at_utc, updated_at_utc) values (2, 'two', 'BTCUSDT', 'LONG', '1h', 5, 1, 'run', 'two', 'ACTIVE', 12, ?, ?)",
+            [now, now],
+        )
+        connection.execute(
+            "insert into strategies (strategy_id, strategy_name, symbol, side, timeframe, close_ma_len, order_count, analysis_run_id, candidate_identity, lifecycle_status, current_result_id, created_at_utc, updated_at_utc) values (3, 'three', 'BTCUSDT', 'SHORT', '1h', 5, 1, 'run', 'three', 'ACTIVE', 13, ?, ?)",
+            [now, now],
+        )
+        previous_imported = datetime(2025, 12, 31, tzinfo=UTC)
+        cleared_imported = datetime(2026, 1, 1, 12, tzinfo=UTC)
+        connection.execute(
+            "insert into selection_review_imports "
+            "(review_import_id, selection_run_id, workbook_sha256, imported_at_utc, row_count) "
+            "values ('review-old', 'sel', ?, ?, 2)",
+            ["d" * 64, previous_imported],
+        )
+        connection.execute(
+            "insert into selection_review_rows values ('review-old', 1, 'FINALIST', 7, null, 'old finalist')"
+        )
+        connection.execute(
+            "insert into selection_review_rows values ('review-old', 2, 'FINALIST', 8, null, 'old finalist')"
+        )
+        # A review row can be malformed or synthetic; it must not make a
+        # strategy from another direction eligible for this LONG reconciliation.
+        connection.execute(
+            "insert into selection_review_rows values ('review-old', 3, 'FINALIST', 9, null, 'wrong direction')"
+        )
+        connection.execute(
+            "insert into selection_review_imports "
+            "(review_import_id, selection_run_id, workbook_sha256, imported_at_utc, row_count) "
+            "values ('review-clear', 'sel', ?, ?, 1)",
+            ["e" * 64, cleared_imported],
+        )
+        connection.execute(
+            "insert into selection_review_rows values ('review-clear', 2, null, null, null, 'keep this comment')"
+        )
+        connection.execute(
+            "insert into selection_runs values ('sel-short', (select value from schema_info where key='database_instance_id'), 'BTCUSDT', 'SHORT', 'v1', '{}', ?, '{}', ?, 1, 1, 1, 20, ?, ?)",
+            ["f" * 64, "g" * 64, "h" * 64, previous_imported],
+        )
+        connection.execute(
+            "insert into selection_review_imports "
+            "(review_import_id, selection_run_id, workbook_sha256, imported_at_utc, row_count) "
+            "values ('review-short', 'sel-short', ?, ?, 1)",
+            ["i" * 64, previous_imported],
+        )
+        connection.execute(
+            "insert into selection_review_rows values ('review-short', 3, 'FINALIST', 1, null, 'short finalist')"
+        )
         instance = connection.execute("select value from schema_info where key='database_instance_id'").fetchone()[0]
         data = combined_control_workbook_bytes(
             [{"symbol": "BTCUSDT", "side": "LONG", "strategy_id": 1, "result_id": 11, "user_status": "REJECTED", "user_rank": None, "auto_status": "FINALIST", "auto_rank": 1}],
@@ -487,8 +572,24 @@ def test_combined_control_import_is_atomic_and_idempotent() -> None:
         result = import_combined_control_workbook(connection, data)
         assert result["group_count"] == 1
         assert connection.execute("select tag from strategy_tags where strategy_id=1").fetchall() == [("REJECTED",)]
+        imported_rows = connection.execute(
+            "select strategy_id, user_status, user_rank, comment from selection_review_rows where review_import_id = ? order by strategy_id",
+            [result["review_import_ids"][0]],
+        ).fetchall()
+        assert imported_rows == [
+            (1, "REJECTED", None, ""),
+            (2, "RESERVE", None, "keep this comment"),
+        ]
+        assert connection.execute(
+            "select row_count from selection_review_imports where review_import_id = ?",
+            [result["review_import_ids"][0]],
+        ).fetchone() == (2,)
         replay = import_combined_control_workbook(connection, data)
         assert replay["review_import_ids"] == result["review_import_ids"]
+        assert connection.execute(
+            "select count(*) from selection_review_rows where review_import_id = ?",
+            [result["review_import_ids"][0]],
+        ).fetchone() == (2,)
 
 
 @pytest.mark.parametrize("reason", [
@@ -501,7 +602,7 @@ def test_server_issued_control_accepts_user_edits_and_failure_only_group(reason:
         initialize_performance_v2(connection)
         now = datetime(2026, 1, 1, tzinfo=UTC)
         connection.execute(
-            "insert into strategies values (1, 'one', 'BTCUSDT', 'LONG', '1h', 5, 1, 'run', 'one', 'ACTIVE', 11, ?, ?)",
+            "insert into strategies (strategy_id, strategy_name, symbol, side, timeframe, close_ma_len, order_count, analysis_run_id, candidate_identity, lifecycle_status, current_result_id, created_at_utc, updated_at_utc) values (1, 'one', 'BTCUSDT', 'LONG', '1h', 5, 1, 'run', 'one', 'ACTIVE', 11, ?, ?)",
             [now, now],
         )
         connection.execute(
@@ -572,18 +673,31 @@ def test_server_issued_control_accepts_user_edits_and_failure_only_group(reason:
                 auto_reason, analog_group_key, auto_analog_of_strategy_id, prior_rejected, stage_trace_json)
                 values ('sel', 1, 11, 'FINALIST', 5.5, 1, ?, null, null, false, '{}')""", [reason]
         )
+        connection.execute(
+                "insert into selection_review_imports "
+                "(review_import_id, selection_run_id, workbook_sha256, imported_at_utc, row_count) "
+                "values ('review-prior', 'sel', ?, ?, 1)",
+            ["p" * 64, datetime(2025, 12, 31, tzinfo=UTC)],
+        )
+        connection.execute(
+            "insert into selection_review_rows values ('review-prior', 1, 'FINALIST', 9, null, 'prior rank')"
+        )
 
         workbook = load_workbook(BytesIO(issued))
         headers = {cell.value: cell.column for cell in workbook["Candidates"][1]}
         rendered_reason = workbook["Candidates"].cell(2, headers["Причина"]).value
         expected_reason = (
-            "1. PARETO_PL_PTS_PER_ORDER" if reason == "PARETO_PLATEAU_POINTS_PER_ORDER"
+            "2. PARETO_PLATEAU_POINTS_PER_ORDER" if reason == "PARETO_PLATEAU_POINTS_PER_ORDER"
             else reason
         )
         assert rendered_reason == expected_reason
         unedited = import_combined_control_workbook(connection, issued)
         assert unedited["group_count"] == unedited["row_count"] == 1
-        workbook["Candidates"].cell(2, headers["User Status"]).value = "RESERVE"
+        assert connection.execute(
+            "select user_status, user_rank from selection_review_rows where review_import_id = ? and strategy_id = 1",
+            [unedited["review_import_ids"][0]],
+        ).fetchone() == ("RESERVE", None)
+        workbook["Candidates"].cell(2, headers["User Status"]).value = "FINALIST"
         workbook["Candidates"].cell(2, headers["User Rank"]).value = 1
         edited_io = BytesIO()
         workbook.save(edited_io)
@@ -595,7 +709,19 @@ def test_server_issued_control_accepts_user_edits_and_failure_only_group(reason:
         assert replay["review_import_ids"] == imported["review_import_ids"]
         assert connection.execute(
             "select user_status, user_rank from selection_review_rows order by rowid desc limit 1"
-        ).fetchone() == ("RESERVE", 1)
+        ).fetchone() == ("FINALIST", 1)
+
+        rejected = load_workbook(BytesIO(issued))
+        rejected_headers = {cell.value: cell.column for cell in rejected["Candidates"][1]}
+        rejected["Candidates"].cell(2, rejected_headers["User Status"]).value = "REJECTED"
+        rejected["Candidates"].cell(2, rejected_headers["User Rank"]).value = 1
+        rejected_io = BytesIO()
+        rejected.save(rejected_io)
+        rejected_result = import_combined_control_workbook(connection, rejected_io.getvalue())
+        assert connection.execute(
+            "select user_status, user_rank from selection_review_rows where review_import_id = ? and strategy_id = 1",
+            [rejected_result["review_import_ids"][0]],
+        ).fetchone() == ("REJECTED", None)
 
         tampered = load_workbook(BytesIO(issued))
         tampered_headers = {cell.value: cell.column for cell in tampered["Candidates"][1]}

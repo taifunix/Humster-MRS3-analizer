@@ -26,7 +26,12 @@ from .performance_v2_store import (
     require_performance_v2_readable,
 )
 from .performance_v2_selection import SELECTION_REASON_ALIASES
-from .performance_v2_selection_review import effective_selection_decisions
+from .performance_v2_selection_review import (
+    _prior_finalist_ids_for_pair_side,
+    _reconcile_prior_finalist_user_fields,
+    effective_selection_decisions,
+)
+from .evaluation_protocol import EvaluationTarget, apply_protocol_v2, apply_stored_ma_facts, load_stored_ma_facts
 from .strategy_json import generate_strategy
 
 
@@ -552,13 +557,14 @@ def validate_combined_control_workbook(data: bytes) -> tuple[dict[str, object], 
                 raise FinalistRetestError("CONTROL_INVALID_STATUS")
             raw_rank = row["User Rank"]
             if raw_rank not in (None, ""):
-                if isinstance(raw_rank, bool) or int(raw_rank) != raw_rank or int(raw_rank) <= 0 or status not in {"FINALIST", "RESERVE"}:
+                if isinstance(raw_rank, bool) or int(raw_rank) != raw_rank or int(raw_rank) <= 0 or status not in {"FINALIST", "RESERVE", "REJECTED"}:
                     raise FinalistRetestError("CONTROL_INVALID_RANK")
-                group = (row["Pair"], row["Direction"])
-                rank = int(raw_rank)
-                if rank in ranks.setdefault(group, set()):
-                    raise FinalistRetestError("CONTROL_DUPLICATE_RANK")
-                ranks[group].add(rank)
+                if status != "REJECTED":
+                    group = (row["Pair"], row["Direction"])
+                    rank = int(raw_rank)
+                    if rank in ranks.setdefault(group, set()):
+                        raise FinalistRetestError("CONTROL_DUPLICATE_RANK")
+                    ranks[group].add(rank)
             if row["RETEST"] not in (None, "", "RETEST"):
                 raise FinalistRetestError("CONTROL_INVALID_RETEST")
             if row["Comment"] is not None and len(str(row["Comment"])) > 1000:
@@ -607,6 +613,61 @@ def validate_combined_control_workbook(data: bytes) -> tuple[dict[str, object], 
 
 
 read_combined_control_workbook = validate_combined_control_workbook
+
+
+def _reconciled_control_decisions(
+    connection: duckdb.DuckDBPyConnection,
+    symbol: str,
+    side: str,
+    review_id: str,
+    rows: Sequence[Mapping[str, object]],
+) -> list[list[object]]:
+    prior_finalists = _prior_finalist_ids_for_pair_side(connection, symbol, side)
+    submitted_ids: set[int] = set()
+    decisions: list[list[object]] = []
+    submitted_fields: dict[int, tuple[str, int | None]] = {}
+    for row in rows:
+        strategy_id = int(row["Strategy ID"])
+        status = str(row["User Status"]).strip().upper()
+        rank = None if row["User Rank"] in (None, "") else int(row["User Rank"])
+        submitted_fields[strategy_id] = (status, rank)
+    reconciled_fields = _reconcile_prior_finalist_user_fields(submitted_fields, prior_finalists)
+    for row in rows:
+        strategy_id = int(row["Strategy ID"])
+        submitted_ids.add(strategy_id)
+        status, rank = reconciled_fields[strategy_id]
+        analog = None if row["Analog Of ID"] in (None, "") else int(row["Analog Of ID"])
+        if strategy_id in prior_finalists and status == "RESERVE":
+            analog = None
+        decisions.append([
+            review_id, strategy_id, status, rank, analog,
+            "" if row["Comment"] is None else str(row["Comment"]),
+        ])
+
+    missing = sorted(prior_finalists - submitted_ids)
+    if missing:
+        comments = dict(connection.execute(
+            """select strategy_id, comment from (
+                   select rows.strategy_id, rows.comment,
+                          row_number() over (
+                              partition by rows.strategy_id
+                              order by imports.imported_at_utc desc, imports.review_import_id desc
+                          ) as newest
+                     from selection_review_rows rows
+                     join selection_review_imports imports using (review_import_id)
+                     join selection_runs runs using (selection_run_id)
+                     join strategies using (strategy_id)
+                    where rows.strategy_id in (select unnest(?::bigint[]))
+                      and runs.symbol = ? and runs.side = ?
+                       and strategies.symbol = runs.symbol and strategies.side = runs.side
+               ) where newest = 1""",
+            [missing, symbol, side],
+        ).fetchall())
+        decisions.extend([
+            [review_id, strategy_id, "RESERVE", None, None, comments.get(strategy_id)]
+            for strategy_id in missing
+        ])
+    return decisions
 
 
 def _legacy_import_combined_control_workbook(
@@ -695,19 +756,16 @@ def _legacy_import_combined_control_workbook(
             if connection.execute("select 1 from selection_review_imports where workbook_sha256 = ?", [review_id]).fetchone():
                 review_ids.append(review_id)
                 continue
-            connection.execute(
-                "insert into selection_review_imports (review_import_id, selection_run_id, workbook_sha256, imported_at_utc, row_count) values (?, ?, ?, ?, ?)",
-                [review_id, run_id, review_id, now, len(group_rows)],
-            )
-            decision_rows = []
+            decision_rows = _reconciled_control_decisions(connection, symbol, side, review_id, group_rows)
             retest_ids = []
             for row in group_rows:
                 strategy_id = int(row["Strategy ID"])
-                rank = None if row["User Rank"] in (None, "") else int(row["User Rank"])
-                analog = None if row["Analog Of ID"] in (None, "") else int(row["Analog Of ID"])
-                decision_rows.append([review_id, strategy_id, str(row["User Status"]).strip().upper(), rank, analog, "" if row["Comment"] is None else str(row["Comment"])])
                 if row["RETEST"] == "RETEST":
                     retest_ids.append(strategy_id)
+            connection.execute(
+                "insert into selection_review_imports (review_import_id, selection_run_id, workbook_sha256, imported_at_utc, row_count) values (?, ?, ?, ?, ?)",
+                [review_id, run_id, review_id, now, len(decision_rows)],
+            )
             connection.executemany(
                 "insert into selection_review_rows (review_import_id, strategy_id, user_status, user_rank, user_analog_of_strategy_id, comment) values (?, ?, ?, ?, ?, ?)",
                 decision_rows,
@@ -929,20 +987,16 @@ def import_combined_control_workbook(
             if existing:
                 review_ids.append(review_id)
                 continue
-            connection.execute(
-                "insert into selection_review_imports (review_import_id, selection_run_id, workbook_sha256, imported_at_utc, row_count) values (?, ?, ?, ?, ?)",
-                [review_id, run_id, review_id, now, len(group)],
-            )
-            decisions = []
+            decisions = _reconciled_control_decisions(connection, _symbol, _side, review_id, group)
             retest_ids = []
             for row in group:
                 strategy_id = int(row["Strategy ID"])
-                rank = None if row["User Rank"] in (None, "") else int(row["User Rank"])
-                analog = None if row["Analog Of ID"] in (None, "") else int(row["Analog Of ID"])
-                status = str(row["User Status"]).strip().upper()
-                decisions.append([review_id, strategy_id, status, rank, analog, "" if row["Comment"] is None else str(row["Comment"])])
                 if row["RETEST"] == "RETEST":
                     retest_ids.append(strategy_id)
+            connection.execute(
+                "insert into selection_review_imports (review_import_id, selection_run_id, workbook_sha256, imported_at_utc, row_count) values (?, ?, ?, ?, ?)",
+                [review_id, run_id, review_id, now, len(decisions)],
+            )
             connection.executemany("insert into selection_review_rows (review_import_id, strategy_id, user_status, user_rank, user_analog_of_strategy_id, comment) values (?, ?, ?, ?, ?, ?)", decisions)
             ids = [int(row["Strategy ID"]) for row in group]
             connection.execute("delete from strategy_tags where tag = 'REJECTED' and strategy_id in (select unnest(?::bigint[]))", [ids])
@@ -976,17 +1030,26 @@ def _config_digest(config: object) -> str:
     })
 
 
-def finalist_retest_config_digest(templates: Mapping[object, object], tester_config: object = None) -> str:
+def finalist_retest_config_digest(
+    templates: Mapping[object, object], tester_config: object = None, evaluation: EvaluationTarget | None = None,
+) -> str:
     """Hash the inputs that can change generated retest strategy JSON."""
     if not isinstance(templates, Mapping):
         raise FinalistRetestError("CONFIG_INVALID", "retest templates are invalid")
-    return canonical_digest({
+    document: dict[str, object] = {
         "tester_config_sha256": _config_digest(tester_config),
         "template_sha256": {
             str(side): _config_digest(Path(template) if isinstance(template, str) else template)
             for side, template in sorted(templates.items(), key=lambda item: str(item[0]))
         },
-    })
+    }
+    if evaluation is not None:
+        # Protocol v2 §7a: the base and the exchange replace the constant 1000.
+        document["evaluation"] = {"base": format(evaluation.base.normalize(), "f"), "exchange": evaluation.exchange}
+        if evaluation.profile_digest is not None:
+            # P7 spec §4: the exchange profile changes the strategies and the tester config.
+            document["evaluation"]["profile"] = evaluation.profile_digest  # type: ignore[index]
+    return canonical_digest(document)
 
 
 def build_finalist_retest_manifest(
@@ -1000,6 +1063,7 @@ def build_finalist_retest_manifest(
     listing_dates: Mapping[str, object] | Path | None = None,
     tester_config: object = None,
     job_id: str | None = None,
+    evaluation: EvaluationTarget | None = None,
 ) -> FinalistRetestBatch:
     """Freeze and publish one native SINGLE_MODE manifest for the cohort."""
     cohort = freeze_finalist_cohort(
@@ -1014,6 +1078,10 @@ def build_finalist_retest_manifest(
     if not isinstance(templates, Mapping):
         raise FinalistRetestError("CONFIG_INVALID", "retest templates are invalid")
     run_id = job_id or f"finalist-retest-{sha256(cohort.cohort_sha256.encode('ascii')).hexdigest()[:24]}"
+    stored_ma = (
+        load_stored_ma_facts(connection, [int(member["strategy_id"]) for member in cohort.members])
+        if evaluation is not None else {}
+    )
     generated: list[dict[str, object]] = []
     strategy_runs: dict[str, str] = {}
     names_by_candidate: dict[str, list[str]] = {}
@@ -1052,12 +1120,18 @@ def build_finalist_retest_manifest(
         basic = strategy.get("basic")
         if isinstance(basic, dict):
             basic.update({
-                "my_fix_balance": 1000.0,
+                "my_fix_balance": 1000.0 if evaluation is None else float(evaluation.base),
                 "balance_percentage_long": 100.0,
                 "balance_percentage_short": 100.0,
                 "risk_long": 1.0,
                 "risk_short": 1.0,
             })
+        if evaluation is not None:
+            apply_stored_ma_facts(
+                strategy, member["side"], stored_ma.get(int(member["strategy_id"])),
+                [item["order_id"] for item in member["orders"]],  # type: ignore[index]
+            )
+            apply_protocol_v2(strategy, evaluation)
         filename = f"{member['strategy_name']}.json"
         strategy_runs[filename] = str(member["analysis_run_id"])
         candidate_identity = str(member["candidate_identity"])
@@ -1076,7 +1150,7 @@ def build_finalist_retest_manifest(
         f"{member['strategy_name']}.json": canonical_digest(strategy)
         for member, strategy in zip(cohort.members, generated, strict=True)
     }
-    config_sha256 = finalist_retest_config_digest(templates, tester_config)
+    config_sha256 = finalist_retest_config_digest(templates, tester_config, evaluation=evaluation)
     unsigned: dict[str, object] = {
         "format_version": 1,
         "analysis_run_id": run_id,
@@ -1284,7 +1358,9 @@ def current_effective_finalist_members(
     dates: those are inputs to a new retest freeze, while this export represents
     the already effective selection decision.
     """
-    require_performance_v2(connection)
+    schema_version = require_performance_v2_readable(connection)
+    if schema_version not in {10, 11, 12}:
+        raise PerformanceV2StoreError("Performance database does not have schema version 10, 11 or 12")
     if type(include_reserve) is not bool:
         raise FinalistRetestError("INVALID_REQUEST", "include_reserve must be a boolean")
     decisions = effective_selection_decisions(connection)

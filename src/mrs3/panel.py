@@ -123,6 +123,19 @@ from .config import (
 )
 from .duckdb_import import ImportJobResult, ImportPreflight, ImportProgress, ImportRequest, SnapshotProgress, import_html_tree, preflight_html_import
 from .duckdb_source_schema import migrate_source_database
+from .exchange_profiles import (
+    ExchangeProfile,
+    ExchangeProfileError,
+    PerformanceDatabaseError,
+    exchange_template_names,
+    inside_project,
+    load_exchange_profile,
+    load_performance_databases,
+    parse_performance_databases,
+    relative_project_path,
+    require_apart_from_default,
+    save_performance_databases,
+)
 from .loader import load_listing_dates
 from .duckdb_direct import (
     CANONICAL_GRID_VERSION,
@@ -228,6 +241,13 @@ from .fresh_analysis_strategies import (
 )
 from .fresh_shortlist import ShortlistBusyError, parse_fresh_shortlist_request, serialize_applied_options
 from .tester_run_files import publish_run_snapshots
+from .evaluation_protocol import (
+    EvaluationProtocolError,
+    EvaluationTarget,
+    evaluation_target,
+    require_protocol_v2_strategy,
+    require_protocol_v2_tester_config,
+)
 from .panel_strategy_batch import LocalStrategyBatchService, StrategyBatchValidationError, validate_strategy_manifest
 from .panel_tester_runs import LocalRunsBatchService
 from .panel_fast_strategy_test import (
@@ -249,11 +269,14 @@ from .performance_v2_store import (
     PerformanceV2Config,
     PerformanceV2StoreError,
     PerformanceV2WriterLock,
+    database_identity,
     initialize_performance_v2,
     load_performance_v2_config,
     performance_v2_database_path,
     require_performance_v2,
     require_performance_v2_readable,
+    require_database_identity,
+    PerformanceV2IdentityError,
 )
 from .performance_v2_maintenance import (
     PerformanceV2MaintenanceError,
@@ -282,6 +305,10 @@ from .performance_v2_selection import (
     selection_cache_status,
     selection_equity_facts_token,
     write_selection_workbook,
+    AllPairsPartition,
+    coordinate_all_pairs,
+    build_combined_selection_workbook,
+    validate_combined_selection_workbook,
     retest_cohort_request,
 )
 from .performance_v2_equity_regime import (
@@ -292,17 +319,21 @@ from .performance_v2_selection_review import (
     SelectionReviewError,
     _selection_rows,
     apply_prior_rejected,
-    automatic_filter_rejected_strategy_ids,
+    attach_rejection_reasons,
+    automatic_filter_rejected_ids,
     _current_equity_revisions,
     import_retest_tags,
     import_selection_review,
+    import_combined_selection_workbook,
     import_selection_user_fields,
     latest_effective_finalists,
     latest_user_reviews_by_strategy,
     new_run_metadata,
     persist_selection_snapshot,
     persist_selection_snapshots,
+    rejection_reason_label,
 )
+from .performance_v2_publication import publish_publication
 from .performance_v2_retest import build_retest_manifest, retest_status
 from .performance_v2_finalist_retest import (
     FinalistRetestError,
@@ -849,7 +880,7 @@ async function startAction(action) {
   try {
     const response = await fetch('/api/start', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload(action))});
     const body = await response.json();
-    if (!response.ok) throw new Error(body.error || 'Ошибка запуска');
+    if (!response.ok) throw new Error(body.error?.code ? (body.error.message || body.error.code) : (body.error || 'Ошибка запуска'));
     notice.textContent = 'Задача запущена.'; render(body);
   } catch (error) { notice.textContent = error.message; }
 }
@@ -1820,6 +1851,8 @@ class PanelController:
                     }
                     if any(confirmation.get(key) != value for key, value in expected_confirmation.items()):
                         raise ValueError("v6 tester confirmation does not match the generated manifest")
+            if action == "tester-run":
+                self._require_protocol_v2_legacy_run(payload, strategies)
             command.extend(["--strategies", str(strategies)])
             if action in {"tester-plan", "tester-run"} and payload.get("output_csv"):
                 output = self._path(self._required(payload, "output_csv"))
@@ -1954,6 +1987,196 @@ class PanelController:
             except (OSError, UnicodeDecodeError, json.JSONDecodeError, PerformanceV2SelectionError, ValueError) as error:
                 raise PerformanceV2ApiError("SELECTION_SETTINGS_INVALID", status=400) from error
 
+    _PERFORMANCE_DATABASE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+
+    def _local_config_path(self) -> Path:
+        return self.default_config.with_name("config.local.json")
+
+    def _performance_database_busy(self) -> bool:
+        """Unfinished jobs, open report collections or pending imports block a database switch (P7 spec §5)."""
+        for job in self._panel_jobs.list():
+            if job.get("state") not in TERMINAL:
+                return True
+            if job.get("kind") != "strategies.tester.collection":
+                continue
+            try:
+                runtime = self._panel_jobs.runtime(str(job.get("job_id")))
+            except PanelJobError:
+                continue
+            state = runtime.get("collection_state")
+            members = runtime.get("members")
+            current = [
+                member for member in members if isinstance(member, Mapping) and member.get("superseded") is not True
+            ] if isinstance(members, list) else []
+            if state == "VERIFIED" or (state == "OPEN" and current):
+                return True
+        return False
+
+    def _performance_database_row(
+        self, name: str | None, root: Path, protocol: str, exchange: str | None, active: bool, busy: bool = False,
+    ) -> dict[str, object]:
+        resolved = Path(root).resolve()
+        try:
+            relative = resolved.relative_to(self._local_config_path().parent.resolve()).as_posix()
+        except ValueError:
+            relative = resolved.as_posix()
+        database = resolved / "strategy_performance.duckdb"
+        row: dict[str, object] = {
+            "name": name, "database_root": relative, "evaluation_protocol": protocol, "exchange": exchange,
+            "active": active, "exists": database.is_file(), "size_bytes": None, "markers": None,
+        }
+        if not database.is_file():
+            return row
+        if busy or not self._performance_v2_writer_lock.acquire(blocking=False):
+            # A job or a Panel writer may be connecting: a second connection could make its connect fail.
+            try:
+                row["size_bytes"] = database.stat().st_size
+            except OSError:
+                pass
+            return row
+        try:
+            row["size_bytes"] = database.stat().st_size
+            if row["size_bytes"]:
+                with duckdb.connect(str(database), read_only=True) as connection:
+                    marker_protocol, marker_exchange = database_identity(connection)
+                    version = connection.execute(
+                        "select value from schema_info where key = 'schema_version'"
+                    ).fetchone()
+                row["markers"] = {
+                    "evaluation_protocol": marker_protocol, "exchange": marker_exchange,
+                    "schema_version": None if version is None else str(version[0]),
+                }
+        except (OSError, duckdb.Error, PerformanceV2StoreError):
+            # An open writer or a foreign file: the list stays readable without markers.
+            row["markers"] = None
+        finally:
+            self._performance_v2_writer_lock.release()
+        return row
+
+    def performance_databases_get(self) -> dict[str, object]:
+        """Registered PerformanceDBs and the default one (P7 spec §5)."""
+        local = self._local_config_path()
+        databases = load_performance_databases(local)
+        default = self._default_performance_v2_config()
+        busy = self._performance_database_busy()
+        rows = [self._performance_database_row(
+            None, default.database_root, default.evaluation_protocol, default.exchange, databases.active is None, busy,
+        )]
+        rows.extend(
+            self._performance_database_row(
+                item.name, local.parent / item.database_root, item.evaluation_protocol, item.exchange,
+                databases.active == item.name, busy,
+            )
+            for item in databases.items
+        )
+        return {
+            "active": databases.active, "items": rows, "exchanges": list(exchange_template_names(self.root)),
+            "busy": busy,
+        }
+
+    def _performance_databases_section(self) -> dict[str, object]:
+        local = self._local_config_path()
+        try:
+            document = json.loads(local.read_text(encoding="utf-8")) if local.is_file() else {}
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise PerformanceDatabaseError("PERFORMANCE_DATABASES_INVALID", "config.local.json is unreadable") from error
+        section = document.get("performance_databases") if isinstance(document, dict) else None
+        if section is None:
+            return {"active": None, "items": {}}
+        if not isinstance(section, dict) or not isinstance(section.get("items", {}), dict):
+            raise PerformanceDatabaseError("PERFORMANCE_DATABASES_INVALID", "performance_databases is invalid")
+        return {"active": section.get("active"), "items": dict(section.get("items", {}))}
+
+    def performance_databases_activate(self, payload: Mapping[str, object]) -> dict[str, object]:
+        """Make an entry (or the default database, name None) active; only when nothing runs (P7 spec §5)."""
+        if not isinstance(payload, Mapping) or set(payload) != {"name"}:
+            raise PerformanceDatabaseError("INVALID_REQUEST", "activate needs exactly the field name")
+        name = payload["name"]
+        if name is not None and not isinstance(name, str):
+            raise PerformanceDatabaseError("INVALID_REQUEST", "name must be a string or null")
+        with self._lock, self._panel_jobs.lock:
+            section = self._performance_databases_section()
+            if name is not None and name not in section["items"]:  # type: ignore[operator]
+                raise PerformanceDatabaseError("PERFORMANCE_DATABASE_UNKNOWN", f"no database named {name}")
+            if self._performance_database_busy():
+                raise PerformanceDatabaseError("RESOURCE_BUSY", "finish or clear running jobs and report collections first")
+            section["active"] = name
+            save_performance_databases(self._local_config_path(), section)
+        return self.performance_databases_get()
+
+    def performance_databases_create(self, payload: Mapping[str, object]) -> dict[str, object]:
+        """Create an empty protocol v2 database for an exchange and register it (P7 spec §5)."""
+        if not isinstance(payload, Mapping) or set(payload) != {"name", "database_root", "exchange"}:
+            raise PerformanceDatabaseError("INVALID_REQUEST", "create needs name, database_root and exchange")
+        name, root_value, exchange = payload["name"], payload["database_root"], payload["exchange"]
+        if not isinstance(name, str) or not self._PERFORMANCE_DATABASE_NAME.fullmatch(name):
+            raise PerformanceDatabaseError("INVALID_REQUEST", "name allows letters, digits, '.', '_' and '-' (1-64)")
+        if not isinstance(exchange, str) or not exchange.strip():
+            raise PerformanceDatabaseError("INVALID_REQUEST", "exchange must be a non-empty string")
+        exchange = exchange.strip()
+        local = self._local_config_path()
+        try:
+            root = relative_project_path(root_value, "database_root")
+        except ValueError as error:
+            raise PerformanceDatabaseError("INVALID_REQUEST", str(error)) from None
+        if len(root.parts) < 2 or root.parts[0].casefold() != "data":
+            raise PerformanceDatabaseError("INVALID_REQUEST", "database_root must be a folder inside data/")
+        try:
+            # The marker takes the spelling of the template folder: it is the exchange.name of the bot.
+            exchange = load_exchange_profile(self.root, exchange).exchange
+        except ExchangeProfileError as error:
+            raise PerformanceDatabaseError(error.code, error.message) from error
+        with self._lock:
+            section = self._performance_databases_section()
+            if any(str(key).casefold() == name.casefold() for key in section["items"]):  # type: ignore[union-attr]
+                raise PerformanceDatabaseError("PERFORMANCE_DATABASE_EXISTS", f"a database named {name} already exists")
+            section["items"][name] = {  # type: ignore[index]
+                "database_root": root.as_posix(), "evaluation_protocol": "v2", "exchange": exchange,
+            }
+            default = self._default_performance_v2_config()
+            # Validate the new section (paths, overlaps, default root) before anything is written.
+            require_apart_from_default(parse_performance_databases(section, local.parent), local.parent, default.database_root)
+            try:
+                target = inside_project(local.parent, root, "database_root")
+                data_root = inside_project(local.parent, Path("data"), "data")
+            except ValueError as error:
+                raise PerformanceDatabaseError("INVALID_REQUEST", str(error)) from None
+            if data_root not in target.parents:
+                raise PerformanceDatabaseError("INVALID_REQUEST", "database_root must be a folder inside data/")
+            if target == default.database_root.resolve():
+                raise PerformanceDatabaseError("INVALID_REQUEST", "database_root is the default database folder")
+            if target.exists() and (not target.is_dir() or any(target.iterdir())):
+                raise PerformanceDatabaseError("INVALID_REQUEST", "database_root must be a new or empty folder")
+            created = not target.exists()
+            try:
+                self._initialize_missing_performance_v2_target(
+                    replace(default, database_root=target, evaluation_protocol="v2", exchange=exchange),
+                )
+                save_performance_databases(local, section)
+            except (OSError, duckdb.Error, ValueError) as error:
+                # Leave no half-created database behind: a retry must find a new or empty folder again.
+                shutil.rmtree(target, ignore_errors=True)
+                if not created:
+                    target.mkdir(parents=True, exist_ok=True)
+                if isinstance(error, ValueError) and not isinstance(error, PerformanceV2StoreError):
+                    # For example the new root overlaps the v1 database root.
+                    raise PerformanceDatabaseError("PERFORMANCE_DATABASES_INVALID", str(error)) from error
+                raise PerformanceDatabaseError(
+                    "PERFORMANCE_DATABASE_CREATE_FAILED", "the database or config.local.json could not be written",
+                ) from error
+        return self.performance_databases_get()
+
+    def _default_performance_v2_config(self) -> PerformanceV2Config:
+        try:
+            return load_performance_v2_config(
+                self.default_config.with_name("config.performance.json"),
+                v1_database_root=self._panel_path("performance_db_root"), use_active_entry=False,
+            )
+        except PerformanceDatabaseError:
+            raise
+        except ValueError as error:
+            raise PerformanceDatabaseError("PERFORMANCE_DATABASES_INVALID", str(error)) from error
+
     def analysis_profile_get(self) -> dict[str, object]:
         with self._lock:
             return load_analysis_settings(self.default_config)
@@ -2084,10 +2307,9 @@ class PanelController:
         job_id: str | None = None,
     ) -> dict[str, object]:
         job_id = uuid.uuid4().hex if job_id is None else job_id
-        self._panel_jobs.submit(kind, request, f"panel:{job_id}", resource_keys, job_id=job_id)
+        # The runtime is persisted with the job, so a journal failure leaves no half-created job.
+        self._panel_jobs.submit(kind, request, f"panel:{job_id}", resource_keys, job_id=job_id, runtime=runtime or None)
         self._panel_jobs.transition(job_id, "RUNNING")
-        if runtime:
-            self._panel_jobs.sync(job_id, {"state": "RUNNING", "phase": "RUNNING"}, runtime=runtime)
         try:
             if before_start is not None:
                 before_start(job_id)
@@ -3256,6 +3478,7 @@ class PanelController:
     def strategies_fresh_generate(self, payload: Mapping[str, object]) -> dict[str, object]:
         if "output_dir" in payload:
             raise ValueError("output_dir is server-controlled")
+        self._evaluation_target()
         if any(not isinstance(key, str) or key.startswith("_") for key in payload):
             raise ValueError("private fields are not allowed")
         options, min_shift_enabled, min_shift_pct = self._fresh_shortlist_settings(payload)
@@ -3314,6 +3537,7 @@ class PanelController:
 
     def strategies_fresh_generate_runs(self, payload: Mapping[str, object]) -> dict[str, object]:
         """Publish the selected filtered candidates as tester run snapshots."""
+        self._evaluation_target()
         options, min_shift_enabled, min_shift_pct = self._fresh_shortlist_settings(payload)
         if set(payload).difference({"analysis_run_id", "filter_version", "filters", "pretest_ab_enabled", "ladder_enabled", "pareto_enabled", "min_shift_enabled", "min_shift_pct", "selection_token", "selected_scopes", "start_date", "end_date"}):
             raise ValueError("tester run request contains unsupported fields")
@@ -3342,18 +3566,20 @@ class PanelController:
             expected_artifact_sha256=evaluation.artifact_sha256,
         )
         runner = RunnerConfig.from_json(self.default_config)
+        target = self._evaluation_target()
         with TesterTargetLock(runner.bot_root):
             result = publish_run_snapshots(
                 self.root / "Input" / "run_snapshot_2.json", runner.bot_root, runner.tester_config, structures,
                 start_date, end_date, runner.max_parallel_submissions, self._analysis_config_loader(self.default_config),
                 analysis_run_id=analysis_id,
-                tester_config_template=mrs3_tester_config_template(self.root),
+                tester_config_template=self._mrs3_tester_template(target),
                 pretest_ab_provenance=self._pretest_ab_provenance(options[0]),
                 analysis_input_digest=manifest.get("analysis_input_digest"),
                 shortlist_provenance=self._fresh_shortlist_provenance(evaluation, selected_ids),
                 before_publish=lambda: self._assert_fresh_analysis_digest(
                     analysis_path, evaluation.artifact_sha256,
                 ),
+                evaluation=target,
             )
         return {"phase": "COMMITTED", "analysis_run_id": analysis_id, **result}
 
@@ -3394,6 +3620,7 @@ class PanelController:
             prepared, evaluation, scopes, require_one_side=True,
         )
         scope_sides = {scope[1] for scope in scopes}
+        target = self._evaluation_target()
         config = self._analysis_config_loader(self.default_config)
         output_root = self.root / "Output" / "fresh-shortlist-v2" / analysis_id
         output_root.mkdir(parents=True, exist_ok=True)
@@ -3405,7 +3632,7 @@ class PanelController:
                 analysis_id,
                 selected_ids,
                 scopes,
-                self._workflow_default("strategy_templates", side=next(iter(scope_sides))),
+                self._ready_strategy_template(target, next(iter(scope_sides))),
                 staging,
                 config,
                 surface_path=self._fresh_analysis_surfaces.get(analysis_id),
@@ -3413,6 +3640,7 @@ class PanelController:
                 **({"min_shift_enabled": True, "min_shift_pct": min_shift_pct}
                    if min_shift_enabled else {}),
                 selection=evaluation,
+                evaluation=target,
             )
             self._assert_fresh_analysis_digest(analysis_path, evaluation.artifact_sha256)
             staging.replace(final)
@@ -3472,7 +3700,7 @@ class PanelController:
         }
 
     def analysis_catalog(self) -> dict[str, object]:
-        """List validated fresh analysis artifacts so an existing run can be reopened.
+        """List validated root-level fresh analysis artifacts for reopening.
 
         Mirrors `surface_catalog`: a file that does not validate is skipped
         rather than offered, because offering it would only fail on open.
@@ -3483,7 +3711,7 @@ class PanelController:
                 directory = directory.parent
             candidates = sorted(
                 (
-                    path for path in directory.rglob("*.analysis-v6.duckdb")
+                    path for path in directory.glob("*.analysis-v6.duckdb")
                     if path.is_file() and not path.is_symlink()
                 ),
                 key=lambda path: str(path).casefold(),
@@ -3706,6 +3934,143 @@ class PanelController:
             )
         return self._strategy_batch_service
 
+    def _ready_strategy_template(self, target: EvaluationTarget, side: str) -> Path:
+        if target.strategy_template is not None:
+            return Path(target.strategy_template)
+        return self._workflow_default("strategy_templates", side=side)
+
+    def _evaluation_target(self) -> EvaluationTarget:
+        """Protocol v2 target of the active PerformanceDB; refuses before any MRS3 render or launch (§7a)."""
+        config = self._performance_v2_config()
+        profile = self._exchange_profile(config)
+        return evaluation_target(
+            config, profile.mrs3_tester if profile is not None else mrs3_tester_config_template(self.root), profile,
+            project_root=self.root,
+        )
+
+    def _exchange_profile(self, config: object) -> ExchangeProfile | None:
+        """Templates of the exchange of the active protocol v2 database (P7 spec §3); None for a v1 database."""
+        exchange = getattr(config, "exchange", None)
+        if getattr(config, "evaluation_protocol", "v1") != "v2" or not exchange:
+            return None
+        try:
+            return load_exchange_profile(self.root, exchange)
+        except ExchangeProfileError as error:
+            raise EvaluationProtocolError(error.code, error.message) from error
+
+    def _mrs3_tester_template(self, target: EvaluationTarget) -> Path:
+        """MRS3 tester template of the exchange of `target` (P7 spec §4)."""
+        return target.tester_template or mrs3_tester_config_template(self.root)
+
+    def _mrs3_strategy_templates(self, target: EvaluationTarget) -> Mapping[str, object]:
+        """MRS3 strategy template of the exchange for both sides (P7 spec §4).
+
+        A target without exchange templates (tests) keeps `panel_workflow.strategy_templates`.
+        """
+        if target.strategy_template is not None:
+            return {"LONG": str(target.strategy_template), "SHORT": str(target.strategy_template)}
+        templates = self._workflow_defaults().get("strategy_templates", {})
+        return templates if isinstance(templates, Mapping) else {}
+
+    def _listing_dates_source(self) -> tuple[Path, str | None]:
+        """Listing dates of the active database: the file of `panel_workflow`, the sheet of the exchange (P7 spec §4)."""
+        profile = self._exchange_profile(self._performance_v2_config())
+        return self._workflow_default("listing_dates_path"), None if profile is None else profile.listing_dates_sheet
+
+    @staticmethod
+    def _protocol_v2_runtime(target: EvaluationTarget) -> dict[str, object]:
+        """Runtime marker of an MRS3 job rendered under protocol v2 for one base and exchange."""
+        return {
+            "evaluation_protocol": "v2",
+            "evaluation_base": format(target.base.normalize(), "f"),
+            "evaluation_exchange": target.exchange,
+            # P7 spec §4: a switch of the database or a profile change starts jobs anew.
+            "evaluation_database": target.database,
+            "evaluation_profile": target.profile_digest or "none",
+        }
+
+    @classmethod
+    def _matches_protocol_v2(cls, runtime: Mapping[str, object], target: EvaluationTarget) -> bool:
+        return all(runtime.get(key) == value for key, value in cls._protocol_v2_runtime(target).items())
+
+    def _require_import_target(self, tester_job_id: str, is_collection_job: bool) -> None:
+        """Reports rendered for another database or profile do not enter this one (P7 spec §4).
+
+        A collection is checked through every current member; jobs without a v2 marker import as before.
+        """
+        runtime = self._panel_jobs.runtime(tester_job_id)
+        runtimes = [runtime]
+        members = runtime.get("members") if is_collection_job else None
+        for member in members if isinstance(members, list) else ():
+            if not isinstance(member, Mapping) or member.get("superseded") is True:
+                continue
+            try:
+                runtimes.append(self._panel_jobs.runtime(str(member.get("tester_job_id"))))
+            except PanelJobError:
+                continue
+        marked = [item for item in runtimes if item.get("evaluation_protocol") == "v2"]
+        if not marked:
+            return
+        target = self._evaluation_target()
+        if any(not self._matches_protocol_v2(item, target) for item in marked):
+            raise EvaluationProtocolError(
+                "IMPORT_TARGET_CHANGED", "the tester job was rendered for another PerformanceDB or exchange profile",
+            )
+
+    def _require_protocol_v2_tester_template(self, target: EvaluationTarget) -> None:
+        try:
+            document = json.loads(self._mrs3_tester_template(target).read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise EvaluationProtocolError("PROTOCOL_V2_TESTER_CONFIG_REJECTED", "MRS3 tester template is unreadable") from error
+        require_protocol_v2_tester_config(document if isinstance(document, Mapping) else {}, target)
+
+    def _require_protocol_v2_legacy_run(self, payload: Mapping[str, object], strategies: Path) -> None:
+        """Legacy `tester-run`: strategies, the bot tester config and any resumed config snapshot meet protocol v2."""
+        target = self._evaluation_target()
+        self._require_protocol_v2_strategy_dir(strategies, target)
+        runner = RunnerConfig.from_json(self._path(self._required(payload, "config")))
+        try:
+            tester_config = json.loads(Path(runner.tester_config).read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise EvaluationProtocolError("PROTOCOL_V2_TESTER_CONFIG_REJECTED", "bot tester config is unreadable") from error
+        require_protocol_v2_tester_config(tester_config if isinstance(tester_config, Mapping) else {}, target)
+        output = self._path(self._required(payload, "output_csv"))
+        if output.with_name(f".{output.stem}.tester-config.snapshot").exists():
+            # A resumed run would reuse the frozen pre-check config (runner/workflow.py).
+            raise EvaluationProtocolError(
+                "PROTOCOL_V2_TESTER_CONFIG_REJECTED", "a resumed run would reuse an unchecked tester config snapshot",
+            )
+
+    def _require_protocol_v2_strategy_dir(self, directory: Path, target: EvaluationTarget) -> None:
+        for path in sorted(Path(directory).glob("*.json")):
+            if path.name == "strategy_manifest.json":
+                continue
+            try:
+                strategy = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise EvaluationProtocolError("PROTOCOL_V2_RENDER_REJECTED", f"strategy {path.name} is unreadable") from error
+            require_protocol_v2_strategy(strategy if isinstance(strategy, Mapping) else {}, target)
+
+    def _require_protocol_v2_manifest(self, manifest_path: Path, target: EvaluationTarget) -> None:
+        """Every strategy of a READY/RETEST manifest and the tester template meet protocol v2 before launch."""
+        self._require_protocol_v2_tester_template(target)
+        validated = validate_strategy_manifest(Path(manifest_path))
+        self._require_protocol_v2_strategy_dir(validated.strategy_source, target)
+
+    def _require_protocol_v2_runs(self, target: EvaluationTarget) -> None:
+        """Published RUNS snapshots (strategy and embedded tester config) meet protocol v2 before launch."""
+        runner = RunnerConfig.from_json(self.default_config)
+        runs = Path(runner.bot_root) / "tester" / "runs"
+        for path in sorted(runs.glob("*.json")) if runs.is_dir() else ():
+            try:
+                snapshot = json.loads(path.read_text(encoding="utf-8"))
+                settings = snapshot["settings"]
+                strategy, tester_config = settings[0], snapshot["tester_config"]
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError, KeyError, IndexError, TypeError) as error:
+                raise EvaluationProtocolError("PROTOCOL_V2_RENDER_REJECTED", f"RUNS snapshot {path.name} is unreadable") from error
+            require_protocol_v2_strategy(strategy, target)
+            require_protocol_v2_tester_config(tester_config, target)
+
     def _runs_batch(self) -> LocalRunsBatchService:
         if self._runs_batch_service is None:
             self._runs_batch_service = LocalRunsBatchService(RunnerConfig.from_json(self.default_config), on_update=self._record_special_job)
@@ -3765,7 +4130,7 @@ class PanelController:
         return names
 
     def strategies_tester_start(self, payload: Mapping[str, object]) -> dict[str, object]:
-        unexpected = set(payload).difference({"analysis_run_id", "start_date", "end_date", "test_start", "test_end", "initial_balance", "collect_reports"})
+        unexpected = set(payload).difference({"analysis_run_id", "start_date", "end_date", "test_start", "test_end", "collect_reports"})
         if unexpected:
             raise ValueError("tester start request contains unsupported fields")
         collect_reports = payload.get("collect_reports", False)
@@ -3782,9 +4147,12 @@ class PanelController:
             raise ValueError("start_date and end_date are required")
         initial_balance = self._requested_initial_balance(payload)
         manifest = self._fresh_strategy_manifest(analysis_id)
+        evaluation = self._evaluation_target()
+        self._require_protocol_v2_manifest(Path(manifest), evaluation)
         expected_names = self._manifest_strategy_names(manifest) if collect_reports else ()
         request = {"analysis_run_id": analysis_id, "start_date": start_date, "end_date": end_date, "initial_balance": initial_balance, "mode": "SINGLE_MODE", "collect_reports": collect_reports}
         single_mode_service = self._single_mode_strategy_test()
+        tester_template = self._mrs3_tester_template(evaluation)
         reconcile = getattr(single_mode_service, "reconcile_pending_cleanup", None)
         if callable(reconcile):
             reconcile()
@@ -3804,8 +4172,10 @@ class PanelController:
                 start_date=start_date,
                 end_date=end_date,
                 job_id=job_id,
+                tester_config_template=tester_template,
                 **({"initial_balance": initial_balance} if initial_balance is not None else {}),
             ),
+            runtime=self._protocol_v2_runtime(evaluation),
             before_start=register if collect_reports else None,
         )
 
@@ -3821,6 +4191,12 @@ class PanelController:
             raise PanelJobError("RETEST_RETRY_NOT_ALLOWED")
         if source.get("state") not in {"FAILED", "CANCELLED"}:
             raise PanelJobError("TESTER_JOB_NOT_RECOVERABLE")
+        evaluation = self._evaluation_target()
+        if not self._matches_protocol_v2(source_runtime, evaluation):
+            # Protocol v2 §7a: a job rendered before P6 or for another base/exchange is started anew.
+            raise PanelJobError("RETRY_PRE_PROTOCOL_V2")
+        self._require_protocol_v2_tester_template(evaluation)
+        tester_template = self._mrs3_tester_template(evaluation)
 
         def register(job_id: str) -> None:
             runtime = self._panel_jobs.runtime(source_job_id)
@@ -3845,13 +4221,17 @@ class PanelController:
             "strategies.tester.retry",
             {"source_job_id": source_job_id},
             ("strategies.tester",),
-            lambda job_id: self._single_mode_strategy_test().retry(source_job_id, job_id=job_id),
+            lambda job_id: self._single_mode_strategy_test().retry(
+                source_job_id, job_id=job_id, tester_config_template=tester_template,
+            ),
+            runtime=self._protocol_v2_runtime(evaluation),
             before_start=register,
         )
 
     def strategies_tester_runs_start(self, payload: Mapping[str, object]) -> dict[str, object]:
         if payload:
             raise ValueError("tester RUNS request contains unsupported fields")
+        self._require_protocol_v2_runs(self._evaluation_target())
         try:
             return self._start_tracked_panel_job(
                 "strategies.tester.runs", {}, ("strategies.tester",),
@@ -4331,7 +4711,7 @@ class PanelController:
     def _retest_explicit_range(self, payload: Mapping[str, object]) -> tuple[str, str] | None:
         if not isinstance(payload, Mapping):
             raise ValueError("RETEST start request must be an object")
-        allowed = {"test_start", "test_end", "start_date", "end_date", "initial_balance"}
+        allowed = {"test_start", "test_end", "start_date", "end_date"}
         if set(payload).difference(allowed):
             raise ValueError("RETEST start request contains unsupported fields")
         pairs = [("test_start", "test_end"), ("start_date", "end_date")]
@@ -4354,19 +4734,21 @@ class PanelController:
             raise ValueError("RETEST test_start must be before test_end")
         return start, end
 
-    def _retest_listing_context(self) -> tuple[Path, Path]:
-        configured = self._workflow_default("listing_dates_path")
+    def _retest_listing_context(self) -> tuple[Path, Path, str | None]:
+        configured, sheet = self._listing_dates_source()
         try:
             relative = configured.resolve().relative_to(self.root.resolve())
         except ValueError:
             raise ValueError("RETEST listing dates path must be inside the project") from None
         if not configured.is_file():
             raise ValueError("RETEST listing dates file is unavailable")
-        return configured.resolve(), Path(*relative.parts)
+        return configured.resolve(), Path(*relative.parts), sheet
 
-    def _validate_retest_listing(self, connection: duckdb.DuckDBPyConnection, path: Path, start: str) -> None:
+    def _validate_retest_listing(
+        self, connection: duckdb.DuckDBPyConnection, path: Path, start: str, sheet: str | None = None,
+    ) -> None:
         try:
-            listing_dates = load_listing_dates(path)
+            listing_dates = load_listing_dates(path) if sheet is None else load_listing_dates(path, sheet)
         except Exception as error:
             raise ValueError("RETEST listing dates file is invalid") from error
         symbols = [row[0] for row in connection.execute(
@@ -4406,17 +4788,23 @@ class PanelController:
             if not target.exists():
                 return {"count": 0, "retest_count": 0, "active_count": 0, "phase": "IDLE"}
             raise ValueError("Performance v2 RETEST status is unavailable") from error
+        try:
+            listing_path, listing_sheet = self._listing_dates_source()
+        except (EvaluationProtocolError, ValueError):
+            # Status stays readable; the launch reports the profile error with its code.
+            listing_path, listing_sheet = self._workflow_default("listing_dates_path"), None
         return {
             "count": status.active_count,
             "retest_count": status.active_count,
             "active_count": status.active_count,
             "default_start": defaults[0] if defaults else None,
             "default_end": defaults[1] if defaults else None,
-            "listing_dates_path": str(self._workflow_default("listing_dates_path")),
+            "listing_dates_path": str(listing_path),
+            **({"listing_dates_sheet": listing_sheet} if listing_sheet is not None else {}),
             "phase": "READY" if status.active_count else "IDLE",
         }
 
-    def _reusable_retest_job(self) -> dict[str, object] | None:
+    def _reusable_retest_job(self, evaluation: EvaluationTarget) -> dict[str, object] | None:
         """Find the newest committed RETEST inbox still backed by tester files.
 
         New registry records carry a persisted creation time.  Legacy records
@@ -4547,6 +4935,8 @@ class PanelController:
                     continue
                 if job.get("retest") is not True and runtime.get("retest") is not True:
                     continue
+                if not self._matches_protocol_v2(runtime, evaluation):
+                    continue
                 if "retest_import_job_id" in runtime:
                     previous_import_id = runtime.get("retest_import_job_id")
                     if not isinstance(previous_import_id, str) or not previous_import_id.strip():
@@ -4585,18 +4975,22 @@ class PanelController:
         explicit = self._retest_explicit_range(payload)
         if explicit is not None:
             self._validate_retest_end_date(explicit[1])
-        reusable = self._reusable_retest_job()
+        evaluation = self._evaluation_target()
+        self._require_protocol_v2_tester_template(evaluation)
+        tester_template = self._mrs3_tester_template(evaluation)
+        reusable = self._reusable_retest_job(evaluation)
         if reusable is not None:
             return reusable
-        listing_path, listing_relative = self._retest_listing_context()
-        templates = self._workflow_defaults().get("strategy_templates", {})
+        listing_path, listing_relative, listing_sheet = self._retest_listing_context()
+        templates = self._mrs3_strategy_templates(evaluation)
         with self._performance_v2_writer_lock, duckdb.connect(str(target), read_only=True) as connection:
             start, end = self._retest_range(payload, connection)
-            self._validate_retest_listing(connection, listing_path, start)
+            self._validate_retest_listing(connection, listing_path, start, listing_sheet)
             batch = build_retest_manifest(
                 connection,
                 templates if isinstance(templates, Mapping) else {},
                 config.strategy_root.parent if config.strategy_root is not None else self.root / "Output",
+                evaluation=evaluation,
             )
         runtime = {
             "retest": True,
@@ -4608,6 +5002,8 @@ class PanelController:
             "test_end": end,
             "initial_balance": initial_balance,
             "listing_dates_path": str(listing_relative),
+            **({"listing_dates_sheet": listing_sheet} if listing_sheet is not None else {}),
+            **self._protocol_v2_runtime(evaluation),
         }
         request = {
             "manifest_path": str(batch.manifest_path),
@@ -4628,6 +5024,7 @@ class PanelController:
                 start_date=start,
                 end_date=end,
                 job_id=job_id,
+                tester_config_template=tester_template,
                 **({"initial_balance": initial_balance} if initial_balance is not None else {}),
             ),
             runtime=runtime,
@@ -4750,6 +5147,9 @@ class PanelController:
                 stat = target.stat()
             except OSError as error:
                 raise PerformanceV2ApiError("PERFORMANCE_V2_NOT_FOUND", status=404, message="Performance v2 database is unavailable") from error
+            config = self._performance_v2_config()
+            # The configured protocol/exchange is part of the key: a config change
+            # without a database change must be checked again (protocol v2 §4.1).
             identity = (
                 str(target.resolve()),
                 int(stat.st_dev),
@@ -4757,12 +5157,14 @@ class PanelController:
                 int(stat.st_ctime_ns),
                 int(stat.st_mtime_ns),
                 int(stat.st_size),
+                config.evaluation_protocol,
+                config.exchange,
             )
             if identity in self._performance_v2_schema_ready:
                 return
             try:
                 if stat.st_size == 0:
-                    self._initialize_missing_performance_v2_target(self._performance_v2_config())
+                    self._initialize_missing_performance_v2_target(config)
                 version = None
                 schema_repair_required = False
                 with duckdb.connect(str(target), read_only=True) as connection:
@@ -4786,8 +5188,10 @@ class PanelController:
                                 "PERFORMANCE_V2_MIGRATION_REQUIRED", status=409,
                                 message="Existing Performance v2 database requires an explicit offline migration",
                             )
-                        if version in {"9", "10"}:
+                        if version in {"9", "10", "11", "12"}:
                             require_performance_v2_readable(connection)
+                            # Refuse a mismatching database before any migration writes to it.
+                            require_database_identity(connection, config)
                             repairable_columns = {
                                 ("window_metrics", "holding_seconds"),
                                 ("window_metrics", "time_in_market_pct"),
@@ -4809,13 +5213,17 @@ class PanelController:
                                       and table_name in ('window_metrics', 'strategy_results')"""
                             ).fetchall())
                             schema_repair_required = not repairable_columns.issubset(existing_columns)
-                if version != "10" or schema_repair_required:
+                if version != "12" or schema_repair_required:
                     with self._performance_v2_writer_guard(target):
                         with duckdb.connect(str(target)) as connection:
                             initialize_performance_v2(connection)
                             require_performance_v2(connection)
+                with duckdb.connect(str(target), read_only=True) as connection:
+                    require_database_identity(connection, config)
             except PerformanceV2ApiError:
                 raise
+            except PerformanceV2IdentityError as error:
+                raise PerformanceV2ApiError(error.code, status=409, message=str(error)) from error
             except PerformanceV2StoreError as error:
                 raise PerformanceV2ApiError("PERFORMANCE_V2_SCHEMA_INVALID", status=500, message=str(error)) from error
             except duckdb.Error as error:
@@ -4828,6 +5236,7 @@ class PanelController:
             identity = (
                 str(target.resolve()), int(stat.st_dev), int(stat.st_ino),
                 int(stat.st_ctime_ns), int(stat.st_mtime_ns), int(stat.st_size),
+                config.evaluation_protocol, config.exchange,
             )
             self._performance_v2_schema_ready.add(identity)
 
@@ -4853,7 +5262,9 @@ class PanelController:
                         int(existing.st_mtime_ns), int(existing.st_size),
                     )
                 with duckdb.connect(str(staging)) as connection:
-                    initialize_performance_v2(connection)
+                    initialize_performance_v2(
+                        connection, evaluation_protocol=config.evaluation_protocol, exchange=config.exchange,
+                    )
                     require_performance_v2(connection)
                 if empty_identity is not None:
                     current = target.stat()
@@ -4917,6 +5328,7 @@ class PanelController:
             expected_collection_id = tester_job_id
         if tester_job.get("state") != "COMMITTED" or tester_job.get("inbox_ready") is not True:
             raise ValueError("Performance v2 import requires a committed tester inbox")
+        self._require_import_target(tester_job_id, is_collection_job)
         if not _internal and not is_collection_job and self._panel_jobs.runtime(tester_job_id).get("performance_v2_import_verified") is not True:
             raise ValueError("Performance v2 import requires explicit inbox verification")
         if not _internal:
@@ -4982,8 +5394,9 @@ class PanelController:
             raise ValueError("test_start and test_end must be valid ISO dates")
         if payload.get("listing_dates_path") is not None:
             raise ValueError("listing_dates_path is configured by the server")
+        listing_source, listing_dates_sheet = self._listing_dates_source()
         try:
-            listing_dates_path = self._workflow_default("listing_dates_path").resolve().relative_to(self.root.resolve())
+            listing_dates_path = listing_source.resolve().relative_to(self.root.resolve())
         except ValueError:
             raise ValueError("Performance v2 listing dates file is unavailable") from None
         if self._performance_v2_jobs is None:
@@ -5008,6 +5421,7 @@ class PanelController:
             test_end=test_end if isinstance(test_end, str) else None,
             listing_dates_path=listing_dates_path,
             listing_dates_root=self.root,
+            listing_dates_sheet=listing_dates_sheet,
             expected_current_result_ids=expected_current,
             expected_inbox_manifest_sha256=expected_inbox_manifest_sha256,
             expected_collection_id=expected_collection_id,
@@ -5434,7 +5848,7 @@ class PanelController:
 
     @staticmethod
     def _bulk_retest_range(payload: Mapping[str, object], listing_dates: Mapping[str, object], connection: duckdb.DuckDBPyConnection, include_reserve: bool) -> tuple[str, str]:
-        allowed = {"include_reserve", "clear_reports", "test_start", "test_end", "start_date", "end_date", "initial_balance"}
+        allowed = {"include_reserve", "clear_reports", "test_start", "test_end", "start_date", "end_date"}
         if set(payload).difference(allowed):
             raise FinalistRetestError("INVALID_REQUEST", "bulk retest request contains unsupported fields")
         if type(include_reserve) is not bool:
@@ -5463,16 +5877,18 @@ class PanelController:
     def strategies_performance_v2_finalist_retest_start(self, payload: Mapping[str, object]) -> dict[str, object]:
         if not isinstance(payload, Mapping):
             raise FinalistRetestError("INVALID_REQUEST", "bulk retest request must be an object")
-        if set(payload).difference({"include_reserve", "clear_reports", "test_start", "test_end", "start_date", "end_date", "initial_balance"}):
+        if set(payload).difference({"include_reserve", "clear_reports", "test_start", "test_end", "start_date", "end_date"}):
             raise FinalistRetestError("INVALID_REQUEST", "bulk retest request contains unsupported fields")
         include_reserve = payload.get("include_reserve", False)
         clear_reports = payload.get("clear_reports", False)
         if type(clear_reports) is not bool:
             raise FinalistRetestError("INVALID_REQUEST", "clear_reports must be a boolean")
         initial_balance = self._requested_initial_balance(payload)
-        listing_path, listing_relative = self._retest_listing_context()
+        listing_path, listing_relative, listing_sheet = self._retest_listing_context()
         try:
-            listing_dates = load_listing_dates(listing_path)
+            listing_dates = (
+                load_listing_dates(listing_path) if listing_sheet is None else load_listing_dates(listing_path, listing_sheet)
+            )
         except Exception as error:
             raise FinalistRetestError("LISTING_DATE_INVALID", "listing dates are invalid") from error
         config = self._performance_v2_config()
@@ -5487,7 +5903,10 @@ class PanelController:
         target = performance_v2_database_path(config)
         if not target.is_file():
             raise FinalistRetestError("PERFORMANCE_V2_NOT_FOUND", "Performance v2 database is unavailable")
-        templates = self._workflow_defaults().get("strategy_templates", {})
+        evaluation = self._evaluation_target()
+        templates = self._mrs3_strategy_templates(evaluation)
+        self._require_protocol_v2_tester_template(evaluation)
+        tester_template = self._mrs3_tester_template(evaluation)
         with self._performance_v2_writer_lock, duckdb.connect(str(target), read_only=True) as connection:
             start, end = self._bulk_retest_range(payload, listing_dates, connection, include_reserve)
             current_cohort = freeze_finalist_cohort(
@@ -5497,7 +5916,7 @@ class PanelController:
         if not current_cohort.members:
             raise FinalistRetestError("COHORT_EMPTY", "bulk retest cohort has no runnable members")
         current_config_sha256 = finalist_retest_config_digest(
-            templates if isinstance(templates, Mapping) else {}
+            templates if isinstance(templates, Mapping) else {}, evaluation=evaluation,
         )
         for existing in self._panel_jobs.list():
             if existing.get("kind") != "strategies.performance.v2.finalist-retest":
@@ -5507,7 +5926,8 @@ class PanelController:
             except PanelJobError:
                 continue
             same_request = (
-                old_runtime.get("scope") == current_cohort.scope
+                self._matches_protocol_v2(old_runtime, evaluation)
+                and old_runtime.get("scope") == current_cohort.scope
                 and old_runtime.get("test_start") == start
                 and old_runtime.get("test_end") == end
                 and old_runtime.get("cohort_sha256") == current_cohort.cohort_sha256
@@ -5528,12 +5948,14 @@ class PanelController:
                 connection, templates if isinstance(templates, Mapping) else {},
                 config.strategy_root.parent if config.strategy_root is not None else self.root / "Output",
                 test_start=start, test_end=end, include_reserve=include_reserve,
-                listing_dates=listing_dates, job_id=run_id,
+                listing_dates=listing_dates, job_id=run_id, evaluation=evaluation,
             )
         runtime = {
             "bulk_retest": True, "scope": batch.cohort.scope, "cohort_sha256": batch.cohort.cohort_sha256,
+            **self._protocol_v2_runtime(evaluation),
             "config_sha256": batch.config_sha256, "manifest_sha256": sha256(batch.manifest_path.read_bytes()).hexdigest(),
             "test_start": start, "test_end": end, "listing_dates_path": str(listing_relative),
+            **({"listing_dates_sheet": listing_sheet} if listing_sheet is not None else {}),
             "initial_balance": initial_balance,
             "manifest_path": str(batch.manifest_path), "cohort_members": _json_value([dict(member) for member in batch.cohort.members]),
             "exclusions": [item.as_dict() for item in batch.cohort.exclusions],
@@ -5555,6 +5977,7 @@ class PanelController:
             ("strategies.tester", "performance-v2-finalist-retest"),
             lambda job_id: self._single_mode_strategy_test().start(
                 batch.manifest_path, analysis_run_id=batch.run_id, start_date=start, end_date=end, job_id=job_id,
+                tester_config_template=tester_template,
                 clear_reports=clear_reports,
                 **({"initial_balance": initial_balance} if initial_balance is not None else {}),
             ), runtime=runtime,
@@ -5563,9 +5986,11 @@ class PanelController:
     def strategies_performance_v2_finalist_retest_preview(self, include_reserve: bool = False) -> dict[str, object]:
         if type(include_reserve) is not bool:
             raise FinalistRetestError("INVALID_REQUEST", "include_reserve must be a boolean")
-        listing_path, _ = self._retest_listing_context()
+        listing_path, _, listing_sheet = self._retest_listing_context()
         try:
-            listing_dates = load_listing_dates(listing_path)
+            listing_dates = (
+                load_listing_dates(listing_path) if listing_sheet is None else load_listing_dates(listing_path, listing_sheet)
+            )
         except Exception as error:
             raise FinalistRetestError("LISTING_DATE_INVALID", "listing dates are invalid") from error
         target = performance_v2_database_path(self._performance_v2_config())
@@ -7039,15 +7464,21 @@ class PanelController:
                     user_review_rows = latest_user_reviews_by_strategy(
                         connection, [int(strategy_id) for strategy_id in result["strategy_id"]]
                     )
-                    pending_rejected = automatic_filter_rejected_strategy_ids(
+                    pending_by_source = automatic_filter_rejected_ids(
                         result, request, selection_config,
                     )
+                    pending_reasons = {
+                        strategy_id: rejection_reason_label(source)
+                        for source, strategy_ids in pending_by_source.items()
+                        for strategy_id in strategy_ids
+                    }
                     for row in _selection_rows(result):
                         strategy_id = int(row["strategy_id"])
                         if row.get("prior_rejected") is True:
                             user_review_rows.setdefault(strategy_id, {})["user_status"] = "REJECTED"
-                        if strategy_id in pending_rejected:
+                        if strategy_id in pending_reasons:
                             user_review_rows.setdefault(strategy_id, {})["user_status"] = "REJECTED"
+                    attach_rejection_reasons(connection, user_review_rows, pending_reasons)
                 workbook = write_selection_workbook(
                     result, Path(directory) / "finalists.xlsx", request, metadata, user_review_rows
                 )
@@ -7076,6 +7507,31 @@ class PanelController:
         except SelectionReviewError as error:
             status = 409 if error.code in {
                 "SELECTION_REVIEW_NOT_LATEST_RUN", "SELECTION_REVIEW_STALE_RESULTS", "SELECTION_REVIEW_ALREADY_IMPORTED"
+            } else 400
+            details = f": {error.details}" if error.details else ""
+            raise PerformanceV2ApiError(error.code, status=status, message=f"{error}{details}") from error
+        except PerformanceV2StoreError as error:
+            raise PerformanceV2ApiError("PERFORMANCE_V2_SCHEMA_INVALID", status=500, message=str(error)) from error
+        except duckdb.Error as error:
+            raise PerformanceV2ApiError("PERFORMANCE_V2_LOCKED", status=409, message="Performance v2 database is locked") from error
+
+    def strategies_performance_v2_selection_aggregate_import(
+        self, data: bytes, *, aggregate_import_id: str, operation_key: str,
+    ) -> dict[str, object]:
+        target = performance_v2_database_path(self._performance_v2_config())
+        if not target.is_file():
+            raise PerformanceV2ApiError("PERFORMANCE_V2_NOT_FOUND", status=404)
+        self._ensure_performance_v2_schema(target)
+        try:
+            with self._performance_v2_writer_guard(target), duckdb.connect(str(target)) as connection:
+                return import_combined_selection_workbook(
+                    connection, target.parent, data,
+                    aggregate_import_id=aggregate_import_id, operation_key=operation_key,
+                )
+        except SelectionReviewError as error:
+            status = 409 if error.code in {
+                "SELECTION_REVIEW_STALE", "SELECTION_REVIEW_ALREADY_IMPORTED",
+                "STALE_RESULTS", "OPERATION_KEY_CONFLICT",
             } else 400
             details = f": {error.details}" if error.details else ""
             raise PerformanceV2ApiError(error.code, status=status, message=f"{error}{details}") from error
@@ -8849,6 +9305,7 @@ class PanelController:
     def start_analysis_strategies(self, payload: Mapping[str, object]) -> dict[str, object]:
         run_id = self._required(payload, "run_id")
         selected_scopes = self._analysis_selected_scopes(payload)
+        self._evaluation_target()
         source_v6_surface_raw = payload.get("source_v6_surface_path")
         source_v6_surface_path = (
             self._path(source_v6_surface_raw)
@@ -8934,6 +9391,7 @@ class PanelController:
             with self._lock:
                 job.phase = "GENERATING"
             config = self._analysis_config_loader(job.config_path)
+            target = self._evaluation_target()
             if job.source_v6_surface_path is not None:
                 result = generate_v6_analysis_strategies(
                     job.source_v6_surface_path,
@@ -8943,12 +9401,13 @@ class PanelController:
                     job.template_path,
                     job.output_dir,
                     config,
+                    evaluation=target,
                 )
             else:
                 connection = self._direct_connection_factory(str(self._analysis_path()), read_only=True)
                 result = self._analysis_strategy_func(
                     connection, job.run_id, job.candidate_ids, job.selected_scopes, job.template_path, job.output_dir,
-                    config, job.criteria,
+                    config, job.criteria, evaluation=target,
                 )
             with self._lock:
                 job.strategies_path = Path(result.strategies_path)
@@ -9779,6 +10238,140 @@ class _PanelServer(ThreadingHTTPServer):
         return {"restarting": True}
 
 
+    @staticmethod
+    def _selection_process_all_pairs(payload: Mapping[str, object]) -> bool:
+        value = payload.get("process_all_pairs", False)
+        if type(value) is not bool:
+            raise ValueError("process_all_pairs must be a boolean")
+        return value
+
+    def _selection_operation_key(self, payload: Mapping[str, object]) -> str:
+        value = payload.get("operation_key")
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("operation_key is required")
+        if "\0" in value or value != value.strip():
+            raise ValueError("operation_key is invalid")
+        return value.strip().lower()
+
+    def strategies_performance_v2_selection_aggregate_preview(
+        self, payload: Mapping[str, object],
+    ) -> dict[str, object]:
+        """Validate operation controls without evaluating or writing anything."""
+        if not isinstance(payload, Mapping):
+            raise ValueError("selection payload must be an object")
+        process_all_pairs = self._selection_process_all_pairs(payload)
+        request_payload = dict(payload)
+        request_payload.pop("process_all_pairs", None)
+        request_payload.pop("operation_key", None)
+        request_payload.pop("action", None)
+        request = parse_selection_request(request_payload)
+        return {
+            "process_all_pairs": process_all_pairs,
+            "pair": request.symbol,
+            "side": request.side,
+            "finalists_only": request.finalists_only,
+            "requires_confirmation": True,
+            "action": "EXPORT" if payload.get("action", "EXPORT") == "EXPORT" else "WRITE_REJECTED",
+        }
+
+    def _selection_aggregate_operation(
+        self, payload: Mapping[str, object], *, write_rejected: bool,
+    ) -> tuple[str, bytes | None, object]:
+        """Run one explicit all-pairs action through the Task3/4 coordinator.
+
+        The coordinator remains the only mutation writer.  Workbook bytes are
+        assembled from its frozen partition result and are never written to a
+        path by this controller.
+        """
+        if not isinstance(payload, Mapping):
+            raise ValueError("selection payload must be an object")
+        process_all_pairs = self._selection_process_all_pairs(payload)
+        operation_key = ""
+        if process_all_pairs or "operation_key" in payload:
+            operation_key = self._selection_operation_key(payload)
+        request_payload = dict(payload)
+        request_payload.pop("process_all_pairs", None)
+        request_payload.pop("operation_key", None)
+        request_payload.pop("action", None)
+        request = parse_selection_request(request_payload)
+        if not process_all_pairs:
+            # Keep the established single-pair behavior byte-for-byte and do
+            # not add operation-only fields to its canonical request/hash.
+            filename, data = self.strategies_performance_v2_selection(request_payload)
+            return filename, data, {"process_all_pairs": False, "operation_key": operation_key}
+        config = load_selection_config(self.default_config.with_name("config.performance.json"))
+        performance_config = self._performance_v2_config()
+        target = performance_v2_database_path(performance_config)
+        if not target.is_file():
+            raise PerformanceV2ApiError("PERFORMANCE_V2_NOT_FOUND", status=404)
+        with duckdb.connect(str(target)) as connection:
+            evaluated = coordinate_all_pairs(
+                connection, target.parent, request, config=config,
+                operation_key=operation_key, publish=False,
+            )
+            package = evaluated.package
+            if package is None:
+                raise PerformanceV2ApiError("PERFORMANCE_V2_PUBLICATION_INVALID", status=500)
+            partitions = tuple(
+                AllPairsPartition(item.pair, item.side, item.source_run_id, item.result)
+                for item in evaluated.partitions
+            )
+            strategy_ids = [
+                int(value)
+                for item in partitions
+                for value in item.result.get("strategy_id", pd.Series(dtype=int)).tolist()
+            ]
+            user_review_rows = latest_user_reviews_by_strategy(connection, strategy_ids)
+            attach_rejection_reasons(connection, user_review_rows)
+            data = build_combined_selection_workbook(
+                partitions,
+                database_instance_id=package.database_instance_id,
+                publication_id=package.publication_id,
+                decision_group_id=package.decision_group_id,
+                controls_sha256=package.controls_sha256,
+                render_model_sha256=package.render_model_sha256,
+                user_review_rows=user_review_rows,
+            )
+            validate_combined_selection_workbook(data)
+            publication = publish_publication(
+                connection, target.parent,
+                replace(
+                    package,
+                    export_workbook_sha256=(sha256(data).hexdigest() if not write_rejected else None),
+                ),
+            )
+            return (
+                "performance-v2-selection-all-pairs.xlsx" if data is not None else "",
+                None if write_rejected else data,
+                {
+                    "process_all_pairs": True,
+                    "operation_key": operation_key,
+                    "publication_id": publication.publication_id,
+                    "decision_group_id": package.decision_group_id,
+                    "partitions": len(partitions),
+                },
+            )
+
+    def strategies_performance_v2_selection_export_action(
+        self, payload: Mapping[str, object],
+    ) -> tuple[str, bytes]:
+        filename, data, _metadata = self._selection_aggregate_operation(payload, write_rejected=False)
+        if data is None:
+            raise ValueError("selection export did not produce workbook bytes")
+        return filename, data
+
+    def strategies_performance_v2_selection_write_rejected(
+        self, payload: Mapping[str, object],
+    ) -> dict[str, object]:
+        _filename, _data, metadata = self._selection_aggregate_operation(payload, write_rejected=True)
+        return {"status": "COMMITTED", **dict(metadata)}
+
+    def strategies_performance_v2_selection_aggregate_validate(
+        self, data: bytes,
+    ) -> dict[str, object]:
+        return validate_combined_selection_workbook(data)
+
+
 class _PanelHandler(BaseHTTPRequestHandler):
     server: _PanelServer
     _PERFORMANCE_V2_EXPORT = "/api/v2/strategies/performance-v2/export"
@@ -9966,6 +10559,17 @@ class _PanelHandler(BaseHTTPRequestHandler):
                 result = self.server.controller.panel_settings_reload()
             except PanelSettingsError as error:
                 self._json(400, {"error": str(error)})
+                return
+            self._json(200, result)
+            return
+        if parsed.path == "/api/v2/settings/performance-databases":
+            try:
+                result = self.server.controller.performance_databases_get()
+            except PerformanceDatabaseError as error:
+                self._json(400, {"error": {"code": error.code, "message": error.message}})
+                return
+            except (OSError, ValueError):
+                self._json(400, {"error": {"code": "PERFORMANCE_DATABASES_INVALID", "message": "PerformanceDB settings are unavailable"}})
                 return
             self._json(200, result)
             return
@@ -10362,6 +10966,7 @@ class _PanelHandler(BaseHTTPRequestHandler):
         fresh_generation = endpoint == "/api/v2/strategies/fresh/generate"
         performance_v2_windows_endpoint = endpoint == "/api/v2/strategies/performance-v2/windows"
         performance_v2_selection_endpoint = endpoint == "/api/v2/strategies/performance-v2/selection"
+        performance_v2_selection_aggregate_import_endpoint = endpoint == "/api/v2/strategies/performance-v2/selection/aggregate-import"
         performance_v2_maintenance_apply_endpoint = endpoint == "/api/v2/strategies/performance-v2/maintenance/apply"
         performance_v2_maintenance_endpoint = endpoint in {
             "/api/v2/strategies/performance-v2/maintenance/preview",
@@ -10373,10 +10978,10 @@ class _PanelHandler(BaseHTTPRequestHandler):
         portfolio_submission_route = bool(re.fullmatch(r"/api/v2/portfolio/campaigns/[^/]+/tester-submissions", endpoint))
         if equity_filter_endpoint:
             pass
-        elif bulk_retest_endpoint is None and endpoint != "/api/v2/strategies/performance-v2/selection-settings" and endpoint not in {"/api/start", "/api/browse", "/api/duckdb-import/settings", "/api/duckdb-import/preflight", "/api/duckdb-import/start", "/api/duckdb-import/cancel", "/api/duckdb-import/migrate", "/api/duckdb-direct/coverage", "/api/duckdb-direct/preflight", "/api/duckdb-direct/start", "/api/duckdb-direct/cancel", "/api/analysis/library", "/api/analysis/initialize", "/api/analysis/rerun", "/api/analysis/compare", "/api/analysis/export", "/api/analysis/shortlist", "/api/analysis/filter-export", "/api/analysis/strategies", "/api/source-v6/preflight", "/api/source-v6/start", "/api/source-v6/fresh/multiscope/start", "/api/source-v6/fresh/multiscope/analysis/start", "/api/source-v6/cancel", "/api/source-v6/merge", "/api/v2/panel/restart", "/api/v2/settings/validate", "/api/v2/settings/save", "/api/v2/settings/analysis-profile", "/api/v2/jobs", "/api/v2/strategies/tester/verify-inbox", "/api/v2/strategies/tester/report-collection/clear", "/api/v2/testing/local/fill", "/api/v2/testing/local/start", "/api/v2/testing/local/stop", "/api/v2/testing/screener/fill", "/api/v2/testing/screener/start", "/api/v2/testing/screener/stop", "/api/v2/testing/screener/evaluate", "/api/v2/testing/bingx/download", "/api/v2/testing/remote/check-paths", "/api/v2/testing/remote/prepare", "/api/v2/testing/remote/fill", "/api/v2/testing/remote/start", "/api/v2/source/local/import/preflight", "/api/v2/source/local/import/start", "/api/v2/source/local/merge/preflight", "/api/v2/source/local/merge/start", "/api/v2/source/local/cancel", "/api/v2/source/remote/start", "/api/v2/source/remote/cancel", "/api/v2/surfaces/preflight", "/api/v2/surfaces/select", "/api/v2/surfaces/publish", "/api/v2/surfaces/publish/start", "/api/v2/strategies/fresh/analyze", "/api/v2/strategies/fresh/generate", "/api/v2/strategies/fresh/runs", "/api/v2/strategies/fresh/shortlist", "/api/v2/strategies/fresh/open", "/api/v2/strategies/performance-v2/windows", "/api/v2/strategies/performance-v2/selection", "/api/v2/strategies/performance-v2/selection-preview", "/api/v2/strategies/performance-v2/selection-cache-status", "/api/v2/strategies/performance-v2/recalculate", "/api/v2/strategies/performance-v2/recalculate-all", "/api/v2/strategies/performance-v2/selection-review-import", "/api/v2/strategies/performance-v2/selection-user-fields-import", "/api/v2/strategies/performance-v2/retest-tags-import", "/api/v2/strategies/performance-v2/retest/start", "/api/v2/strategies/performance-v2/retest/import"} and not portfolio_route and not performance_v2_maintenance_endpoint:
+        elif bulk_retest_endpoint is None and endpoint != "/api/v2/strategies/performance-v2/selection-settings" and endpoint not in {"/api/start", "/api/browse", "/api/duckdb-import/settings", "/api/duckdb-import/preflight", "/api/duckdb-import/start", "/api/duckdb-import/cancel", "/api/duckdb-import/migrate", "/api/duckdb-direct/coverage", "/api/duckdb-direct/preflight", "/api/duckdb-direct/start", "/api/duckdb-direct/cancel", "/api/analysis/library", "/api/analysis/initialize", "/api/analysis/rerun", "/api/analysis/compare", "/api/analysis/export", "/api/analysis/shortlist", "/api/analysis/filter-export", "/api/analysis/strategies", "/api/source-v6/preflight", "/api/source-v6/start", "/api/source-v6/fresh/multiscope/start", "/api/source-v6/fresh/multiscope/analysis/start", "/api/source-v6/cancel", "/api/source-v6/merge", "/api/v2/panel/restart", "/api/v2/settings/validate", "/api/v2/settings/save", "/api/v2/settings/analysis-profile", "/api/v2/settings/performance-databases/activate", "/api/v2/settings/performance-databases/create", "/api/v2/jobs", "/api/v2/strategies/tester/verify-inbox", "/api/v2/strategies/tester/report-collection/clear", "/api/v2/testing/local/fill", "/api/v2/testing/local/start", "/api/v2/testing/local/stop", "/api/v2/testing/screener/fill", "/api/v2/testing/screener/start", "/api/v2/testing/screener/stop", "/api/v2/testing/screener/evaluate", "/api/v2/testing/bingx/download", "/api/v2/testing/remote/check-paths", "/api/v2/testing/remote/prepare", "/api/v2/testing/remote/fill", "/api/v2/testing/remote/start", "/api/v2/source/local/import/preflight", "/api/v2/source/local/import/start", "/api/v2/source/local/merge/preflight", "/api/v2/source/local/merge/start", "/api/v2/source/local/cancel", "/api/v2/source/remote/start", "/api/v2/source/remote/cancel", "/api/v2/surfaces/preflight", "/api/v2/surfaces/select", "/api/v2/surfaces/publish", "/api/v2/surfaces/publish/start", "/api/v2/strategies/fresh/analyze", "/api/v2/strategies/fresh/generate", "/api/v2/strategies/fresh/runs", "/api/v2/strategies/fresh/shortlist", "/api/v2/strategies/fresh/open", "/api/v2/strategies/performance-v2/windows", "/api/v2/strategies/performance-v2/selection", "/api/v2/strategies/performance-v2/selection-preview", "/api/v2/strategies/performance-v2/selection-cache-status", "/api/v2/strategies/performance-v2/recalculate", "/api/v2/strategies/performance-v2/recalculate-all", "/api/v2/strategies/performance-v2/selection-review-import", "/api/v2/strategies/performance-v2/selection-user-fields-import", "/api/v2/strategies/performance-v2/retest-tags-import", "/api/v2/strategies/performance-v2/selection/aggregate-import", "/api/v2/strategies/performance-v2/retest/start", "/api/v2/strategies/performance-v2/retest/import"} and not portfolio_route and not performance_v2_maintenance_endpoint:
             self._json(404, {"error": "not found"})
             return
-        if endpoint in {"/api/v2/strategies/performance-v2/selection-review-import", "/api/v2/strategies/performance-v2/selection-user-fields-import", "/api/v2/strategies/performance-v2/retest-tags-import"}:
+        if endpoint in {"/api/v2/strategies/performance-v2/selection-review-import", "/api/v2/strategies/performance-v2/selection-user-fields-import", "/api/v2/strategies/performance-v2/retest-tags-import", "/api/v2/strategies/performance-v2/selection/aggregate-import"}:
             error_code = "RETEST_TAG_IMPORT_INVALID_FILE" if endpoint.endswith("retest-tags-import") else "SELECTION_REVIEW_INVALID_FILE"
             if self.headers.get("Content-Type", "").partition(";")[0].strip().casefold() != "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet":
                 self._json(415, {"error": {"code": error_code, "message": "XLSX Content-Type required"}})
@@ -10395,6 +11000,13 @@ class _PanelHandler(BaseHTTPRequestHandler):
                     result = self.server.controller.strategies_performance_v2_selection_user_fields_import(self.rfile.read(length))
                 elif endpoint.endswith("retest-tags-import"):
                     result = self.server.controller.strategies_performance_v2_retest_tags_import(self.rfile.read(length))
+                elif performance_v2_selection_aggregate_import_endpoint:
+                    query = parse_qs(urlparse(self.path).query)
+                    result = self.server.controller.strategies_performance_v2_selection_aggregate_import(
+                        self.rfile.read(length),
+                        aggregate_import_id=query.get("aggregate_import_id", [""])[0],
+                        operation_key=query.get("operation_key", [""])[0],
+                    )
                 else:
                     result = self.server.controller.strategies_performance_v2_selection_review_import(self.rfile.read(length))
             except PerformanceV2ApiError as error:
@@ -10541,6 +11153,12 @@ class _PanelHandler(BaseHTTPRequestHandler):
                 result = self.server.controller.strategies_performance_v2_maintenance_apply(document)
             elif endpoint == "/api/v2/strategies/performance-v2/selection":
                 result = self.server.controller.strategies_performance_v2_selection(document)
+            elif endpoint == "/api/v2/strategies/performance-v2/selection/preview":
+                result = self.server.controller.strategies_performance_v2_selection_aggregate_preview(document)
+            elif endpoint == "/api/v2/strategies/performance-v2/selection/export":
+                result = self.server.controller.strategies_performance_v2_selection_export_action(document)
+            elif endpoint == "/api/v2/strategies/performance-v2/selection/write-rejected":
+                result = self.server.controller.strategies_performance_v2_selection_write_rejected(document)
             elif endpoint == "/api/v2/strategies/performance-v2/selection-settings":
                 result = self.server.controller.performance_v2_selection_settings(document)
             elif endpoint == "/api/v2/strategies/performance-v2/selection-preview":
@@ -10563,6 +11181,10 @@ class _PanelHandler(BaseHTTPRequestHandler):
                 result = self.server.controller.panel_settings_save(document)
             elif endpoint == "/api/v2/settings/analysis-profile":
                 result = self.server.controller.analysis_profile_save(document)
+            elif endpoint == "/api/v2/settings/performance-databases/activate":
+                result = self.server.controller.performance_databases_activate(document)
+            elif endpoint == "/api/v2/settings/performance-databases/create":
+                result = self.server.controller.performance_databases_create(document)
             elif endpoint == "/api/browse":
                 kind = document.get("kind")
                 multiple = document.get("multiple", False)
@@ -10654,6 +11276,13 @@ class _PanelHandler(BaseHTTPRequestHandler):
                 return
             self._json(409 if error.code in {"RESOURCE_BUSY", "JOB_CAPACITY_EXHAUSTED", "IDEMPOTENCY_CONFLICT", "RESTART_BLOCKED"} else 400, {"error": error.code})
             return
+        except EvaluationProtocolError as error:
+            self._json(409, {"error": {"code": error.code, "message": str(error)}})
+            return
+        except PerformanceDatabaseError as error:
+            status = 409 if error.code in {"RESOURCE_BUSY", "PERFORMANCE_DATABASE_EXISTS"} else 500 if error.code == "PERFORMANCE_DATABASE_CREATE_FAILED" else 400
+            self._json(status, {"error": {"code": error.code, "message": error.message}})
+            return
         except FinalistRetestError as error:
             status = 400 if error.code in {"INVALID_REQUEST", "INVALID_TEST_RANGE"} else 409
             self._json(status, {"error": {"code": error.code, "message": str(error)}})
@@ -10721,7 +11350,7 @@ class _PanelHandler(BaseHTTPRequestHandler):
                 self._json(500, {"error": {"code": "INTERNAL", "message": "Performance v2 calculation failed"}})
                 return
             raise
-        if performance_v2_selection_endpoint:
+        if performance_v2_selection_endpoint or endpoint == "/api/v2/strategies/performance-v2/selection/export":
             filename, data = result
             self.send_response(200)
             self.send_header("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
@@ -10752,6 +11381,17 @@ class _PanelHandler(BaseHTTPRequestHandler):
             self._export_method_not_allowed()
             return
         self._json(404, {"error": "not found"})
+
+# The aggregate action helpers are defined beside the HTTP handler helpers in
+# this module.  Bind them to the controller as well so routes and direct tests
+# use the same implementation without duplicating the operation contract.
+PanelController._selection_process_all_pairs = staticmethod(_PanelServer._selection_process_all_pairs)
+PanelController._selection_operation_key = _PanelServer._selection_operation_key
+PanelController.strategies_performance_v2_selection_aggregate_preview = _PanelServer.strategies_performance_v2_selection_aggregate_preview
+PanelController._selection_aggregate_operation = _PanelServer._selection_aggregate_operation
+PanelController.strategies_performance_v2_selection_export_action = _PanelServer.strategies_performance_v2_selection_export_action
+PanelController.strategies_performance_v2_selection_write_rejected = _PanelServer.strategies_performance_v2_selection_write_rejected
+PanelController.strategies_performance_v2_selection_aggregate_validate = _PanelServer.strategies_performance_v2_selection_aggregate_validate
 
 
 def create_panel_server(

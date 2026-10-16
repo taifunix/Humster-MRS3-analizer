@@ -957,3 +957,45 @@ def test_generate_v6_rejects_invalid_run_provenance_and_ready_input(tmp_path: Pa
     selected_scope = [("ETHUSDT", "LONG", "1h")] if failure == "wrong_scope" else [("BTCUSDT", "LONG", "1h")]
     with pytest.raises(ValueError):
         generate_v6_analysis_strategies("surface.duckdb", run_id, candidate_ids, selected_scope, template, tmp_path / "out", config)
+
+
+def test_generate_analysis_strategies_applies_protocol_v2(tmp_path: Path, monkeypatch) -> None:
+    from decimal import Decimal
+
+    from mrs3.analysis_strategies import generate_analysis_strategies
+    from mrs3.evaluation_protocol import EvaluationTarget
+
+    connection = duckdb.connect(":memory:")
+    ensure_analysis_schema(connection)
+    _seed_run(connection)
+    ready = {"structure_id": "STR_1", "symbol": "BTCUSDT", "side": "LONG", "timeframe": "1h", "common_close_ma": 9, "order_count": 2, "status": "READY_MRS3_STRUCTURE", "orders": [{"id": 1, "plateau_id": "P1", "point_id": "BTCUSDT|LONG|1h|100|3|9", "open_ma": 3, "shift_bp": 100, "shift_pct": 1.0, "source_pnl_pct": 10.0, "source_dd_pct": 2.0, "source_efficiency": 5.0, "trades": 7, "close_support": 1.0, "standalone_eligible": True, "depth_eligible": True}, {"id": 2, "plateau_id": "P2", "point_id": "BTCUSDT|LONG|1h|200|4|9", "open_ma": 4, "shift_bp": 200, "shift_pct": 2.0, "source_pnl_pct": 11.0, "source_dd_pct": 2.0, "source_efficiency": 5.5, "trades": 8, "close_support": 1.0, "standalone_eligible": True, "depth_eligible": True}]}
+    connection.execute("insert into candidates values ('C1', 'R1', 'S1', ?)", [json.dumps(ready)])
+    _seed_surface_point(connection, "BTCUSDT|LONG|1h|100|3|9")
+    _seed_surface_point(connection, "BTCUSDT|LONG|1h|200|4|9")
+    points = pd.DataFrame([
+        {"point_id": "BTCUSDT|LONG|1h|100|3|9", "symbol": "BTCUSDT", "side": "LONG", "timeframe": "1h", "shift_bp": 100, "open_ma": 3, "close_ma": 9, "pnl_pct": 10.0, "dd_pct": 2.0, "trades": 7, "event_mode": "legacy_trades_proxy", "point_event_count": 7, "event_ids_hash": "legacy"},
+        {"point_id": "BTCUSDT|LONG|1h|200|4|9", "symbol": "BTCUSDT", "side": "LONG", "timeframe": "1h", "shift_bp": 200, "open_ma": 4, "close_ma": 9, "pnl_pct": 11.0, "dd_pct": 2.0, "trades": 8, "event_mode": "legacy_trades_proxy", "point_event_count": 8, "event_ids_hash": "legacy"},
+    ])
+    monkeypatch.setattr("mrs3.analysis_strategies.load_published_surface", lambda _connection, surface_id: PipelineInput(surface_id, points))
+    template = tmp_path / "template.json"; template.write_text(json.dumps(_protocol_v2_template(_template())), encoding="utf-8")
+
+    result = generate_analysis_strategies(
+        connection, "R1", ["C1"], [("BTCUSDT", "LONG", "1h")], template,
+        tmp_path / "generated", AlgorithmConfig.defaults(), evaluation=EvaluationTarget(Decimal("10000"), "Bybit"),
+    )
+
+    strategies = [json.loads(path.read_text(encoding="utf-8")) for path in result.strategies_path.glob("*.json")]
+    assert len(strategies) == 2
+    assert all(item["basic"]["my_fix_balance"] == 10000.0 and item["exchange"]["name"] == "Bybit" for item in strategies)
+
+
+def _protocol_v2_template(template: dict[str, object]) -> dict[str, object]:
+    result = json.loads(json.dumps(template))
+    result["exchange"] = {"name": "Template", "use_upnl": False, "use_frozen_balance": True}
+    result["basic"].update({
+        "use_fix": True, "my_fix_balance": 0.0, "balance_percentage_long": 100.0, "balance_percentage_short": 100.0,
+        "risk_long": 1.0, "risk_short": 1.0, "max_balance": 0.0,
+    })
+    for key in ("ma_close_long", "ma_close_short"):
+        result["mrs3"][key].update({"type": "SMA", "source": "ohlc4"})
+    return result

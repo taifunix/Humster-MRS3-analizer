@@ -31,7 +31,10 @@ TABLES = (
     "import_files", "selection_runs", "selection_results",
     "selection_review_imports", "selection_review_rows", "strategy_tags",
     "optimizer_prepared_inputs", "equity_quality_metrics", "strategy_rejection_sources",
+    "selection_publications", "selection_publication_runs", "selection_aggregate_imports",
+    "strategy_report_metrics", "strategy_report_regimes", "strategy_report_monthly",
 )
+_V12_REPORT_TABLES = ("strategy_report_metrics", "strategy_report_regimes", "strategy_report_monthly")
 TABLE_LEADING_KEY = {
     "strategies": "strategy_id",
     "analysis_plateaus": "analysis_run_id",
@@ -46,10 +49,16 @@ TABLE_LEADING_KEY = {
     "selection_results": "selection_run_id",
     "selection_review_imports": "review_import_id",
     "selection_review_rows": "review_import_id",
+    "selection_publications": "publication_id",
+    "selection_publication_runs": "publication_id",
+    "selection_aggregate_imports": "aggregate_import_id",
     "strategy_tags": "strategy_id",
     "optimizer_prepared_inputs": "result_id",
     "equity_quality_metrics": "result_id",
     "strategy_rejection_sources": "strategy_id",
+    "strategy_report_metrics": "result_id",
+    "strategy_report_regimes": "result_id",
+    "strategy_report_monthly": "result_id",
 }
 TABLE_PRIMARY_KEY = {
     "strategies": ("strategy_id",),
@@ -67,16 +76,23 @@ TABLE_PRIMARY_KEY = {
     "selection_results": ("selection_run_id", "strategy_id"),
     "selection_review_imports": ("review_import_id",),
     "selection_review_rows": ("review_import_id", "strategy_id"),
+    "selection_publications": ("publication_id",),
+    "selection_publication_runs": ("publication_id", "pair", "side", "role"),
+    "selection_aggregate_imports": ("aggregate_import_id",),
     "strategy_tags": ("strategy_id", "tag"),
     "optimizer_prepared_inputs": ("result_id",),
     "equity_quality_metrics": ("result_id", "algo_version"),
     "strategy_rejection_sources": ("strategy_id", "source_kind", "reason_code"),
+    "strategy_report_metrics": ("result_id",),
+    "strategy_report_regimes": ("result_id", "regime"),
+    "strategy_report_monthly": ("result_id", "month"),
 }
 PREPARED = "optimizer_prepared_inputs"
 RANGE_VALUES = 128
 FETCH_BATCH = 4096
 PREPARED_FETCH_BATCH = 16
 MAX_FAST_VERIFY_RANGE_ROWS = 20_000_000
+FAST_VERIFY_TARGET_RANGE_ROWS = 10_000_000
 CAPACITY_RESERVE = 10 * 1024**3
 MEMORY_LIMIT = "16GB"
 FAST_VERIFY_TABLES = {"strategy_actions", "strategy_equity"}
@@ -414,23 +430,25 @@ def _copy_table(
 ) -> int:
     columns = _table_columns(connection, "origin", table)
     target_columns = _table_columns(connection, "main", table)
-    legacy_selection_results = (
-        table == "selection_results"
-        and target_columns == (*columns, "equity_regime_json")
-    )
-    if columns != target_columns and not legacy_selection_results:
-        raise ValueError(f"source/target column schema mismatch for {table}")
+    appended = _appended_columns(table, columns, target_columns)
+    legacy_selection_results = table == "selection_results" and bool(appended)
+    legacy_aggregate_imports = table == "selection_review_imports" and bool(appended)
     selected = ", ".join(_ident(column) for column in target_columns)
-    source_selected = ", ".join(_ident(column) for column in columns)
-    if legacy_selection_results:
-        source_selected += ", NULL"
+    source_selected = ", ".join(_ident(column) for column in columns) + ", NULL" * len(appended)
     lead = _ident(TABLE_LEADING_KEY[table])
     copied = 0
-    ranges = (
-        result_ranges
-        if TABLE_LEADING_KEY[table] == "result_id" and result_ranges is not None
-        else _ranges(connection, table)
-    )
+    if table in FAST_VERIFY_TABLES:
+        # Each filtered insert scans the unclustered source; size ranges by rows.
+        target_catalog = str(connection.execute("select current_database()").fetchone()[0])
+        ranges = _fast_verify_ranges(
+            connection, table, "origin", target_catalog, target_rows=FAST_VERIFY_TARGET_RANGE_ROWS,
+        )
+    else:
+        ranges = (
+            result_ranges
+            if TABLE_LEADING_KEY[table] == "result_id" and result_ranges is not None
+            else _ranges(connection, table)
+        )
     for low, high in ranges:
         _capacity(spill_root, output_parent)
         if table == PREPARED:
@@ -456,6 +474,29 @@ def _copy_table(
         copied += count
         _progress(callback, {"phase": "copy", "table": table, "rows": copied})
     return copied
+
+
+# Columns that schema migrations append to an existing table; a compacted copy
+# of an older source keeps them NULL.
+_APPENDED_COLUMNS = {
+    "selection_results": ("equity_regime_json",),
+    "selection_review_imports": ("aggregate_import_id",),
+    "strategies": ("close_ma_type", "close_ma_source"),
+    "strategy_orders": ("open_ma_type", "open_ma_source"),
+    "strategy_results": (
+        "sizing_my_fix_balance", "sizing_balance_percentage_short", "sizing_risk_short",
+        "tester_version", "report_format",
+    ),
+}
+
+
+def _appended_columns(table: str, columns: tuple[str, ...], target_columns: tuple[str, ...]) -> tuple[str, ...]:
+    if columns == target_columns:
+        return ()
+    appended = target_columns[len(columns):]
+    if target_columns[: len(columns)] == columns and appended == _APPENDED_COLUMNS.get(table):
+        return appended
+    raise ValueError(f"source/target column schema mismatch for {table}")
 
 
 def _equal(left: object, right: object) -> bool:
@@ -509,12 +550,9 @@ def _verify_table(
 ) -> int:
     columns = _table_columns(connection, "origin", table)
     target_columns = _table_columns(connection, "main", table)
-    legacy_selection_results = (
-        table == "selection_results"
-        and target_columns == (*columns, "equity_regime_json")
-    )
-    if columns != target_columns and not legacy_selection_results:
-        raise ValueError(f"source/target column schema mismatch for {table}")
+    appended = _appended_columns(table, columns, target_columns)
+    legacy_selection_results = table == "selection_results" and bool(appended)
+    legacy_aggregate_imports = table == "selection_review_imports" and bool(appended)
     payload_index = columns.index("prepared_json") if table == PREPARED else -1
     typed_columns = tuple(column for index, column in enumerate(columns) if index != payload_index)
     source_count = int(connection.execute(f"select count(*) from origin.main.{_ident(table)}").fetchone()[0])
@@ -567,6 +605,15 @@ def _verify_table(
         "select count(*) from main.selection_results where equity_regime_json is not null"
     ).fetchone()[0]:
         raise ValueError("legacy selection snapshots were backfilled during v9 migration")
+    if legacy_aggregate_imports and connection.execute(
+        "select count(*) from main.selection_review_imports where aggregate_import_id is not null"
+    ).fetchone()[0]:
+        raise ValueError("legacy review imports were assigned aggregate lineage during v11 migration")
+    for column in appended:
+        if connection.execute(
+            f"select count(*) from main.{_ident(table)} where {_ident(column)} is not null"
+        ).fetchone()[0]:
+            raise ValueError(f"schema-upgraded column {table}.{column} was backfilled during migration")
     _progress(callback, {"phase": "verify", "table": table, "rows": checked})
     return checked
 
@@ -638,6 +685,48 @@ def _fast_except_count(
     ).fetchone()[0])
 
 
+def _fast_verify_ranges(
+    connection: duckdb.DuckDBPyConnection,
+    table: str,
+    source_catalog: str,
+    target_catalog: str,
+    *,
+    target_rows: int,
+) -> tuple[tuple[int, int], ...]:
+    """Contiguous result_id ranges of about `target_rows` source rows.
+
+    Each range costs a full scan of an unclustered source table, so ranges are
+    sized by rows, not by a fixed number of result IDs. The first and last
+    bounds extend to both catalogs' extremes so candidate-only IDs are covered.
+    """
+    lead = _ident("result_id")
+    counts = connection.execute(
+        f"select {lead}, count(*) from {_ident(source_catalog)}.main.{_ident(table)} "
+        f"group by {lead} order by {lead}"
+    ).fetchall()
+    bounds = connection.execute(
+        f"select min(r), max(r) from ("
+        f"select {lead} as r from {_ident(source_catalog)}.main.{_ident(table)} union all "
+        f"select {lead} from {_ident(target_catalog)}.main.{_ident(table)})"
+    ).fetchone()
+    if bounds[0] is None:
+        return ()
+    low, high = int(bounds[0]), int(bounds[1])
+    ranges: list[tuple[int, int]] = []
+    start, rows, last = low, 0, None
+    for result_id, count in counts:
+        if result_id is None:
+            raise ValueError(f"NULL result_id rows cannot be ranged in {table}")
+        result_id, count = int(result_id), int(count)
+        if rows and rows + count > target_rows:
+            ranges.append((start, last))
+            start, rows = last + 1, 0
+        rows += count
+        last = result_id
+    ranges.append((start, high))
+    return tuple(ranges)
+
+
 def _verify_fast_table(
     connection: duckdb.DuckDBPyConnection,
     table: str,
@@ -647,6 +736,7 @@ def _verify_fast_table(
     callback: Callable[[dict[str, object]], object] | None,
     *,
     max_ranges: int | None = None,
+    range_counts: dict[str, int] | None = None,
 ) -> int:
     source_schema = _fast_column_signature(connection, source_catalog, table)
     target_schema = _fast_column_signature(connection, target_catalog, table)
@@ -669,7 +759,16 @@ def _verify_fast_table(
             raise ValueError(f"NULL result_id rows cannot be ranged in {table}")
         if source_count != target_count:
             raise ValueError(f"row count mismatch in {table}")
-    ranges = result_ranges[:max_ranges] if max_ranges is not None else result_ranges
+    # result_ranges (128 IDs each) are kept for the typed comparator; the SQL
+    # path re-slices by rows so the unclustered source is scanned far less often.
+    del result_ranges
+    all_ranges = _fast_verify_ranges(
+        connection, table, source_catalog, target_catalog,
+        target_rows=FAST_VERIFY_TARGET_RANGE_ROWS,
+    )
+    ranges = all_ranges[:max_ranges] if max_ranges is not None else all_ranges
+    if range_counts is not None:
+        range_counts[table] = len(ranges)
 
     checked = 0
     range_count = len(ranges)
@@ -761,8 +860,8 @@ def verify_existing_candidate(
 
         with duckdb.connect(str(source), read_only=True) as source_connection:
             source_version = require_performance_v2_readable(source_connection)
-            if source_version not in {8, 9, 10}:
-                raise ValueError("source schema version must be 8, 9 or 10")
+            if source_version not in {8, 9, 10, 11, 12}:
+                raise ValueError("source schema version must be 8, 9, 10, 11 or 12")
             _unknown_catalog_objects(source_connection)
             source_markers = _markers(source_connection)
             source_tables = _table_names(source_connection)
@@ -771,8 +870,8 @@ def verify_existing_candidate(
         with duckdb.connect(str(candidate), read_only=True) as connection:
             _configure_connection(connection, workers, spill)
             target_version = require_performance_v2_readable(connection)
-            if target_version not in {8, 9, 10} or target_version < source_version:
-                raise ValueError("candidate schema version must be 8, 9 or 10 and no older than source")
+            if target_version != 12:
+                raise ValueError("candidate schema version must be 12")
             _unknown_catalog_objects(connection)
             target_markers = _markers(connection)
             target_tables = _table_names(connection)
@@ -781,10 +880,17 @@ def verify_existing_candidate(
                 raise ValueError("source/candidate sequence state differs")
             if target_version == source_version and target_signature != source_signature:
                 raise ValueError("source/candidate catalog signatures differ")
+            expected_tables = set(source_tables)
             if target_version >= 9 and source_version == 8:
-                if target_tables != source_tables | {"strategy_rejection_sources"}:
-                    raise ValueError("source/candidate catalog tables differ")
-            elif target_tables != source_tables:
+                expected_tables.add("strategy_rejection_sources")
+            if target_version >= 11 and source_version < 11:
+                expected_tables.update({
+                    "selection_publications", "selection_publication_runs",
+                    "selection_aggregate_imports",
+                })
+            if target_version >= 12 and source_version < 12:
+                expected_tables.update(_V12_REPORT_TABLES)
+            if target_tables != frozenset(expected_tables):
                 raise ValueError("source/candidate catalog tables differ")
             if target_markers != {**source_markers, "schema_version": str(target_version)}:
                 raise ValueError("database markers or instance identity differ")
@@ -808,10 +914,10 @@ def verify_existing_candidate(
                             verified_counts[table] = _verify_fast_table(
                                 connection, table, source_catalog, target_catalog,
                                 result_ranges, progress_callback, max_ranges=smoke_ranges,
+                                range_counts=verified_ranges,
                             )
                         except _FastVerifyUnsupported as exc:
                             raise ValueError(f"smoke mode cannot verify SQL columns in {table}") from exc
-                        verified_ranges[table] = min(smoke_ranges, len(result_ranges))
                     continue
                 if table in FAST_VERIFY_TABLES:
                     try:
@@ -969,10 +1075,10 @@ def compact_performance_v2(
         if _commission_nullable(target) != ("NO" if source_version in {5, 6} else "YES"):
             raise ValueError("native schema copy changed commission_rate nullability")
         initialize_performance_v2(target, create_if_missing=False)
-        if require_performance_v2_readable(target) != 10:
-            raise ValueError("target did not reach schema version 10")
+        if require_performance_v2_readable(target) != 12:
+            raise ValueError("target did not reach schema version 12")
         if _commission_nullable(target) != "YES":
-            raise ValueError("target commission_rate is not nullable in schema version 10")
+            raise ValueError("target commission_rate is not nullable in schema version 12")
         target_signature = _catalog_signature(target)
         if any(int(target.execute(f"select count(*) from main.{_ident(table)}").fetchone()[0]) for table in TABLES):
             raise ValueError("target was not empty before migration")
@@ -991,11 +1097,11 @@ def compact_performance_v2(
 
         with duckdb.connect(str(stage), read_only=True) as check:
             _configure_connection(check, workers, spill)
-            if require_performance_v2_readable(check) != 10:
-                raise ValueError("candidate is not a readable v10 database")
+            if require_performance_v2_readable(check) != 12:
+                raise ValueError("candidate is not a readable v12 database")
             if _commission_nullable(check) != "YES":
-                raise ValueError("candidate commission_rate is not nullable in schema version 10")
-            if _markers(check) != {**source_markers, "schema_version": "10"}:
+                raise ValueError("candidate commission_rate is not nullable in schema version 12")
+            if _markers(check) != {**source_markers, "schema_version": "12"}:
                 raise ValueError("database markers were not preserved")
             if _catalog_signature(check) != target_signature:
                 raise ValueError("database catalog changed during compaction")
@@ -1048,7 +1154,7 @@ def compact_performance_v2(
             "source": {"path": str(source), **source_before, "sha256": source_hash_before, "wal": source_wal_before},
             "source_after": {**source_after, "sha256": source_hash_after, "wal": source_wal_after},
             "source_schema_version": source_version,
-            "target": {"path": str(output), **stage_stat, "sha256": target_hash, "schema_version": 10},
+            "target": {"path": str(output), **stage_stat, "sha256": target_hash, "schema_version": 12},
             "table_counts": counts,
             "verified_table_counts": verified_counts,
             "prepared": payload_stats,

@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 from threading import Event, Lock, RLock, Thread
 import time
 from typing import Callable, Mapping
@@ -22,7 +23,7 @@ from .panel_testing import mrs3_tester_config_template
 from .performance import PerformanceParseError, _raw_markup, _series
 from .performance_v2_html import CURRENT_ACTION_HEADERS
 from .performance_v2_input import _latest_tester_end_date
-from .runner.config import RunnerConfig
+from .runner.config import RunnerConfig, UnsafePathError, validate_strategy_directory
 from .runner.files import capture_tester_settings, restore_tester_settings, validate_runner_paths
 from .runner.http import TesterHttpClient
 from .runner.inbox import InboxCaptureError, capture_run_snapshot_inbox
@@ -73,6 +74,8 @@ class _Job:
     inbox_path: Path | None = None
     single_mode: bool = False
     target_finalized: bool = False
+    # Tester template captured at start (P7 spec §4: exchange profile fees of this job).
+    tester_config_template: Path | None = None
     target_owner: TesterTargetLock | None = None
     target_snapshot: object | None = None
     cleanup_pending: bool = False
@@ -90,6 +93,7 @@ def _client(config: RunnerConfig) -> TesterHttpClient:
 
 _CURRENT_METRIC_HEADERS = ("Metric", "Value")
 _WINDOWS_FILE_RELEASE_SECONDS = 30.0
+_FILE_ATTRIBUTE_REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
 _SINGLE_MODE_CLEANUP_RETRY_ATTEMPTS = 3
 
 
@@ -164,8 +168,16 @@ def _clear_directory(path: Path, *, expected: Path) -> None:
     for entry in tuple(resolved.iterdir()):
         while True:
             try:
-                if entry.is_dir() and not entry.is_symlink():
+                info = entry.stat(follow_symlinks=False)
+                mode = info.st_mode
+                is_reparse_point = stat.S_ISLNK(mode) or bool(
+                    getattr(info, "st_file_attributes", 0) & _FILE_ATTRIBUTE_REPARSE_POINT
+                    or getattr(info, "st_reparse_tag", 0)
+                )
+                if stat.S_ISDIR(mode) and not is_reparse_point:
                     shutil.rmtree(entry)
+                elif stat.S_ISDIR(mode) and is_reparse_point:
+                    entry.rmdir()
                 else:
                     entry.unlink(missing_ok=True)
                 break
@@ -179,6 +191,19 @@ def _clear_directory(path: Path, *, expected: Path) -> None:
                 f"runtime directory could not be cleared: {resolved} ({remaining[0].name})"
             )
         time.sleep(0.1)
+
+
+def _clear_strategy_directory(path: Path, *, bot_root: Path) -> None:
+    root = bot_root.resolve()
+    try:
+        resolved = validate_strategy_directory(path, root)
+    except UnsafePathError as error:
+        raise FastStrategyTestError("refusing to clear unexpected strategy path") from error
+    for expected in (root / "tester" / "settings_strategy", root / "settings_strategy"):
+        if resolved == expected:
+            _clear_directory(resolved, expected=expected)
+            return
+    raise FastStrategyTestError("refusing to clear unexpected strategy path")
 
 
 def _install_names(source: Path, target: Path, names: tuple[str, ...]) -> None:
@@ -221,20 +246,31 @@ def _write_fast_tester_config(
         "include_chart_ohlc": False,
         "include_chart_balance": True,
         "include_chart_position": False,
-        "include_strategy_settings": True,
         "include_trades_table": True,
         "include_summary_table": True,
         "include_monthly_returns_heatmap": False,
         "include_position_stats": False,
         "enable_timing_logs": False,
     }
-    document.update({"StartDate": start, "EndDate": end, "use_runs": False, "single_mode": single_mode, **report_settings})
+    if single_mode:
+        report_settings.update({
+            "include_settings": True,
+            "include_analytics": False,
+            "analytics_monte_carlo": 0,
+            "analytics_monte_carlo_seed": 42,
+        })
+    document.update({"StartDate": start, "EndDate": end, "use_runs": False, "single_mode": single_mode})
     if initial_balance is not None:
         document["InitialBalance"] = parse_initial_balance(initial_balance)
     report = document.get("report")
     if not isinstance(report, dict):
         raise FastStrategyTestError("tester config report must be an object")
     report.update(report_settings)
+    report.pop("include_strategy_settings", None)
+    document.pop("include_strategy_settings", None)
+    # Report settings live only inside "report"; drop stale root copies.
+    for key in report_settings:
+        document.pop(key, None)
     document["max_parallel_runs"] = config.max_parallel_submissions
     temporary = path.with_name(path.name + ".tmp")
     try:
@@ -532,7 +568,7 @@ class LocalFastStrategyTestService:
             raise FastStrategyTestError("Fast TEST manifest cannot be written") from error
 
     def _publish_incomplete(self, job: _Job, names: tuple[str, ...]) -> None:
-        _clear_directory(job.strategy_dir, expected=self.config.bot_root / "settings_strategy")
+        _clear_strategy_directory(job.strategy_dir, bot_root=self.config.bot_root)
         _install_names(job.manifest.strategy_source, job.strategy_dir, names)
 
     def _run(self, job: _Job) -> None:
@@ -637,7 +673,7 @@ class LocalFastStrategyTestService:
                 runtime_config,
                 job.start_date,
                 job.end_date,
-                template_path=self.tester_config_template,
+                template_path=job.tester_config_template or self.tester_config_template,
                 initial_balance=job.initial_balance,
             )
             job.report_dir.mkdir(parents=True, exist_ok=True)
@@ -657,7 +693,7 @@ class LocalFastStrategyTestService:
                 if job.single_mode:
                     self._set_phase(job, "BATCH_PREPARE", batch_number=batch_number, batch_total=len(batches))
                 self._stop_bot(runtime_config)
-                _clear_directory(job.strategy_dir, expected=self.config.bot_root / "settings_strategy")
+                _clear_strategy_directory(job.strategy_dir, bot_root=self.config.bot_root)
                 _install_names(job.manifest.strategy_source, job.strategy_dir, names)
                 self._set_progress(job, batch_current=batch_number, active=0)
                 if job.single_mode:
@@ -880,6 +916,7 @@ class LocalFastStrategyTestService:
         job_id: str | None = None,
         clear_reports: bool = False,
         initial_balance: object | None = None,
+        tester_config_template: Path | None = None,
     ) -> dict[str, object]:
         manifest = validate_strategy_manifest(Path(manifest_path))
         if manifest.analysis_run_id != analysis_run_id:
@@ -899,6 +936,7 @@ class LocalFastStrategyTestService:
             if identifier in self._jobs:
                 raise FastStrategyTestError("Fast TEST job id is already used")
             job = _Job(identifier, Path(manifest_path).resolve(), manifest, names, names, *dates, report_dir, strategy_dir, initial_balance=balance, single_mode=self.single_mode, clear_reports=clear_reports)
+            job.tester_config_template = None if tester_config_template is None else Path(tester_config_template)
             self._jobs[identifier] = job
             job.progress = {"current": 0, "total": len(names), "batch_current": 0, "batch_total": 0, "active": 0, "retries": 0, "failed": 0}
             job.thread = Thread(
@@ -1170,7 +1208,9 @@ class LocalFastStrategyTestService:
             job.phase = "COMMITTED"
             job.error = None
 
-    def retry(self, source_job_id: str, *, job_id: str | None = None) -> dict[str, object]:
+    def retry(
+        self, source_job_id: str, *, job_id: str | None = None, tester_config_template: Path | None = None,
+    ) -> dict[str, object]:
         with self._lock:
             source_job = self._jobs.get(source_job_id)
             if source_job is None:
@@ -1248,6 +1288,7 @@ class LocalFastStrategyTestService:
                 failed_names=set(failed),
                 preserve_reports=True,
                 single_mode=source_job.single_mode,
+                tester_config_template=None if tester_config_template is None else Path(tester_config_template),
             )
             job.progress = {
                 "current": len(job.verified_reports),
@@ -1546,7 +1587,7 @@ class LocalSingleModeStrategyTestService(LocalFastStrategyTestService):
         validated_reports: dict[str, Path] = {}
         try:
             self._stop_bot(config)
-            _clear_directory(job.strategy_dir, expected=self.config.bot_root / "settings_strategy")
+            _clear_strategy_directory(job.strategy_dir, bot_root=self.config.bot_root)
             _install_names(job.manifest.strategy_source, job.strategy_dir, names)
             batch_baseline = {
                 path.name: (path.stat().st_mtime_ns, path.stat().st_size)
@@ -1649,7 +1690,7 @@ class LocalSingleModeStrategyTestService(LocalFastStrategyTestService):
             job.end_date,
             single_mode=True,
             initial_balance=job.initial_balance,
-            template_path=self.tester_config_template,
+            template_path=job.tester_config_template or self.tester_config_template,
         )
         job.tester_config_bytes = config.tester_config.read_bytes()
         batches = [
@@ -1693,7 +1734,7 @@ class LocalSingleModeStrategyTestService(LocalFastStrategyTestService):
             raise BatchRetryExhausted(
                 "native SINGLE_MODE reports missing after retries: " + ", ".join(incomplete)
             )
-        _clear_directory(job.strategy_dir, expected=self.config.bot_root / "settings_strategy")
+        _clear_strategy_directory(job.strategy_dir, bot_root=self.config.bot_root)
         job.state = "COMMITTED"
         job.phase = "COMMITTED"
         self._write_manifest(job)

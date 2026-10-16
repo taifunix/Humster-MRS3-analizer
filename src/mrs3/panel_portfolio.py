@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_HALF_UP
 import asyncio
 import base64
 import copy
@@ -34,7 +34,7 @@ import pandas as pd
 
 from .audit import normalize_xlsx_workbook, write_audit_workbook
 from .panel_jobs import PanelJobError, PanelJobRegistry
-from .panel_testing import mrs3_tester_config_template
+from .panel_testing import portfolio_stage2_tester_config_template
 from .runner.files import file_fingerprint, read_stable_file
 from .runner.results import CORE_METRICS, ResultParseError, WizardResult, load_wizard_results
 from .portfolio.config import (
@@ -45,9 +45,11 @@ from .portfolio.config import (
     migrate_portfolio_config_document,
 )
 from .config import load_duckdb_import_settings
+from .performance_v2_store import database_identity
 from .performance_v2_optimizer import (
     MissingPreparedOptimizerInput,
     OptimizerIntegrityError,
+    PREPARATION_VERSION,
     prepare_current_optimizer_inputs,
     read_prepared_optimizer_inputs,
 )
@@ -90,7 +92,7 @@ _PATH = re.compile(
     r"|(?<![\w])(?:[^\\/\s,;)]+[\\/])+\.\.(?:[\\/][^\s,;)]*)?"
     r"|(?<![\w])\.\.(?:[\\/][^\s,;)]*)+"
 )
-_WEIGHTED_TEMPLATE_PATH = Path(__file__).resolve().parents[2] / "templates" / "strategies" / "portfolio-weighted-mrs" / "base.json"
+_WEIGHTED_TEMPLATE_PATH = Path(__file__).resolve().parents[2] / "templates" / "exchanges" / "Bybit" / "portfolio-strategy.json"
 SUMMARY_HEADERS = ("Key", "Value")
 FINALIST_HEADERS = (
     "Campaign ID", "Strategy ID", "Result ID", "Pair", "Direction", "User Status", "User Rank",
@@ -128,7 +130,7 @@ WEIGHTED_SUMMARY_HEADERS = ("Key", "Value")
 # Stage 1 workbook uses operator-facing columns; legacy sheets remain unchanged.
 WEIGHTED_VARIANT_HEADERS = (
     "№", "ID", "Профиль", "Поз.", "Состав", "Банк\nнасыщ., USDT", "Целевой\nбанк, USDT",
-    "Мин. банк DD\nистории, USDT", "Банк DD P95\nстресса, USDT", "Банк\nлимитов, USDT", "PnL 30д,\nUSDT", "MaxDD SUM,\nUSDT", "DD истории,\n%",
+    "Мин. банк DD\nистории, USDT", "Банк DD\nсобств. истории, USDT", "Банк DD P95\nстресса, USDT", "Банк\nлимитов, USDT", "PnL 30д,\nUSDT", "MaxDD SUM,\nUSDT", "DD истории,\n%",
     "CDaR 20%\nUSDT · ц/н", "CDaR 10%\nUSDT · ц/н", "IM\nUSDT · ц/н", "MM\nUSDT · ц/н", "Номинал\nпортф., USDT",
 )
 WEIGHTED_MEMBER_HEADERS = (
@@ -154,6 +156,34 @@ class PortfolioPanelError(ValueError):
         self.status = status
         self.field_errors = [dict(item) for item in field_errors]
         super().__init__(message or code)
+
+
+def _foreign_exchange(database: Path) -> str | None:
+    """Exchange marker of a PerformanceDB other than Bybit; None for Bybit or an unmarked (v1) database."""
+    with duckdb.connect(str(database), read_only=True) as connection:
+        markers = connection.execute(
+            "select count(*) from information_schema.tables where table_name = 'schema_info'"
+        ).fetchone()[0]
+        if not markers:
+            return None
+        _protocol, exchange = database_identity(connection)
+    return exchange if exchange is not None and exchange.strip() and exchange.strip().casefold() != "bybit" else None
+
+
+def _require_exchange_data(database: Path) -> None:
+    """Stage 1/2 use Bybit margin and liquidity data only (P7 spec §2): another exchange is refused."""
+    try:
+        exchange = _foreign_exchange(database)
+    except (OSError, duckdb.Error, ValueError) as error:
+        raise PortfolioPanelError(
+            "PERFORMANCE_DB_UNAVAILABLE", "performance database cannot be read", status=422,
+        ) from error
+    if exchange is not None:
+        raise PortfolioPanelError(
+            "EXCHANGE_DATA_UNAVAILABLE",
+            f"optimizer margin and liquidity data for {exchange} are not collected yet",
+            status=422,
+        )
 
 
 def _portfolio_panel_job_error(error: PanelJobError) -> PortfolioPanelError:
@@ -369,6 +399,66 @@ def _candidate_required_bank(candidate: Mapping[str, Any]) -> Decimal:
     return bank
 
 
+_LOT_X_STEP = Decimal("0.01")
+
+
+def _template_ordered(value: Any, template: Any) -> Any:
+    """Order mapping keys as in the template; keys absent there keep their order at the end."""
+    if isinstance(value, Mapping):
+        shape = template if isinstance(template, Mapping) else {}
+        ordered = {key: _template_ordered(value[key], shape[key]) for key in shape if key in value}
+        for key, item in value.items():
+            if key not in ordered:
+                ordered[key] = _template_ordered(item, None)
+        return ordered
+    if isinstance(value, (list, tuple)):
+        item_shape = template[0] if isinstance(template, (list, tuple)) and template else None
+        return [_template_ordered(item, item_shape) for item in value]
+    return value
+
+
+def _tester_number(value: Decimal, like: Any) -> int | float:
+    return float(value) if isinstance(like, float) else (int(value) if value == value.to_integral_value() else float(value))
+
+
+def _tester_strategy_json(strategy: Mapping[str, Any], template: Mapping[str, Any]) -> str:
+    """Render one strategy for the tester: template key order, indented, tester rounding.
+
+    balance_percentage_* round up to whole percent (zero stays zero); every
+    mrs3 entry-order list rounds lot_x to cents and puts the rounding residual
+    of the list total on its last order.
+    """
+    rendered = json.loads(json.dumps(_plain(strategy), ensure_ascii=False, allow_nan=False))
+    basic = rendered.get("basic")
+    if isinstance(basic, dict):
+        for key in ("balance_percentage_long", "balance_percentage_short"):
+            value = basic.get(key)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue
+            number = Decimal(str(value))
+            if number > 0:
+                basic[key] = _tester_number(number.to_integral_value(rounding=ROUND_CEILING), 1)
+    mrs3 = rendered.get("mrs3")
+    if isinstance(mrs3, dict):
+        for key in ("ma_long", "ma_short"):
+            orders = mrs3.get(key)
+            if not isinstance(orders, list) or not orders or any(
+                not isinstance(order, dict) or isinstance(order.get("lot_x"), bool) or not isinstance(order.get("lot_x"), (int, float))
+                for order in orders
+            ):
+                continue
+            lots = [Decimal(str(order["lot_x"])) for order in orders]
+            total = sum(lots, Decimal(0)).quantize(_LOT_X_STEP, rounding=ROUND_HALF_UP)
+            rounded = [lot.quantize(_LOT_X_STEP, rounding=ROUND_HALF_UP) for lot in lots[:-1]]
+            rounded.append(total - sum(rounded, Decimal(0)))
+            if rounded[-1] < 0 or (lots[-1] > 0 and rounded[-1] <= 0):
+                raise ValueError("candidate lot_x rounding leaves a non-positive last order")
+            for order, lot in zip(orders, rounded):
+                order["lot_x"] = float(lot)
+    ordered = _template_ordered(rendered, template)
+    return json.dumps(ordered, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
+
+
 def _stage2_material(candidate: Mapping[str, Any]) -> dict[str, Any]:
     """Render the exact tester inputs and receipt from one committed candidate."""
     candidate_id = candidate.get("candidate_id")
@@ -385,6 +475,8 @@ def _stage2_material(candidate: Mapping[str, Any]) -> dict[str, Any]:
     strategy_jsons: dict[str, str] = {}
     sizing_by_name: dict[str, dict[str, Any]] = {}
     max_balance_by_name: dict[str, Any] = {}
+    exchanges: set[str] = set()
+    strategy_template, _template_digest = _load_weighted_template()
     for payload in payloads:
         if not isinstance(payload, Mapping):
             raise ValueError("candidate strategy wrapper is invalid")
@@ -418,7 +510,9 @@ def _stage2_material(candidate: Mapping[str, Any]) -> dict[str, Any]:
             raise ValueError("candidate max_balance is invalid") from error
         if not max_balance.is_finite() or max_balance <= 0:
             raise ValueError("candidate max_balance is invalid")
-        strategy_jsons[name] = _json(strategy) + "\n"
+        strategy_jsons[name] = _tester_strategy_json(strategy, strategy_template)
+        exchange = strategy.get("exchange")
+        exchanges.add(str(exchange.get("name", "")) if isinstance(exchange, Mapping) else "")
         sizing_by_name[name] = {key: facts[key] for key in ("B", "C", "q", "x")}
         max_balance_by_name[name] = basic["max_balance"]
     if len(strategy_jsons) < 2:
@@ -430,7 +524,7 @@ def _stage2_material(candidate: Mapping[str, Any]) -> dict[str, Any]:
     end = datetime.fromisoformat(period["end_utc"].replace("Z", "+00:00")).astimezone(timezone.utc) - timedelta(days=1)
     if start.date() > end.date():
         raise ValueError("tester period is invalid")
-    template = json.loads(mrs3_tester_config_template().read_text(encoding="utf-8"))
+    template = json.loads(portfolio_stage2_tester_config_template().read_text(encoding="utf-8"))
     if (
         not isinstance(template, dict)
         or type(template.get("use_runs")) is not bool
@@ -452,9 +546,12 @@ def _stage2_material(candidate: Mapping[str, Any]) -> dict[str, Any]:
         "EndDate": end.date().isoformat(),
         "InitialBalance": initial_balance,
         "single_mode": False,
-        "UpdateData": False,
+        "UpdateData": True,
     })
-    tester_config_json = _json(template) + "\n"
+    if exchanges == {"Bybit"}:
+        # Operator rule for Stage 2 tester runs: Bybit-only batches use MakerFee 0.
+        template["MakerFee"] = 0.0
+    tester_config_json = json.dumps(template, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
     members = candidate.get("members")
     if isinstance(members, (str, bytes)) or not isinstance(members, Sequence) or any(
         not isinstance(member, Mapping) for member in members
@@ -1370,17 +1467,26 @@ class PortfolioPanelService:
             raise PortfolioPanelError("CONFIG_INVALID", "portfolio settings are invalid", status=422) from error
 
     @staticmethod
+    def _foreign_exchange_database(database: Path) -> bool:
+        try:
+            return _foreign_exchange(database) is not None
+        except (OSError, duckdb.Error, ValueError):
+            # An unreadable database is reported by the finalist readers.
+            return False
+
+    @staticmethod
     def _path_from_config(root: Path, value: Any) -> Path:
         path = Path(str(value))
         return (root / path).resolve() if not path.is_absolute() else path.resolve()
 
     def _current_finalist_metadata(
-        self, document: Mapping[str, Any], *, require_result_ids: bool = False,
+        self, document: Mapping[str, Any], *, require_result_ids: bool = False, rows_out: list | None = None,
     ) -> tuple[Path, list[str], dict[str, int], tuple[int, ...]]:
         inputs = document.get("inputs") if isinstance(document.get("inputs"), Mapping) else {}
         database = self._path_from_config(self.root, inputs.get("performance_db", ""))
         if not database.is_file():
             raise PortfolioPanelError("PERFORMANCE_DB_UNAVAILABLE", "performance database is unavailable", status=422)
+        _require_exchange_data(database)
         with duckdb.connect(str(database), read_only=True) as connection:
             pair_rows = connection.execute("select distinct symbol, side from selection_runs order by symbol, side").fetchall()
         pair_keys = tuple(
@@ -1407,7 +1513,62 @@ class PortfolioPanelService:
                 )
             if type(result_id) is int:
                 result_ids.append(result_id)
+            if rows_out is not None:
+                rows_out.append(row)
         return database, sorted(finalists), finalists, tuple(dict.fromkeys(result_ids))
+
+    @staticmethod
+    def _finalist_history(database: Path, rows: Sequence[Mapping[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+        """Day-aligned history of each current finalist, grouped by Pair|Side in rank order.
+
+        Uses the optimizer's period rule: the complete effective range when it is
+        valid, otherwise the report range; starts round up and ends round down to
+        whole UTC days, as the common pretest period does.
+        """
+        identities = [
+            (f"{row['symbol'].strip().upper()}|{row['side'].strip().upper()}", row["result_id"], row.get("user_rank"))
+            for row in rows
+            if isinstance(row, Mapping) and isinstance(row.get("symbol"), str) and isinstance(row.get("side"), str)
+            and type(row.get("result_id")) is int
+        ]
+        if not identities:
+            return {}
+        placeholders = ",".join("?" for _ in identities)
+        with duckdb.connect(str(database), read_only=True) as connection:
+            periods = {
+                int(result_id): (report_start, report_end, effective_start, effective_end)
+                for result_id, report_start, report_end, effective_start, effective_end in connection.execute(
+                    "select result_id, report_start_utc, report_end_utc, effective_start_utc, effective_end_utc"
+                    f" from strategy_results where result_id in ({placeholders})",
+                    [result_id for _pair, result_id, _rank in identities],
+                ).fetchall()
+            }
+
+        def utc(value: Any) -> datetime | None:
+            if not isinstance(value, datetime):
+                return None
+            return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+
+        history: dict[str, list[dict[str, Any]]] = {}
+        for pair, result_id, rank in identities:
+            entry = {"rank": rank if type(rank) is int else None, "start": None, "end": None}
+            # A finalist without a usable period keeps its slot so the rank cutoff stays exact.
+            history.setdefault(pair, []).append(entry)
+            period = periods.get(result_id)
+            if period is None:
+                continue
+            report_start, report_end, effective_start, effective_end = (utc(value) for value in period)
+            if effective_start is not None and effective_end is not None and effective_end > effective_start:
+                start, end = effective_start, effective_end
+            elif report_start is not None and report_end is not None and report_end > report_start:
+                start, end = report_start, report_end
+            else:
+                continue
+            start_day = start.date() if start == datetime.combine(start.date(), datetime.min.time(), timezone.utc) else start.date() + timedelta(days=1)
+            entry.update(start=start_day.isoformat(), end=end.date().isoformat())
+        for items in history.values():
+            items.sort(key=lambda item: (item["rank"] is None, item["rank"] or 0))
+        return history
 
     @staticmethod
     def _prepared_finalists_state(database: Path, result_ids: Sequence[int]) -> dict[str, Any]:
@@ -1424,6 +1585,32 @@ class PortfolioPanelService:
         if available == required:
             return {"state": "READY", "required": required, "ready": available}
         return {"state": "ERROR", "required": required, "ready": available}
+
+    @staticmethod
+    def _prepared_finalists_metadata_state(database: Path, result_ids: Sequence[int]) -> dict[str, Any]:
+        requested = tuple(dict.fromkeys(int(result_id) for result_id in result_ids))
+        required = len(requested)
+        if not required:
+            return {"state": "READY", "required": 0, "ready": 0}
+        placeholders = ",".join("?" for _ in requested)
+        with duckdb.connect(str(database), read_only=True) as connection:
+            rows = connection.execute(
+                f"""select result_id, preparation_version, availability_status,
+                           unavailable_reason
+                      from optimizer_prepared_inputs
+                     where result_id in ({placeholders})""",
+                list(requested),
+            ).fetchall()
+        by_id = {int(row[0]): row for row in rows}
+        if any(result_id not in by_id for result_id in requested):
+            return {"state": "NEEDS_PREPARATION", "required": required, "ready": 0}
+        ready = sum(
+            1 for result_id in requested
+            if by_id[result_id][1] == PREPARATION_VERSION
+            and by_id[result_id][2] == "AVAILABLE"
+            and by_id[result_id][3] is None
+        )
+        return {"state": "READY" if ready == required else "ERROR", "required": required, "ready": ready}
 
     def _latest_finalist_preparation_failed(self) -> bool:
         jobs = [
@@ -1452,6 +1639,7 @@ class PortfolioPanelService:
         pairs: list[str] = []
         finalists: dict[str, int] = {}
         preparation = {"state": "NEEDS_PREPARATION", "required": 0, "ready": 0}
+        finalist_history: dict[str, list[dict[str, Any]]] = {}
         if state != "READY":
             stage1.append(f"SETTINGS_{state}")
         if state == "READY" and document is not None:
@@ -1459,16 +1647,24 @@ class PortfolioPanelService:
             database = self._path_from_config(self.root, inputs.get("performance_db", ""))
             if not database.is_file():
                 stage1.append("PERFORMANCE_DB_UNAVAILABLE")
+            elif self._foreign_exchange_database(database):
+                stage1.append("EXCHANGE_DATA_UNAVAILABLE")
             else:
                 try:
+                    finalist_rows: list = []
                     database, pairs, finalists, result_ids = self._current_finalist_metadata(
-                        document, require_result_ids=self._uses_production_finalists_reader,
+                        document, require_result_ids=self._uses_production_finalists_reader, rows_out=finalist_rows,
                     )
+                    try:
+                        finalist_history = self._finalist_history(database, finalist_rows)
+                    except Exception:
+                        # History is an editing aid; it never blocks Stage 1.
+                        finalist_history = {}
                     active = self.active_job()
                     if active is not None and active.get("kind") == "FINALIST_PREPARATION":
                         preparation = {"state": "PREPARING", "required": len(result_ids), "ready": 0}
                     elif self._uses_production_finalists_reader:
-                        preparation = self._prepared_finalists_state(database, result_ids)
+                        preparation = self._prepared_finalists_metadata_state(database, result_ids)
                     else:
                         preparation = {"state": "READY", "required": len(result_ids), "ready": len(result_ids)}
                     if pairs and preparation["state"] != "READY":
@@ -1479,12 +1675,14 @@ class PortfolioPanelService:
                     pairs = []
                     finalists = {}
                     stage1.append("FINALISTS_UNAVAILABLE")
-        if not pairs and state == "READY" and "PERFORMANCE_DB_UNAVAILABLE" not in stage1:
+        if not pairs and state == "READY" and not {"PERFORMANCE_DB_UNAVAILABLE", "EXCHANGE_DATA_UNAVAILABLE"} & set(stage1):
             stage1.append("NO_FINALISTS")
         active = self.active_job()
         if active is not None:
             stage1.append("PORTFOLIO_JOB_ACTIVE")
         stage1 = list(dict.fromkeys(stage1))
+        search = document.get("search") if document else None
+        combination_limit = search.get("max_enumerated_combinations") if isinstance(search, Mapping) else None
         return {
             "stage1": {"enabled": not stage1, "blockers": stage1},
             "stage2": {"enabled": False, "blockers": ["PORTFOLIO_JOB_STAGE2_NOT_AUTHORIZED"]},
@@ -1495,11 +1693,15 @@ class PortfolioPanelService:
             "available_pairs": pairs,
             "current_finalists": finalists,
             "preparation": preparation,
+            "combination_limit": combination_limit if type(combination_limit) is int and combination_limit > 0 else None,
+            "finalist_history": finalist_history,
         }
 
     def _snapshot_finalists(self, document: Mapping[str, Any], launch: Mapping[str, Any]) -> tuple[tuple[dict[str, Any], ...], tuple[dict[str, Any], ...]]:
         inputs = document.get("inputs") if isinstance(document.get("inputs"), Mapping) else {}
         database = self._path_from_config(self.root, inputs.get("performance_db", ""))
+        if database.is_file():
+            _require_exchange_data(database)
         pairs = tuple(
             (pair["pair"], side)
             for pair in launch["pairs"]
@@ -1602,9 +1804,16 @@ class PortfolioPanelService:
             result = run_portfolio_adapter(selected, campaign, **adapter_kwargs)
         except Exception as error:
             raise PortfolioPanelError("PORTFOLIO_JOB_FAILED", "portfolio adapter failed", status=500) from error
+        blockers = list(result.blockers)
+        diagnostics = getattr(result, "diagnostics", None)
+        if isinstance(diagnostics, Mapping):
+            count = diagnostics.get("combination_count")
+            limit = diagnostics.get("combination_limit")
+            if type(count) is int and count > 0 and type(limit) is int and limit > 0 and count > limit:
+                blockers.append(f"COMBINATIONS={count}; LIMIT={limit}")
         return {
             "variants": result.variants,
-            "blockers": list(result.blockers),
+            "blockers": blockers,
             "excluded": result.excluded,
             "warnings": result.warnings,
             "status": getattr(result, "status", "PASS"),
@@ -2884,13 +3093,14 @@ class PortfolioPanelService:
             self.registry.transition(job_id, "RUNNING", phase=STAGE2_STAGES[0])
             self._sync_runtime(job_id, started_at=_now(), stage_index=0, completed_stages=0)
             tester = self._local_testing_service_provider()
-            for prepared in prepared_candidates:
+            for batch_position, prepared in enumerate(prepared_candidates):
                 if self._cancelled(job_id):
                     raise asyncio.CancelledError
                 candidate_index = prepared["candidate_index"]
+                # Progress counts positions within this batch, which may be a selection.
                 self._sync_runtime(
                     job_id,
-                    current_index=candidate_index,
+                    current_index=batch_position,
                     current_candidate_id=prepared["candidate_id"],
                     stage_index=0,
                     completed_stages=0,
@@ -3319,6 +3529,7 @@ class PortfolioPanelService:
             reserve_reason = _weighted_value(metrics, "reserve_unknown_reason")
             required_bank = _weighted_value(metrics, "B_required_usdt", "required_bank_usdt", "B_required_margin_usdt")
             historical_bank = _weighted_value(metrics, "historical_bank_usdt", "bank_for_path_usdt")
+            own_history_bank = _weighted_value(metrics, "own_history_dd_bank_usdt")
             stress_bank = _weighted_value(metrics, "B_risk_usdt", "stress_p95_bank_usdt", "stress_bank_p95_usdt")
             margin_bank = _weighted_value(metrics, "B_margin_usdt")
             if stress_bank == "UNKNOWN":
@@ -3439,6 +3650,7 @@ class PortfolioPanelService:
                 "B required USDT": required_bank,
                 "Required bank USDT": required_bank,
                 "Historical bank USDT": historical_bank,
+                "Own-history DD bank USDT": own_history_bank,
                 "Stress bank P95 USDT": stress_bank,
                 "Margin-only bank USDT": margin_bank,
                 "B available USDT": available,
@@ -3475,6 +3687,7 @@ class PortfolioPanelService:
                 "MM saturation %": percentage_of_saturation(_weighted_value(metrics, "M_all_usdt")),
                 "MaxDD SUM USDT": _weighted_source_maxdd_sum(campaign, weighted_members),
                 "Total full notional USDT": total_notional,
+                "Legacy MA prototype members": _weighted_value(variant, "legacy_ma_prototype_members"),
                 "Weighted members": weighted_members,
             })
         return summary
@@ -3601,6 +3814,7 @@ class PortfolioPanelService:
                     display(variant_summary.get("B saturation USDT")),
                     display(variant_summary.get("Target bank USDT")),
                     display(variant_summary.get("Historical bank USDT")),
+                    display(variant_summary.get("Own-history DD bank USDT")),
                     display(variant_summary.get("Stress bank P95 USDT")),
                     display(variant_summary.get("Margin-only bank USDT")),
                     display(_weighted_value(metrics, "p30_limiter_model_usdt_30d", "p30_common_usdt_30d")),
@@ -3726,6 +3940,7 @@ class PortfolioPanelService:
                 ["Профиль", val(weighted_variant, "profile") if weighted_variant is not None else None],
                 ["Целевой банк, USDT", display(weighted_summary.get("Target bank USDT")) or ("UNCAPPED" if weighted_summary.get("Target bank USDT") == "UNCAPPED" else None)],
                 [f"Минимальный банк для DD ≤ {limit_text}% на истории", display(weighted_summary.get("Historical bank USDT"))],
+                [f"Банк, при котором худшая просадка одной пары на её собственной истории ≤ {limit_text}%", display(weighted_summary.get("Own-history DD bank USDT"))],
                 [f"Банк для DD ≤ {limit_text}% в 95% стресс-сценариев", display(weighted_summary.get("Stress bank P95 USDT"))],
                 ["Банк для профильных лимитов, USDT", display(weighted_summary.get("Margin-only bank USDT"))],
                 ["PnL, USDT", display(_weighted_value(top_metrics, "p30_limiter_model_usdt_30d", "p30_common_usdt_30d"))],
@@ -3885,7 +4100,7 @@ class PortfolioPanelService:
                         enriched = self._summary(campaign, (), (), (candidate,), ())
                         for key in (
                             "weighted_result_schema",
-                            "Weighted candidate ID", "B required USDT", "Required bank USDT", "Historical bank USDT",
+                            "Weighted candidate ID", "B required USDT", "Required bank USDT", "Historical bank USDT", "Own-history DD bank USDT",
                             "Stress bank P95 USDT", "Margin-only bank USDT", "B saturation USDT", "B margin USDT",
                             "P30 common USDT/30d", "P30 limiter USDT/30d", "MaxDD %", "CDaR peak80 USDT",
                             "CDaR peak90 USDT", "IM all USDT", "MM all USDT", "Total full notional USDT", "Weighted members",
@@ -3898,7 +4113,62 @@ class PortfolioPanelService:
                                 summary[key] = _plain(enriched[key])
                 except PortfolioPanelError:
                     pass
-        return {"campaign_id": campaign_id, "input_digest": campaign["input_digest"], "config_digest": campaign["config_digest"], "summary": summary, "blockers": summary.get("blockers", []), "workbook_available": workbook.is_file()}
+        return {
+            "campaign_id": campaign_id,
+            "input_digest": campaign["input_digest"],
+            "config_digest": campaign["config_digest"],
+            "summary": summary,
+            "blockers": summary.get("blockers", []),
+            "workbook_available": workbook.is_file(),
+            "candidates": self._stage2_candidate_rows(campaign_id, campaign, runtime),
+        }
+
+    def _stage2_candidate_rows(self, campaign_id: str, campaign: Mapping[str, Any], runtime: Mapping[str, Any]) -> list[dict[str, Any]]:
+        """Compact per-portfolio facts of the committed artifact, for Stage 2 selection."""
+        artifact_digest = runtime.get("executables_digest")
+        if not isinstance(artifact_digest, str) or re.fullmatch(r"[0-9a-f]{64}", artifact_digest) is None:
+            return []
+        try:
+            artifact = self._load_stage1_executables(campaign_id, campaign["input_digest"], campaign["config_digest"], artifact_digest)
+        except PortfolioPanelError:
+            return []
+        candidates = artifact.get("candidates") if isinstance(artifact, Mapping) else None
+        if not isinstance(candidates, list):
+            return []
+
+        def text(value: Any) -> str | None:
+            if isinstance(value, bool) or value is None:
+                return None
+            try:
+                number = Decimal(str(value))
+            except (InvalidOperation, TypeError, ValueError):
+                return None
+            return format(number, "f") if number.is_finite() else None
+
+        rows = []
+        for order, candidate in enumerate(candidates):
+            if not isinstance(candidate, Mapping) or not isinstance(candidate.get("candidate_id"), str):
+                continue
+            metrics = candidate.get("metrics") if isinstance(candidate.get("metrics"), Mapping) else {}
+            stress = metrics.get("bootstrap_p95_banks_usdt")
+            stress_values = [text(item) for item in stress] if isinstance(stress, (list, tuple)) else []
+            stress_values = [Decimal(item) for item in stress_values if item is not None]
+            payloads = candidate.get("strategy_payloads")
+            rows.append({
+                "candidate_id": candidate["candidate_id"],
+                "order": order,
+                "profile": candidate.get("profile"),
+                "positions": len(payloads) if isinstance(payloads, list) else None,
+                "required_bank_usdt": text(metrics.get("required_bank_usdt")),
+                "p30_usdt_30d": text(metrics.get("p30_common_usdt_30d")),
+                "historical_bank_usdt": text(metrics.get("historical_bank_usdt")),
+                "own_history_dd_bank_usdt": text(metrics.get("own_history_dd_bank_usdt")),
+                "stress_bank_usdt": format(max(stress_values), "f") if stress_values else None,
+                "margin_bank_usdt": text(metrics.get("B_margin_usdt")),
+                "cdar80_usdt": text(metrics.get("cdar_peak80_usdt")),
+                "max_drawdown_pct": text(metrics.get("max_drawdown_pct")),
+            })
+        return rows
 
     def workbook(self, campaign_id: str) -> bytes:
         saved, runtime = self._campaign_by_id(campaign_id)
@@ -3920,16 +4190,29 @@ class PortfolioPanelService:
             raise PortfolioPanelError("PORTFOLIO_JOB_WORKBOOK_UNAVAILABLE", "workbook is not available", status=409) from None
 
     def submit_tester_submission(self, campaign_id: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+        keys = set(payload) if isinstance(payload, Mapping) else set()
+        raw_selection = payload.get("candidate_ids") if isinstance(payload, Mapping) else None
         if (
             not isinstance(campaign_id, str)
             or not campaign_id
             or not isinstance(payload, Mapping)
-            or set(payload) != {"confirmed", "campaign_id"}
+            or keys not in ({"confirmed", "campaign_id"}, {"confirmed", "campaign_id", "candidate_ids"})
             or payload.get("confirmed") is not True
             or payload.get("campaign_id") != campaign_id
+            or (
+                "candidate_ids" in keys
+                and (
+                    not isinstance(raw_selection, list)
+                    or not raw_selection
+                    or any(not isinstance(item, str) or re.fullmatch(r"[0-9a-f]{64}", item) is None for item in raw_selection)
+                    or len(set(raw_selection)) != len(raw_selection)
+                )
+            )
         ):
             raise PortfolioPanelError("PORTFOLIO_CAMPAIGN_INVALID", "campaign confirmation is invalid", status=422)
-        with self._lock, self.registry.lock:
+        selection = frozenset(raw_selection) if "candidate_ids" in keys else None
+
+        def stage2_jobs():
             for saved in self.registry.list():
                 if saved.get("kind") != "portfolio.stage2":
                     continue
@@ -3939,11 +4222,37 @@ class PortfolioPanelService:
                     raise PortfolioPanelError("PORTFOLIO_JOB_RUNTIME_UNAVAILABLE", "portfolio job runtime is unavailable", status=500) from error
                 binding = runtime.get("stage2") if isinstance(runtime.get("stage2"), Mapping) else {}
                 if binding.get("campaign_id") == campaign_id:
+                    bindings = binding.get("candidate_bindings")
+                    ids = frozenset(item[0] for item in bindings if isinstance(item, (list, tuple)) and item) if isinstance(bindings, (list, tuple)) else frozenset()
+                    yield saved, ids
+
+        with self._lock, self.registry.lock:
+            if selection is None:
+                # Legacy whole-campaign submission: any batch of this Campaign is returned as before.
+                for saved, _ids in stage2_jobs():
                     return {"campaign_id": campaign_id, "job_id": saved["job_id"], "status": self._project_state(saved)}
+            attempt = 0
+            if selection is not None:
+                # An identical selection returns its live or successful batch; after a
+                # failed, cancelled or interrupted batch it starts a fresh attempt.
+                for saved, ids in stage2_jobs():
+                    if ids != selection:
+                        continue
+                    state = self._project_state(saved)
+                    if state in {"FAILED", "CANCELLED", "INTERRUPTED"}:
+                        attempt += 1
+                        continue
+                    return {"campaign_id": campaign_id, "job_id": saved["job_id"], "status": state}
             saved_stage1, _runtime = self._campaign_by_id(campaign_id)
             if self._project_state(saved_stage1) != "SUCCEEDED":
                 raise PortfolioPanelError("PORTFOLIO_STAGE2_CAMPAIGN_NOT_READY", "stage 1 campaign is not ready", status=409)
             prepared_candidates = self._prepare_stage2_batch(campaign_id)
+            if selection is not None:
+                known = {prepared["candidate_id"] for prepared in prepared_candidates}
+                if not selection <= known:
+                    raise PortfolioPanelError("PORTFOLIO_STAGE2_SELECTION_INVALID", "selected portfolios are not in this campaign", status=422)
+                # The committed artifact order is kept; the selection only filters it.
+                prepared_candidates = tuple(prepared for prepared in prepared_candidates if prepared["candidate_id"] in selection)
             candidate_bindings = [
                 [prepared["candidate_id"], prepared["candidate_digest"]]
                 for prepared in prepared_candidates
@@ -3957,6 +4266,10 @@ class PortfolioPanelService:
                 "candidate_bindings": candidate_bindings,
             }
             submission_key = f"portfolio-stage2:{campaign_id}"
+            if selection is not None:
+                submission_key += ":" + hashlib.sha256(",".join(sorted(selection)).encode("ascii")).hexdigest()
+                if attempt:
+                    submission_key += f":attempt-{attempt}"
             created_job_id: str | None = None
             try:
                 saved = self.registry.submit("portfolio.stage2", {"campaign_id": campaign_id}, submission_key, ("portfolio_optimizer",))

@@ -22,13 +22,15 @@ from ..performance_v2_selection import (
     _ab_metrics_from_windows,
     _consistency_summary,
     _consistency_windows,
+    _fee_efficiency,
     _return_30d,
     _selection_windows,
     _trade_rate_30d,
     load_selection_candidates,
     parse_selection_request,
 )
-from ..performance_v2_store import require_performance_v2_readable
+from ..performance_v2_sizing import fixed_lot_base
+from ..performance_v2_store import _V12_COLUMN_ADDITIONS, require_performance_v2_readable
 from ..performance_v2_store import decode_optimizer_source_metadata
 from ..performance_v2_selection_review import STATUSES as USER_STATUSES
 from ..performance_v2_optimizer import (
@@ -45,6 +47,7 @@ from ..performance_v2_windows import (
     _Equity,
     _calculate,
 )
+from .own_history import own_history_unit_drawdown
 from .canonical import (
     CanonicalList,
     CanonicalEnvelope,
@@ -180,6 +183,7 @@ class _SourceSeries:
     initial_balance: Decimal | None
     actions: tuple[Mapping[str, Any], ...]
     equity: tuple[Mapping[str, Any], ...]
+    fixed_base: Decimal | None = None
 
 
 class _PreparedResultRow(dict[str, Any]):
@@ -212,14 +216,26 @@ def _in_clause(ids: Sequence[int]) -> str:
     return ",".join("?" for _ in ids)
 
 
+# Schema-v12 columns enter source documents only when set, so documents and
+# digests of rows without the new facts stay byte-identical (protocol v2 §4.5).
+_V12_OPTIONAL_COLUMNS = frozenset(column for _table, column, _type in _V12_COLUMN_ADDITIONS)
+_V12_TABLES = frozenset(table for table, _column, _type in _V12_COLUMN_ADDITIONS)
+
+
 def _records_for_ids(connection: duckdb.DuckDBPyConnection, table: str, column: str, ids: Sequence[int]) -> tuple[dict[str, Any], ...]:
     if not ids:
         return ()
     # Table and column names are constants at every call site.
-    return _fetch_records(
+    rows = _fetch_records(
         connection,
         f"select * from {table} where {column} in ({_in_clause(ids)})",
         ids,
+    )
+    if table not in _V12_TABLES:
+        return rows
+    return tuple(
+        {key: value for key, value in row.items() if not (key in _V12_OPTIONAL_COLUMNS and value is None)}
+        for row in rows
     )
 
 
@@ -345,6 +361,17 @@ _DECIMAL_FIELD_TYPES: dict[str, tuple[str, str]] = {
     "sizing_balance_percentage_long": ("percent", "%"),
     "sizing_risk_long": ("scalar", "1"),
     "sizing_max_balance": ("money", "currency"),
+    "sizing_my_fix_balance": ("money", "currency"),
+    "sizing_balance_percentage_short": ("percent", "%"),
+    "sizing_risk_short": ("scalar", "1"),
+    "fixed_lot_base": ("money", "currency"),
+    # Selection candidate facts added after the snapshot registry was written.
+    "completed_cycle_net_pnl": ("money", "currency"),
+    "top5_pnl": ("money", "currency"),
+    "pnl_after_top5": ("money", "currency"),
+    "history_days": ("scalar", "1"),
+    "fees_share_pct": ("percent", "%"),
+    "fees_per_30d_pct": ("percent", "%"),
 }
 for _field in (
     "total_pnl_pct", "max_drawdown_pct", "return_pct", "daily_growth_pct", "fees_pct", "win_rate_pct",
@@ -379,6 +406,27 @@ for _order in range(1, 5):
 for _order in range(1, 5):
     _DECIMAL_FIELD_TYPES[f"order_{_order}_open_multiplier"] = ("multiplier", "1")
     _DECIMAL_FIELD_TYPES[f"order_{_order}_lot_x"] = ("lot", "1")
+
+# Selection settings added in the filter-sequence revision. Absolute research
+# thresholds compared with percent facts are percentage points; the rest are ratios.
+for _field in (
+    "ab_decline_cap_pct", "hard_dd_pct", "hard_pnl30_floor_pct", "top5_share_pct",
+    "researched_b_abs", "researched_dd_abs", "researched_stage3_near_b_abs", "researched_stage3_near_dd_abs",
+    # Stage settings canonicalized through the request payload.
+    "min_shift_pct", "pnl_tolerance_pct",
+):
+    _DECIMAL_FIELD_TYPES[_field] = ("percent", "%")
+for _field in (
+    "lot_full_dd5_multiplier", "lot_full_dd_multiplier", "lot_tolerance", "hard_dd_profit_multiplier",
+    "hard_ratio", "researched_pnl_dd5_ratio", "researched_pnl_b_ratio", "researched_b_rel",
+    "researched_dd5_abs", "researched_dd5_rel", "researched_dd_rel", "researched_stage3_near_b_rel",
+    "researched_stage3_near_dd5_abs", "researched_stage3_near_dd5_rel", "researched_stage3_near_dd_rel",
+    "researched_stage3_near_points_ratio", "researched_points_mean_ratio", "researched_points_same_floor_ratio",
+    "researched_points_cross_floor_ratio", "researched_points_single_best_ratio", "researched_open_ma_delta",
+    "researched_close_ma_delta", "researched_hold_p95_ratio", "researched_hold_median_ratio",
+    "researched_hold_p95_veto_ratio",
+):
+    _DECIMAL_FIELD_TYPES[_field] = ("scalar", "1")
 
 
 def _decimal_type(field: str, currency: str) -> tuple[str, str]:
@@ -464,6 +512,7 @@ def _refresh_candidate_metrics(
     candidates: list[dict[str, Any]],
     metrics: Mapping[tuple[int, datetime, datetime, str], WindowMetrics],
     selection_config: SelectionConfig,
+    fixed_result_ids: frozenset[int] = frozenset(),
 ) -> None:
     """Replace cache-derived candidate values with metrics from frozen series."""
     for candidate in candidates:
@@ -477,12 +526,15 @@ def _refresh_candidate_metrics(
 
         pnl_30d = _return_30d(full, report_start, report_end)
         trade_rate = _trade_rate_30d(full, report_start, report_end)
+        fees_share, fees_30d = _fee_efficiency(full, report_start, report_end, fixed=result_id in fixed_result_ids)
         candidate.update(
             total_trades=full.trade_count,
             trades_30d=trade_rate,
             pnl_30d_pct=pnl_30d,
             profit_factor=full.profit_factor,
             win_rate_pct=full.win_rate_pct,
+            fees_share_pct=fees_share,
+            fees_per_30d_pct=fees_30d,
         )
         drawdown = candidate.get("max_drawdown_pct")
         risk_scale = Decimal(5) / drawdown if isinstance(drawdown, Decimal) and drawdown > 0 else None
@@ -827,6 +879,10 @@ def read_performance_snapshot(
                 frame = load_selection_candidates(connection, request, selection_config, cache_only=True)
                 for row in frame.to_dict(orient="records"):
                     candidate = dict(row)
+                    # Display and lot-mode helpers of the selection frame; snapshot
+                    # documents and digests must not change (sizing comes from result rows).
+                    for field in ("ma_kind", "lot_mode", "lot_base"):
+                        candidate.pop(field, None)
                     try:
                         symbol = candidate["symbol"]
                         side = candidate["side"]
@@ -890,6 +946,7 @@ def read_performance_snapshot(
             equity_rows = _records_for_ids(connection, "strategy_equity", "result_id", tuple(result_ids))
             provenance = _selection_provenance(connection, parsed, tuple(strategy_ids))
             provenance["admission_lineage"] = admission_lineage
+            side_by_strategy = {int(row["strategy_id"]): row.get("side") for row in strategy_rows}
             for result in result_rows:
                 result_id = int(result["result_id"])
                 source_rows[result_id] = _SourceSeries(
@@ -899,6 +956,7 @@ def read_performance_snapshot(
                     None if result.get("initial_balance") is None else _to_decimal(result["initial_balance"]),
                     tuple(row for row in action_rows if int(row["result_id"]) == result_id),
                     tuple(row for row in equity_rows if int(row["result_id"]) == result_id),
+                    fixed_lot_base(result, side_by_strategy.get(int(result["strategy_id"]))),
                 )
             connection.execute("commit")
     except PortfolioInputError:
@@ -922,8 +980,12 @@ def read_performance_snapshot(
                     actions,
                     equity,
                     initial_balance=series.initial_balance,
+                    fixed_base=series.fixed_base,
                 )
-        _refresh_candidate_metrics(candidates, metrics, selection_config)
+        _refresh_candidate_metrics(
+            candidates, metrics, selection_config,
+            frozenset(result_id for result_id, series in source_rows.items() if series.fixed_base is not None),
+        )
 
         candidate_records = tuple(
             _frozen(dict(row)) for row in sorted(candidates, key=lambda row: (int(row["strategy_id"]), int(row["result_id"])))
@@ -1173,13 +1235,18 @@ def _finalist_order(row: Mapping[str, Any]) -> dict[str, Any]:
     shift_bp = _source_integer(row.get("shift_bp"), "shift_bp")
     if order_id <= 0 or open_ma_len <= 0 or shift_bp < 0:
         raise PortfolioInputError("invalid source strategy order", code="INVALID_SOURCE_VALUE")
-    return {
+    order = {
         "order_id": order_id,
         "open_ma_len": open_ma_len,
         "open_multiplier": _source_decimal(row.get("open_multiplier"), "open_multiplier", minimum=Decimal("0"), exclusive_minimum=True),
         "shift_bp": shift_bp,
         "lot_x": _source_decimal(row.get("lot_x"), "lot_x", minimum=Decimal("0"), exclusive_minimum=True),
     }
+    # MA facts (schema v12) enter the document only when set (protocol v2 §4.5).
+    for field in ("open_ma_type", "open_ma_source"):
+        if row.get(field) is not None:
+            order[field] = _source_text(row.get(field), field)
+    return order
 
 
 def apply_finalist_cutoff(
@@ -1283,6 +1350,25 @@ def read_current_finalists(
                 key for key, fact in facts.items()
                 if key[:2] in pair_values and fact.get("user_status") == "FINALIST"
             ]
+            if not include_series:
+                pair_order = {pair: index for index, pair in enumerate(pair_values)}
+                return tuple(
+                    {
+                        "strategy_id": strategy_id,
+                        "result_id": result_id,
+                        "symbol": symbol,
+                        "side": side,
+                        "user_status": "FINALIST",
+                        "user_rank": _user_rank(facts[key].get("user_rank")),
+                        "selection_run_id": facts[key].get("selection_run_id"),
+                        "review_import_id": facts[key].get("review_import_id"),
+                    }
+                    for key in sorted(
+                        finalist_keys,
+                        key=lambda item: (pair_order[item[:2]], _user_rank(facts[item].get("user_rank")) or 0, item[2], item[3]),
+                    )
+                    for symbol, side, strategy_id, result_id in (key,)
+                )
             strategy_ids = tuple(dict.fromkeys(key[2] for key in finalist_keys))
             result_ids = tuple(dict.fromkeys(key[3] for key in finalist_keys))
             strategy_rows = _records_for_ids(connection, "strategies", "strategy_id", strategy_ids)
@@ -1444,6 +1530,16 @@ def read_current_finalists(
                     "max_drawdown_pct": max_drawdown_pct,
                     "recovery_factor": recovery_factor,
                     "strategy_orders": ordered_orders,
+                    **{
+                        field: _source_text(source.get(field), field)
+                        for field in ("close_ma_type", "close_ma_source")
+                        if source.get(field) is not None
+                    },
+                    # Only FIXED members carry their base, so DYNAMIC rows are unchanged.
+                    **(
+                        {"fixed_lot_base": fixed_base}
+                        if (fixed_base := fixed_lot_base(source_result, side)) is not None else {}
+                    ),
                     "selection_run_id": provenance["selection_run_id"],
                     "review_import_id": provenance["review_import_id"],
                     "source_provenance": provenance,
@@ -1555,6 +1651,9 @@ class PreparedWeightedInput:
     cycles: Mapping[str, tuple[Mapping[str, Any], ...]]
     diagnostics: Mapping[str, Any]
     preparation_key: str
+    # Per-unit drawdown of each strategy over its own full history (ADR-0069);
+    # empty means "not computed" and disables the own-history cap.
+    own_history_unit_drawdowns: tuple[Decimal, ...] = ()
 
     @property
     def period(self) -> tuple[datetime, datetime]:
@@ -1645,6 +1744,11 @@ def _cycle_records(row: Mapping[str, Any], period_end: datetime) -> tuple[Mappin
             sizing_max_balance=setting("sizing_max_balance", basic, setting("max_balance", basic)),
             actions=tuple(row.get("actions", row.get("action_series", ()))),
             equity=tuple(row.get("equity", row.get("equity_series", row.get("equity_path", ())))),
+            # Schema-v12 facts come from stored columns only (absent for legacy rows),
+            # never from the report metadata, so legacy source documents are unchanged.
+            sizing_my_fix_balance=row.get("sizing_my_fix_balance"),
+            sizing_balance_percentage_short=row.get("sizing_balance_percentage_short"),
+            sizing_risk_short=row.get("sizing_risk_short"),
         )
         cycles = _optimizer_cycle_records(source)
     except (OptimizerIntegrityError, InvalidOperation, TypeError, ValueError, KeyError) as error:
@@ -2024,9 +2128,13 @@ def prepare_weighted_input(
         for cycle in values
     ):
         raise PortfolioInputError("mixed-side cycle attribution is unavailable", code="ONE_WAY_CYCLE_ATTRIBUTION_UNAVAILABLE")
+    own_drawdowns = tuple(
+        own_history_unit_drawdown(row.get("equity", row.get("equity_series", row.get("equity_path", ()))), source_cycles[_period_row_key(row)])
+        for row in ordered
+    )
     one_way_evidence = MappingProxyType({**dict(one_way_evidence), "participants": strategy_ids})
     diagnostics = _frozen({"rows": diagnostic_rows, "period": period.evidence, "one_way": one_way_evidence})
-    prepared = PreparedWeightedInput(start, end, history_step_minutes, tuple(item.isoformat().replace("+00:00", "Z") for item in timestamps), strategy_ids, tuple(tuple(row) for row in columns), tuple(tuple(row) for row in valid), tuple(tuple(row) for row in reasons), _frozen(cycles), diagnostics, key)
+    prepared = PreparedWeightedInput(start, end, history_step_minutes, tuple(item.isoformat().replace("+00:00", "Z") for item in timestamps), strategy_ids, tuple(tuple(row) for row in columns), tuple(tuple(row) for row in valid), tuple(tuple(row) for row in reasons), _frozen(cycles), diagnostics, key, own_drawdowns)
     if cache is not None:
         cache[key] = prepared
     return prepared

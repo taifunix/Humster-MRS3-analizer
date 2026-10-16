@@ -1,12 +1,29 @@
 # MRS3 Current Status
 
-Last updated: 2026-10-10
+Last updated: 2026-10-16
 
 This file is a current-status snapshot, not a session log. Earlier progress notes remain in Git history; feature contracts and detailed evidence belong in the linked specs, reports, and plans.
 
 Use [PRD.md](PRD.md) for the feature registry and [docs/README.md](docs/README.md)
 for the documentation map. Read the linked contract only for the active task;
 do not treat this file as a replacement for a feature specification.
+
+## Merge of origin/main into the BingX line (2026-10-16)
+
+Local BingX commits (`6b723ab`..`7528b3f`) were merged with origin/main up to
+`8f73d19`; backup branch `backup/bingx-before-merge-2026-10-16`. Conflicts in
+`PRD.md`, `progress.md` and the Panel POST allow-list in `src/mrs3/panel.py`
+were resolved by keeping both sides. Verification from `.venv`:
+BingX/panel testing/base-lot/minute-capacity tests 205 passed; full suite
+43 failed, 6752 passed, 12 skipped. Clean origin/main gives 44 failed with the
+same set except three timing-dependent Panel tests that pass or fail between
+reruns; no new failure comes from the merge.
+
+Open: the BingX downloader still writes `_1m.csv`; parquet packing for the new
+tester is part B of the
+[remote handoff](docs/superpowers/plans/2026-10-16-remote-handoff-bingx-parquet-source-v6-csv.md).
+BingX fees differ between RUNNER 01 BingX mode (0.0002/0.0005) and
+`templates/exchanges/BingX/mrs3-tester.json` (0.00012/0.0003) — to be confirmed.
 
 ## BingX data downloader (2026-10-10)
 
@@ -67,6 +84,611 @@ SCREENER 01 BingX run on XLP (2026-07-22..10-10, 70 day files, 12 weekend days
 without files) produced 304 BingX reports with trades in every month and no
 tester log errors.
 
+## Local tester v2 strategy directory (2026-10-14)
+
+The local tester now stages Single Mode strategies in `tester/settings_strategy`
+and retains the exact legacy root-level directory as a supported config value.
+Focused verification of runner config, config defaults, report cleanup, and
+strategy staging passed: 10 tests passed, 183 deselected. An earlier broad
+Panel sweep was stopped before completion; the later report-profile suite
+covering the related Panel/protocol modules passed 594 tests with one Windows
+symlink-capability skip.
+
+The live Single Mode run used a 20-strategy manifest for 2026-09-13 through
+2026-10-13. Panel recorded `COMMITTED`, 20/20 verified reports, zero failed
+strategies, and no job error; the report collection is `VERIFIED` with 20
+reports. The read-only Performance v2 parser accepted all 20 as format
+`2026-10` / tester `2026/10/10`, with settings, Metric/Value tables, action
+tables, wallet series, and equity series. Across the collection there are 268
+action rows, 25,999 wallet samples, 25,999 equity samples, 2,000 summary metric
+cells, and 792 non-empty scalar analytics values. The separate analytics output, monthly and
+regime rows are absent; HTML scans found zero OHLC chart, position chart,
+position-statistics, or timing-section markers, and zero Monte Carlo mentions.
+No PerformanceDB import was launched. This is not a DD5 retest or a verdict on
+strategy quality. Next:
+decide whether to import the verified collection or run a separate DD5 retest.
+Blockers: none for the completed report-profile check.
+
+## Next: PerformanceDB upgrade for the new tester report (2026-10-12)
+
+Approved contract: [PerformanceDB new report format](docs/specs/2026-10-12-performance-db-new-report-format.md),
+implemented together with P2–P6 of the
+[MRS3 evaluation protocol v2](docs/specs/2026-10-12-mrs3-evaluation-protocol-v2.md)
+in this session (user decision). Order: N1 parse → P2+N2 schema v12 → P3+N3
+import → N4 maintenance/compaction → P4–P6 → P7 Panel database selection.
+N1 is done: `parse_current_performance_v2_html` reads the 2026-10 format
+(version-only detection, compatible duplicate metrics, 59 analytics labels,
+regimes and monthly returns); the real sample parses fully; legacy parsing is
+unchanged (reviewed against HEAD on all fixtures and real 2026/09/22 reports).
+P2a is committed (schema v12): additive migration v11 → v12
+(MA type/source columns, three sizing columns, `tester_version`,
+`report_format`, tables `strategy_report_metrics`, `strategy_report_regimes`,
+`strategy_report_monthly`), optional `schema_info` markers
+`evaluation_protocol`/`exchange` written at creation from
+`unified_performance_v2.evaluation_protocol`/`exchange`. The Panel schema
+gate (`_ensure_performance_v2_schema`, keyed also by the configured protocol
+and exchange) and the import runner refuse a mismatching database before any
+migration (`EVALUATION_PROTOCOL_MISMATCH`, `EXCHANGE_MISMATCH`); read-only
+routes that bypass the gate do not check identity yet (P7 adds database
+selection). Readers accept v5–v12; Panel migrates a v9–v11 database to v12 on
+open. Maintenance, compaction and prune cover the new tables and appended
+columns; import REPLACE clears the report rows. Evidence: a copy of the live
+v11 database (16.9 GB, 49 125 strategies, 122 M equity rows) migrated in 45 s
+with identical row counts and empty new columns/tables. Broad suite: the only
+failures besides the 57 that already fail on clean HEAD are the two
+template-pinned finalist-retest tests.
+P2b is committed: the import records MA type/source of the
+close MA and every order (ADD writes them, REPLACE fills empty ones) and the
+v12 sizing facts (`my_fix_balance`, SHORT percentage/risk); a report whose
+known MA facts differ from the stored strategy or from its same-batch
+representative is rejected alone as `REJECTED:MA_SETTINGS_CHANGED` on the
+REPLACE, non-covering SKIPPED and tombstone paths.
+P2c: Stage 2 builds each strategy with the stored MA type/source of every
+order and of the close MA (protocol v2 §4.5); a member without facts keeps the
+`portfolio-weighted-mrs` prototype and its JSON is unchanged. Finalist source
+documents carry the facts only when set. The Stage 2 variant records
+`legacy_ma_prototype_members` (members with any missing fact) and the Panel
+summary shows it as `Legacy MA prototype members` (`UNKNOWN` for older results).
+P2d: selection and PerformanceDB workbooks add the display-only `MA type`
+column after `MA` (amendment in the
+[XLSX column contract](docs/specs/2026-10-07-performance-v2-xlsx-column-contract.md));
+legacy rows and pre-v12 databases give blank cells; aggregate workbooks
+exported without it stay importable. The Panel strategy card shows the MA
+type/source next to Close MA and each Open MA when stored.
+P3+N3: the parser accepts `use_upnl` true (protocol v1) or false (v2); the
+import rejects a report alone when it is an incomplete v2
+(`PROTOCOL_V2_INCOMPLETE`, names the unmet fields), when its protocol differs
+from the database marker (`EVALUATION_PROTOCOL_MISMATCH`, an unmarked database
+is v1) or when the database has an exchange marker and `exchange.name` differs
+(`EXCHANGE_MISMATCH`). Every result records `tester_version`/`report_format`;
+2026-10 reports take `max_drawdown` from `Max Drawdown, USDT` and `total_trades`
+from `Fills (reduce / close)` and store the analytics tables in the same
+transaction; a report whose core the import recomputes (warm-up trim) stores no
+analytics. Consequence until P6: reports rendered from the user's edited
+`retest-mrs3` template (`use_upnl=false`) are rejected by a v1 database as
+`EVALUATION_PROTOCOL_MISMATCH`; they need a v2 database.
+P4 (FIXED metrics): `performance_v2_sizing.fixed_lot_base` recognises a stored
+protocol-v2 fixed lot (use_upnl=false, frozen balance, use_fix, max_balance=0,
+active side 100%/risk 1) and gives B = my_fix_balance × percentage / 100. For
+such results window metrics use R = ΔW / B (growth exp(R), daily log R/days,
+fees / B, linear drawdown (peak − E) / B), equity quality and regime use
+ln Ẽ = (E − E0) / B with linear drawdowns and peak gap, and selection rebases
+the report `max_drawdown_pct`, `total_pnl_pct` and `pnl_without_best_trade_pct`
+on B (hence risk_scale, DD5, CE); EQUAL/INCOME compare only within one lot mode
+and base. Workbooks add `Lot mode` after `MA type`; the Panel card shows
+`Lot FIXED B=…`. DYNAMIC and legacy results are unchanged. Invariant 2 is
+pinned on a synthetic fixture. The E1–E6 evidence scripts live in
+`scripts/equity_research/` (`sizing_evidence.py`, `sizing_fills.py`,
+`base_size.py`); a smoke test runs them read-only on a small synthetic database.
+P5: the optimizer accepts FIXED results (use_fix=true and use_upnl=false with a
+stored base, active side 100%/risk 1, max_balance 0; the inactive side may be
+NULL) next to DYNAMIC; FIXED cycles are normalised as (closing − opening
+balance) / B, and tested capacity in sizing and the default pre-test evaluator
+uses B (finalist rows of FIXED results carry `fixed_lot_base`). DYNAMIC source
+documents, digests, prepared JSON and availability reasons are unchanged for
+rows without schema-v12 facts (checked on a 1 458-combination grid). DYNAMIC
+rows imported after P3 that store v12 facts get a new source digest and are
+prepared again on the next preparation.
+P6a/b: `src/mrs3/evaluation_protocol.py` gives the target of the active
+database (base B = `InitialBalance` of the MRS3 tester template, exchange from
+`unified_performance_v2`; a v1 database is refused as `DATABASE_PROTOCOL_V1`),
+applies `my_fix_balance = B` and `exchange.name` and checks the §4.2 predicate
+(`PROTOCOL_V2_RENDER_REJECTED` names the unmet fields). The READY JSON
+generators (fresh, legacy, v6), RUNS (strategy and embedded tester config),
+RETEST and finalist RETEST accept the target (the finalist config digest
+includes the base and exchange). P6c1: the Panel takes the target before every
+MRS3 flow (READY JSON fresh/legacy/v6, RUNS publication and start, single-mode
+tester start, RETEST, finalist RETEST, legacy `tester-run`), checks the tester
+template and every manifest strategy or RUNS snapshot before launch, answers
+refusals with HTTP 409 and their code (`DATABASE_PROTOCOL_V1`,
+`DATABASE_UNAVAILABLE`, `EVALUATION_PROTOCOL_MISMATCH`, `EXCHANGE_MISMATCH`,
+`PROTOCOL_V2_RENDER_REJECTED`, `PROTOCOL_V2_TESTER_CONFIG_REJECTED`), and no
+longer takes a start balance (API and UI). New MRS3 jobs record
+`evaluation_protocol`/`evaluation_base`/`evaluation_exchange`; a retry or a RETEST
+inbox reuse of a job without the same marker is refused
+(`RETRY_PRE_PROTOCOL_V2`) or skipped. The protocol v2 templates are committed.
+MRS3 tests need a protocol v2 PerformanceDB: set
+`unified_performance_v2.database_root` to a new folder, `evaluation_protocol: v2`
+and `exchange` in `config.performance.json` (P7 adds this to the Panel
+settings). P6c3: RETEST and finalist RETEST repeat the stored MA type/source
+of every order and of the close MA (a strategy without stored facts keeps the
+template prototype), so a template change does not turn retest reports into
+`MA_SETTINGS_CHANGED`. P6 is complete.
+P7 ([spec](docs/specs/2026-10-13-panel-performance-db-selection.md), approved
+2026-10-13): P7a spec. P7b: `config.local.json` `performance_databases.active`
+overrides root/protocol/exchange in `load_performance_v2_config`; job markers
+add `evaluation_database`/`evaluation_profile`; the finalist digest adds the
+exchange templates; imports of jobs rendered for another target are refused
+(`IMPORT_TARGET_CHANGED`); listing dates read the exchange's sheet. (The P7b
+`exchange_profiles` overrides and `results/.tester-templates` were replaced by
+P7e template folders.) P7c: Settings → «PerformanceDB и биржа»
+lists the default and registered databases (folder, protocol, exchange, file
+markers, size), switches the active one (`performance_databases.active`, refused
+with `RESOURCE_BUSY` while a job runs or a report collection is open or
+verified) and creates an empty protocol v2 database with exchange markers in a
+new folder under `data/` (`/api/v2/settings/performance-databases`,
+`…/activate`, `…/create`). P7d: portfolio Stage 1 (readiness blocker,
+finalist preparation, campaign submit) refuses a PerformanceDB marked with an
+exchange other than Bybit (`EXCHANGE_DATA_UNAVAILABLE`, HTTP 422); unmarked v1
+and Bybit databases work as before; Stage 2 reuses the checked campaign. P7e
+(user decision 2026-10-13): exchange templates replace the `config.local.json`
+profiles. `templates/exchanges/<exchange>/` holds `exchange.json` (listing-date
+sheet), `mrs3-strategy.json`, `mrs3-tester.json` and the optional optimizer
+`portfolio-*.json`; the former MRS3 and optimizer templates moved byte-for-byte
+to `templates/exchanges/Bybit/`, `BingX/` has the BingX account and fees. The
+active database's exchange picks the folder for READY, RETEST and finalist
+RETEST; launch checks compare `exchange.account` and the fee/funding fields
+(`account_type` is not checked). A new exchange is a new folder. P7 is
+complete.
+Plan (deferred, user decision 2026-10-13): optimizer adaptation for BingX
+(margin parameters from the exchange API, minute liquidity in the `BingX`
+folder next to the Bybit one, `portfolio-*.json` for BingX). Next work: the
+[CSV Direct integration and shift grid 7.5% plan](docs/superpowers/plans/2026-10-13-csv-direct-integration-and-shift-grid-750.md)
+— part A merges `feat/csv-direct-analysis` into main (ADR renumber to 0071,
+exchange key in the analysis DB, background job); part B extends the MRS2 shift
+grid 5.5% → 7.5% (step 0.4%) with backward compatibility (effective grid =
+legacy grid plus the longest present extension prefix); seven user decisions
+listed in B3.
+Before part B changes the plateau logic (2026-10-14): a walk-forward study on
+the full Source v6 databases (remote machine, no surfaces or analysis DBs
+needed) collects facts on whether plateau-based selection predicts future
+PnL and drawdown better than alternatives (neighbourhood robustness, plateau
+centre, shift depth). The remote session delivers facts and a parquet export
+only; reconciliation with the local analysis DBs and final conclusions are
+done locally. Prompt:
+[plateau OOS study](docs/superpowers/plans/2026-10-14-plateau-oos-study-prompt.md).
+The remote study delivered facts and an export (2026-10-15):
+[remote facts](docs/reports/2026-10-14-plateau-oos-facts.md). A local study on
+that export ([stable zones](docs/reports/2026-10-15-plateau-zones-local-study.md))
+found that the current plateau adds nothing to the economic filter, while the
+neighbourhood median of PnL30/Ulcer predicts forward quality and risk.
+Validation (2026-10-15..16,
+[plateau v4 validation plan](docs/superpowers/plans/2026-10-15-plateau-v4-validation-plan.md),
+scripts `scripts/plateau_research/`): real MRS3 tick tests of 1 419 strategies
+28 days forward and 958 runs on their training windows. Admitting a pair/TF
+only when its best 2-order v4 structure scores > 20 with training DD <= 6%
+gave about 10-11%/month at a fixed lot with 1-3% losing strategies; scores
+<= 10 gave about 3%/month with 20% losing. Not better than the plain
+structure: first order 0.5-0.6% on liquid pairs, 3-order/deep/wide order sets,
+diverse twins, INCOME lots ([ADR-0076](docs/decisions/0076-mrs3-equal-lots-only.md)),
+the A/B filter. Within a pair the forward return is not predictable, the risk
+is. Draft rules in the plan: READY v4, risk categories (training DD <= 2 /
+2-3.5 / 3.5-6%), ranking and the optimizer finalist per category, removal of
+Pareto/legacy ranks, 20-day periodic MRS2 CSV runs merged per period in CSV
+Direct with a data repository journal. Separate 21-day periods scored as the
+mean of per-period scores were not worse than one window (section A12a).
+Test sets and results stay local, not committed. Remote handoff prompt:
+[remote handoff](docs/superpowers/plans/2026-10-16-remote-handoff-bingx-parquet-source-v6-csv.md);
+the CSV Direct prototype stays on branch `feat/csv-direct-analysis` (pushed,
+not merged: 47 commits behind main, its ADR-0070 number is taken in main).
+Next: remote handoff (merge
+the BingX candle work, tester-format parquet packing, Source v6 -> period CSV
+generator with a check against real tester CSVs), threshold calibration, then
+the implementation specification. Out-of-time recheck around 2026-11-12.
+User decision 2026-10-12: one PerformanceDB per exchange with an
+`schema_info.exchange` marker (protocol v2 §4.1); the CSV Direct analysis DB
+(branch `feat/csv-direct-analysis`) must also record the exchange from the run
+snapshot `exchange.name` — pending, separate commit on that branch. The current parser rejects the new HTML
+(`metrics contain duplicate or empty keys`). The old database must keep
+working after the additive v11 → v12 migration; missing analytics is not an
+error. The protocol v2 templates are committed with P6c1 (below).
+
+## Portfolio input snapshot registry (fix 2026-10-13)
+
+Since `eae54c0` (2026-10-01) every portfolio input snapshot failed with
+`UNKNOWN_DECIMAL_FIELD`: 33 new Decimal `SelectionConfig` settings and the
+candidate facts `history_days`, `completed_cycle_net_pnl`, `top5_pnl`,
+`pnl_after_top5`, `fees_share_pct`, `fees_per_30d_pct` had no snapshot type.
+All are registered explicitly (a test fails when a new Decimal setting or
+candidate fact has no type), as are the stage settings `min_shift_pct` and
+`pnl_tolerance_pct`. The snapshot now also recomputes `fees_share_pct` and
+`fees_per_30d_pct` from the frozen series, so its digest no longer depends on
+the window cache. 14 tests in `test_portfolio_input.py` still fail on stale
+fixtures (`selection_results` 12 columns, `selection_review_imports` 6 columns,
+schema version `'12' == '8'`), unrelated to this fix.
+
+## Reason of REJECTED rows in selection workbooks (2026-10-12)
+
+In the pair selection and all-pairs workbooks, a row shown as `REJECTED` now
+names the filter or review that set `REJECTED` (for example
+`AB_DETERIORATION;REJECTED`) instead of the first stage that fired in the
+current run. Display only; persisted selection results are unchanged. Finalist
+control/retest workbooks are excluded because their `Причина` is a protected
+import field. Known limit: review imports and finalist retest rewrite
+`REJECTED` tags as `SELECTION_REVIEW`. Contract: the amendment in the
+[XLSX column contract](docs/specs/2026-10-07-performance-v2-xlsx-column-contract.md).
+Restart Panel to use it.
+
+## MRS2 point settings: out-of-sample check (2026-10-12)
+
+A read-only study compared point facts in an earlier analysis with the same
+point's B tail in a later analysis of the same pair (14 analysis pairs, 20
+symbol links). Within pairs only the current DD ≤ 12 cap predicts later
+results; PnL > 5, PnL/DD ≥ 3 and WR ≥ 68 do not, and tighter PF, WR, PnL/DD or
+plateau size rules do not separate points either. A DD cap of 10% is not
+supported by the data (no direction at 10–11%, a weak unproven lean at 8–9%);
+it is only an optional risk policy in the user's Panel settings. The current
+PRETEST A/B rule removes points that later lose less often (14.2% vs 23.9%),
+so CSV Direct needs no A/B replacement on this evidence. A first attempt via PerformanceDB is withdrawn:
+its MRS3 use source `open`, the MRS2 points `ohlc4`. Gap rules, READY and
+plateau settings need the protocol-v2 (`ohlc4`) MRS3 database. Report and
+deferred list: [MRS2 point settings OOS](docs/reports/2026-10-12-mrs2-point-settings-oos.md);
+scripts: `scripts/mrs2_research/`.
+
+## Fee efficiency columns in the selection XLSX (2026-10-12)
+
+The selection workbooks now show `Fees share, %` (fees as a share of the gross
+pre-fee return) and `Fees/30, %` right after `Top 5 share, %`. Both come from the
+cached full-report window facts and are display-only. Contract: the fee
+amendment in the
+[XLSX column contract](docs/specs/2026-10-07-performance-v2-xlsx-column-contract.md).
+Aggregate workbooks exported before these columns remain importable (the
+previous header tuple is accepted with its own hash). Verification: selection,
+aggregate workbook, publication, export and review suites, 481 passed.
+
+## Equity evaluation research (2026-10-12)
+
+A read-only walk-forward study compared equity facts with what each strategy
+did next, within its pair, on three non-overlapping periods (cuts T−14, T−28
+and T−42).
+
+- **Return within a pair is not predicted** by equity speed, STRONG/WEAK,
+  smoothness, B, DD5 or the R7.3 score.
+- **Risk is predicted:** most consistently by depth below the high-water mark
+  and relative smoothness within the pair; less consistently by the latest
+  weekly loss and DECLINE (DECLINE measured only on the T−14/T−7 cuts).
+- **Filter 7 shows no measurable effect** (approximate replay).
+- **Self-computed risk analytics** (`rolling_risk.py`, no look-ahead, also
+  measured on the new drawdown after the cut): the mean daily worst floating
+  loss is the strongest predictor of the new drawdown after the cut on all three
+  cuts, ahead of CVaR, Ulcer and smoothness; against the all-time high-water
+  mark it is comparable to Ulcer (report §2a). User decision 2026-10-12: keep
+  both in-pair risk flags (smoothness `ROUGH_IN_PAIR` and MAE-like
+  `HIGH_FLOAT_IN_PAIR`) and choose after the protocol-v2 recheck. Depth below
+  the high-water mark mostly describes the current state:
+  on the clean outcome it predicts future drawdown only weakly. Preliminary,
+  pending the protocol-v2 recheck.
+- **Caveat: survivorship bias.** The sample contains only strategies still in
+  the database. Rejection filters partly looked at the outcome windows (A/B
+  deterioration uses the last 14 days), so the conclusions are preliminary
+  until the protocol-v2 database is analysed before rejection filters run.
+
+Evidence:
+[walk-forward report](docs/reports/2026-10-12-equity-evaluation-walk-forward.md).
+Proposed contract; the user decided D1 (pause is a finalist) and D15 (unheld breakout ≤5% is a pause) on 2026-10-12, other items are still open:
+[equity risk evaluation](docs/specs/2026-10-12-equity-risk-evaluation.md).
+The recommended filter set keeps filters 2–6 and 8–10 and turns off filter 7.
+
+The research scripts are in `scripts/equity_research/`; the report lists each
+script, its input and how to run it. Metrics of the new tester report worth
+recording for the next analysis:
+[tester metrics to record](docs/reports/2026-10-12-tester-report-metrics-to-record.md).
+
+Next step: repeat the rolling-origin study on the protocol-v2
+database once longer tests exist.
+
+## PerformanceDB compaction and faster verification (2026-10-12)
+
+The live PerformanceDB was compacted from 31.14 GiB to 15.76 GiB and is now
+schema v11. Cause of the old size: DuckDB never shrinks the file on DELETE.
+About half of the physical rows in `strategy_equity` (238 M vs 122 M live) and
+`strategy_actions` were deleted tuples, plus 8.4 GiB of free blocks. Rejected
+retirement itself had removed all heavy facts correctly.
+
+The candidate was built with `scripts/compact_performance_v2.py` and verified
+with `scripts/verify_performance_v2_candidate.py`. All 20 tables matched
+row-for-row, and the source SHA-256 was unchanged before and after. It was
+swapped in on D:; the old file is kept as
+`data/performance-v2/strategy_performance.pre-compact-20261012.duckdb` until
+the user confirms the Panel works.
+
+The verifier compared large tables in 128-result-id ranges, so each range
+rescanned the unclustered source: about 90 s per range and 384 ranges for
+`strategy_equity`, roughly 9 h. Large tables are now copied and verified in
+row-sized ranges of about 10 M rows. The exact `EXCEPT ALL` comparison in both
+directions is unchanged. Contract: the 2026-10-12 amendment in
+[lossless compaction](docs/specs/2026-09-30-performance-db-lossless-compaction.md).
+
+On the real DB, verification took 3 h 47 min in total. That includes source and
+candidate hashing, `strategy_actions` (2 ranges), `strategy_equity` (13 ranges,
+about 1 h 45 min) and about 2 h for the single-threaded typed comparison of
+`window_metrics`, `selection_results` and `optimizer_prepared_inputs`. Copying
+the candidate to D: and hash-checking it took 132 s.
+
+Verification: `tests/test_performance_v2_compact.py` 37 passed. Independent
+review passed after one fix round.
+
+Next step: speed up the typed comparison of medium tables and the prepared
+payloads (SQL `EXCEPT ALL` where types allow, parallel payload decoding).
+Delete the pre-compact backup only after user confirmation.
+
+## MRS3 evaluation protocol v2 (2026-10-12)
+
+Approved; P1 implemented, P2–P6 pending. Evaluation tests of MRS3 move to a
+fixed lot of 10 000 USDT with `LimitOrderVolumeCheck=false` and entry MA
+source `ohlc4`, and their results go to a **new** PerformanceDB. The current
+database stays the protocol-v1 database and keeps working without data
+changes; mixing protocols in one database is refused. Stage 2 of the
+optimizer keeps its own tester template with %-of-balance sizing and the
+volume check. Contract:
+[protocol v2 spec](docs/specs/2026-10-12-mrs3-evaluation-protocol-v2.md);
+decision: [ADR-0070](docs/decisions/0070-mrs3-evaluation-protocol-v2.md).
+
+Found while preparing it: in both MRS3 strategy templates the first LONG
+entry prototype is `SMA/open` (SHORT is `SMA/ohlc4`), and the generator copies
+it to every level, while the MRS2 plateau points are tested with `ohlc4`. All
+2 361 JSON files of the last finalist RETEST are LONG with `SMA/open` entries.
+PerformanceDB does not store MA type or source; P2 adds them (additive schema
+v12).
+
+Read-only evidence (2026-10-12, 30 370 current results): compounding alone
+barely changes the top-5 per pair (identical in 92–96% of pools); fixed-lot
+curves measured by the current window formulas would match only 41%, so P4
+normalizes fixed-lot metrics. A 10 000 USDT base keeps the qty-step error of
+the smallest order level under 1% for 80 of 81 pairs. Full evidence:
+[discussion A3/B2](docs/superpowers/plans/2026-10-12-universal-equity-evaluation-discussion.md).
+
+P1: optimizer Stage 2 reads `templates/tester/portfolio-stage2/config_tester.json`
+(a byte copy of the old MRS3 template); its rendered config is pinned by
+SHA-256 in tests. Verification: `.venv\Scripts\python.exe -m pytest
+-p no:cacheprovider -q tests/test_panel_portfolio.py tests/test_panel_testing.py
+tests/test_panel_fast_strategy_test.py tests/test_panel_strategy_batch.py
+tests/test_tester_run_files.py` — 466 passed, 1 skipped (Windows symlinks).
+Independent review: `CODE_REVIEW_PASS`; the pin and three nits were applied.
+
+The new tester report format of 2026-10-09 is not yet parsed by Performance
+v2 import (duplicate analytics metric names); its adaptation is a separate
+task before the tester update.
+
+Next step: P2 (schema v12 audit first). Mass testing only after P6, in the
+new database.
+
+## Portfolio MILP composition selection (2026-10-10)
+
+Stage 1 no longer fails when the finalist product exceeds
+`search.max_enumerated_combinations`. Above the bound, one MILP per profile
+over the union of slot options ranks up to `2 × max_candidates` distinct
+portfolios; each is then evaluated by the unchanged exact path. The form
+shows the live combination count, the bound and the mode. Contract:
+[UI spec amendment 2026-10-10](docs/specs/2026-09-06-portfolio-optimizer-panel-ui.md);
+decision: [ADR-0066](docs/decisions/0066-portfolio-milp-composition-selection.md).
+The adapter progress sink lacked `import time`, which silently dropped every
+adapter-level progress event. That is fixed in the same change. The change
+also carries the 2026-10-09 lightweight readiness and combination-limit detail
+hunks.
+
+Diagnosis evidence: one composition × one profile costs about 49 s with 30
+workers (106 s single-threaded). Only bootstrap is parallel, and it spawns a
+process pool per call. On the real 117-finalist snapshot, facts took 102 s
+(minute files are reused, about 0.2 s per symbol) and layer preparation 58 s.
+Each MILP solve took 9–130 s, rising as cuts accumulate; 20 solves took 19 min.
+The earlier 32-minute facts stage did not reproduce. Measured overheads:
+per-request SSL context creation in the market snapshot, and a full 14 MB
+`.panel-jobs.json` rewrite on each progress/journal sync.
+
+Verification: composition selection 10 passed; adapter + selection 365
+passed. A broad run of portfolio/Panel modules gave 1143 passed and 1 skipped.
+Its 34 failures are known and pre-existing: 32 `ab_decline_cap_pct` /
+11-of-12-column fixtures, the maintenance copy expectation, and the Windows
+Node command-line length. `node --check` and `git diff --check` passed.
+Independent review: one MAJOR (silent profile loss on a selector time-out) and
+the MINOR findings were fixed; the re-review passed. Adapter progress now
+reaches the Panel for the first time. The Panel reporter marks the total
+inconsistent after the first substage switch, so later progress shows no
+ETA. Next step: restart Panel to load the code, then rerun the
+full-universe Campaign. No PerformanceDB or
+tester was used.
+
+## Portfolio own-history drawdown cap (2026-10-10)
+
+Stage 1 now caps each member by its own worst drawdown: `x_i·d_i ≤ max_dd·B`.
+Here `d_i` is the member's per-unit drawdown over its full own history, not
+only the common window, and `max_dd` is the profile DD limit. This is a
+per-member concentration cap, not a sum of DDs. The common-path DD, CDaR and
+bootstrap stay as they were. The cap is enforced in the LP/MILP, in the
+fixed-bank LPs and in the exact bank. Decision:
+[ADR-0069](docs/decisions/0069-portfolio-own-history-drawdown-cap.md);
+contract: the own-history amendment in the
+[weighted-search spec](docs/specs/2026-09-14-portfolio-optimizer-weighted-search.md).
+The Stage 1 summary, XLSX and `/results` show `own_history_dd_bank_usdt`;
+the web table column waits for the parallel `app.js` work.
+
+Why: in Stage 2 tester runs, the 9-pair candidate (bank 72) reached a 61%
+drawdown. Under the new rule its TSEM/MSTU sizes would need a bank of about
+730.
+
+Real evidence: the frozen 61-pair Campaign, rerun offline with 30 workers,
+gave PASS in 19 min.
+
+| Level | Members | Bank | P30 | Own-history bank |
+| --- | --- | --- | --- | --- |
+| top | 61 | 715 | 1641 | 390 |
+| bottom | 61 | 72 | 328 | 58 |
+
+Before the cap the same ladder went from 61 members down to 9, with P30
+1643 → 360. Lower levels now shrink the whole portfolio instead of
+concentrating it. The margin bank binds at every level.
+
+Verification: the own-history, weighted-search, adapter, optimizer and
+panel portfolio suites give 933 passed, 1 skipped. `test_portfolio_input.py`
+has 34 failures, all from the parallel v11 schema changes. Independent review
+passed after one fix round.
+
+## Stage 2 strategy files in tester format (2026-10-10)
+
+Stage 2 strategy and tester-config JSON are now indented, with keys in the
+template order. `balance_percentage_*` round up to a whole percent (0 stays
+0). `lot_x` rounds to 0.01, with the remainder on the last order; a
+non-positive last order fails closed. `MakerFee` is 0 for Bybit-only
+batches. Contract: the 2026-10-10 tester-rendering amendment in the
+[UI spec](docs/specs/2026-09-06-portfolio-optimizer-panel-ui.md).
+
+Accepted by the operator: rounding percentages up enlarges positions (small
+`q` the most) and can exceed the liquidity cap C.
+
+Follow-up (operator rules): Stage 2 tester config uses `UpdateData=true`.
+Report settings live only inside `report`; the shared MRS3 tester template
+and the fast strategy-test writer no longer put them at the root. Both local
+exports were updated.
+
+Evidence: portfolios 01 (61 strategies, bank 716) and 10 (9 strategies,
+bank 72) of `campaign-df84e07d885f4fb8a7b5d9c97a05b5d2` were re-exported
+locally. All 70 files were checked. No tester run was started; the Panel
+backend needs a restart to use the new rendering.
+
+Verification: `tests/test_panel_portfolio.py` 297 passed, 1 skipped.
+Independent review passed.
+
+## Pair table controls and Stage 2 portfolio selection (2026-10-10)
+
+The pair table gets a separate `История` column (bold `≈ N д` and the date
+range), a `Выбрать N финалистов` button with an N field, and a display sort:
+A–Z, shortest history first, or most finalists first.
+
+The Stage 2 card lists every committed Stage 1 portfolio with its main facts
+and a checkbox. `Отправить на тест` sends only the checked ones, in artifact
+order. `/results` exposes the rows, and submission accepts `candidate_ids`;
+each distinct selection is its own batch.
+
+Contract: the 2026-10-10 pair-table/Stage 2 amendment in the
+[UI spec](docs/specs/2026-09-06-portfolio-optimizer-panel-ui.md), which also
+lists where Stage 2 writes on disk. Live: `/results` for the 61-pair Campaign
+returns 10 portfolio rows. No tester run was started; the operator will start
+it from the Panel.
+
+Verification: static UI and panel portfolio suites pass, except the 2 known
+pre-existing failures. Independent review passed.
+
+## Portfolio pair history and selection summary (2026-10-10)
+
+The Stage 1 form now shows, for every pair, the history of the finalists its
+current limits would select. Under the table it shows the totals: pairs,
+finalists, the common history of the whole selection, and a rough runtime
+estimate. Readiness exposes `finalist_history` (day-aligned periods in rank
+order, with no series reads); a history failure never blocks Stage 1.
+Contract: the 2026-10-10 pair-history amendment in the
+[UI spec](docs/specs/2026-09-06-portfolio-optimizer-panel-ui.md).
+
+Live check: all 61 pairs and 117 finalists give ≈ 21 days of common history
+(16.09–07.10) and ≈ 17 min, against 16 min measured. The shortest histories,
+21 days each, are HORIZON, MEITU and SENSETIME.
+
+The "minimum risk at target P30" search mode is recorded as a planned option
+in the [optimizer spec](docs/specs/2026-09-05-portfolio-optimizer.md), Phase 4.
+It has only a prototype so far; the product keeps the bank-ladder frontier as
+"maximum P30 under a bounded risk/bank".
+
+Stage 2 dry run (read-only, no tester start): for all 10 candidates of
+`campaign-df84e07d885f4fb8a7b5d9c97a05b5d2`, `_stage2_material` built a tester
+config and strategy JSONs (61 → 9 strategies, 16.09–06.10, `InitialBalance` =
+required bank 716 → 72). Observation: candidate 10 has `InitialBalance` 72 while
+its strategies' `max_balance` is 72.17 (whole-USDT bank vs exact sizing). The
+real tester batch still needs explicit user authorization.
+
+Verification: Panel portfolio and static UI suites pass, except the 2 known
+pre-existing failures (maintenance copy, Windows `node -e` length).
+Independent review passed.
+
+## Portfolio bank-ladder frontier (2026-10-10)
+
+Stage 1 now returns, per profile, up to `max_candidates` genuinely different
+portfolios. Each is the MILP-optimal choice of finalists and weights for one
+bank level across all compositions, then exactly evaluated. This replaces
+both the exhaustive enumeration and the top-K MILP ranking, which produced
+near-copies. Decision: [ADR-0067](docs/decisions/0067-portfolio-bank-ladder-frontier.md);
+contract: the 2026-10-10 frontier amendment in the
+[UI spec](docs/specs/2026-09-06-portfolio-optimizer-panel-ui.md).
+
+The same change fixes three issues found on real data:
+- binding bank ceilings failed exact LPs with `BANK_UNAVAILABLE`;
+- a MILP on the default HiGHS thread count broke every later LP in the
+  process with "Status 0: Not Set";
+- scaled zero weights (`0E-90`) failed payloads.
+
+Real evidence: the full universe (61 pairs, 117 finalists, 4·10^14
+compositions, AGGRESSIVE, bank 1600) SUCCEEDED in 16 min with 10 monotone
+candidates. Margin bank went 715 → 71, P30 1643 → 360, members 61 → 9.
+
+Walk-forward check (14 days in-sample, 7 out): returns hold out of sample. In
+this data the margin constraint binds rather than drawdown, so lower levels
+concentrate. Their out-of-sample P30/maxDD (57 → 12) is worse than
+proportionally scaling the full portfolio (60). The ladder is therefore
+"maximum P30 per margin budget", not a minimum-risk frontier. A
+min-CDaR-at-target-P30 mode was prototyped and kept diversification, with
+out-of-sample P30/maxDD 38–61. It is recorded as a future option in the
+optimizer spec (Phase 4).
+
+Verification: portfolio suites 593 passed; independent review and re-review
+passed.
+
+## Portfolio Stage 1 throughput and hang fix (2026-10-10)
+
+Three reviewed infrastructure changes. Contracts: the 2026-10-10 amendments in
+the [weighted-search spec](docs/specs/2026-09-14-portfolio-optimizer-weighted-search.md)
+and the [UI spec](docs/specs/2026-09-06-portfolio-optimizer-panel-ui.md).
+
+- **Job journal.** The frozen Campaign in a job runtime is shared by reference
+  and never serialized into `.panel-jobs.json`. Measured: 2.26 s → 0.16 s per
+  progress update with the real 14 MB journal and a 16 MB Campaign.
+- **Market reference.** One keep-alive HTTP client and 10 requests/sec instead
+  of 2/sec, with retry and cooldown unchanged. Measured: 14.9 s → 6.0 s on 10
+  symbols. The snapshot is taken once per Campaign per unique pair; it is not
+  repeated per strategy or portfolio.
+- **Bootstrap pool.** The worker context goes through a private temp file in
+  `%TEMP%\mrs3-process-context`, not the child start-up pipe. A child dying at
+  start-up now raises `BrokenProcessPool`; the pool is replaced and the
+  unfinished tasks are retried once. Before, the parent blocked forever; a
+  2026-10-09 Panel job hung for over an hour this way. One pool serves the
+  whole Campaign and is owned by the job thread. Measured: 49 s → about 12 s
+  per composition.
+
+Verification: focused suites pass (panel jobs 49, market snapshot 36, process
+worker 6). The independent review passed, and its MINOR findings (thread
+ownership, cache release, temp-file sweep) were fixed with tests.
+
+## Portfolio executable identity on real lot-model data (2026-10-10)
+
+Every real lot-model Campaign failed post-search with
+`WEIGHTED_EXECUTABLE_IDENTITY_INVALID`: the Decimal `liquidity_v25_usdt` and
+`liquidity_a15` evidence was not JSON serializable. A real-data probe found no
+other Decimal path. Both fields are now bound as exact, finite canonical text;
+non-finite values fail closed. Contract: the 2026-10-10 identity amendment in the
+[UI spec](docs/specs/2026-09-06-portfolio-optimizer-panel-ui.md). Verification:
+adapter and selection suites, 366 passed; a restarted Panel run of the 61-pair
+5×2 Campaign passed composition 0 and continued. Independent review passed.
+The earlier run of that Campaign hung in a Windows multiprocessing spawn: a
+bootstrap child died at start-up while the parent was blocked writing to its
+pipe. It needed a Panel restart. The bootstrap pool spawn path is unchanged,
+and this remains an open reliability risk.
+
+Real-data evidence: Campaign `campaign-00b399c7100c42bf8692075d4ab9b72c` covered
+61 pairs, 5 of them with two finalists (32 compositions, exhaustive
+path), AGGRESSIVE profile, bank 1600. It SUCCEEDED in 78 min (about 2.4 min
+per composition) with 10 candidates. Candidate 1: required bank 719 USDT,
+source-proxy P30 1502 USDT/30d, historical DD 30%; candidates 2–10 differ only
+in the SOXX/SPCH/VST/XLK finalist choice (P30 1485–1502). These are
+pretest proxies, not tick-tested MRS3 results.
+
 ## Panel job admission reliability (2026-10-09)
 
 Panel job submission now persists `QUEUED` before worker dispatch, removes an
@@ -84,6 +706,28 @@ table. `git diff --check` passed. Live Panel restart and status check are still
 complete: Panel API on port 8766 responds, the stale in-memory QUEUED job is
 gone, and no `hb_c.exe` process is running. No tester run or PerformanceDB was
 used.
+
+## Performance v2 import launcher source (2026-10-09)
+
+Import job `8dda736e70b3449e890d1a4c0f908af7` failed before reading reports.
+Diagnosis found the local venv's editable install resolving code from
+`.worktrees/heavy-db-optimization`, which accepts schema v8, while the
+configured target is schema v10. The job's public error does not expose the
+underlying DuckDB open exception, but this runtime mismatch is incompatible;
+the current checkout's `src` passes the read-only v10 schema guard. No import
+was retried; database inspections used read-only connections.
+
+The Windows Panel launchers disable delayed expansion; the shared launcher
+prepends its checkout's `src` to `PYTHONPATH` without an empty path component
+and preserves existing entries. The other launchers delegate to it. Git pins
+Windows `.bat`, `.cmd`, and `.ps1` scripts under `scripts/` to CRLF. Focused
+`tests/test_panel_launcher.py` passed cmd.exe source-resolution checks for
+direct start and both wrappers with unset and pre-populated paths, including
+`!`, `^`, `%`, and a later duplicate `src` entry while caller delayed expansion
+was enabled. Panel was restarted on port 8766 and `/` returned HTTP 200. A
+stale non-listening `start_new_panel` process tree was stopped; the active
+listener remained available. No import was retried; the next step is user
+verification.
 
 ## PerformanceDB maintenance
 
@@ -113,8 +757,12 @@ implemented locally; its live migration remains open. Evidence and exact
 status rules are linked from the [equity status map](docs/specs/2026-10-03-equity-regime-status-map.md).
 
 Card 6 partial selection review import and the global finalist retest control
-are implemented. Blank `User Status` and `User Rank` cells now clear saved
-values. Final focused verification with
+are implemented. In the Card 6 `Импортировать статусы и ранги из XLSX` path,
+each import now reconciles prior FINALIST decisions for only the imported
+Pair + Side: an absent ID or a row without FINALIST plus rank becomes RESERVE
+with no rank; explicit REJECTED remains REJECTED with no rank. The ledger stays
+append-only. Other blank `User Status` and `User Rank` cells retain the
+documented clear behavior. Final focused verification with
 `.venv\Scripts\python.exe -m pytest -p no:cacheprovider tests/test_performance_v2_selection_review.py tests/test_performance_v2_store.py tests/test_performance_v2_compact.py tests/test_performance_v2_maintenance.py tests/test_panel_performance_v2.py`
 passed 477 tests with 4 platform skips. This covers transactional v9-to-v10
 migration, rollback/retry, and Panel schema preflight. A separate clean-HEAD
@@ -124,6 +772,15 @@ The live v9 database migration is still pending: after deploying this version,
 the Panel schema preflight must run before the Card 6 import. No live database
 mutation or Panel restart was performed. Independent code review returned
 `CODE_REVIEW_PASS`.
+
+### 2026-10-09 - Card 6 XLSX imports: reconcile prior finalists
+
+- Both Card 6 import paths reconcile prior FINALIST decisions for the exact Pair + Side: a prior FINALIST remains FINALIST only when re-imported with FINALIST and a non-empty rank; explicit REJECTED remains REJECTED and clears rank; every other prior FINALIST, including IDs absent from the current selection run, is appended as RESERVE with rank NULL. Existing review comments/history are preserved. The selection-review button contract is [ADR-0065](docs/decisions/0065-performance-v2-card6-partial-import-finalist-reconciliation.md); the combined-control path is covered by [ADR-0064](docs/decisions/0064-performance-v2-finalist-retest-review-reconciliation.md).
+- Verification after review fixes: `.venv\Scripts\python.exe -m pytest -p no:cacheprovider --basetemp <unique C:\Temp folder> --tb=short tests/test_performance_v2_selection_review.py tests/test_performance_v2_finalist_retest.py tests/test_panel_performance_v2_retest.py -k "not PARETO_PLATEAU_POINTS_PER_ORDER"`: 215 passed, 1 skipped, 1 deselected; temp folder removed. Four later edge-case regressions also passed. The skip is Windows symlink availability.
+- The 215-test run and four edge-case runs preceded the final REJECTED-tag-scope patch. Tests were not rerun after that patch per the user's explicit instruction. The final tag-sync change is therefore unverified; if testing is later authorized, cover both preservation of an omitted finalist's existing REJECTED tag and cleanup/re-add of the tag for a submitted REJECTED row.
+- Three unrelated broader-suite failures were reproduced on clean HEAD `8b755c4a292e0107ea6e2b701df6b865f9d792a9`: PARETO reason-alias rendering fails before import; v4 import migration test expects schema v9 though migration returns v10; prune fixture inserts 11 values into the 12-column `selection_results`. No production change was made for them. The Panel endpoints serialize writers with process and cross-process PerformanceDB locks; the import transaction covers finalist lookup, review append, and REJECTED tag synchronization.
+- The user imported `AMGN.xlsx`. Read-only verification matched its workbook hash to an import journal entry for AMGNUSDT/LONG (15 rows): 3 FINALIST (ranks 1–3), 8 RESERVE, 4 blank. No database mutation by the agent; no Panel restart performed by the agent. Independent code review returned `CODE_REVIEW_PASS`. Next: after restarting Panel from this checkout, the user can re-import the 81 workbooks; the final tag-scope patch remains unverified by tests at the user's request.
+
 ## Other verified Panel changes
 
 Panel PerformanceDB recalculation now serializes access through the controller
@@ -149,10 +806,40 @@ database, tester or Panel process was used.
 ## Bybit base-lot XLSX export (2026-10-07)
 
 The one-command [Bybit base-lot export](docs/specs/2026-10-07-bybit-base-lot-export.md)
-reuses the validated seven-day minute-liquidity window, writes the base lot to
-`Actual!C`, and writes the UTC date or an explicit cell error to `Actual!D`.
-Focused tests and independent review passed; no live workbook or network run
+now maintains ten UTC-date size columns in `Actual!C:L`; each header is a date
+and each value uses the seven complete dates preceding that header date. The
+pair and listing-date columns A/B are preserved; legacy output columns C/D are
+replaced. Later runs rotate only the date columns. A complete current date is
+skipped unless retained error cells need retry. Missed dates rebuild a
+contiguous ten-day window while mapping overlapping values by date; future
+listing dates remain blank. Historical errors are retried and empty filters are
+created through L. The filter preserves criteria outside the rewritten dates.
+Focused verification: 39 tests passed; `git diff --check` and `py_compile`
+passed; independent Opus `CODE_REVIEW_PASS`. No live workbook or network run
 was performed.
+## Bybit base-lot export: tester parquet, completeness, 10-day average (2026-10-16)
+
+The [base-lot export](docs/specs/2026-10-07-bybit-base-lot-export.md) now
+reads only the tester's `<SYMBOL><date>_1m.parquet` day files (CSV is no longer
+produced). A missing day is backfilled from the official Bybit trade archive
+and written in the tester's own parquet format (INT64/DOUBLE/INT32, REQUIRED,
+ZSTD, `hb.schema = candles_1m/1`) through `pyarrow`, a new dependency. Every
+run aligns the ten date columns with the run date and fills every blank or
+`ERROR:` cell of a pair listed by that date; numeric cells are kept. Layout:
+A pair, B listing, C `Среднее 10д, USDT` (floored mean of the numeric lots in
+D:M, recomputed on every saved run), D:M ten dates. A sheet with dates in C:L
+is moved one column right once (values, styles, widths without overlapping
+`<col>` ranges, filter criteria); foreign data in C1 or in M fails without
+replacing the workbook. ISO text date headers left by an Excel table are
+accepted and rewritten as dates.
+Verification: 132 focused tests passed (`test_calculate_bybit_base_lots`,
+`test_portfolio_minute_capacity`, `test_portfolio_minute_refinement`,
+`test_portfolio_position_sizing`); `git diff --check` clean; independent
+`CODE_REVIEW_PASS` after one fix (parquet column types are now validated). Live run on the
+local workbook: 546 lots for 2026-10-07..16, 91 pairs, 0 errors, 0 blank
+listed cells; a second run the same day is a byte-identical no-op. Open: one
+tester run on a day written by the export to confirm Parquet.Net reads it.
+
 ## Fresh shortlist Minimum Shift gate (2026-10-08)
 
 The fresh **Shortlist and READY JSON** flow has an optional
@@ -176,7 +863,7 @@ the first operational step below.
 - Bybit collector: phases 1 through 8 are delivered; live integration and soak evidence in phase 9 remain open. See the [collector specification](docs/specs/2026-09-05-bybit-market-data-collector.md) and [implementation plan](docs/superpowers/plans/2026-09-05-bybit-market-data-collector.md).
 - Canonical Phase 1: Tasks 0–12B are recorded complete; Task 12C fresh real-source smoke/performance remains open. Follow the [active specification](docs/specs/2026-08-16-mrs3-v07-canonical-phase1.md) and [implementation plan](docs/superpowers/plans/2026-08-16-mrs3-v07-canonical-phase1.md).
 - Portfolio Optimizer: Stage 2 ordered-batch implementation has fixture/fake evidence and independent `CODE_REVIEW_PASS`; no real tester run occurred. M6–M8 evidence ledgers are unadopted until the governing phased specification is reconciled. This does not authorize a real joint tester run, recommendation, trading admission, or live use. M5/M6 readiness, PnL floor, individual-DD ceiling, liquidity/freshness limits, profile ranking, and fresh user authorization remain open gates. The Phase 13 limiter work remains off-only while the bot limiter is not operational. See the [optimizer specification](docs/specs/2026-09-05-portfolio-optimizer.md), [UI contract](docs/specs/2026-09-06-portfolio-optimizer-panel-ui.md), [batch decision](docs/decisions/0059-portfolio-stage2-sequential-batch.md), and [implementation plan](docs/superpowers/plans/2026-10-07-portfolio-stage2-sequential-batch.md).
-- Campaign combination preflight: the configured limit and server-side rejection of over-limit job creation are implemented. The form still does not calculate or display the exact finalist combination product before submission. See the [Portfolio Optimizer UI specification](docs/specs/2026-09-06-portfolio-optimizer-panel-ui.md).
+- Portfolio MILP selection: oversized universes rank by the discovery-LP proxy; the union grid can be shorter than a composition's own period and LONG+SHORT symbols use an approximate one-way mask. Near-duplicate finalists can yield micro-variant candidates. Lightweight readiness does not compare prepared `source_digest`; a stale preparation is caught only at Campaign creation/run. See [ADR-0066](docs/decisions/0066-portfolio-milp-composition-selection.md).
 ## Next steps
 
 1. Restart or reload the Panel before using the Minimum Shift, finalist equity-filter and Finalist/Reserved-only selection controls; no live restart was performed during verification.
@@ -240,3 +927,117 @@ eligible for all 2361 strategies. Targeted recovery suites pass 180 tests with
 1 Windows symlink-capability skip. The live PerformanceDB was intentionally
 updated by this import. Next step: run the eligible equity filter when desired;
 no full finalist RETEST is needed. Blockers: none.
+
+Portfolio Optimizer lightweight readiness (2026-10-09): startup readiness now
+reads current FINALIST identity/count metadata and prepared-row headers only;
+it does not load strategy/action/equity payloads or decode `prepared_json`.
+Explicit finalist preparation and Campaign submission retain the strict
+prepared-artifact validation. Recovery keeps the latest terminal Campaign
+visible while unlocking Stage 1 for `SUCCEEDED`, `FAILED`, `CANCELLED`, and
+`INTERRUPTED`; only a nonterminal job freezes the form. Focused checks pass 9
+tests; review follow-up coverage passes 12 tests. Full Panel UI/Portfolio
+modules report 444 passed, 1 platform skip, and 3 known unrelated failures
+(maintenance copy expectation, Windows Node command-line length, and the
+11/12-column selection fixture). The shared selection insert was made
+column-explicit for schema compatibility; the full `test_portfolio_input.py`
+run then reports 117 passed and 32 unrelated failures from the in-progress
+`SelectionConfig.ab_decline_cap_pct` snapshot contract and remaining historical
+raw inserts. A separate strict-series/light-metadata contract run passes all 7
+tests. The maintenance copy failure reproduces from an isolated clean `HEAD`
+archive. No live database or Panel process was changed. Next step:
+restart/reload Panel and confirm the pair picker becomes editable without a
+full startup audit.
+
+Portfolio combination-limit error detail (2026-10-09): when weighted finalist
+composition enumeration exceeds `search.max_enumerated_combinations`, the
+persisted failed-Campaign message now retains `COMBINATION_LIMIT_EXCEEDED` and
+adds the exact product and configured limit. The adapter count/limit regression
+and persisted Panel status regression pass (3 focused tests). Reload Panel
+before the next run; the failed status will show `COMBINATIONS=N; LIMIT=M`.
+
+## Performance v2 P5.2 all-pairs filtering and direct rejection (2026-10-10)
+
+P5.2 is implemented and independently reviewed. The root-verified evidence
+ledger is: additive v11 migration tests/review `PASS`; selection suite `253
+passed`; aggregate-import suite `12 passed`; publication suite `65 passed`;
+all-pairs suite `17 passed`; Panel suite `205 passed, 4 skipped`; and static UI
+suite `172 passed`. Task6 styling/STALLED-boundary work and Task7
+filters-11-27/performance work are now root-verified, each with independent
+`CODE_REVIEW_PASS`.
+
+The current v11 contract-suite accounting is `469 passed` with `20 warnings`
+total. The initial full rerun recorded `455 passed` plus `14` compact failures,
+all solely from the `C:\Temp` capacity guard. A sanctioned capacity mock reran
+the compact module with `30 passed`, so all `469` logical tests pass. No real
+full-corpus compaction rehearsal is claimed; the guard itself was tested by the
+mock.
+
+The bounded PARETO/filter measurement conclusion is that the existing
+`PARETO_PLATEAU_POINTS_PER_ORDER` reason/alias expectation is unchanged;
+disabled legacy filter stage bodies are skipped, but candidate preparation is
+unconditional. Legacy filters are thus collapsed presentation-only; no risky
+loader optimization or safe-disable branch landed. This is not a production
+performance claim. The final holistic independent review returned
+`CODE_REVIEW_PASS`; no live-database, tick-test, or DD5-retest claim is made.
+
+## Bybit base-lot history repair (2026-10-10)
+
+The partially initialized Actual-sheet history was rebuilt for 2026-10-01 through
+2026-10-10. `--rebuild-history` recalculates all eligible pair/date cells,
+preserves the workbook if any calculation fails, clears stale output filters,
+and formats integral lot sizes without decimal digits. The workbook now has
+910 numeric values for 91 pairs and ten dates, zero calculation errors, and
+the expected 10 blank cells in the empty trailing row; AutoFilter is `A1:L93`.
+The focused suite passes 44 tests, `py_compile` and `git diff --check` pass, and
+independent Opus review returned `CODE_REVIEW_PASS`. Next step: normal daily
+execution uses the no-flag rotation path. Blockers: none.
+
+## Published-surface analysis catalog (2026-10-14)
+
+The "1. Analysis of published surface" picker now lists validated
+`*.analysis-v6.duckdb` files directly under the configured analysis root;
+nested folders are excluded. Verification: the catalog, fresh-strategy,
+shortlist and static-UI panel tests pass (267 tests) using
+`.venv\Scripts\python.exe -m pytest -q tests\test_panel_analysis_catalog.py tests\test_panel_fresh_strategies.py tests\test_panel_fresh_shortlist_v2.py tests\test_panel_static_ui.py`.
+The complete `test_panel*.py` sweep was stopped before completion. Next step:
+restart the Panel to load the updated catalog logic.
+
+## SINGLE_MODE collection launch checkbox and import integrity (2026-10-14)
+
+The report-collection checkbox now starts unchecked on Panel page load, and
+collection status refreshes no longer change the choice. The checkbox now also
+selects the target of the shared Verify/Import controls: unchecked uses the
+current ordinary tester job even when an older collection remains OPEN or
+VERIFIED. Reload recovery includes the newest COMMITTED ordinary tester job
+before inbox verification, so an explicit Verify remains available after a
+page refresh. Four focused static UI checks pass. The current ordinary
+20-strategy tester job is COMMITTED and awaits its ordinary inbox verification;
+the older 20-report collection remains VERIFIED but is not selected while the
+checkbox is off. No PerformanceDB import was launched by the agent. Next step:
+hard-refresh Panel and press Verify with the checkbox off.
+
+## Panel job journal locked-replacement fallback (2026-10-14)
+
+The failed SINGLE_MODE admission was rejected before tester startup because an
+external process kept the 14 MB `.panel-jobs.json` open without delete sharing.
+The lock remained after stopping Panel, while direct read/write access remained
+available. Atomic replacement remains primary and retains its bounded 10-attempt,
+0.45-second Windows retry. If that retry is exhausted for an existing writable
+journal, the registry saves and fsyncs the old journal to a recovery sidecar,
+then overwrites and verifies the completed payload in place. The complete
+sidecar is atomically published after storing both old and intended journal
+bytes and is directory-synced before the overwrite where supported. Startup and
+later saves preserve either complete payload, or restore old bytes after a
+partial overwrite; a missing journal is restored and an unreadable or malformed
+sidecar fails closed while preserving both files. Format-1 records with an
+intended digest remain readable. Directory entries are synced after atomic
+replacement and sidecar/staging-file changes where supported. Missing journals
+and failed direct writes remain fail-closed. Strategy paths now reject symlink
+and junction/reparse-point components, derive cleanup expectations from fixed
+allowed paths, and remove child reparse points without traversing targets. A
+real locked-journal save previously retained all 190 jobs. The seven changed
+config/runner/Single Mode/UI/template test modules pass 467 tests; one real
+symbolic-link test skips because this Windows account cannot create symlinks.
+Portable link checks and real Windows junction path/cleanup tests pass. No
+tester or PerformanceDB import was started by the agent. Next step: launch
+SINGLE_MODE from the refreshed Panel.

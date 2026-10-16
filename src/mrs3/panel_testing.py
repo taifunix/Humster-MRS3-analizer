@@ -58,9 +58,17 @@ _TEMPLATES = {
 }
 
 
+def _template_root(repo_root: Path | None) -> Path:
+    return Path(repo_root).resolve() if repo_root is not None else Path(__file__).resolve().parents[2]
+
+
 def mrs3_tester_config_template(repo_root: Path | None = None) -> Path:
-    root = Path(repo_root).resolve() if repo_root is not None else Path(__file__).resolve().parents[2]
-    return root / "templates/tester/mrs3/config_tester.json"
+    return _template_root(repo_root) / "templates/exchanges/Bybit/mrs3-tester.json"
+
+
+def portfolio_stage2_tester_config_template(repo_root: Path | None = None) -> Path:
+    """Tester config for optimizer Stage 2 runs, separate from MRS3 evaluation tests (ADR-0070)."""
+    return _template_root(repo_root) / "templates/exchanges/Bybit/portfolio-tester.json"
 
 
 def _resolve_repo_path(repo_root: Path, relative: str) -> Path:
@@ -482,7 +490,6 @@ class LocalTestingService:
             or type(tester_config.get("single_mode")) is not bool
             or tester_config.get("single_mode") is not False
             or type(tester_config.get("UpdateData")) is not bool
-            or tester_config.get("UpdateData") is not False
             or type(tester_config.get("use_runs")) is not bool
             or tester_config.get("use_runs") is not False
             or tester_config.get("parameter_mining") != []

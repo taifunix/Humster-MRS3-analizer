@@ -62,7 +62,7 @@ def test_v5_retest_status_and_manifest_are_read_only(tmp_path: Path) -> None:
     database, _strategy_id, _result_id = _v5_database(tmp_path)
     output_dir = tmp_path / "output-root" / "manifest"
     output_dir.mkdir(parents=True)
-    template = Path(__file__).resolve().parents[1] / "templates/strategies/retest-mrs3/base.json"
+    template = Path(__file__).resolve().parents[1] / "templates/exchanges/Bybit/mrs3-strategy.json"
 
     before = _database_state(database)
     with duckdb.connect(str(database), read_only=True) as connection:

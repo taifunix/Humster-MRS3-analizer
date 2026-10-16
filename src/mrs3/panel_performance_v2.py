@@ -34,6 +34,7 @@ from .performance_v2_store import (
     require_performance_v2,
     require_performance_v2_readable,
 )
+from .performance_v2_sizing import load_fixed_lot_bases
 from .performance_v2_windows import (
     METRICS_VERSION,
     WindowMetrics,
@@ -45,8 +46,10 @@ from .performance_v2_windows import (
 from .performance_v2_selection import (
     SelectionConfig,
     SelectionRequest,
+    has_ma_fact_columns,
     load_selection_candidates,
     retest_cohort_request,
+    strategy_ma_kinds,
     write_selection_workbook,
 )
 from .performance_v2_selection_review import (
@@ -176,7 +179,9 @@ def _export_xlsx(
             "strategy_id": strategy_id, "strategy_name": row[1], "symbol": row[2], "side": row[3],
             "timeframe": row[4], "close_ma_len": row[5], "order_count": row[6], "result_id": row[25],
             "effective_start_utc": row[31], "effective_end_utc": row[32],
-            "max_drawdown_pct": row[40], "finalist": status in {"FINALIST", "RESERVE"},
+            # A FIXED result shows its drawdown as a fraction of the base B (protocol v2 §4.6).
+            "max_drawdown_pct": candidate["max_drawdown_pct"] if candidate.get("lot_mode") == "FIXED" else row[40],
+            "finalist": status in {"FINALIST", "RESERVE"},
             "auto_status": status or "UNSELECTED", "auto_rank": rank, "final_rank": rank,
             "prior_retest": tagged, "elimination_reason": None,
         })
@@ -366,6 +371,8 @@ def export_performance_v2(
                 review["user_rank"] = None if decision is None else decision[1]
                 user_reviews[strategy_id] = review
             cached_candidates = _export_cached_candidates(connection, rows, selection_config)
+            for strategy_id, ma_kind in strategy_ma_kinds(connection, [int(row[0]) for row in rows]).items():
+                cached_candidates[strategy_id] = {**cached_candidates.get(strategy_id, {}), "ma_kind": ma_kind}
             equity_regime_snapshots = _export_equity_regime_snapshots(connection, rows, schema_version)
             decision_order = {"FINALIST": 1, "RESERVE": 2}
             rows.sort(key=lambda row: (
@@ -424,6 +431,7 @@ class PerformanceV2PanelRequest:
     test_end: str | None = None
     listing_dates_path: Path | None = None
     listing_dates_root: Path | None = None
+    listing_dates_sheet: str | None = None
     tester_strategy_root: Path | None = None
     tester_bot_root: Path | None = None
     expected_current_result_ids: Mapping[str, int] | None = None
@@ -599,6 +607,33 @@ def performance_v2_catalog(connection: duckdb.DuckDBPyConnection) -> dict[str, o
     for strategy in strategies:
         strategy["current_result_id"] = strategy["result_id"]
         strategy["orders"] = orders_by_strategy[int(strategy["strategy_id"])]
+    if strategies and has_ma_fact_columns(connection):
+        # Schema-v12 MA facts are added only when set, so a legacy catalog is unchanged.
+        by_id = {int(strategy["strategy_id"]): strategy for strategy in strategies}
+        for strategy_id, kind, source in connection.execute(
+            "select strategy_id, close_ma_type, close_ma_source from strategies"
+            " where close_ma_type is not null or close_ma_source is not null"
+        ).fetchall():
+            strategy = by_id.get(int(strategy_id))
+            if strategy is not None:
+                strategy.update({key: value for key, value in (("close_ma_type", kind), ("close_ma_source", source)) if value is not None})
+        orders_by_key = {
+            (int(strategy["strategy_id"]), int(order["order_id"])): order
+            for strategy in strategies for order in strategy["orders"]
+        }
+        for strategy_id, order_id, kind, source in connection.execute(
+            "select strategy_id, order_id, open_ma_type, open_ma_source from strategy_orders"
+            " where open_ma_type is not null or open_ma_source is not null"
+        ).fetchall():
+            order = orders_by_key.get((int(strategy_id), int(order_id)))
+            if order is not None:
+                order.update({key: value for key, value in (("open_ma_type", kind), ("open_ma_source", source)) if value is not None})
+    # Only FIXED results carry a lot mode, so a legacy catalog is unchanged.
+    fixed_bases = load_fixed_lot_bases(connection, [int(strategy["result_id"]) for strategy in strategies])
+    for strategy in strategies:
+        base = fixed_bases.get(int(strategy["result_id"]))
+        if base is not None:
+            strategy.update({"lot_mode": "FIXED", "lot_base": format(base.normalize(), "f")})
     return {"strategies": strategies}
 
 
@@ -770,6 +805,7 @@ class LocalPerformanceV2Service:
                 test_end=request.test_end,
                 listing_dates_path=request.listing_dates_path,
                 listing_dates_root=request.listing_dates_root,
+                listing_dates_sheet=request.listing_dates_sheet,
                 expected_current_result_ids=request.expected_current_result_ids,
                 expected_inbox_manifest_sha256=request.expected_inbox_manifest_sha256,
                 expected_collection_id=request.expected_collection_id,

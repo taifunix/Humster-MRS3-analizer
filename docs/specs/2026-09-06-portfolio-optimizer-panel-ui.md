@@ -1005,3 +1005,247 @@ current finalist set. Until READY, Calculate is disabled. During PREPARING all
 three Stage 1 actions are disabled. Campaign creation repeats the READY check;
 it never fills the prepared-input cache implicitly. A replaced current result
 therefore cannot borrow the prior revision's prepared data.
+
+### Lightweight readiness and terminal Campaign editing amendment (2026-10-09)
+
+`GET /api/v2/portfolio/readiness` is a metadata-only UI query. It may read the
+current FINALIST identities/counts and the small `optimizer_prepared_inputs`
+row headers needed to distinguish missing, available, and invalid preparation,
+but it must not load or decode `prepared_json`, `strategy_actions`, or
+`strategy_equity`. The strict preparation version/source digest/artifact check
+remains mandatory in both explicit `POST /api/v2/portfolio/finalist-inputs`
+handling and Campaign creation before a job is admitted. A lightweight READY
+response is therefore permission to edit the form, not proof that the later
+strict snapshot will succeed.
+
+Startup recovery may return the latest terminal Stage 1/Stage 2 Campaign so its
+status and results remain visible. `SUCCEEDED`, `FAILED`, `CANCELLED`, and
+`INTERRUPTED` jobs do not freeze the Stage 1 form; only a nonterminal active job
+does. The operator can immediately change pairs/profiles and submit a new
+Campaign without first pressing `New calculation`. The button still clears the
+displayed terminal Campaign when an empty result view is desired.
+
+### Combination-limit failure detail amendment (2026-10-09)
+
+When exact weighted finalist composition enumeration exceeds
+`search.max_enumerated_combinations`, the failed Campaign keeps the stable
+`COMBINATION_LIMIT_EXCEEDED` blocker and displays both the exact computed
+composition count and configured limit in its persisted error message. The
+count is the product of the eligible, cutoff finalist pools actually used by
+the server; it is not a UI estimate or the number of generated candidates.
+
+### MILP composition selection amendment (2026-10-10)
+
+Decision: [ADR-0066](../decisions/0066-portfolio-milp-composition-selection.md).
+This amendment supersedes the fail-closed overflow above and the
+Calculate-blocking part of the 2026-09-24 combination preflight.
+
+- Goal: a Campaign with any finalist universe size finishes in bounded time
+  without abandoning the exact evaluation of the portfolios it returns.
+- Non-goals: no change to the exact single-composition search, ranking,
+  retention, `max_candidates`, Stage 2, Settings schema, or PerformanceDB.
+- Input: the cutoff slot pools (product size `N`),
+  `search.max_enumerated_combinations` (`M`), and each launch profile.
+- `N <= M`: exhaustive enumeration in product order, unchanged.
+- `N > M`: per profile, `rank_slot_compositions` returns up to
+  `min(N, 2 × max_candidates)` distinct portfolios, best by the discovery-LP
+  objective first. It is one MILP over the union of slot options, with exactly
+  one option per slot. A no-good cut over the positive-weight choices is added
+  after each solve, and each solve is limited by
+  `weighted_search.wall_time_seconds`. Each returned composition is evaluated
+  by the exact path for that profile only. The result carries the warning
+  `COMPOSITION_SELECTION_MILP:COMBINATIONS=N;EVALUATED=<count>`.
+- The union of slot options is assembled once per Campaign. Its common UTC
+  grid must cover `minimum_common_days`. A time-limited solve keeps its feasible
+  incumbent and ends that profile's ranking. Each solve emits a
+  `COMPOSITION_SELECTION` progress event.
+- Selector failure: blocker `COMPOSITION_SELECTION_UNAVAILABLE:<code>`. This
+  includes a profile with no MILP solution, a short union grid, and a duplicate
+  strategy inside one slot. The Panel message keeps `COMBINATIONS=N; LIMIT=M`.
+- Readiness adds `combination_limit` (`M`, or `null` when unavailable). Below
+  the pair table the form shows `Комбинаций: N · лимит точного перебора: M` and
+  the mode that will run. Calculate is not disabled by `N`.
+- Invariants: no prepared input ever contains two members of one Pair + Side,
+  because the union is assembled from valid layer compositions cut to their
+  common UTC grid. The MILP output is a selector, never a published metric.
+- Acceptance evidence: on small universes the MILP order equals exhaustive
+  `_solve_lp` maximization, with and without margin bounds. Zero-weight
+  relabellings are not repeated. The adapter evaluates only the selected
+  compositions per profile. On the real 117-finalist snapshot (4·10^14
+  compositions), one solve takes 9–60 s.
+
+### Executable identity liquidity evidence amendment (2026-10-10)
+
+The lot-model enrichment stores `liquidity_v25_usdt` and `liquidity_a15` as
+exact `Decimal` values. The weighted executable identity binds both evidence
+fields as exact, finite canonical decimal text (`_weighted_decimal_text`), the
+same encoding it uses for sizes and the bank. A non-finite value is
+`WEIGHTED_EXECUTABLE_IDENTITY_INVALID`. Other evidence, including
+`optimizer_source_metadata`, still must already be plain JSON, and an embedded
+`Decimal` there remains `WEIGHTED_EXECUTABLE_IDENTITY_INVALID`. Before this
+change every real lot-model Campaign failed post-search with
+`WEIGHTED_EXECUTABLE_IDENTITY_INVALID`, because those two fields were not JSON
+serializable. Acceptance: a regression test binds the Decimal V25/A15 values,
+and a real 61-pair Campaign passes the identity stage.
+
+### Bank-ladder frontier amendment (2026-10-10)
+
+Decision: [ADR-0067](../decisions/0067-portfolio-bank-ladder-frontier.md). It
+supersedes the candidate selection of the MILP amendment above; the union
+assembly, failure codes and progress events stay.
+
+- Goal: `max_candidates` genuinely different portfolios per profile, not
+  near-copies of the saturated one.
+- Per profile, two MILP solves find the best P30 under the profile ceiling and
+  the smallest bank `B_sat` keeping it. Then `K = max_candidates` levels
+  `b_k = B_sat × k / K` (rounded up to 0.01 USDT, capped by the ceiling, and
+  skipped below 1 USDT) each get a P30-maximizing MILP over all finalist
+  compositions.
+- Each level's composition is evaluated by the exact path. `b_k` is passed as
+  `frontier_bank_usdt` / `lp_bank_limit` and bounds only the discovery LP;
+  acceptance keeps the profile ceiling and the full stress/margin bank. Each
+  level contributes only its best variant. A level with `BANK_UNAVAILABLE` is
+  skipped and counted in the warnings. Duplicates (same finalists, weights
+  within 1% relative L1) are kept once. The warning is
+  `COMPOSITION_SELECTION_FRONTIER:COMBINATIONS=N;LEVELS=<count>`.
+- The Panel shows `Комбинаций финалистов: N · отбор: MILP-фронтир по уровням
+  банка …`. `search.max_enumerated_combinations` and readiness
+  `combination_limit` remain for schema compatibility but no longer select a
+  mode.
+- Acceptance: each frontier level equals the exhaustive best LP composition at
+  that bank, with and without margin bounds. Levels have strictly decreasing
+  bank and P30. Binding banks pick other finalists. The adapter evaluates every
+  point at its own bank. A real full-universe Campaign (61 pairs, 117
+  finalists) completes.
+
+### Job-journal persistence cost amendment (2026-10-10)
+
+A running Stage 1 job keeps its frozen Campaign (tens of MB) in
+`runtime["campaign"]` next to `campaign_snapshot`. Progress and journal updates
+used to JSON round-trip that Campaign in `runtime()` and `sync()`, then
+serialize it once more in `_save` only to drop it. That cost about 2.3 s per
+update with a 16 MB Campaign, inside the calculation thread. The registry now
+shares `runtime["campaign"]` by reference between runtime copies, since it is
+written once at admission and only read afterwards. `_save` never serializes a
+Campaign that has a snapshot descriptor; a legacy Campaign without a
+descriptor is still persisted. Every other runtime key keeps its deep copy.
+Measured with the real 14 MB journal: 2.26 s → 0.16 s per progress update.
+
+### Pair history and selection summary amendment (2026-10-10)
+
+- Readiness adds `finalist_history`: for each current `PAIR|SIDE`, the
+  finalists in User Rank order with their history as whole UTC days
+  (`start`, `end`). The period rule is the optimizer's: the complete effective
+  range if valid, else the report range; starts round up and ends round down
+  to whole days. It reads `strategy_results` periods only. A finalist without
+  a usable period keeps its rank slot with `start`/`end` = `null`, so the
+  top-N cutoff stays exact. A history read failure returns `{}` and never
+  blocks Stage 1.
+- Each pair row shows `История: ≈ N д · dd.mm–dd.mm` for the finalists its
+  current LONG/SHORT limits would select (top-N by rank).
+- Under the pair table: `Выбрано пар · финалистов · совместная история · расчёт
+  ≈ … (оценка)`. The common history is the latest start to the earliest end over
+  all selected finalists. This is the same intersection the common pretest
+  period starts from, before its coverage rules.
+- The runtime estimate is a rough model fitted to the 2026-10-10 real runs
+  (61 pairs, 117 finalists, 21 days, 10 levels: about 16 min): `30 + 1.6·pairs
+  + 0.5·finalists·r + Σ_profiles[(K+2)·0.17·finalists·r + K·pairs·r]` seconds,
+  with `r = days/21` and `K = max_candidates`. It is guidance, not a bound.
+- Acceptance: helper behaviour via node (rank cutoff, intersection, labels,
+  estimate range, invalid limits); readiness history from DuckDB periods;
+  live check: 61 pairs, 21 days (16.09–07.10), estimate ≈ 17 min.
+
+### Pair table controls and Stage 2 portfolio selection amendment (2026-10-10)
+
+**Pair table.**
+- A separate `История` column shows `≈ N д` (bold) · `dd.mm–dd.mm` without a
+  label word.
+- The action row is `Выбрать все`, `Выбрать N финалистов` [N], `Выбрать
+  максимум`, `Отменить выбор`. `Выбрать N финалистов` selects every pair and
+  sets each side to `min(N, available)`; an invalid N is flagged and nothing
+  changes.
+- A sort selector on the right of the same row offers three display orders:
+  by name A–Z; by history, shortest first, with unknown last; by available
+  finalists, most first. Ties are broken by name. Sorting changes the display
+  order only, never the launch payload.
+
+**Stage 2 selection.**
+- `GET /campaigns/{id}/results` adds `candidates`: one compact row per
+  committed artifact candidate, in artifact order. Each row has `candidate_id`,
+  `order`, `profile`, `positions`, `required_bank_usdt`, `p30_usdt_30d`,
+  `historical_bank_usdt`, `stress_bank_usdt` (max of the bootstrap P95 banks),
+  `margin_bank_usdt`, `cdar80_usdt` and `max_drawdown_pct`, as decimal strings
+  or `null`. The table omits `max_drawdown_pct`: the historical bank is defined
+  by DD = profile limit, so that value always equals the limit.
+- The Stage 2 card lists these rows with a checkbox on the left, plus a header
+  checkbox for all. Nothing is selected initially. Rows are shown only for
+  the Campaign they were loaded for. A new calculation or a different
+  displayed Campaign clears them until that Campaign's own rows arrive. The button is `Отправить на
+  тест` and is enabled only with at least one selected portfolio.
+- The submission body may add `candidate_ids`: a non-empty list of unique
+  64-hex ids. Otherwise it is malformed (`PORTFOLIO_CAMPAIGN_INVALID`, 422).
+  Ids must belong to the committed artifact
+  (`PORTFOLIO_STAGE2_SELECTION_INVALID`, 422). The batch runs the selected
+  candidates in committed artifact order; the selection only filters it.
+- Idempotency is per selection and is checked before the batch is prepared.
+  The same set of ids for the same Campaign returns its live or successful
+  job. After a `FAILED`, `CANCELLED` or `INTERRUPTED` batch it starts a new
+  attempt. A different set creates a new batch under the shared tester
+  resource lock. Batch progress (`current_index`) counts positions within the
+  selected batch. A body without `candidate_ids`
+  keeps the previous whole-Campaign behaviour, including returning any
+  existing batch of that Campaign. This amends the "new Stage 1 Campaign
+  required for another batch" rule of the 2026-10-07 amendment.
+- Real tester execution still requires the operator's explicit action.
+
+**Where Stage 2 writes on disk** (from `config.local.json` →
+`tester_runner`):
+1. Private staging copy:
+   `<inbox_root>/panel-testing/mrs3-testing-*/strategies/PORTFOLIO_<SYMBOL>_<strategy>_<result>.json`.
+2. Install into the tester: `<bot_root>/<strategy_dir>`
+   (`settings_strategy`), and the config `<bot_root>/<tester_config>`
+   (`config_tester.json`). Both are snapshotted before the fill and restored
+   by `stop()`.
+3. Reports: `<bot_root>/tester/report/<candidate_id>/`.
+
+### Tester strategy rendering amendment (2026-10-10)
+
+This supersedes "canonical deterministic UTF-8 JSON" for the Stage 2 strategy
+and tester-config files. They are now rendered for the tester as follows:
+
+- **Format.** UTF-8 JSON with a two-space indent and a trailing newline. Keys
+  follow the order of `templates/strategies/portfolio-weighted-mrs/base.json`,
+  recursively; list items follow the template's first item. Keys absent from
+  the template keep their order after the template keys. The tester config
+  keeps the MRS3 tester template's key order.
+- **`basic.balance_percentage_long/short`** round up to a whole percent; a
+  zero stays zero.
+- **`mrs3.ma_long` / `mrs3.ma_short`.** Each order's `lot_x` rounds half-up
+  to 0.01. The last order takes the remainder, so the list total equals the
+  original total rounded to 0.01. If the last order would become negative, or a
+  positive last order would become 0, rendering fails closed (`ValueError`, the candidate is not prepared).
+- **`MakerFee`** is `0` in the tester config when every strategy's exchange
+  is Bybit; otherwise the template value stays.
+- Sizing receipts (`facts` B/C/q/x, `max_balance`) remain the exact artifact
+  values. Only the rendered files carry the rounding, and the
+  receipts/manifests hash those rendered bytes.
+- Known consequence, accepted by the operator on 2026-10-10: rounding a
+  percentage up enlarges every position of that strategy by
+  `ceil(100q)/(100q)` and lets its cap `max_balance·p/100` exceed the
+  liquidity cap C. Small `q` are hit hardest (q = 0.3% → ×3.3). Stage 2
+  therefore tests a somewhat larger portfolio than the one Stage 1 sized.
+- Evidence: the 70 strategies of the two exported portfolios were checked for
+  template order, whole percentages, cent `lot_x` and preserved totals.
+
+Tester config follow-up (2026-10-10, operator rule). This supersedes
+`UpdateData=false` in the Phase 7 local baseline paragraph (§11) and in the
+Stage 2 preparation paragraph before P7-R4:
+- Stage 2 writes `UpdateData=true`, so the tester refreshes its market data
+  before the run. `LocalTestingService.fill_prebuilt` still requires
+  `UpdateData` to be a boolean, but no longer requires `false`. Accepted
+  effects: reruns of the same candidate may see refreshed data, and the
+  download counts against the Stage 2 total wait (`stall_timeout_seconds`).
+- Report settings (`enable_html_report`, `include_*`, `enable_timing_logs`)
+  live only inside `report`. The canonical MRS3 tester template no longer
+  repeats them at the root. The fast strategy-test writer no longer writes
+  them at the root and drops stale root copies of those settings only.

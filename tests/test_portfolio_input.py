@@ -75,12 +75,17 @@ def _add_review(
         [run_id, instance_id, symbol, side, f"request-hash-{run_id}", f"config-hash-{run_id}", f"workbook-hash-{run_id}", selection_time],
     )
     connection.execute(
-        """insert into selection_results values
+        """insert into selection_results
+           (selection_run_id, strategy_id, result_id_at_selection, auto_status,
+            auto_score, auto_rank, auto_reason, analog_group_key,
+            auto_analog_of_strategy_id, prior_rejected, stage_trace_json) values
            (?, ?, ?, 'FINALIST', 1, 1, 'selected', '{}', null, false, '{}')""",
         [run_id, strategy_id, result_id],
     )
     connection.execute(
-        "insert into selection_review_imports values (?, ?, ?, ?, 1)",
+        "insert into selection_review_imports "
+        "(review_import_id, selection_run_id, workbook_sha256, imported_at_utc, row_count) "
+        "values (?, ?, ?, ?, 1)",
         [review_id, run_id, f"review-hash-{review_id}", selection_time],
     )
     connection.execute(
@@ -473,7 +478,7 @@ def test_read_current_finalists_preserves_untouched_review_in_later_partial_run(
             [second_result_id, second_strategy_id],
         )
         connection.execute(
-            "insert into strategy_orders values (?, 1, 7, .995, 125, 1, 'run', 'P1', 8)",
+            "insert into strategy_orders (strategy_id, order_id, open_ma_len, open_multiplier, shift_bp, lot_x, analysis_run_id, plateau_id, base_point_trades) values (?, 1, 7, .995, 125, 1, 'run', 'P1', 8)",
             [second_strategy_id],
         )
         connection.execute(
@@ -1361,21 +1366,49 @@ def test_read_current_finalists_can_skip_large_series_for_metadata_consumers(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    database = _database(tmp_path)
+    class MetadataConnection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, query, _parameters=None):
+            assert query == "begin transaction"
+            return self
+
+    facts = {
+        ("BTCUSDT", "LONG", 1, 11): {
+            "user_status": "FINALIST",
+            "user_rank": 1,
+            "selection_run_id": "run",
+            "review_import_id": "review",
+        },
+    }
     calls: list[str] = []
-    original = portfolio_input._records_for_ids
 
-    def checked(connection, table, column, ids):
+    def unexpected_records(_connection, table, _column, _ids):
         calls.append(table)
-        return original(connection, table, column, ids)
+        raise AssertionError(f"metadata reader loaded {table}")
 
-    monkeypatch.setattr(portfolio_input, "_records_for_ids", checked)
-    row = read_current_finalists(database, [("BTCUSDT", "LONG")], False)[0]
+    monkeypatch.setattr(portfolio_input.duckdb, "connect", lambda *_args, **_kwargs: MetadataConnection())
+    monkeypatch.setattr(portfolio_input, "require_performance_v2_readable", lambda *_args: None)
+    monkeypatch.setattr(portfolio_input, "_current_review_facts", lambda *_args, **_kwargs: (facts, set(facts), ()))
+    monkeypatch.setattr(portfolio_input, "_records_for_ids", unexpected_records)
 
+    row = read_current_finalists(tmp_path / "performance.duckdb", [("BTCUSDT", "LONG")], False)[0]
+
+    assert "strategies" not in calls
+    assert "strategy_results" not in calls
+    assert "strategy_orders" not in calls
     assert "strategy_actions" not in calls
     assert "strategy_equity" not in calls
-    assert "actions" not in row
-    assert "equity" not in row
+    assert set(row) == {
+        "strategy_id", "result_id", "symbol", "side", "user_status", "user_rank",
+        "selection_run_id", "review_import_id",
+    }
+    assert row["selection_run_id"] == "run"
+    assert row["review_import_id"] == "review"
     assert "action_series" not in row
     assert "equity_series" not in row
 
@@ -2797,3 +2830,159 @@ def test_current_result_common_period_shorter_than_minimum_fails_closed() -> Non
     result = resolve_common_pretest_period((row,), minimum_common_days=14)
     assert not result.available
     assert result.reason == "COMMON_PRETEST_PERIOD_UNAVAILABLE"
+
+
+def test_read_current_finalists_carries_ma_facts_only_when_set(tmp_path: Path) -> None:
+    database = _database(tmp_path)
+    with duckdb.connect(str(database)) as connection:
+        strategy_id = connection.execute("select strategy_id from strategies where symbol = 'BTCUSDT' and side = 'LONG'").fetchone()[0]
+        connection.execute(
+            """insert into strategy_orders (strategy_id, order_id, open_ma_len, open_multiplier, shift_bp, lot_x,
+               analysis_run_id, plateau_id, base_point_trades)
+               select strategy_id, 2, open_ma_len + 1, open_multiplier, shift_bp + 100, lot_x,
+                      analysis_run_id, plateau_id, base_point_trades
+                 from strategy_orders where strategy_id = ? and order_id = 1""",
+            [strategy_id],
+        )
+        connection.execute("update strategies set order_count = 2 where strategy_id = ?", [strategy_id])
+    legacy = read_current_finalists(database, [("BTCUSDT", "LONG")])[0]
+    assert "close_ma_type" not in legacy and "close_ma_source" not in legacy
+    assert all("open_ma_type" not in order and "open_ma_source" not in order for order in legacy["strategy_orders"])
+
+    with duckdb.connect(str(database)) as connection:
+        connection.execute("update strategies set close_ma_type = 'SMA', close_ma_source = 'ohlc4'")
+        connection.execute(
+            "update strategy_orders set open_ma_type = 'EMA', open_ma_source = 'close'"
+            " where strategy_id = ? and order_id = 2",
+            [strategy_id],
+        )
+    row = read_current_finalists(database, [("BTCUSDT", "LONG")])[0]
+
+    assert (row["close_ma_type"], row["close_ma_source"]) == ("SMA", "ohlc4")
+    first, second = row["strategy_orders"]
+    assert first["order_id"] == 1 and "open_ma_type" not in first and "open_ma_source" not in first
+    assert (second["order_id"], second["open_ma_type"], second["open_ma_source"]) == (2, "EMA", "close")
+
+
+def test_snapshot_candidates_exclude_display_only_ma_kind(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Isolate from the pre-existing unregistered selection Decimal fields.
+    original = portfolio_input._decimal_type
+
+    def tolerant(field, currency):
+        try:
+            return original(field, currency)
+        except PortfolioInputError:
+            return ("scalar", "1")
+
+    monkeypatch.setattr(portfolio_input, "_decimal_type", tolerant)
+    database = _database(tmp_path)
+    with duckdb.connect(str(database)) as connection:
+        if connection.execute(
+            "select count(*) from information_schema.columns where table_name = 'strategies' and column_name = 'close_ma_type'"
+        ).fetchone()[0]:
+            connection.execute("update strategies set close_ma_type = 'SMA', close_ma_source = 'ohlc4'")
+    snapshot = _snapshot(database, [REQUEST])
+
+    assert all("ma_kind" not in candidate for candidate in snapshot.candidates)
+    assert all("ma_kind" not in item for item in snapshot.payload["candidates"].items)
+
+
+def test_every_selection_config_decimal_has_a_snapshot_type() -> None:
+    from dataclasses import fields
+
+    config = portfolio_input.SelectionConfig()
+    decimals = {field.name for field in fields(config) if isinstance(getattr(config, field.name), Decimal)}
+
+    # A new Decimal setting must get a deliberate snapshot type (UNKNOWN_DECIMAL_FIELD otherwise).
+    missing = sorted(name for name in decimals if name not in portfolio_input._DECIMAL_FIELD_TYPES)
+    assert not missing
+    assert portfolio_input._decimal_type("researched_dd_abs", "USDT") == ("percent", "%")
+    assert portfolio_input._decimal_type("researched_dd5_abs", "USDT") == ("scalar", "1")
+    for stage_field in ("min_shift_pct", "pnl_tolerance_pct"):
+        assert portfolio_input._decimal_type(stage_field, "USDT") == ("percent", "%")
+
+
+def test_every_decimal_selection_candidate_fact_has_a_snapshot_type(tmp_path: Path) -> None:
+    database = _database(tmp_path)
+    with duckdb.connect(str(database)) as connection:
+        frame = portfolio_input.load_selection_candidates(
+            connection, REQUEST, portfolio_input.SelectionConfig(),
+        )
+    decimal_fields = {
+        column for column in frame.columns
+        # Missing optional columns are NaN in the frame; only real numbers need a type.
+        if any(isinstance(value, Decimal) or (isinstance(value, float) and value == value) for value in frame[column].tolist())
+    }
+
+    assert decimal_fields
+    assert sorted(
+        field for field in decimal_fields - {"lot_base"} if field not in portfolio_input._DECIMAL_FIELD_TYPES
+    ) == []
+
+
+def test_snapshot_measures_fixed_results_on_their_base(tmp_path: Path) -> None:
+    database = _database(tmp_path)
+    dynamic = _snapshot(database).candidates[0]
+    with duckdb.connect(str(database)) as connection:
+        connection.execute(
+            """update strategy_results set sizing_use_upnl = false, sizing_use_frozen_balance = true,
+               sizing_use_fix = true, sizing_max_balance = 0, sizing_my_fix_balance = 50,
+               sizing_balance_percentage_long = 100, sizing_risk_long = 1"""
+        )
+        connection.execute("delete from window_metrics")
+        selection = portfolio_input.load_selection_candidates(connection, REQUEST, portfolio_input.SelectionConfig()).iloc[0]
+    fixed = _snapshot(database).candidates[0]
+
+    assert fixed["pnl_30d_pct"] != dynamic["pnl_30d_pct"]
+    assert abs(fixed["pnl_30d_pct"] - selection["pnl_30d_pct"]) < Decimal("1e-10")  # selection reads the 12-place cache
+    assert fixed["max_drawdown_pct"] == selection["max_drawdown_pct"] == Decimal("10")
+    assert "lot_mode" not in fixed and "lot_base" not in fixed
+
+
+def test_portfolio_cycles_of_a_fixed_row_are_normalised_by_the_base() -> None:
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    row = {
+        "result_id": 7, "strategy_id": 3, "symbol": "BTCUSDT", "side": "LONG",
+        "imported_at_utc": start, "report_start_utc": start, "initial_balance": Decimal("1000"),
+        "sizing_use_upnl": False, "sizing_use_frozen_balance": True, "sizing_use_fix": True,
+        "sizing_balance_percentage_long": Decimal("100"), "sizing_risk_long": Decimal("1"),
+        "sizing_max_balance": Decimal("0"), "sizing_my_fix_balance": Decimal("500"),
+        "actions": (
+            {"action_index": 0, "timestamp_utc": start + timedelta(days=1), "symbol": "BTCUSDT", "action": "opened",
+             "size": Decimal("1"), "price": Decimal("100"), "cost": Decimal("100"), "post_size": Decimal("1"),
+             "balance": Decimal("1000"), "pnl": Decimal("0"), "fee": Decimal("0")},
+            {"action_index": 1, "timestamp_utc": start + timedelta(days=2), "symbol": "BTCUSDT", "action": "closed",
+             "size": Decimal("1"), "price": Decimal("110"), "cost": Decimal("110"), "post_size": Decimal("0"),
+             "balance": Decimal("1010"), "pnl": Decimal("10"), "fee": Decimal("0")},
+        ),
+        "equity": ({"sample_index": 0, "timestamp_utc": start, "equity": Decimal("1000")},),
+    }
+
+    fixed = portfolio_input._cycle_records(row, start + timedelta(days=3))
+    dynamic = portfolio_input._cycle_records(
+        {key: value for key, value in row.items() if key != "sizing_my_fix_balance"}
+        | {"sizing_use_upnl": True, "sizing_use_fix": False},
+        start + timedelta(days=3),
+    )
+
+    assert [cycle["normalized_pnl"] for cycle in fixed] == [Decimal("10") / Decimal("500")]
+    assert [cycle["normalized_pnl"] for cycle in dynamic] == [Decimal("10") / Decimal("1000")]
+
+
+def test_only_fixed_finalists_carry_their_lot_base(tmp_path: Path) -> None:
+    database = _database(tmp_path)
+    dynamic = read_current_finalists(database, [("BTCUSDT", "LONG")])[0]
+    with duckdb.connect(str(database)) as connection:
+        connection.execute(
+            """update strategy_results set sizing_use_upnl = false, sizing_use_frozen_balance = true,
+               sizing_use_fix = true, sizing_max_balance = 0, sizing_my_fix_balance = 250,
+               sizing_balance_percentage_long = 100, sizing_risk_long = 1"""
+        )
+        result_id = int(connection.execute("select result_id from strategy_results").fetchone()[0])
+    # The new sizing changes the source digest, so the optimizer input is prepared again.
+    prepare_current_optimizer_inputs(str(database), [result_id])
+    fixed = read_current_finalists(database, [("BTCUSDT", "LONG")])[0]
+
+    assert "fixed_lot_base" not in dynamic
+    assert fixed["fixed_lot_base"] == Decimal("250")
+    assert fixed["initial_balance"] != Decimal("250")

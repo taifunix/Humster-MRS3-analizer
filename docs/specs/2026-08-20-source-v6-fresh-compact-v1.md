@@ -196,6 +196,10 @@ digests, algorithm version, configuration hash, listing-date snapshot hash and
 `real_independent_events`.  The panel submits selected scopes as a multi-select
 and obtains the worker limit from `duckdb_import.workers`.
 
+The existing-analysis picker lists validated `*.analysis-v6.duckdb` files
+located directly in the configured `analysis_root`. It does not search nested
+directories; the catalog keeps each choice addressable relative to that root.
+
 ## 9. Minimum review disposition
 
 Each implementation task requires an independent reviewer disposition of

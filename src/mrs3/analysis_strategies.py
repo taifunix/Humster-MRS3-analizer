@@ -20,6 +20,7 @@ from .selection import (
     require_complete_operational_facts,
     validate_frozen_operational_facts,
 )
+from .evaluation_protocol import EvaluationTarget, apply_protocol_v2
 from .strategy_json import generate_strategy, validate_strategy, validate_unique_names
 
 
@@ -222,6 +223,8 @@ def generate_analysis_strategies(
     output_dir: Path | str,
     config: AlgorithmConfig,
     criteria: tuple[str, ...] = (),
+    *,
+    evaluation: EvaluationTarget | None = None,
 ) -> GeneratedAnalysisStrategies:
     """Publish EQUAL and INCOME JSON variants from one immutable analysis run."""
     found = connection.execute(
@@ -331,6 +334,8 @@ def generate_analysis_strategies(
         for method in methods:
             strategy = generate_strategy(template, structure, allocate_lots(structure["orders"], method, config), method, config)
             validate_strategy(strategy, structure, selected, config)
+            if evaluation is not None:
+                apply_protocol_v2(strategy, evaluation)
             generated.append(strategy)
             variants.append({"strategy_name": strategy["name"], "structure_id": structure["structure_id"], "lot_method": method.value, "json_filename": f"{strategy['name']}.json", "variant_type": "BASE_1ORD" if int(structure["order_count"]) == 1 else "MRS3"})
     validate_unique_names(generated)
@@ -490,6 +495,8 @@ def generate_v6_analysis_strategies(
     template_path: Path | str,
     output_dir: Path | str,
     config: AlgorithmConfig,
+    *,
+    evaluation: EvaluationTarget | None = None,
 ) -> GeneratedAnalysisStrategies:
     """Generate READY JSON directly from one committed Source v6 surface run.
 
@@ -540,6 +547,8 @@ def generate_v6_analysis_strategies(
         for method in methods:
             strategy = generate_strategy(template, structure, allocate_lots(structure["orders"], method, config), method, config)
             validate_strategy(strategy, structure, points, config)
+            if evaluation is not None:
+                apply_protocol_v2(strategy, evaluation)
             generated.append(strategy)
             variants.append({"strategy_name": strategy["name"], "structure_id": structure["structure_id"], "lot_method": method.value, "json_filename": f"{strategy['name']}.json", "variant_type": "MRS3", "candidate_identity": candidate_identity})
     if not generated:

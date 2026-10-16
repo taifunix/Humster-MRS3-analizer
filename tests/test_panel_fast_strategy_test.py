@@ -4,7 +4,9 @@ from dataclasses import replace
 from decimal import Decimal
 from hashlib import sha256
 import json
+import os
 from pathlib import Path
+import subprocess
 import time
 from threading import Event
 from types import SimpleNamespace
@@ -16,6 +18,7 @@ import mrs3.panel_fast_strategy_test as fast_strategy_module
 from mrs3.panel_fast_strategy_test import LocalFastStrategyTestService, LocalSingleModeStrategyTestService
 from mrs3.panel_fast_strategy_test import FastStrategyTestError
 from mrs3.panel_fast_strategy_test import _has_current_performance_v2_layout
+from mrs3.panel_fast_strategy_test import _clear_strategy_directory
 from mrs3.panel_fast_strategy_test import _write_fast_tester_config
 from mrs3.panel_fast_strategy_test import parse_initial_balance
 from mrs3.locking import TesterTargetLock
@@ -93,7 +96,7 @@ def _config(tmp_path: Path) -> RunnerConfig:
         executable_path=bot / "hb_c.exe",
         base_url="http://127.0.0.1:8087",
         port=8087,
-        strategy_dir=bot / "settings_strategy",
+        strategy_dir=bot / "tester" / "settings_strategy",
         report_dir=bot / "tester" / "report" / "my_test",
         wizard_result=bot / "tester" / "wizard_result.json",
         wizard_progress=bot / "tester" / "wizard_progress.json",
@@ -209,6 +212,140 @@ def test_runtime_directory_cleanup_fails_if_deleted_entry_remains_visible(
         fast_strategy_module._clear_directory(runtime, expected=runtime)
 
 
+def test_strategy_cleanup_uses_the_validated_resolved_directory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    bot_root = tmp_path / "bot"
+    strategy_dir = bot_root / "tester" / "settings_strategy"
+    strategy_dir.mkdir(parents=True)
+    calls = []
+
+    def capture_clear(path: Path, *, expected: Path) -> None:
+        calls.append((path, expected))
+
+    monkeypatch.setattr(fast_strategy_module, "_clear_directory", capture_clear)
+
+    _clear_strategy_directory(strategy_dir, bot_root=bot_root)
+
+    assert len(calls) == 1
+    assert calls[0][0] is not calls[0][1]
+    assert calls[0][0] == strategy_dir.resolve()
+    assert calls[0][1] == bot_root.resolve() / "tester" / "settings_strategy"
+
+
+def test_runtime_directory_cleanup_unlinks_symlink_like_entry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    runtime = tmp_path / "settings_strategy"
+    runtime.mkdir()
+    calls = []
+
+    class SymlinkLikeEntry:
+        name = "outside"
+
+        def stat(self, *, follow_symlinks: bool = True):
+            assert follow_symlinks is False
+            return SimpleNamespace(st_mode=0o120000)
+
+        def unlink(self, *, missing_ok: bool = False) -> None:
+            calls.append(("unlink", missing_ok))
+
+    real_iterdir = Path.iterdir
+    listed = False
+
+    def iter_runtime(path: Path):
+        nonlocal listed
+        if path == runtime.resolve() and not listed:
+            listed = True
+            return iter((SymlinkLikeEntry(),))
+        if path == runtime.resolve():
+            return iter(())
+        return real_iterdir(path)
+
+    monkeypatch.setattr(Path, "iterdir", iter_runtime)
+    monkeypatch.setattr(fast_strategy_module.shutil, "rmtree", lambda *_args: pytest.fail("must not descend into symlink"))
+
+    fast_strategy_module._clear_directory(runtime, expected=runtime)
+
+    assert calls == [("unlink", True)]
+
+
+def test_runtime_directory_cleanup_unlinks_junction_reparse_point(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    runtime = tmp_path / "settings_strategy"
+    runtime.mkdir()
+    calls = []
+
+    class JunctionLikeEntry:
+        name = "junction"
+
+        def stat(self, *, follow_symlinks: bool = True):
+            assert follow_symlinks is False
+            return SimpleNamespace(st_mode=0o040000, st_file_attributes=0x400, st_reparse_tag=0xA0000003)
+
+        def rmdir(self) -> None:
+            calls.append("rmdir")
+
+        def unlink(self, *, missing_ok: bool = False) -> None:
+            calls.append("unlink")
+
+    real_iterdir = Path.iterdir
+    listed = False
+
+    def iter_runtime(path: Path):
+        nonlocal listed
+        if path == runtime.resolve() and not listed:
+            listed = True
+            return iter((JunctionLikeEntry(),))
+        if path == runtime.resolve():
+            return iter(())
+        return real_iterdir(path)
+
+    monkeypatch.setattr(Path, "iterdir", iter_runtime)
+    monkeypatch.setattr(fast_strategy_module.shutil, "rmtree", lambda *_args: pytest.fail("must not recurse through junction"))
+
+    fast_strategy_module._clear_directory(runtime, expected=runtime)
+
+    assert calls == ["rmdir"]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows directory junction test")
+def test_runtime_directory_cleanup_preserves_target_of_real_junction(tmp_path: Path) -> None:
+    runtime = tmp_path / "settings_strategy"
+    runtime.mkdir()
+    external = tmp_path / "external"
+    external.mkdir()
+    protected = external / "keep.json"
+    protected.write_text("{}", encoding="utf-8")
+    junction = runtime / "outside"
+    result = subprocess.run(
+        ["cmd.exe", "/d", "/c", "mklink", "/J", str(junction), str(external)],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    fast_strategy_module._clear_directory(runtime, expected=runtime)
+
+    assert protected.read_text(encoding="utf-8") == "{}"
+    assert not junction.exists()
+
+
+def test_strategy_cleanup_unlinks_symlink_child_without_touching_external_target(tmp_path: Path) -> None:
+    bot_root = tmp_path / "bot"
+    strategy_dir = bot_root / "tester" / "settings_strategy"
+    strategy_dir.mkdir(parents=True)
+    external = tmp_path / "external"
+    external.mkdir()
+    protected = external / "keep.json"
+    protected.write_text("{}", encoding="utf-8")
+    link = strategy_dir / "outside"
+    try:
+        link.symlink_to(external, target_is_directory=True)
+    except (OSError, NotImplementedError) as error:
+        pytest.skip(f"directory symlink unavailable: {error}")
+
+    _clear_strategy_directory(strategy_dir, bot_root=bot_root)
+
+    assert protected.read_text(encoding="utf-8") == "{}"
+    assert list(strategy_dir.iterdir()) == []
+
+
 def test_fast_writer_starts_from_template_and_preserves_unrelated_keys(tmp_path: Path) -> None:
     config = _config(tmp_path)
     template = tmp_path / "config-template.json"
@@ -220,7 +357,12 @@ def test_fast_writer_starts_from_template_and_preserves_unrelated_keys(tmp_path:
         "InitialBalance": 1000.0,
         "max_parallel_runs": 99,
         "include_chart_balance": False,
-        "report": {"include_chart_balance": False, "include_position_stats": True},
+        "report": {
+            "include_chart_balance": False,
+            "include_position_stats": True,
+            "include_settings": True,
+            "include_strategy_settings": False,
+        },
         "unrelated": {"keep": [1, 2, 3]},
     }), encoding="utf-8")
 
@@ -242,10 +384,73 @@ def test_fast_writer_starts_from_template_and_preserves_unrelated_keys(tmp_path:
     assert rendered["InitialBalance"] == 2500.5
     assert isinstance(rendered["InitialBalance"], float)
     assert rendered["max_parallel_runs"] == config.max_parallel_submissions
-    assert rendered["include_chart_balance"] is True
+    assert "include_chart_balance" not in rendered
+    assert set(rendered) & set(rendered["report"]) == set()
     assert rendered["report"]["include_chart_balance"] is True
     assert rendered["report"]["include_position_stats"] is False
     assert rendered["report"]["include_trades_table"] is True
+    assert rendered["report"]["include_settings"] is True
+    assert "include_strategy_settings" not in rendered["report"]
+
+
+def test_single_mode_writer_uses_performance_v2_core_report_profile(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    template = tmp_path / "config-template.json"
+    template.write_text(json.dumps({
+        "include_strategy_settings": False,
+        "include_analytics": True,
+        "analytics_monte_carlo": 500,
+        "analytics_monte_carlo_seed": 7,
+        "report": {
+            "include_strategy_settings": False,
+            "include_analytics": True,
+        },
+    }), encoding="utf-8")
+
+    _write_fast_tester_config(
+        config,
+        "2026-09-13",
+        "2026-10-13",
+        single_mode=True,
+        template_path=template,
+    )
+
+    rendered = json.loads(config.tester_config.read_text(encoding="utf-8"))
+    report = rendered["report"]
+    assert report["enable_html_report"] is True
+    assert report["include_settings"] is True
+    assert report["include_chart_balance"] is True
+    assert report["include_summary_table"] is True
+    assert report["include_trades_table"] is True
+    assert report["include_analytics"] is False
+    assert report["include_monthly_returns_heatmap"] is False
+    assert report["include_chart_ohlc"] is False
+    assert report["include_chart_position"] is False
+    assert report["include_position_stats"] is False
+    assert report["analytics_monte_carlo"] == 0
+    assert report["analytics_monte_carlo_seed"] == 42
+    assert report["enable_timing_logs"] is False
+    assert "include_strategy_settings" not in report
+    for key in ("include_strategy_settings", "include_settings", "include_analytics", "analytics_monte_carlo", "analytics_monte_carlo_seed"):
+        assert key not in rendered
+
+
+def test_writer_drops_legacy_settings_alias_for_current_template(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    template = tmp_path / "config-template.json"
+    template.write_text(json.dumps({
+        "report": {
+            "include_settings": True,
+            "include_strategy_settings": False,
+        },
+    }), encoding="utf-8")
+
+    _write_fast_tester_config(config, "2026-09-13", "2026-10-13", template_path=template)
+
+    rendered = json.loads(config.tester_config.read_text(encoding="utf-8"))
+    assert rendered["single_mode"] is False
+    assert rendered["report"]["include_settings"] is True
+    assert "include_strategy_settings" not in rendered["report"]
 
 
 @pytest.mark.parametrize("value", ("", "abc", "1,5", "0", "-1", "NaN", True, 10 ** 1000))

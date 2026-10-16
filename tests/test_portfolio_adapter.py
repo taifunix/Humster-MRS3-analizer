@@ -1,7 +1,8 @@
+import hashlib
 import json
 from collections.abc import Mapping
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import importlib
 import inspect
@@ -135,6 +136,210 @@ def test_weighted_composition_preflight_rejects_product_overflow_before_build() 
         adapter_module._enumerate_weighted_compositions(rows, launch, 5)
 
 
+def _frontier_from_product(monkeypatch, level=Decimal("100")):
+    """Make the frontier return every composition at one bank level (loop-only tests)."""
+    from itertools import product as _product
+
+    monkeypatch.setattr(adapter_module, "_milp_union_inputs", lambda *args, **kwargs: object())
+    monkeypatch.setattr(
+        adapter_module,
+        "_milp_frontier_compositions",
+        lambda slots, union, campaign, profile, **kwargs: tuple(
+            (tuple(choice), level) for choice in _product(*(rows for _symbol, _side, rows in slots))
+        ),
+    )
+
+
+def _oversized_universe_campaign(max_candidates: int = 2):
+    campaign = _weighted_build_campaign()
+    campaign["config_document"]["search"]["max_enumerated_combinations"] = 5
+    campaign["launch"] = {
+        "pairs": ({"pair": "S", "max_finalist_long": 2, "max_finalist_short": 3},),
+        "profiles": (
+            {"profile_id": "BALANCED", "bank_available_usdt": Decimal("1000"), "max_candidates": max_candidates},
+            {"profile_id": "AGGRESSIVE", "bank_available_usdt": None, "max_candidates": 1},
+        ),
+    }
+    selected = tuple(
+        {"symbol": "S", "side": side, "user_rank": index, "strategy_id": index, "result_id": index}
+        for side, count, start in (("LONG", 2, 1), ("SHORT", 3, 3))
+        for index in range(start, start + count)
+    )
+    return campaign, selected
+
+
+def test_build_adapter_reports_exact_count_when_composition_selection_is_unavailable(monkeypatch) -> None:
+    campaign, selected = _oversized_universe_campaign()
+    def unavailable(*_args, **_kwargs):
+        raise CampaignContractError("COMMON_PERIOD_UNAVAILABLE")
+    monkeypatch.setattr(adapter_module, "_milp_union_inputs", unavailable)
+    monkeypatch.setattr(adapter_module, "_build_portfolio_candidates_single", lambda *args, **kwargs: pytest.fail("evaluated"))
+
+    result = build_portfolio_candidates(
+        selected,
+        campaign,
+        capacities={},
+        reference=None,
+        mark_prices={},
+        spread_observations={},
+        spread_history_statuses={"S": "READY"},
+        now_ms=0,
+    )
+
+    assert result.status == "FAIL"
+    assert result.blockers == ("COMPOSITION_SELECTION_UNAVAILABLE:COMMON_PERIOD_UNAVAILABLE",)
+    assert result.diagnostics == {
+        "combination_count": 6,
+        "combination_limit": 5,
+    }
+
+
+def test_build_adapter_fails_closed_when_a_profile_ranking_has_no_solution(monkeypatch) -> None:
+    campaign, selected = _oversized_universe_campaign()
+    monkeypatch.setattr(adapter_module, "_milp_union_inputs", lambda *args, **kwargs: object())
+    calls = []
+    def frontier(slots, union, profile_campaign, profile, **kwargs):
+        calls.append(profile["profile_id"])
+        if profile["profile_id"] == "AGGRESSIVE":
+            raise ValueError("COMPOSITION_SELECTION_NO_SOLUTION")
+        return (((slots[0][2][0], slots[1][2][0]), Decimal("10")),)
+    monkeypatch.setattr(adapter_module, "_milp_frontier_compositions", frontier)
+    monkeypatch.setattr(adapter_module, "_build_portfolio_candidates_single", lambda *args, **kwargs: pytest.fail("evaluated"))
+
+    result = build_portfolio_candidates(
+        selected, campaign, capacities={}, reference=None, mark_prices={}, spread_observations={},
+        spread_history_statuses={"S": "READY"}, now_ms=0,
+    )
+
+    assert calls == ["BALANCED", "AGGRESSIVE"]
+    assert result.blockers == ("COMPOSITION_SELECTION_UNAVAILABLE:COMPOSITION_SELECTION_NO_SOLUTION",)
+    assert result.diagnostics == {"combination_count": 6, "combination_limit": 5}
+
+
+def test_build_adapter_evaluates_frontier_points_at_their_bank_levels(monkeypatch) -> None:
+    campaign, selected = _oversized_universe_campaign(max_candidates=2)
+    union = object()
+    union_calls = []
+    def union_inputs(slots, union_campaign, **kwargs):
+        union_calls.append(len(slots))
+        return union
+    selector_calls: list[tuple[str, int, int]] = []
+    progress_events = []
+    def selector(slots, received_union, profile_campaign, profile, *, levels, progress=None):
+        assert received_union is union
+        selector_calls.append((profile["profile_id"], levels, len(slots)))
+        progress({"completed": 1, "total": levels + 2, "status": 0})
+        long_rows, short_rows = slots[0][2], slots[1][2]
+        frontier = (((long_rows[1], short_rows[2]), Decimal("50")), ((long_rows[0], short_rows[0]), Decimal("25")))
+        return frontier[:levels]
+    evaluated: list[tuple[str, tuple[int, ...], Decimal]] = []
+    def fake_single(composition, profile_campaign, *args, **kwargs):
+        profiles = profile_campaign["launch"]["profiles"]
+        assert len(profiles) == 1
+        ids = tuple(row["strategy_id"] for row in composition)
+        evaluated.append((profiles[0]["profile_id"], ids, profiles[0]["frontier_bank_usdt"]))
+        assert profiles[0]["bank_available_usdt"] == {"BALANCED": Decimal("1000"), "AGGRESSIVE": None}[profiles[0]["profile_id"]]
+        return adapter_module.AdapterResult(
+            "PASS",
+            variants=({"identity": f"{profiles[0]['profile_id']}-{ids[0]}-{ids[1]}", "profile_id": profiles[0]["profile_id"], "metrics": {"p30_common_usdt_30d": Decimal(str(sum(ids))), "cdar_peak80_usdt": Decimal("1"), "required_bank_usdt": Decimal("1")}},),
+        )
+    monkeypatch.setattr(adapter_module, "_milp_union_inputs", union_inputs)
+    monkeypatch.setattr(adapter_module, "_milp_frontier_compositions", selector)
+    monkeypatch.setattr(adapter_module, "_build_portfolio_candidates_single", fake_single)
+
+    result = build_portfolio_candidates(
+        selected, campaign, capacities={}, reference=None, mark_prices={}, spread_observations={},
+        spread_history_statuses={"S": "READY"}, now_ms=0, progress_callback=progress_events.append,
+    )
+
+    assert result.status == "PASS"
+    assert union_calls == [2]
+    assert selector_calls == [("BALANCED", 2, 2), ("AGGRESSIVE", 1, 2)]
+    assert evaluated == [
+        ("BALANCED", (2, 5), Decimal("50")), ("BALANCED", (1, 3), Decimal("25")),
+        ("AGGRESSIVE", (2, 5), Decimal("50")),
+    ]
+    assert [item["identity"] for item in result.variants] == ["BALANCED-2-5", "BALANCED-1-3", "AGGRESSIVE-2-5"]
+    assert "COMPOSITION_SELECTION_FRONTIER:COMBINATIONS=6;LEVELS=3" in result.warnings
+    selection_events = [event for event in progress_events if event.get("substage") == "COMPOSITION_SELECTION"]
+    # Same-substage events inside the 0.25 s throttle window may be coalesced.
+    assert (selection_events[0]["completed"], selection_events[0]["total"]) == (1, 4)
+    assert selection_events[0]["detail"] == "profile BALANCED MILP solve 1"
+
+
+def _layered_union_fixture(monkeypatch):
+    from mrs3.portfolio.input import PreparedWeightedInput
+
+    start = datetime(2026, 9, 1, tzinfo=timezone.utc)
+    grid = tuple(start + timedelta(days=index) for index in range(6))
+    def prepared(ids, first, last, offset):
+        rows = tuple(
+            tuple(Decimal(offset + 10 * column + t) for column in range(len(ids)))
+            for t in range(first, last)
+        )
+        return PreparedWeightedInput(grid[first], grid[last], 5, grid[first:last + 1], tuple(ids), rows, (), (), {}, {}, "k")
+    layers = {
+        (1, 3): prepared((1, 3), 0, 5, 0),
+        (2, 4): prepared((2, 4), 1, 5, 100),
+        (2, 5): prepared((2, 5), 1, 4, 200),
+    }
+    def layer_inputs(rows, *_args, **_kwargs):
+        ids = tuple(row["strategy_id"] for row in rows)
+        members = tuple({"strategy_id": strategy_id, "position_size_usdt": Decimal(strategy_id * 100)} for strategy_id in ids)
+        margins = {strategy_id: {"a": Decimal("0.1"), "b": Decimal("0.01")} for strategy_id in ids}
+        return members, layers[ids], margins
+    monkeypatch.setattr(adapter_module, "_selector_layer_inputs", layer_inputs)
+    campaign, selected = _oversized_universe_campaign()
+    slots, _total = adapter_module._weighted_slot_pools(selected, campaign["launch"])
+    return campaign, slots
+
+
+def test_milp_selector_merges_layers_on_common_grid_and_maps_choices(monkeypatch) -> None:
+    campaign, slots = _layered_union_fixture(monkeypatch)
+    captured = {}
+    def frontier(delta, caps, milp_slots, **kwargs):
+        captured.update(delta=delta, caps=caps, slots=milp_slots, kwargs=kwargs)
+        return (weighted_search_module.FrontierPoint((2, 3), Decimal("9"), Decimal("12.5")),)
+    monkeypatch.setattr(weighted_search_module, "slot_composition_frontier", frontier)
+
+    union = adapter_module._milp_union_inputs(
+        slots, campaign, capacities={}, reference=None, mark_prices={}, now_ms=0, margin_coefficients=None,
+    )
+    ranked = adapter_module._milp_frontier_compositions(slots, union, campaign, campaign["launch"]["profiles"][0], levels=3)
+
+    # Union columns follow first appearance: 1, 3 (layer 0), 2, 4 (layer 1), 5 (layer 2);
+    # rows are the common grid [day 1, day 4) of all three layers.
+    assert captured["slots"] == ((0, 2), (1, 3, 4))
+    assert captured["caps"] == tuple(Decimal(value) for value in (100, 300, 200, 400, 500))
+    assert [row[0] for row in captured["delta"]] == [Decimal(1), Decimal(2), Decimal(3)]
+    assert [row[4] for row in captured["delta"]] == [Decimal(211), Decimal(212), Decimal(213)]
+    assert captured["kwargs"]["common_days"] == Decimal(3)
+    assert captured["kwargs"]["bank_available"] == Decimal("1000")
+    assert captured["kwargs"]["levels"] == 3
+    assert [(tuple(row["strategy_id"] for row in composition), bank) for composition, bank in ranked] == [((2, 4), Decimal("12.5"))]
+
+
+def test_milp_union_rejects_a_common_grid_shorter_than_minimum_common_days(monkeypatch) -> None:
+    campaign, slots = _layered_union_fixture(monkeypatch)
+    campaign["config_document"]["search"]["composition"]["parameters"]["minimum_common_days"] = 4
+
+    with pytest.raises(CampaignContractError, match="COMMON_PERIOD_UNAVAILABLE"):
+        adapter_module._milp_union_inputs(
+            slots, campaign, capacities={}, reference=None, mark_prices={}, now_ms=0, margin_coefficients=None,
+        )
+
+
+def test_milp_union_rejects_duplicate_strategy_inside_one_slot() -> None:
+    campaign, _selected = _oversized_universe_campaign()
+    row = {"symbol": "S", "side": "LONG", "user_rank": 1, "strategy_id": 1, "result_id": 1}
+    slots = (("S", "LONG", (row, {**row, "user_rank": 2, "result_id": 2})),)
+
+    with pytest.raises(CampaignContractError, match="COMPOSITION_SELECTION_DUPLICATE_STRATEGY"):
+        adapter_module._milp_union_inputs(
+            slots, campaign, capacities={}, reference=None, mark_prices={}, now_ms=0, margin_coefficients=None,
+        )
+
+
 def test_weighted_composition_rejects_canonical_launch_pair_collision() -> None:
     rows = ({"symbol": "BTCUSDT", "side": "LONG", "user_rank": 1, "strategy_id": 1, "result_id": 1},)
     with pytest.raises(CampaignContractError) as error:
@@ -174,7 +379,58 @@ def test_weighted_composition_enumerator_rejects_duplicate_rank_without_selectio
     assert error.value.code == "USER_RANK_DUPLICATE"
 
 
-def test_build_adapter_evaluates_all_compositions_and_keeps_profile_top_k(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_build_adapter_keeps_one_best_variant_per_frontier_level(monkeypatch: pytest.MonkeyPatch) -> None:
+    _frontier_from_product(monkeypatch)
+    campaign, selected = _oversized_universe_campaign(max_candidates=4)
+    campaign["launch"]["profiles"] = campaign["launch"]["profiles"][:1]
+
+    def two_variants(composition, *args, **kwargs):
+        ids = tuple(row["strategy_id"] for row in composition)
+        return adapter_module.AdapterResult("PASS", variants=tuple(
+            {"identity": f"{ids}-{suffix}", "profile_id": "BALANCED", "metrics": {
+                "p30_common_usdt_30d": Decimal(str(sum(ids))) + bonus, "cdar_peak80_usdt": Decimal("1"), "required_bank_usdt": Decimal("1"),
+            }}
+            for suffix, bonus in (("base", Decimal("0.5")), ("cdar", Decimal("0")))
+        ))
+
+    monkeypatch.setattr(adapter_module, "_build_portfolio_candidates_single", two_variants)
+    result = build_portfolio_candidates(
+        selected, campaign, capacities={}, reference=None, mark_prices={}, spread_observations={},
+        spread_history_statuses={"S": "READY"}, now_ms=0,
+    )
+
+    # Six levels, four kept, one variant from each level only.
+    assert [item["identity"] for item in result.variants] == [
+        "(2, 5)-base", "(1, 5)-base", "(2, 4)-base", "(1, 4)-base",
+    ]
+
+
+def test_build_adapter_skips_a_frontier_level_whose_bank_is_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
+    _frontier_from_product(monkeypatch)
+    campaign, selected = _oversized_universe_campaign(max_candidates=6)
+    campaign["launch"]["profiles"] = campaign["launch"]["profiles"][:1]
+
+    def level(composition, *args, **kwargs):
+        ids = tuple(row["strategy_id"] for row in composition)
+        if ids == (2, 5):
+            return adapter_module.AdapterResult("FAIL", blockers=("PROFILE:BALANCED:BANK_UNAVAILABLE",))
+        return adapter_module.AdapterResult("PASS", variants=({"identity": str(ids), "profile_id": "BALANCED", "metrics": {
+            "p30_common_usdt_30d": Decimal(str(sum(ids))), "cdar_peak80_usdt": Decimal("1"), "required_bank_usdt": Decimal("1"),
+        }},))
+
+    monkeypatch.setattr(adapter_module, "_build_portfolio_candidates_single", level)
+    result = build_portfolio_candidates(
+        selected, campaign, capacities={}, reference=None, mark_prices={}, spread_observations={},
+        spread_history_statuses={"S": "READY"}, now_ms=0,
+    )
+
+    assert result.status == "PASS"
+    assert len(result.variants) == 5
+    assert "PROFILE:BALANCED:BANK_UNAVAILABLE:COUNT=1" in result.warnings
+
+
+def test_build_adapter_evaluates_every_frontier_point_and_keeps_profile_top_k(monkeypatch: pytest.MonkeyPatch) -> None:
+    _frontier_from_product(monkeypatch, Decimal("77"))
     campaign = _weighted_build_campaign()
     campaign["config_document"]["search"]["max_enumerated_combinations"] = 6
     campaign["launch"] = {
@@ -187,9 +443,11 @@ def test_build_adapter_evaluates_all_compositions_and_keeps_profile_top_k(monkey
         for index in range(start, start + count)
     )
     calls: list[tuple[int, ...]] = []
-    def fake_single(composition, *args, **kwargs):
+    banks: set = set()
+    def fake_single(composition, level_campaign, *args, **kwargs):
         ids = tuple(row["strategy_id"] for row in composition)
         calls.append(ids)
+        banks.update(profile["frontier_bank_usdt"] for profile in level_campaign["launch"]["profiles"])
         return adapter_module.AdapterResult(
             "PASS",
             variants=({"identity": f"candidate-{ids[0]}-{ids[1]}", "profile_id": "BALANCED", "metrics": {"p30_common_usdt_30d": Decimal(str(sum(ids))), "cdar_peak80_usdt": Decimal("1"), "required_bank_usdt": Decimal("1")}},),
@@ -202,10 +460,12 @@ def test_build_adapter_evaluates_all_compositions_and_keeps_profile_top_k(monkey
     )
     assert result.status == "PASS"
     assert calls == [(1, 3), (1, 4), (1, 5), (2, 3), (2, 4), (2, 5)]
+    assert banks == {Decimal("77")}
     assert [item["identity"] for item in result.variants] == ["candidate-2-5", "candidate-1-5"]
 
 
 def test_build_adapter_keeps_distinct_compositions_that_only_change_zero_member(monkeypatch: pytest.MonkeyPatch) -> None:
+    _frontier_from_product(monkeypatch)
     campaign = _weighted_build_campaign()
     campaign["config_document"]["search"]["max_enumerated_combinations"] = 2
     campaign["launch"] = {
@@ -280,6 +540,7 @@ def test_build_adapter_keeps_distinct_compositions_that_only_change_zero_member(
 
 
 def test_build_adapter_decorates_composition_exclusions_with_provenance(monkeypatch: pytest.MonkeyPatch) -> None:
+    _frontier_from_product(monkeypatch)
     campaign = _weighted_build_campaign()
     campaign["config_document"]["search"]["max_enumerated_combinations"] = 2
     campaign["launch"] = {
@@ -341,6 +602,7 @@ def test_build_adapter_decorates_composition_exclusions_with_provenance(monkeypa
 
 
 def test_build_adapter_keeps_passing_profile_variants_with_ordinary_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    _frontier_from_product(monkeypatch)
     campaign = _weighted_build_campaign()
     campaign["config_document"]["search"]["max_enumerated_combinations"] = 1
     campaign["launch"] = {
@@ -351,19 +613,25 @@ def test_build_adapter_keeps_passing_profile_variants_with_ordinary_failure(monk
         ),
     }
     selected = ({"symbol": "BTCUSDT", "side": "LONG", "user_rank": 1, "strategy_id": 11, "result_id": 101},)
-    monkeypatch.setattr(adapter_module, "_build_portfolio_candidates_single", lambda *args, **kwargs: adapter_module.AdapterResult(
-        "FAIL", variants=({"identity": "v", "profile_id": "BALANCED", "scenario_id": "BALANCED", "metrics": {
+    def per_profile(_composition, level_campaign, *args, **kwargs):
+        if level_campaign["launch"]["profiles"][0]["profile_id"] == "AGGRESSIVE":
+            return adapter_module.AdapterResult("FAIL", blockers=("PROFILE:AGGRESSIVE:LP_INFEASIBLE",))
+        return adapter_module.AdapterResult("PASS", variants=({"identity": "v", "profile_id": "BALANCED", "scenario_id": "BALANCED", "metrics": {
             "p30_common_usdt_30d": Decimal("2"), "cdar_peak80_usdt": Decimal("1"), "required_bank_usdt": Decimal("1"),
-        }},), blockers=("PROFILE:AGGRESSIVE:LP_INFEASIBLE",),
-    ))
+        }},))
+    monkeypatch.setattr(adapter_module, "_build_portfolio_candidates_single", per_profile)
     result = build_portfolio_candidates(selected, campaign, capacities={}, reference=None, mark_prices={}, spread_observations={}, spread_history_statuses={"BTCUSDT": "READY"}, now_ms=0)
     assert result.status == "PASS"
     assert len(result.variants) == 1 and result.variants[0]["profile_id"] == "BALANCED"
-    assert result.warnings == ("PROFILE:AGGRESSIVE:LP_INFEASIBLE:COUNT=1",)
+    assert result.warnings == (
+        "COMPOSITION_SELECTION_FRONTIER:COMBINATIONS=1;LEVELS=2",
+        "PROFILE:AGGRESSIVE:LP_INFEASIBLE:COUNT=1",
+    )
 
 
 @pytest.mark.parametrize("reason", ("SYMBOL_CAPACITY_MISMATCH:BTCUSDT", "SYMBOL_CAPACITY_EXCEEDED:BTCUSDT", "MISSING_SYMBOL"))
 def test_build_adapter_preserves_shared_capacity_blocker(reason: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    _frontier_from_product(monkeypatch)
     campaign = _weighted_build_campaign()
     campaign["config_document"]["search"]["max_enumerated_combinations"] = 1
     campaign["launch"] = {"pairs": ({"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0},), "profiles": ({"profile_id": "BALANCED", "bank_available_usdt": Decimal("1000"), "max_candidates": 1},)}
@@ -374,6 +642,7 @@ def test_build_adapter_preserves_shared_capacity_blocker(reason: str, monkeypatc
 
 
 def test_build_adapter_uses_canonical_spread_status_keys(monkeypatch: pytest.MonkeyPatch) -> None:
+    _frontier_from_product(monkeypatch)
     campaign = _weighted_build_campaign()
     campaign["config_document"]["search"]["max_enumerated_combinations"] = 1
     campaign["launch"] = {"pairs": ({"pair": "BTCUSDT", "max_finalist_long": 1, "max_finalist_short": 0},), "profiles": ({"profile_id": "BALANCED", "bank_available_usdt": Decimal("1000"), "max_candidates": 1},)}
@@ -2166,6 +2435,7 @@ def test_runtime_adapter_pretest_bypasses_spread_history_with_preliminary_status
 
 
 def test_outer_builder_accepts_empty_preliminary_spread_facts_for_all_symbols(monkeypatch):
+    _frontier_from_product(monkeypatch)
     selected = (
         {"symbol": "BTCUSDT", "side": "LONG", "user_rank": 1, "strategy_id": 11, "result_id": 101},
         {"symbol": "ETHUSDT", "side": "LONG", "user_rank": 1, "strategy_id": 12, "result_id": 102},
@@ -3294,6 +3564,35 @@ def test_weighted_executable_identity_binds_ordered_zero_member_source_rows():
     assert first != second
 
 
+def test_weighted_executable_identity_encodes_decimal_liquidity_evidence_exactly():
+    # Real lot-model enrichment stores V25/A15 as Decimal; the identity must accept and bind them.
+    campaign = weighted_campaign()
+    member = {"symbol": "BTCUSDT", "side": "LONG", "strategy_id": 11, "result_id": 101, "x_usdt": "100"}
+    payload = {
+        "strategy": {"name": "PORTFOLIO_BTCUSDT_11_101", "basic": {"symbol": "BTCUSDT"}},
+        "account": {}, "facts": {},
+    }
+    enriched = dict(_weighted_required_evidence(member), liquidity_v25_usdt=Decimal("123.40"), liquidity_a15=Decimal("0.5"))
+
+    identity = adapter_module._weighted_executable_identity(
+        campaign, "AGGRESSIVE", "AGGRESSIVE", Decimal("1000"), (member,), (enriched,), (payload,),
+    )
+
+    assert len(identity) == 64
+    assert identity == adapter_module._weighted_executable_identity(
+        campaign, "AGGRESSIVE", "AGGRESSIVE", Decimal("1000"), (member,), (dict(enriched, liquidity_v25_usdt=Decimal("123.4")),), (payload,),
+    )
+    assert identity != adapter_module._weighted_executable_identity(
+        campaign, "AGGRESSIVE", "AGGRESSIVE", Decimal("1000"), (member,), (dict(enriched, liquidity_a15=Decimal("0.6")),), (payload,),
+    )
+    for bad in (Decimal("NaN"), Decimal("Infinity")):
+        with pytest.raises(CampaignContractError) as error:
+            adapter_module._weighted_executable_identity(
+                campaign, "AGGRESSIVE", "AGGRESSIVE", Decimal("1000"), (member,), (dict(enriched, liquidity_v25_usdt=bad),), (payload,),
+            )
+        assert error.value.code == "WEIGHTED_EXECUTABLE_IDENTITY_INVALID"
+
+
 def test_weighted_executable_identity_binds_provenance_sizing_and_mask_evidence():
     campaign = weighted_campaign()
     member = {"symbol": "BTCUSDT", "side": "LONG", "strategy_id": 11, "result_id": 101, "x_usdt": "100"}
@@ -4363,7 +4662,7 @@ def test_weighted_payload_rewrites_basic_symbol_for_member_without_exchange_symb
 
 
 def test_weighted_payload_accepts_new_disk_template_for_btcusdt_fixture():
-    template_path = Path(__file__).parents[1] / "templates" / "strategies" / "portfolio-weighted-mrs" / "base.json"
+    template_path = Path(__file__).parents[1] / "templates" / "exchanges" / "Bybit" / "portfolio-strategy.json"
     template = json.loads(template_path.read_text(encoding="utf-8"))
     member = {"symbol": "BTCUSDT", "side": "LONG", "x_usdt": "100", "priority": 3}
 
@@ -4921,3 +5220,138 @@ def test_weighted_payload_rejects_derived_value_out_of_range_before_formatting(m
     with pytest.raises(CampaignContractError) as error:
         build_weighted_strategy_payload(template, dict(member, x_usdt="1"), Decimal("1e30"), Decimal("1e30"), 3)
     assert error.value.code == "WEIGHTED_PAYLOAD_INVALID"
+
+
+@pytest.mark.parametrize("side", ("LONG", "SHORT"))
+def test_build_strategy_payloads_apply_stored_ma_facts_and_keep_legacy_json(side):
+    suffix = side.lower()
+    orders = (
+        {"order_id": 1, "open_ma_len": 34, "shift_bp": 50, "lot_x": Decimal("0.5")},
+        {"order_id": 2, "open_ma_len": 21, "shift_bp": 150, "lot_x": Decimal("0.5")},
+    )
+    legacy_source = {
+        "symbol": "BTCUSDT", "side": side, "strategy_id": 11, "result_id": 101,
+        "timeframe": "3h", "close_ma_len": 55, "order_count": 2, "strategy_orders": orders,
+    }
+    fact_source = dict(
+        legacy_source, close_ma_type="SMA", close_ma_source="ohlc4",
+        strategy_orders=(
+            dict(orders[0], open_ma_type="SMA", open_ma_source="ohlc4"),
+            dict(orders[1], open_ma_source="close"),
+        ),
+    )
+    member = {
+        "symbol": "BTCUSDT", "side": side, "strategy_id": 11, "result_id": 101,
+        "x_usdt": Decimal("100"), "capacity_usdt": Decimal("400"), "priority": 3,
+    }
+
+    def build(source):
+        enriched = dict(source, position_size_usdt=Decimal("400"), planned_leverage=Decimal("10"))
+        return adapter_module._build_strategy_payloads(
+            _weighted_strategy_template_fixture(), (member,), (source,), (enriched,), Decimal("1000"), 2,
+        )[0]["strategy"]
+
+    legacy = build(legacy_source)
+    with_facts = build(fact_source)
+
+    legacy_orders = legacy["mrs3"][f"ma_{suffix}"]
+    assert all("type" not in entry and "source" not in entry for entry in legacy_orders)
+    assert "type" not in legacy["mrs3"][f"ma_close_{suffix}"]
+    fact_orders = with_facts["mrs3"][f"ma_{suffix}"]
+    assert (fact_orders[0]["type"], fact_orders[0]["source"]) == ("SMA", "ohlc4")
+    assert "type" not in fact_orders[1] and fact_orders[1]["source"] == "close"
+    assert (with_facts["mrs3"][f"ma_close_{suffix}"]["type"], with_facts["mrs3"][f"ma_close_{suffix}"]["source"]) == ("SMA", "ohlc4")
+    for legacy_entry, fact_entry in zip(legacy_orders, fact_orders, strict=True):
+        assert {k: v for k, v in fact_entry.items() if k not in {"type", "source"}} == legacy_entry
+    stripped = json.loads(json.dumps(with_facts, default=str))
+    for entry in stripped["mrs3"][f"ma_{suffix}"] + [stripped["mrs3"][f"ma_close_{suffix}"]]:
+        entry.pop("type", None)
+        entry.pop("source", None)
+    assert stripped == json.loads(json.dumps(legacy, default=str))
+    complete_source = dict(
+        fact_source, strategy_orders=tuple(dict(order, open_ma_type="SMA", open_ma_source="ohlc4") for order in orders),
+    )
+    assert adapter_module._has_complete_ma_facts(complete_source)
+    assert not adapter_module._has_complete_ma_facts(fact_source)
+    assert not adapter_module._has_complete_ma_facts(legacy_source)
+
+
+def test_build_adapter_counts_members_built_from_legacy_ma_prototype(monkeypatch):
+    def source(side, strategy_id, result_id, facts):
+        order = {"order_id": 1, "open_ma_len": 34, "shift_bp": 50, "lot_x": Decimal("1")}
+        row = {
+            "symbol": "BTCUSDT", "side": side, "strategy_id": strategy_id, "result_id": result_id,
+            "timeframe": "3h", "close_ma_len": 55, "order_count": 1, "strategy_orders": (order,),
+            "actions": (), "equity": (),
+        }
+        if facts:
+            row.update(close_ma_type="SMA", close_ma_source="ohlc4",
+                       strategy_orders=(dict(order, open_ma_type="SMA", open_ma_source="ohlc4"),))
+        return row
+
+    selected = (source("LONG", 11, 101, False), source("SHORT", 22, 202, True))
+    enriched = tuple(_weighted_required_evidence(dict(
+        row, position_size_usdt=Decimal("400"), planned_leverage=Decimal("9"),
+    )) for row in selected)
+    solver_members = tuple({
+        "symbol": "BTCUSDT", "side": side, "strategy_id": strategy_id, "result_id": result_id,
+        "x_usdt": Decimal("357"), "capacity_usdt": Decimal("400"), "priority": 3,
+    } for side, strategy_id, result_id in (("LONG", 11, 101), ("SHORT", 22, 202)))
+    candidate = candidate_search.PortfolioCandidate(
+        schema_version="portfolio_candidate_v1", profile_id="BALANCED", scenario_id="BALANCED",
+        identity="solver-candidate", members=solver_members,
+        metrics={"limiter_L": 2, "required_bank_usdt": Decimal("100")},
+    )
+    campaign = _weighted_build_campaign()
+    campaign["weighted_input_rows"] = selected
+    monkeypatch.setattr(adapter_module, "enrich_finalist_rows", lambda *_args, **_kwargs: SimpleNamespace(
+        status="PASS", rows=enriched, exclusions=(), reason=None,
+    ))
+    monkeypatch.setattr(adapter_module, "_prepare_frozen_weighted_input", lambda *args: _prepared_stub(*args))
+    monkeypatch.setattr(adapter_module, "_run_weighted_search", lambda *_args, **_kwargs: candidate_search.SearchResult(
+        status="PASS", candidates=(candidate,), mode=CAMPAIGN_SEARCH_MODE,
+    ))
+
+    result = build_portfolio_candidates(
+        selected, campaign, capacities={}, reference=_payload_reference(), mark_prices={"BTCUSDT": Decimal("100")},
+        spread_observations={}, spread_history_statuses={"BTCUSDT": "READY"}, now_ms=0,
+        margin_coefficients=_margin_evidence(11, 22), strategy_template=_weighted_strategy_template_fixture(),
+    )
+
+    assert result.status == "PASS", (result.blockers, result.excluded)
+    variant = result.variants[0]
+    assert variant["legacy_ma_prototype_members"] == 1
+    payloads = {payload["side"]: payload["strategy"]["mrs3"] for payload in variant["strategy_payloads"]}
+    assert "type" not in payloads["LONG"]["ma_long"][0]
+    assert payloads["SHORT"]["ma_short"][0]["type"] == "SMA"
+    assert payloads["SHORT"]["ma_close_short"]["source"] == "ohlc4"
+
+
+def _real_weighted_template_payload(side):
+    template = json.loads(
+        (Path(__file__).resolve().parents[1] / "templates/exchanges/Bybit/portfolio-strategy.json").read_text(encoding="utf-8")
+    )
+    orders = tuple(
+        {"order_id": number, "open_ma_len": length, "shift_bp": shift, "lot_x": Decimal("0.25")}
+        for number, (length, shift) in enumerate(((34, 50), (21, 150), (55, 300), (13, 600)), start=1)
+    )
+    source = {
+        "symbol": "BTCUSDT", "side": side, "strategy_id": 11, "result_id": 101,
+        "timeframe": "3h", "close_ma_len": 55, "order_count": 4, "strategy_orders": orders,
+    }
+    member = {
+        "symbol": "BTCUSDT", "side": side, "strategy_id": 11, "result_id": 101,
+        "x_usdt": Decimal("100"), "capacity_usdt": Decimal("400"), "priority": 3,
+    }
+    enriched = dict(source, position_size_usdt=Decimal("400"), planned_leverage=Decimal("10"))
+    payload = adapter_module._build_strategy_payloads(template, (member,), (source,), (enriched,), Decimal("1000"), 2)[0]
+    return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+@pytest.mark.parametrize(("side", "digest"), [
+    ("LONG", "e1520da93bb5ea08344ab6671c9ec92c17763af0e349e8cdd94c7ee8671fe9e4"),
+    ("SHORT", "a769ac18f7f02c0ac34403ff41ef15caaf704748b0d88b1372b282f213bfff06"),
+])
+def test_legacy_stage2_payload_from_real_template_is_byte_identical(side, digest):
+    # Golden digests of the pre-P2c payload: rows without MA facts keep the legacy prototype.
+    assert _real_weighted_template_payload(side) == digest

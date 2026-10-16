@@ -4,3 +4,6 @@
 # different machine. `fragment_id` is canonical and unaffected, but pinning the
 # bytes keeps the two from diverging for a confusing reason.
 tests/fixtures/** -text
+/scripts/*.bat text eol=crlf
+/scripts/*.cmd text eol=crlf
+/scripts/*.ps1 text eol=crlf

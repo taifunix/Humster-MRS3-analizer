@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date, datetime, time, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_HALF_EVEN, ROUND_HALF_UP, Decimal, InvalidOperation
 from html.parser import HTMLParser
 import json
 import re
@@ -108,7 +108,65 @@ def _settings(document: object) -> dict[str, object]:
     return candidates[0]
 
 
-def _tables(document: object) -> tuple[dict[str, str], tuple[dict[str, str], ...], tuple[str, ...], tuple[str, ...]]:
+_METRIC_NUMBER = re.compile(r"^([+-]?\d+(?:\.\d+)?)%?$")
+_LEADING_METRIC_NUMBER = re.compile(r"^([+-]?\d+(?:\.\d+)?)%?(?=$|\s|\u00b7)")
+
+
+def _compatible_duplicate_metric(canonical: str, duplicate: str) -> bool:
+    """A repeated metric may restate the first value, rounded or annotated.
+
+    Equal text, two "n/a" forms, or a duplicate whose leading number (an
+    optional "%" ignored) equals the canonical number by value ("9.9" then
+    "9.90") or the canonical number rounded to the duplicate's lower precision
+    ("0.0918" then "0.09 · SYMBOL · time") are compatible. Anything else,
+    including a duplicate more precise than the canonical value but not equal
+    to it, is a conflict.
+    """
+    if canonical == duplicate:
+        return True
+    first, second = canonical.strip(), duplicate.strip()
+    if first.casefold().startswith("n/a") and second.casefold().startswith("n/a"):
+        return True
+    canonical_match = _METRIC_NUMBER.fullmatch(first)
+    duplicate_match = _LEADING_METRIC_NUMBER.match(second)
+    if canonical_match is None or duplicate_match is None:
+        return False
+    canonical_value = Decimal(canonical_match.group(1))
+    duplicate_value = Decimal(duplicate_match.group(1))
+    if canonical_value == duplicate_value:
+        return True
+    exponent = duplicate_value.as_tuple().exponent
+    if canonical_value.as_tuple().exponent >= exponent:
+        return False
+    quantum = Decimal(1).scaleb(exponent)
+    return any(
+        canonical_value.quantize(quantum, rounding=rounding) == duplicate_value
+        for rounding in (ROUND_HALF_UP, ROUND_HALF_EVEN)
+    )
+
+
+def _merge_metric_rows(
+    tables: list[list[tuple[str, str]]], *, report_format_2026_10: bool,
+) -> dict[str, str]:
+    """Merge Metric/Value tables; the first occurrence of a key is canonical."""
+    metrics: dict[str, str] = {}
+    for rows in tables:
+        for key, value in rows:
+            if not key:
+                raise PerformanceParseError("metrics contain duplicate or empty keys")
+            if key in metrics:
+                if not report_format_2026_10:
+                    raise PerformanceParseError("metrics contain duplicate or empty keys")
+                if not _compatible_duplicate_metric(metrics[key], value):
+                    raise PerformanceParseError(f"conflicting duplicate metric: {key}")
+                continue
+            metrics[key] = value
+    return metrics
+
+
+def _tables(
+    document: object, *, report_format_2026_10: bool = False,
+) -> tuple[dict[str, str], tuple[dict[str, str], ...], tuple[str, ...], tuple[str, ...]]:
     metric_matches: list[tuple[dict[str, str], tuple[str, ...]]] = []
     trade_matches: list[tuple[tuple[dict[str, str], ...], tuple[str, ...]]] = []
     for table in document.xpath("//table"):
@@ -117,6 +175,8 @@ def _tables(document: object) -> tuple[dict[str, str], tuple[dict[str, str], ...
         trade_candidate = {"Timestamp", "Symbol", "Action", "PnL"} <= set(headers)
         if (metric_candidate or trade_candidate) and len(headers) != len(set(headers)):
             raise PerformanceParseError("duplicate table header")
+        if report_format_2026_10 and not (metric_candidate or trade_candidate):
+            continue
         rows: list[dict[str, str]] = []
         for row in table.xpath(".//tbody/tr"):
             cells = [_text(cell) for cell in row.xpath("./th|./td")]
@@ -124,13 +184,7 @@ def _tables(document: object) -> tuple[dict[str, str], tuple[dict[str, str], ...
                 raise PerformanceParseError("table row width differs from its headers")
             rows.append(dict(zip(headers, cells, strict=True)))
         if len(headers) >= 2 and headers[:2] == ("Metric", "Value"):
-            metrics: dict[str, str] = {}
-            for row in rows:
-                key, value = row["Metric"], row["Value"]
-                if not key or key in metrics:
-                    raise PerformanceParseError("metrics contain duplicate or empty keys")
-                metrics[key] = value
-            metric_matches.append((metrics, headers))
+            metric_matches.append(([(row["Metric"], row["Value"]) for row in rows], headers))
         if {"Timestamp", "Symbol", "Action", "PnL"} <= set(headers):
             trade_matches.append((tuple(rows), headers))
     if len(trade_matches) != 1:
@@ -138,14 +192,12 @@ def _tables(document: object) -> tuple[dict[str, str], tuple[dict[str, str], ...
     if not metric_matches:
         raise PerformanceParseError("exactly one Metric/Value table is required")
     metric_headers = metric_matches[0][1]
-    metrics: dict[str, str] = {}
-    for candidate, headers in metric_matches:
-        if headers != metric_headers:
-            raise PerformanceParseError("metric table headers differ")
-        for key, value in candidate.items():
-            if key in metrics:
-                raise PerformanceParseError("metrics contain duplicate or empty keys")
-            metrics[key] = value
+    if any(headers != metric_headers for _rows, headers in metric_matches):
+        raise PerformanceParseError("metric table headers differ")
+    metrics = _merge_metric_rows(
+        [rows for rows, _headers in metric_matches],
+        report_format_2026_10=report_format_2026_10,
+    )
     actions, trade_headers = trade_matches[0]
     return metrics, actions, metric_headers, trade_headers
 
@@ -278,7 +330,9 @@ def _stdlib_raw_markup(source: str) -> _RawMarkup:
 _raw_markup = _stdlib_raw_markup
 
 
-def _raw_inventory(source: str, *, allow_empty: bool = False) -> _RawInventory:
+def _raw_inventory(
+    source: str, *, allow_empty: bool = False, report_format_2026_10: bool = False,
+) -> _RawInventory:
     pre_text, raw_tables = _raw_markup(source)
     settings_count = 0
     for raw in pre_text:
@@ -293,7 +347,7 @@ def _raw_inventory(source: str, *, allow_empty: bool = False) -> _RawInventory:
         if isinstance(value, dict) and isinstance(value.get("name"), str) and value["name"] and isinstance(value.get("basic"), dict):
             settings_count += 1
 
-    metric_matches: list[tuple[int, tuple[str, ...], tuple[str, ...]]] = []
+    metric_matches: list[tuple[tuple[str, ...], list[tuple[str, str]]]] = []
     trade_matches: list[tuple[int, tuple[str, ...], tuple[datetime, ...]]] = []
     for headers, rows in raw_tables:
         metric_candidate = len(headers) >= 2 and headers[:2] == ("Metric", "Value")
@@ -305,10 +359,7 @@ def _raw_inventory(source: str, *, allow_empty: bool = False) -> _RawInventory:
         if any(len(row) != len(headers) for row in rows):
             raise PerformanceParseError("table row width differs from its headers")
         if metric_candidate:
-            keys = [row[0] for row in rows]
-            if any(not key for key in keys) or len(keys) != len(set(keys)):
-                raise PerformanceParseError("metrics contain duplicate or empty keys")
-            metric_matches.append((len(rows), headers, tuple(keys)))
+            metric_matches.append((headers, [(row[0], row[1]) for row in rows]))
         if trade_candidate:
             timestamp_index = headers.index("Timestamp")
             trade_matches.append((len(rows), headers, tuple(_timestamp(row[timestamp_index]) for row in rows)))
@@ -318,16 +369,13 @@ def _raw_inventory(source: str, *, allow_empty: bool = False) -> _RawInventory:
         raise PerformanceParseError("exactly one Metric/Value table is required")
     if len(trade_matches) != 1:
         raise PerformanceParseError("exactly one trade table is required")
-    metric_headers = metric_matches[0][1]
-    metric_count = 0
-    metric_keys: set[str] = set()
-    for count, headers, keys in metric_matches:
-        if headers != metric_headers:
-            raise PerformanceParseError("metric table headers differ")
-        if metric_keys.intersection(keys):
-            raise PerformanceParseError("metrics contain duplicate or empty keys")
-        metric_keys.update(keys)
-        metric_count += count
+    metric_headers = metric_matches[0][0]
+    if any(headers != metric_headers for headers, _rows in metric_matches):
+        raise PerformanceParseError("metric table headers differ")
+    metric_count = len(_merge_metric_rows(
+        [rows for _headers, rows in metric_matches],
+        report_format_2026_10=report_format_2026_10,
+    ))
     trade_count, trade_headers, action_timestamps = trade_matches[0]
     return _RawInventory(
         settings_count,
@@ -432,7 +480,7 @@ def _assert_declared_empty(metrics: Mapping[str, str]) -> None:
 
 
 def parse_performance_report(
-    source: bytes, *, allow_zero_activity: bool = False
+    source: bytes, *, allow_zero_activity: bool = False, report_format_2026_10: bool = False,
 ) -> ParsedPerformanceReport:
     """Parse one tester report into settings, metrics, actions and series.
 
@@ -441,17 +489,27 @@ def parse_performance_report(
     DD5 candidates from this parser under ADR-0006, and admitting empty runs
     there would change that contract as a side effect. Only
     `normalize_source_v6` opts in.
+
+    `report_format_2026_10` admits the 2026-10 tester report: repeated metric
+    rows that restate the first value (`_compatible_duplicate_metric`) and
+    extra non-metric tables whose rows use merged cells. Metric and trade tables
+    keep every structural check. Only the Performance v2 parser opts in.
     """
     if not isinstance(source, bytes):
         raise PerformanceParseError("source must be bytes")
     try:
         decoded = source.decode("utf-8", errors="strict")
-        raw = _raw_inventory(decoded, allow_empty=allow_zero_activity)
+        raw = _raw_inventory(
+            decoded, allow_empty=allow_zero_activity,
+            report_format_2026_10=report_format_2026_10,
+        )
         document = html.fromstring(decoded)
     except (UnicodeDecodeError, etree.ParserError) as error:
         raise PerformanceParseError("malformed UTF-8 or HTML") from error
     settings = _settings(document)
-    metrics, actions, metric_headers, trade_headers = _tables(document)
+    metrics, actions, metric_headers, trade_headers = _tables(
+        document, report_format_2026_10=report_format_2026_10,
+    )
     wallet = _series(decoded, "walletSeries", allow_empty=allow_zero_activity)
     equity = _series(decoded, "equitySeries", allow_empty=allow_zero_activity)
     if len(wallet) != len(equity):

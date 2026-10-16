@@ -23,7 +23,7 @@ def test_compact_refuses_existing_target(tmp_path: Path) -> None:
     assert target.read_bytes() == b"keep"
 
 
-def test_compact_copies_complete_small_v10_fixture(tmp_path: Path) -> None:
+def test_compact_copies_complete_small_v11_fixture(tmp_path: Path) -> None:
     from tests.test_performance_v2_selection import _candidate_db
 
     (tmp_path / "source").mkdir()
@@ -32,7 +32,7 @@ def test_compact_copies_complete_small_v10_fixture(tmp_path: Path) -> None:
     strategy_id, result_id = connection.execute(
         "select strategy_id, result_id from strategy_results"
     ).fetchone()
-    selection_run_id = "compact-v10-run"
+    selection_run_id = "compact-v11-run"
     instance_id = connection.execute(
         "select value from schema_info where key = 'database_instance_id'"
     ).fetchone()[0]
@@ -61,6 +61,23 @@ def test_compact_copies_complete_small_v10_fixture(tmp_path: Path) -> None:
            ) values (?, ?, ?, ?, ?, ?, ?, ?, now())""",
         source_evidence,
     )
+    connection.execute(
+        "update strategy_results set tester_version = '2026/10/10', report_format = '2026-10' where result_id = ?",
+        [result_id],
+    )
+    connection.execute(
+        "insert into strategy_report_metrics (result_id, gross_profit_usdt, trades_full_exit, max_unrealized_dd_at_utc) "
+        "values (?, 7.42, 248, '2026-08-31 13:15:00+00')",
+        [result_id],
+    )
+    connection.execute(
+        "insert into strategy_report_regimes values (?, 'TREND_HIGH_VOL', 9, 2.15, 0.2394, 100.0, 48.12)", [result_id],
+    )
+    connection.execute("insert into strategy_report_monthly values (?, '2026-08-01', 3.32)", [result_id])
+    report_rows_before = {
+        table: connection.execute(f"select * from {table} order by all").fetchall()
+        for table in ("strategy_report_metrics", "strategy_report_regimes", "strategy_report_monthly")
+    }
     selection_result_before = connection.execute(
         "select * from selection_results"
     ).fetchall()
@@ -82,6 +99,8 @@ def test_compact_copies_complete_small_v10_fixture(tmp_path: Path) -> None:
             "import_files", "selection_runs", "selection_results",
             "selection_review_imports", "selection_review_rows", "strategy_tags",
             "optimizer_prepared_inputs", "equity_quality_metrics", "strategy_rejection_sources",
+            "selection_publications", "selection_publication_runs", "selection_aggregate_imports",
+            "strategy_report_metrics", "strategy_report_regimes", "strategy_report_monthly",
         )
     }
     connection.close()
@@ -91,12 +110,15 @@ def test_compact_copies_complete_small_v10_fixture(tmp_path: Path) -> None:
     report = compact_performance_v2(source, target, workers=2)
 
     assert report["source_stat_unchanged"] is True
-    assert report["source_schema_version"] == 10
-    assert report["target"]["schema_version"] == 10
+    assert report["source_schema_version"] == 12
+    assert report["target"]["schema_version"] == 12
     assert report["memory_limit"] == "16GB"
     assert report["table_counts"] == {name: int(count) for name, count in before.items()}
     assert report["verified_table_counts"] == report["table_counts"]
     with duckdb.connect(str(target), read_only=True) as compacted:
+        assert {
+            table: compacted.execute(f"select * from {table} order by all").fetchall() for table in report_rows_before
+        } == report_rows_before
         assert compacted.execute("select * from selection_results").fetchall() == selection_result_before
         assert compacted.execute("select * from strategy_rejection_sources").fetchall() == rejection_sources_before
         assert compacted.execute(
@@ -167,7 +189,7 @@ def test_compact_preserves_semantically_invalid_legacy_payload(tmp_path: Path) -
     assert decode_prepared_storage(target_payload) == legacy_payload
 
 
-def test_compact_migrates_empty_v6_schema_to_v10(tmp_path: Path) -> None:
+def test_compact_migrates_empty_v6_schema_to_v11(tmp_path: Path) -> None:
     from tests.test_performance_v2_store import _initialize_v6_fixture
 
     source = tmp_path / "source.duckdb"
@@ -178,7 +200,61 @@ def test_compact_migrates_empty_v6_schema_to_v10(tmp_path: Path) -> None:
     report = compact_performance_v2(source, target, workers=1)
 
     assert report["source_schema_version"] == 6
-    assert report["target"]["schema_version"] == 10
+    assert report["target"]["schema_version"] == 12
+
+
+def test_compact_migrates_v10_source_and_keeps_legacy_review_unlinked(tmp_path: Path) -> None:
+    from tests.test_performance_v2_store import (
+        _insert_migration_selection_run,
+        _prepare_v10_migration_fixture,
+    )
+    from mrs3.performance_v2_store import require_performance_v2_readable
+
+    source = tmp_path / "source-v10.duckdb"
+    with duckdb.connect(str(source)) as connection:
+        _prepare_v10_migration_fixture(connection)
+        _insert_migration_selection_run(connection, "compact-v10-run")
+        connection.execute(
+            "insert into selection_review_imports values ('compact-v10-review', 'compact-v10-run', 'compact-hash', now(), 1)"
+        )
+        assert require_performance_v2_readable(connection) == 10
+    target = tmp_path / "target-v11.duckdb"
+
+    report = compact_performance_v2(source, target, workers=1)
+
+    assert report["source_schema_version"] == 10
+    assert report["target"]["schema_version"] == 12
+    with duckdb.connect(str(source), read_only=True) as original:
+        assert require_performance_v2_readable(original) == 10
+    with duckdb.connect(str(target), read_only=True) as compacted:
+        assert require_performance_v2_readable(compacted) == 12
+        assert compacted.execute(
+            "select aggregate_import_id from selection_review_imports where review_import_id = 'compact-v10-review'"
+        ).fetchone() == (None,)
+        assert compacted.execute("select count(*) from selection_publications").fetchone() == (0,)
+
+    verified_output = tmp_path / "verified-v10-to-v11.duckdb"
+    verified = compact_module.verify_existing_candidate(
+        source, target, verified_output, workers=1,
+    )
+    assert verified["source_schema_version"] == 10
+    assert verified["candidate_schema_version"] == 12
+    assert verified["verified_table_counts"]["selection_review_imports"] == 1
+
+
+def test_verify_candidate_requires_v11_target_for_v10_source(tmp_path: Path) -> None:
+    from tests.test_performance_v2_store import _prepare_v10_migration_fixture
+
+    source = tmp_path / "source-v10.duckdb"
+    with duckdb.connect(str(source)) as connection:
+        _prepare_v10_migration_fixture(connection)
+    candidate = tmp_path / "candidate-v10.duckdb"
+    shutil.copyfile(source, candidate)
+
+    with pytest.raises(ValueError, match="candidate schema version must be 12"):
+        compact_module.verify_existing_candidate(
+            source, candidate, workers=1, spill_parent=tmp_path, smoke_ranges=1,
+        )
 
 
 def test_compact_accepts_v5_commission_rate_not_nullability(tmp_path: Path) -> None:
@@ -195,11 +271,11 @@ def test_compact_accepts_v5_commission_rate_not_nullability(tmp_path: Path) -> N
             "where table_name = 'strategy_results' and column_name = 'commission_rate'"
         ).fetchone() == ("NO",)
 
-    target = tmp_path / "target-v10.duckdb"
+    target = tmp_path / "target-v11.duckdb"
     report = compact_performance_v2(source, target, workers=1)
 
     assert report["source_schema_version"] == 5
-    assert report["target"]["schema_version"] == 10
+    assert report["target"]["schema_version"] == 12
     with duckdb.connect(str(source), read_only=True) as connection:
         assert require_performance_v2_readable(connection) == 5
         assert connection.execute(
@@ -259,17 +335,17 @@ def test_compact_migrates_v8_selection_rows_without_backfill(tmp_path: Path) -> 
         metrics_before = connection.execute("select * from equity_quality_metrics").fetchall()
         assert len(selection_before) == 1
 
-    target = tmp_path / "target-v10.duckdb"
+    target = tmp_path / "target-v11.duckdb"
     report = compact_performance_v2(source, target, workers=1)
 
     assert report["source_schema_version"] == 8
-    assert report["target"]["schema_version"] == 10
+    assert report["target"]["schema_version"] == 12
     assert report["table_counts"]["selection_results"] == 1
     assert report["verified_table_counts"]["selection_results"] == 1
     assert report["table_counts"]["strategy_rejection_sources"] == 0
     assert report["verified_table_counts"]["strategy_rejection_sources"] == 0
     with duckdb.connect(str(target), read_only=True) as connection:
-        assert require_performance_v2_readable(connection) == 10
+        assert require_performance_v2_readable(connection) == 12
         assert connection.execute("select * from selection_results").fetchall() == [
             (*selection_before[0], None)
         ]
@@ -788,3 +864,167 @@ def test_verify_candidate_cli_rejects_nonpositive_worker_override(
 
     assert error.value.code == 2
     assert "workers must be a positive integer" in capsys.readouterr().err
+
+
+def test_fast_verify_ranges_are_row_balanced_and_cover_both_catalogs() -> None:
+    connection = duckdb.connect()
+    connection.execute("attach ':memory:' as origin")
+    for catalog in ("origin", "memory"):
+        connection.execute(f"create table {catalog}.main.strategy_equity (result_id bigint, sample_index integer)")
+    source_counts = {1: 3, 2: 3, 5: 4, 9: 1}
+    for result_id, count in source_counts.items():
+        for index in range(count):
+            connection.execute("insert into origin.main.strategy_equity values (?, ?)", [result_id, index])
+            connection.execute("insert into memory.main.strategy_equity values (?, ?)", [result_id, index])
+    # A candidate-only result_id above the source maximum must still be inside a range.
+    connection.execute("insert into memory.main.strategy_equity values (12, 0)")
+
+    ranges = compact_module._fast_verify_ranges(
+        connection, "strategy_equity", "origin", "memory", target_rows=6,
+    )
+
+    assert ranges == ((1, 2), (3, 12))
+
+
+def test_fast_verify_ranges_isolate_oversized_result_and_handle_empty_table() -> None:
+    connection = duckdb.connect()
+    connection.execute("attach ':memory:' as origin")
+    for catalog in ("origin", "memory"):
+        connection.execute(f"create table {catalog}.main.strategy_equity (result_id bigint, sample_index integer)")
+
+    assert compact_module._fast_verify_ranges(
+        connection, "strategy_equity", "origin", "memory", target_rows=5,
+    ) == ()
+
+    for result_id, count in ((1, 2), (2, 9), (3, 2)):
+        for index in range(count):
+            connection.execute("insert into origin.main.strategy_equity values (?, ?)", [result_id, index])
+
+    assert compact_module._fast_verify_ranges(
+        connection, "strategy_equity", "origin", "memory", target_rows=5,
+    ) == ((1, 1), (2, 2), (3, 3))
+
+
+def test_fast_verifier_uses_one_range_for_small_tables(tmp_path: Path) -> None:
+    from tests.test_performance_v2_selection import _candidate_db
+
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    _candidate_db(source_dir).close()
+    source = source_dir / "strategy_performance.duckdb"
+    candidate = tmp_path / "candidate.duckdb"
+    shutil.copyfile(source, candidate)
+    progress: list[dict[str, object]] = []
+
+    compact_module.verify_existing_candidate(
+        source, candidate, tmp_path / "published.duckdb", workers=1, spill_parent=tmp_path,
+        progress_callback=progress.append,
+    )
+
+    range_events = [event for event in progress if event["phase"] == "verify_range"]
+    assert {event["table"]: event["range_count"] for event in range_events} == {
+        "strategy_actions": 1, "strategy_equity": 1,
+    }
+
+
+def test_compact_copies_large_tables_in_row_balanced_ranges(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tests.test_performance_v2_selection import _candidate_db
+
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    _candidate_db(source_dir).close()
+    calls: list[tuple[str, str, str]] = []
+    original = compact_module._fast_verify_ranges
+
+    def record(connection, table, source_catalog, target_catalog, *, target_rows):
+        calls.append((table, source_catalog, target_catalog))
+        return original(connection, table, source_catalog, target_catalog, target_rows=target_rows)
+
+    monkeypatch.setattr(compact_module, "_fast_verify_ranges", record)
+    report = compact_performance_v2(
+        source_dir / "strategy_performance.duckdb", tmp_path / "compact.duckdb", workers=1,
+    )
+
+    # Called once for the copy and once for the verification of each large table.
+    assert sorted(call[0] for call in calls) == [
+        "strategy_actions", "strategy_actions", "strategy_equity", "strategy_equity",
+    ]
+    assert {call[1] for call in calls} == {"origin"}
+    assert report["table_counts"]["strategy_equity"] == 4
+
+
+def test_fast_verify_ranges_cover_candidate_ids_below_and_between_source_ids() -> None:
+    connection = duckdb.connect()
+    connection.execute("attach ':memory:' as origin")
+    for catalog in ("origin", "memory"):
+        connection.execute(f"create table {catalog}.main.strategy_equity (result_id bigint, sample_index integer)")
+    for result_id in (5, 9):
+        connection.execute("insert into origin.main.strategy_equity values (?, 0)", [result_id])
+    connection.execute("insert into memory.main.strategy_equity values (2, 0), (7, 0)")
+
+    ranges = compact_module._fast_verify_ranges(
+        connection, "strategy_equity", "origin", "memory", target_rows=1,
+    )
+
+    assert ranges == ((2, 5), (6, 9))
+    for candidate_only in (2, 7):
+        assert any(low <= candidate_only <= high for low, high in ranges)
+
+
+def test_fast_verify_ranges_reject_null_result_id_clearly() -> None:
+    connection = duckdb.connect()
+    connection.execute("attach ':memory:' as origin")
+    for catalog in ("origin", "memory"):
+        connection.execute(f"create table {catalog}.main.strategy_equity (result_id bigint, sample_index integer)")
+    connection.execute("insert into origin.main.strategy_equity values (null, 0), (1, 0)")
+
+    with pytest.raises(ValueError, match="NULL result_id"):
+        compact_module._fast_verify_ranges(
+            connection, "strategy_equity", "origin", "memory", target_rows=5,
+        )
+
+
+def test_smoke_report_counts_row_sized_ranges(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from tests.test_performance_v2_selection import _candidate_db
+
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    connection = _candidate_db(source_dir)
+    # Two equity result IDs, while strategy_results still has one 128-ID range.
+    strategy_id = connection.execute(
+        """insert into strategies (strategy_name, symbol, side, timeframe, close_ma_len,
+           order_count, analysis_run_id, candidate_identity, lifecycle_status,
+           created_at_utc, updated_at_utc) values ('second', 'ETHUSDT', 'LONG',
+           '1h', 3, 1, 'run', 'second-1001', 'ACTIVE', now(), now())
+           returning strategy_id"""
+    ).fetchone()[0]
+    connection.execute(
+        """insert into strategy_results (result_id, strategy_id, report_start_utc,
+           report_end_utc, exchange, commission_rate, initial_balance, final_balance,
+           total_pnl, total_pnl_pct, max_drawdown, max_drawdown_pct, total_fees,
+           total_trades, imported_at_utc)
+           values (1001, ?, now(), now(), 'Bybit', .0004, 100, 110, 10, 10, 5, 5, 2, 2, now())""",
+        [strategy_id],
+    )
+    connection.execute("update strategy_equity set result_id = 1001 where sample_index >= 2")
+    connection.close()
+    source = source_dir / "strategy_performance.duckdb"
+    candidate = tmp_path / "candidate.duckdb"
+    shutil.copyfile(source, candidate)
+    monkeypatch.setattr(compact_module, "FAST_VERIFY_TARGET_RANGE_ROWS", 1)
+
+    report = compact_module.verify_existing_candidate(
+        source, candidate, workers=1, spill_parent=tmp_path, smoke_ranges=50,
+    )
+
+    with duckdb.connect(str(source), read_only=True) as connection:
+        expected = {
+            table: len(compact_module._fast_verify_ranges(
+                connection, table, "strategy_performance", "strategy_performance", target_rows=1,
+            ))
+            for table in ("strategy_actions", "strategy_equity")
+        }
+    assert report["verified_ranges"] == expected
+    assert expected["strategy_equity"] == 2

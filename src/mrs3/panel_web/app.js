@@ -502,6 +502,78 @@ const testerCollectionUiHelpers = (() => {
   return { create, endpoint };
 })();
 if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = testerCollectionUiHelpers;
+/* portfolio-selection-helpers:start */
+const portfolioSelectionHelpers = (() => {
+  const DAY_MS = 86400000;
+  const day = (value) => { const time = Date.parse(`${value}T00:00:00Z`); return Number.isFinite(time) ? time : null; };
+  const limit = (requested, available) => (Number.isSafeInteger(requested) && requested > 0 && Number.isSafeInteger(available) && available > 0 ? Math.min(requested, available) : 0);
+  // The optimizer keeps the top-N finalists by User Rank per Pair + Side.
+  const ranked = (history, key, count) => (Array.isArray(history?.[key]) ? history[key] : []).slice(0, count);
+  const selectedHistory = (row, history) => [
+    ...ranked(history, `${row.pair}|LONG`, limit(row.long, row.finalistLong)),
+    ...ranked(history, `${row.pair}|SHORT`, limit(row.short, row.finalistShort)),
+  ];
+  // Common history = latest start .. earliest end over whole UTC days, as the common pretest period.
+  const commonWindow = (items) => {
+    let start = null; let end = null;
+    for (const item of items) {
+      const first = day(item?.start); const last = day(item?.end);
+      if (first === null || last === null) continue;
+      start = start === null ? first : Math.max(start, first);
+      end = end === null ? last : Math.min(end, last);
+    }
+    if (start === null) return null;
+    return { start, end, days: Math.max(0, Math.round((end - start) / DAY_MS)) };
+  };
+  const short = (time) => { const date = new Date(time); return `${String(date.getUTCDate()).padStart(2, '0')}.${String(date.getUTCMonth() + 1).padStart(2, '0')}`; };
+  const label = (value) => (!value ? '—' : (value.end < value.start ? 'нет общего периода' : `≈ ${value.days} д · ${short(value.start)}–${short(value.end)}`));
+  // Rough runtime model fitted to the 2026-10-10 real runs (61 pairs, 117 finalists, 21 days, 10 levels: about 16 min).
+  const etaSeconds = (pairs, finalists, days, profiles) => {
+    const scale = Math.max(1, days || 21) / 21;
+    const base = 30 + 1.6 * pairs + 0.5 * finalists * scale;
+    return profiles.reduce((total, profile) => {
+      const levels = Number.isSafeInteger(Number(profile?.candidates)) ? Math.max(1, Number(profile.candidates)) : 10;
+      return total + (levels + 2) * 0.17 * finalists * scale + levels * 1.0 * pairs * scale;
+    }, base);
+  };
+  const duration = (seconds) => {
+    if (!Number.isFinite(seconds)) return '—';
+    const minutes = Math.round(seconds / 60);
+    if (minutes < 1) return '< 1 мин';
+    return minutes < 60 ? `≈ ${minutes} мин` : `≈ ${Math.floor(minutes / 60)} ч ${minutes % 60} мин`;
+  };
+  const summary = (rows, history, profiles) => {
+    let pairs = 0; let finalists = 0; const items = [];
+    for (const row of rows) {
+      const count = limit(row.long, row.finalistLong) + limit(row.short, row.finalistShort);
+      if (!count) continue;
+      pairs += 1; finalists += count; items.push(...selectedHistory(row, history));
+    }
+    const common = commonWindow(items);
+    return { pairs, finalists, window: common, etaSeconds: pairs ? etaSeconds(pairs, finalists, common?.days, profiles) : 0 };
+  };
+  const labelParts = (value) => (!value ? null : (value.end < value.start ? { days: 'нет общего периода', range: '' } : { days: `≈ ${value.days} д`, range: `${short(value.start)}–${short(value.end)}` }));
+  const pairWindow = (row, history) => commonWindow(selectedHistory(row, history));
+  // Display order only: alpha A–Z, history shortest first (unknown last), finalists most first.
+  const sortRows = (rows, history, mode) => {
+    const byName = (left, right) => String(left.pair).localeCompare(String(right.pair));
+    const days = (row) => { const value = pairWindow(row, history); return value && value.end >= value.start ? value.days : Number.POSITIVE_INFINITY; };
+    const available = (row) => (Number(row.finalistLong) || 0) + (Number(row.finalistShort) || 0);
+    const order = mode === 'history' ? (left, right) => (days(left) - days(right)) || byName(left, right)
+      : mode === 'finalists' ? (left, right) => (available(right) - available(left)) || byName(left, right)
+        : byName;
+    return [...rows].sort(order);
+  };
+  // "Select N finalists": every pair, each side capped by its available finalists.
+  const limitRow = (row, count) => {
+    const cap = (available) => (Number.isSafeInteger(available) && available > 0 ? Math.min(count, available) : 0);
+    const long = cap(row.finalistLong); const shortSide = cap(row.finalistShort);
+    return { long, short: shortSide, selected: long > 0 || shortSide > 0 };
+  };
+  return { pairWindow, summary, label, labelParts, duration, etaSeconds, sortRows, limitRow };
+})();
+if (typeof globalThis !== 'undefined') globalThis.portfolioSelectionHelpers = portfolioSelectionHelpers;
+/* portfolio-selection-helpers:end */
   const { selectCommittedRetestTester, selectRetestTester } = window.retestRecovery;
   let shortlistGroups = [];
   let shortlistItems = [];
@@ -745,7 +817,7 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
     const id = window.location.hash.slice(1) || 'testing';
     showScreen(id);
     if (id === 'portfolio') loadPortfolioScreen();
-    if (id === 'settings') { loadPortfolioSettings(); loadPerformanceV2SelectionSettings(); }
+    if (id === 'settings') { loadPortfolioSettings(); loadPerformanceV2SelectionSettings(); loadPerformanceDatabases(); }
   }
 
   links.forEach((link) => link.addEventListener('click', () => showScreen(link.dataset.screenLink, true)));
@@ -2269,14 +2341,7 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
     selectedScopeKeys.clear();
     renderShortlist();
   });
-  const addInitialBalanceField = (dateInput, id) => {
-    const grid = dateInput?.closest('.field-grid');
-    if (!grid || document.getElementById(id)) return;
-    grid.insertAdjacentHTML('beforeend', `<div class="field-group"><label for="${id}">Стартовый баланс теста</label><input id="${id}" type="number" min="0" step="any" inputmode="decimal" value="1000" required></div>`);
-  };
-  addInitialBalanceField(document.querySelector('#tester-start-date'), 'tester-initial-balance');
-  addInitialBalanceField(document.querySelector('#performance-v2-finalist-retest-start'), 'performance-v2-finalist-retest-initial-balance');
-  addInitialBalanceField(document.querySelector('#performance-v2-retest-start'), 'performance-v2-retest-initial-balance');
+  // Protocol v2 §4.3: MRS3 tests run on the base of the MRS3 tester template; there is no start-balance field.
   const testerCard = strategyCards[2];
   const testerText = testerCard?.querySelector('.progress-block p');
   const testerStatus = document.querySelector('#tester-status');
@@ -2286,8 +2351,8 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
   const testerRetry = document.querySelector('#tester-retry');
   const testerStartDate = document.querySelector('#tester-start-date');
   const testerEndDate = document.querySelector('#tester-end-date');
-  const testerInitialBalance = document.querySelector('#tester-initial-balance');
   const testerCollectReports = document.querySelector('#tester-collect-reports');
+  if (testerCollectReports) testerCollectReports.checked = false;
   const testerCollectionStatus = document.querySelector('#tester-collection-status');
   const testerCollectionClear = document.querySelector('#tester-collection-clear');
   let testerCollectionId = '';
@@ -2300,7 +2365,6 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
   let collectionImportJobId = '';
   const validIsoDate = (value) => /^\d{4}-\d{2}-\d{2}$/.test(value) && !Number.isNaN(Date.parse(`${value}T00:00:00Z`));
   const testerMaxDate = () => { const value = new Date(); value.setHours(0, 0, 0, 0); value.setDate(value.getDate() - 1); return `${value.getFullYear()}-${String(value.getMonth() + 1).padStart(2, '0')}-${String(value.getDate()).padStart(2, '0')}`; };
-  const validInitialBalance = (input) => input?.checkValidity() && Number.isFinite(Number(input.value)) && Number(input.value) > 0 ? Number(input.value) : null;
   if (testerEndDate) testerEndDate.max = testerMaxDate();
   const shiftDateMonths = (value, months) => {
     if (!validIsoDate(value)) return '';
@@ -2319,7 +2383,8 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
   }));
   const testerIsTerminal = (job) => ['COMMITTED', 'CANCELLED', 'FAILED'].includes(job.state);
   const collectionIsActive = () => Boolean(testerCollectionId) && ['OPEN', 'VERIFIED'].includes(testerCollectionState);
-  const collectionImportReady = () => collectionIsActive() && testerCollectionState === 'VERIFIED' && collectionCommittedPacks > 0;
+  const collectionModeSelected = () => testerCollectReports?.checked === true && collectionIsActive();
+  const collectionImportReady = () => collectionModeSelected() && testerCollectionState === 'VERIFIED' && collectionCommittedPacks > 0;
   const refreshCollectionActionControls = () => {
     if (testerStart) testerStart.disabled = collectionActionBusy || testerControlsBusy;
     if (testerRetry) testerRetry.disabled = collectionActionBusy || testerControlsBusy || !testerRetryable;
@@ -2328,9 +2393,9 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
       if (collectionActionBusy) inboxVerifyV2.disabled = true;
       else {
         const ordinaryReady = testerCommitted || testerVerifiable;
-        const collectionReady = collectionIsActive() && collectionCommittedPacks > 0;
+        const collectionReady = collectionModeSelected() && collectionCommittedPacks > 0;
         inboxVerifyV2.disabled = normalVerifyInFlight || Boolean(normalImportAuthorized && authorizedTesterJobId)
-          || (collectionIsActive() ? collectionActivePacks > 0 || !collectionReady : !ordinaryReady);
+          || (collectionModeSelected() ? collectionActivePacks > 0 || !collectionReady : !ordinaryReady);
       }
     }
     if (importStartV2) importStartV2.disabled = collectionActionBusy
@@ -2340,6 +2405,12 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
     collectionActionBusy = busy;
     refreshCollectionActionControls();
   };
+  testerCollectReports?.addEventListener('change', () => {
+    normalImportAuthorized = false;
+    authorizedTesterJobId = '';
+    normalVerifyEpoch += 1;
+    refreshCollectionActionControls();
+  });
   const renderTesterCollection = (collection = {}) => {
     const state = typeof collection.state === 'string' ? collection.state : 'EMPTY';
     const id = typeof collection.collection_id === 'string' ? collection.collection_id : '';
@@ -2349,7 +2420,6 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
     collectionActivePacks = Number.isSafeInteger(Number(collection.active_packs)) ? Number(collection.active_packs) : 0;
     collectionFailedPacks = Number.isSafeInteger(Number(collection.failed_cancelled_packs)) ? Number(collection.failed_cancelled_packs) : 0;
     collectionReportCount = Number.isSafeInteger(Number(collection.exact_committed_report_count)) ? Number(collection.exact_committed_report_count) : 0;
-    if (testerCollectReports) testerCollectReports.checked = collectionIsActive();
     if (testerCollectionStatus) {
       const details = [];
       if (collectionActivePacks > 0) details.push(`активных: ${collectionActivePacks}`);
@@ -2409,7 +2479,7 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
       normalImportAuthorized = false;
       authorizedTesterJobId = '';
     }
-    const importAllowed = normalImportAuthorized && authorizedTesterJobId === (collectionIsActive() ? testerCollectionId : testerJobId)
+    const importAllowed = normalImportAuthorized && authorizedTesterJobId === (collectionModeSelected() ? testerCollectionId : testerJobId)
       && (collectionImportReady() || ready);
     testerCommitted = committed;
     testerVerifiable = verifiable;
@@ -2423,9 +2493,9 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
     testerRetryable = singleMode && ['FAILED', 'CANCELLED'].includes(job.state) && job.job_id === testerJobId;
     setTesterControls(!testerIsTerminal(job));
     if (inboxVerifyV2) {
-      const collectionReady = collectionIsActive() && collectionCommittedPacks > 0;
+      const collectionReady = collectionModeSelected() && collectionCommittedPacks > 0;
       if (collectionActionBusy) inboxVerifyV2.disabled = true;
-      else if (!collectionIsActive()) inboxVerifyV2.disabled = !verifiable || importAllowed;
+      else if (!collectionModeSelected()) inboxVerifyV2.disabled = !verifiable || importAllowed;
       else inboxVerifyV2.disabled = importAllowed || normalVerifyInFlight || collectionActivePacks > 0 || !collectionReady;
     }
     if (importStartV2) importStartV2.disabled = collectionActionBusy || !importAllowed;
@@ -2465,13 +2535,11 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
     }
     const startDate = testerStartDate?.value || '';
     const endDate = testerEndDate?.value || '';
-    const initialBalance = validInitialBalance(testerInitialBalance);
     if (!validIsoDate(startDate) || !validIsoDate(endDate)) { if (testerStatus) testerStatus.textContent = 'Enter valid tester start and end dates.'; return; }
     const maxDate = testerMaxDate();
     if (testerEndDate) testerEndDate.max = maxDate;
     if (endDate > maxDate) { if (testerStatus) testerStatus.textContent = 'Tester end date must not be later than yesterday.'; return; }
     if (startDate > endDate) { if (testerStatus) testerStatus.textContent = 'Tester start date must not be after end date.'; return; }
-    if (initialBalance === null) { if (testerStatus) testerStatus.textContent = 'Enter a positive test initial balance.'; return; }
     normalImportAuthorized = false;
     authorizedTesterJobId = '';
     normalVerifyEpoch += 1;
@@ -2482,7 +2550,7 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
     if (collectReports && !collectionActionLease) return;
     setTesterControls(true);
     try {
-      const result = await remoteRequest('/api/v2/jobs', { kind: 'strategies.tester.start', request: { analysis_run_id: generatedBatchAnalysisId, start_date: startDate, end_date: endDate, initial_balance: initialBalance, collect_reports: collectReports } });
+      const result = await remoteRequest('/api/v2/jobs', { kind: 'strategies.tester.start', request: { analysis_run_id: generatedBatchAnalysisId, start_date: startDate, end_date: endDate, collect_reports: collectReports } });
       testerJobId = result.job?.job_id || '';
       if (!testerJobId) throw new Error('missing job');
       renderTester(result.job); await loadTesterCollection(); await pollTester(); startTesterPolling(1000);
@@ -2549,7 +2617,7 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
         .filter((job) => Number.isFinite(Date.parse(job.created_at_utc)) && (
           ['QUEUED', 'RUNNING', 'CANCELLING'].includes(job.state)
           || ['FAILED', 'CANCELLED'].includes(job.state)
-          || (job.state === 'COMMITTED' && job.inbox_ready === true)
+          || job.state === 'COMMITTED'
         ))
         .sort((a, b) => Date.parse(b.created_at_utc) - Date.parse(a.created_at_utc)
           || String(b.job_id).localeCompare(String(a.job_id)));
@@ -2639,7 +2707,7 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
       normalImportInFlight = false;
       normalImportAuthorized = false;
       authorizedTesterJobId = '';
-      if (inboxVerifyV2) inboxVerifyV2.disabled = collectionIsActive()
+      if (inboxVerifyV2) inboxVerifyV2.disabled = collectionModeSelected()
         ? collectionActivePacks > 0 || collectionCommittedPacks <= 0
         : !testerCommitted;
       if (importStartV2) importStartV2.disabled = true;
@@ -2659,7 +2727,7 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
   };
   inboxVerifyV2?.addEventListener('click', async () => {
     if (collectionActionBusy) return;
-    const collectionId = collectionIsActive() ? testerCollectionId : '';
+    const collectionId = collectionModeSelected() ? testerCollectionId : '';
     const collectionReady = Boolean(collectionId) && collectionCommittedPacks > 0;
     if (!collectionId) {
       if (!testerJobId || !(testerCommitted || testerVerifiable) || normalVerifyInFlight) {
@@ -2690,8 +2758,8 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
         if (verified?.state !== 'VERIFIED' || verified?.collection_id !== collectionId || verified?.importable_collection_job_id !== collectionId) throw new Error('verified collection is not ready');
       } else if (verified?.state !== 'COMMITTED' || verified?.inbox_ready !== true) throw new Error('verified inbox is not ready');
       // Ordinary stale-check remains: verifyEpoch !== normalVerifyEpoch || verifyJobId !== testerJobId || !testerCommitted
-      if (verifyEpoch !== normalVerifyEpoch || verifyJobId !== (collectionIsActive() ? testerCollectionId : testerJobId)
-        || (collectionIsActive() ? !collectionReady : !(testerCommitted || testerVerifiable))
+      if (verifyEpoch !== normalVerifyEpoch || verifyJobId !== (collectionModeSelected() ? testerCollectionId : testerJobId)
+        || (collectionModeSelected() ? !collectionReady : !(testerCommitted || testerVerifiable))
         || (collectionActionLease && !collectionCoordinator.isCurrent(collectionActionLease))) return;
       const authorize = () => {
         normalImportAuthorized = true;
@@ -2799,7 +2867,6 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
   const retestCount = document.querySelector('#performance-v2-retest-count');
   const retestStartDate = document.querySelector('#performance-v2-retest-start');
   const retestEndDate = document.querySelector('#performance-v2-retest-end');
-  const retestInitialBalanceInput = document.querySelector('#performance-v2-retest-initial-balance');
   const retestStart = document.querySelector('#performance-v2-retest-check');
   const retestImport = document.querySelector('#performance-v2-retest-import');
   const retestProgress = document.querySelector('#performance-v2-retest-progress');
@@ -2884,7 +2951,6 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
   retestStart?.addEventListener('click', async () => {
     const start = retestStartDate?.value || '';
     const end = retestEndDate?.value || '';
-    const retestInitialBalance = validInitialBalance(retestInitialBalanceInput);
     retestStart.disabled = true;
     if (retestImport) retestImport.disabled = true;
     retestTesterJobId = '';
@@ -2917,8 +2983,7 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
         }
       }
       if (!validIsoDate(start) || !validIsoDate(end) || start >= end || end > testerMaxDate()) { if (retestStatus) retestStatus.textContent = 'Enter valid RETEST dates ending no later than yesterday.'; retestStart.disabled = false; return; }
-      if (retestInitialBalance === null) { if (retestStatus) retestStatus.textContent = 'Enter a positive test initial balance.'; retestStart.disabled = false; return; }
-      const result = await remoteRequest('/api/v2/strategies/performance-v2/retest/start', { test_start: start, test_end: end, initial_balance: retestInitialBalance });
+      const result = await remoteRequest('/api/v2/strategies/performance-v2/retest/start', { test_start: start, test_end: end });
       retestTesterJobId = result.job?.job_id || '';
       if (!retestTesterJobId) throw new Error('missing RETEST job');
       renderRetestTester(result.job); await pollRetestTester();
@@ -2960,7 +3025,6 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
   const finalistRetestClearReports = document.querySelector('#performance-v2-finalist-retest-clear-reports');
   const finalistRetestStartDate = document.querySelector('#performance-v2-finalist-retest-start');
   const finalistRetestEndDate = document.querySelector('#performance-v2-finalist-retest-end');
-  const finalistRetestInitialBalanceInput = document.querySelector('#performance-v2-finalist-retest-initial-balance');
   const finalistRetestStatus = document.querySelector('#performance-v2-finalist-retest-status');
   const finalistRetestCount = document.querySelector('#performance-v2-finalist-retest-count');
   const finalistRetestSuccesses = document.querySelector('#performance-v2-finalist-retest-successes');
@@ -3058,10 +3122,7 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
   finalistRetestStart?.addEventListener('click', async () => {
     finalistRetestStart.disabled = true;
     try {
-      const finalistInitialBalance = validInitialBalance(finalistRetestInitialBalanceInput);
-      if (finalistInitialBalance === null) throw new Error('Enter a positive test initial balance');
       const payload = { include_reserve: Boolean(finalistRetestReserve?.checked), clear_reports: Boolean(finalistRetestClearReports?.checked) };
-      payload.initial_balance = finalistInitialBalance;
       finalistRetestImportJobId = '';
       finalistRetestHasSuccessfulExport = false;
       updateFinalistRetestExport();
@@ -3382,12 +3443,14 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
       return;
     }
     const summary = document.createElement('p');
-    summary.textContent = [strategy.symbol, strategy.side, strategy.timeframe, `Close MA ${strategy.close_ma_len ?? '—'}`].filter(Boolean).join(' · ');
+    const maKind = (type, source) => (type || source ? ` ${type || '?'} ${source || '?'}` : '');
+    const lotMode = strategy.lot_mode ? `Lot ${strategy.lot_mode}${strategy.lot_base != null ? ` B=${strategy.lot_base}` : ''}` : '';
+    summary.textContent = [strategy.symbol, strategy.side, strategy.timeframe, `Close MA ${strategy.close_ma_len ?? '—'}${maKind(strategy.close_ma_type, strategy.close_ma_source)}`, lotMode].filter(Boolean).join(' · ');
     performanceV2WindowStrategyDetails.append(summary);
     const orders = document.createElement('ul');
     for (const order of strategy.orders || []) {
       const item = document.createElement('li');
-      item.textContent = `Ордер ${order.order_id ?? '—'}: Open MA ${order.open_ma_len ?? '—'} · Shift ${order.shift_bp ?? '—'} bp · Multiplier ${performanceV2MetricText(order.open_multiplier)} · Lot x ${performanceV2MetricText(order.lot_x)}`;
+      item.textContent = `Ордер ${order.order_id ?? '—'}: Open MA ${order.open_ma_len ?? '—'}${maKind(order.open_ma_type, order.open_ma_source)} · Shift ${order.shift_bp ?? '—'} bp · Multiplier ${performanceV2MetricText(order.open_multiplier)} · Lot x ${performanceV2MetricText(order.lot_x)}`;
       orders.append(item);
     }
     if (orders.children.length) performanceV2WindowStrategyDetails.append(orders);
@@ -3589,7 +3652,11 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
     const byId = Object.fromEntries([...selectionPreviewOrder.querySelectorAll('[data-selection-stage]')]
       .map((stage) => [stage.dataset.selectionStage, stage]));
     [...defaultSelectionStageOrder].reverse().forEach((id) => {
-      if (byId[id]) selectionPreviewOrder.insertBefore(byId[id], selectionPreviewOrder.firstChild);
+      const stage = byId[id];
+      if (!stage) return;
+      const parent = stage.parentElement;
+      const firstStage = [...parent.children].find((child) => child.matches('[data-selection-stage]'));
+      if (firstStage && firstStage !== stage) parent.insertBefore(stage, firstStage);
     });
     Object.values(byId).forEach((stage) => {
       stage.querySelector('input[type="checkbox"]').checked = defaultEnabledSelectionStages.has(stage.dataset.selectionStage);
@@ -3606,14 +3673,18 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
 
   const renderSelectionPreviewOrder = () => {
     if (!selectionPreviewOrder) return;
-    [...selectionPreviewOrder.querySelectorAll('[data-selection-stage]')].forEach((stage, index, stages) => {
+    const stages = orderedSelectionStages();
+    stages.forEach((stage, index) => {
       const position = stage.querySelector('[data-selection-position]');
       const up = stage.querySelector('[data-selection-move="up"]');
       const down = stage.querySelector('[data-selection-move="down"]');
       const fixed = fixedSelectionPrefix.has(stage.dataset.selectionStage);
+      const previous = stages[index - 1];
+      const next = stages[index + 1];
+      const sameParent = (candidate) => candidate?.parentElement === stage.parentElement;
       if (position) position.textContent = String(index + 1);
-      if (up) up.disabled = fixed || fixedSelectionPrefix.has(stage.previousElementSibling?.dataset.selectionStage) || index === 0;
-      if (down) down.disabled = fixed || fixedSelectionPrefix.has(stage.nextElementSibling?.dataset.selectionStage) || index === stages.length - 1;
+      if (up) up.disabled = fixed || !sameParent(previous) || fixedSelectionPrefix.has(previous?.dataset.selectionStage) || index === 0;
+      if (down) down.disabled = fixed || !sameParent(next) || fixedSelectionPrefix.has(next?.dataset.selectionStage) || index === stages.length - 1;
     });
   };
 
@@ -3720,14 +3791,14 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
     const button = event.target.closest('[data-selection-move]');
     const stage = button?.closest('[data-selection-stage]');
     if (!button || !stage) return;
-    const target = button.dataset.selectionMove === 'up'
-      ? stage.previousElementSibling
-      : stage.nextElementSibling;
-    if (!target?.matches('[data-selection-stage]')
+    const stages = orderedSelectionStages();
+    const oldIndex = stages.indexOf(stage);
+    const movingUp = button.dataset.selectionMove === 'up';
+    const target = stages[oldIndex + (movingUp ? -1 : 1)];
+    if (!target || target.parentElement !== stage.parentElement
       || fixedSelectionPrefix.has(stage.dataset.selectionStage)
       || fixedSelectionPrefix.has(target.dataset.selectionStage)) return;
-    const oldIndex = orderedSelectionStages().indexOf(stage);
-    selectionPreviewOrder.insertBefore(stage, button.dataset.selectionMove === 'up' ? target : target.nextElementSibling);
+    target.parentElement.insertBefore(stage, movingUp ? target : target.nextElementSibling);
     renderSelectionPreviewOrder();
     markSelectionPreviewDirty(Math.min(oldIndex, orderedSelectionStages().indexOf(stage)));
   });
@@ -4038,6 +4109,59 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
     }
   });
   renderSelectionPreviewOrder();
+
+  // Aggregate selection actions intentionally share one frozen operation key
+  // across preview, confirmation, and retries.  The server owns filtering and
+  // publication; the browser only carries the existing selection controls.
+  const aggregateProcessAllPairs = document.getElementById('performance-v2-selection-process-all-pairs');
+  const aggregateExport = document.getElementById('performance-v2-selection-export');
+  const aggregateWriteRejected = document.getElementById('performance-v2-selection-write-rejected');
+  const aggregateStatus = document.getElementById('performance-v2-selection-aggregate-status');
+  const selectionOrder = document.getElementById('performance-v2-selection-order');
+  if (selectionOrder?.parentElement && aggregateProcessAllPairs?.parentElement) {
+    selectionOrder.parentElement.insertBefore(aggregateProcessAllPairs.parentElement, selectionOrder);
+  }
+  let aggregateOperationKey = '';
+  const aggregatePayload = (action) => {
+    if (!aggregateOperationKey) aggregateOperationKey = (globalThis.crypto?.randomUUID?.() || `selection-${Date.now()}`);
+    return {
+      ...selectionPayload(),
+      action,
+      operation_key: aggregateOperationKey,
+      process_all_pairs: aggregateProcessAllPairs?.checked === true,
+    };
+  };
+  const setAggregateStatus = (value) => { if (aggregateStatus) aggregateStatus.textContent = value; };
+  const resetAggregateOperation = () => { aggregateOperationKey = ''; };
+  const runAggregateAction = async (action) => {
+    const payload = aggregatePayload(action);
+    if (!window.confirm(action === 'EXPORT' ? 'Export the frozen selection workbook?' : 'Write rejected decisions for the frozen selection?')) return;
+    const endpoint = action === 'EXPORT'
+      ? '/api/v2/strategies/performance-v2/selection/export'
+      : '/api/v2/strategies/performance-v2/selection/write-rejected';
+    const button = action === 'EXPORT' ? aggregateExport : aggregateWriteRejected;
+    if (button) button.disabled = true;
+    setAggregateStatus('Preparing selection action...');
+    try {
+      const response = await fetch(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+      if (action === 'EXPORT') {
+        if (!response.ok) { const error = await response.json().catch(() => ({})); throw new Error(error?.error?.message || error?.error || 'Selection export failed'); }
+        const blob = await response.blob();
+        const href = URL.createObjectURL(blob); const link = document.createElement('a'); link.href = href; link.download = 'performance-v2-selection-all-pairs.xlsx'; link.click(); URL.revokeObjectURL(href);
+        setAggregateStatus('Selection workbook exported.');
+      } else {
+        const result = await response.json(); if (!response.ok) throw new Error(result?.error?.message || result?.error || 'Write Rejected failed');
+        setAggregateStatus(`Rejected decisions recorded: ${result?.status || 'COMMITTED'}.`);
+      }
+    } catch (error) { setAggregateStatus(error?.message || 'Selection action failed.'); }
+    finally { if (button) button.disabled = false; }
+  };
+  aggregateProcessAllPairs?.addEventListener('change', () => { resetAggregateOperation(); setAggregateStatus(''); });
+  document.querySelector('#performance-v2-selection-card')?.querySelectorAll('input, select')?.forEach((control) => {
+    if (control !== aggregateProcessAllPairs) { control.addEventListener('change', resetAggregateOperation); control.addEventListener('input', resetAggregateOperation); }
+  });
+  aggregateExport?.addEventListener('click', () => runAggregateAction('EXPORT'));
+  aggregateWriteRejected?.addEventListener('click', () => runAggregateAction('WRITE_REJECTED'));
 
   const performanceV2ExportButton = document.querySelector('#performance-v2-export-button');
   const performanceV2ExportStatus = document.querySelector('#performance-v2-export-status');
@@ -4453,6 +4577,70 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
     } catch (error) { if (researchedSettingsStatus) researchedSettingsStatus.textContent = `Не удалось загрузить настройки: ${error.message}`; }
   }
   document.querySelector('#performance-v2-selection-settings-reload')?.addEventListener('click', loadPerformanceV2SelectionSettings);
+  // PerformanceDB selection (P7 spec §5): list, switch and create one database per exchange.
+  const performanceDatabasesEndpoint = '/api/v2/settings/performance-databases';
+  const performanceDatabasesRows = document.querySelector('#performance-databases-rows');
+  const performanceDatabasesStatus = document.querySelector('#performance-databases-status');
+  const setPerformanceDatabasesStatus = (message) => { if (performanceDatabasesStatus) performanceDatabasesStatus.textContent = message; };
+  function renderPerformanceDatabases(data) {
+    if (!performanceDatabasesRows) return;
+    performanceDatabasesRows.replaceChildren();
+    for (const row of data.items || []) {
+      const line = document.createElement('tr');
+      const markers = row.markers
+        ? `${row.markers.evaluation_protocol} · ${row.markers.exchange || '—'} · схема ${row.markers.schema_version || '—'}`
+        : (row.exists ? 'недоступны' : 'файла ещё нет');
+      const cells = [row.name ?? 'по умолчанию', row.database_root, row.evaluation_protocol, row.exchange || '—', markers,
+        row.size_bytes === null || row.size_bytes === undefined ? '—' : formatBytes(row.size_bytes)];
+      for (const value of cells) { const cell = document.createElement('td'); cell.textContent = String(value); line.append(cell); }
+      const action = document.createElement('td');
+      if (row.active) action.textContent = 'активна';
+      else {
+        const button = document.createElement('button');
+        button.type = 'button'; button.className = 'button button-secondary'; button.textContent = 'Сделать активной';
+        button.disabled = !!data.busy;
+        button.addEventListener('click', () => activatePerformanceDatabase(row.name ?? null));
+        action.append(button);
+      }
+      line.append(action);
+      performanceDatabasesRows.append(line);
+    }
+    const exchange = document.querySelector('#performance-database-exchange');
+    if (exchange) {
+      const current = exchange.value;
+      exchange.replaceChildren(...(data.exchanges || []).map((name) => new Option(name, name)));
+      if (current && (data.exchanges || []).includes(current)) exchange.value = current;
+    }
+    setPerformanceDatabasesStatus(data.busy
+      ? 'Есть запущенные задания или открытый сбор отчётов: переключение недоступно.'
+      : `Активна: ${data.active ?? 'база по умолчанию'}.`);
+  }
+  async function loadPerformanceDatabases() {
+    if (!performanceDatabasesRows) return;
+    try { renderPerformanceDatabases(await requestJson(performanceDatabasesEndpoint)); }
+    catch (error) { setPerformanceDatabasesStatus(`Не удалось загрузить базы: ${error.message}`); }
+  }
+  async function activatePerformanceDatabase(name) {
+    try {
+      renderPerformanceDatabases(await remoteRequest(`${performanceDatabasesEndpoint}/activate`, { name }));
+      if (typeof loadPerformanceV2Catalog === 'function') await loadPerformanceV2Catalog();
+    } catch (error) {
+      setPerformanceDatabasesStatus(error.code === 'RESOURCE_BUSY'
+        ? 'Переключение недоступно: есть запущенные задания или открытый сбор отчётов.'
+        : `Не удалось переключить: ${error.message}`);
+    }
+  }
+  document.querySelector('#performance-databases-reload')?.addEventListener('click', loadPerformanceDatabases);
+  document.querySelector('#performance-database-create')?.addEventListener('click', async () => {
+    const value = (id) => document.querySelector(id)?.value.trim() || '';
+    try {
+      renderPerformanceDatabases(await remoteRequest(`${performanceDatabasesEndpoint}/create`, {
+        name: value('#performance-database-name'), database_root: value('#performance-database-root'),
+        exchange: value('#performance-database-exchange'),
+      }));
+      setPerformanceDatabasesStatus('База создана. Чтобы тестировать на ней, сделайте её активной.');
+    } catch (error) { setPerformanceDatabasesStatus(`Не удалось создать базу: ${error.message}`); }
+  });
   document.querySelector('#performance-v2-selection-settings-save')?.addEventListener('click', async () => {
     if (!researchedSettingsDigest) await loadPerformanceV2SelectionSettings();
     if (!researchedSettingsDigest) return;
@@ -4581,7 +4769,7 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
 
   function loadPortfolioScreen() {
     if (!loadPortfolioScreen.state) {
-      const state = { pairRows: [], readiness: null, configDigest: null, activeJobId: '', job: null, poller: 0, initialized: true, locked: false, renderedJobId: '', renderedPercent: 0, renderedSubstage: '', progressAnchor: 0, progressBaseElapsed: 0, heartbeatAnchor: 0, heartbeatBaseAge: 0, settingsChanged: false, refreshPromise: null };
+      const state = { pairRows: [], pairSort: 'alpha', stage2Candidates: [], stage2Selected: new Set(), stage2Campaign: '', stage2Version: 0, readiness: null, configDigest: null, activeJobId: '', job: null, poller: 0, initialized: true, locked: false, renderedJobId: '', renderedPercent: 0, renderedSubstage: '', progressAnchor: 0, progressBaseElapsed: 0, heartbeatAnchor: 0, heartbeatBaseAge: 0, settingsChanged: false, refreshPromise: null };
       const portfolioJobEndpoint = '/api/v2/portfolio/jobs/';
       const query = (selector) => document.querySelector(selector);
       const prepareButton = query('#portfolio-prepare-finalists');
@@ -4637,6 +4825,10 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
         const changed = job?.settings_changed_since_freeze === true || (state.configDigest && job?.config_digest && state.configDigest !== job.config_digest);
         if (changed) state.settingsChanged = true;
       };
+      const portfolioCombinationFactor = (value, available) => (Number.isSafeInteger(value) && value > 0 && Number.isSafeInteger(available) && available > 0 ? BigInt(Math.min(value, available)) : 1n);
+      const portfolioCombinationCount = (pairs) => pairs.reduce((total, row) => total
+        * portfolioCombinationFactor(row.long, row.finalistLong)
+        * portfolioCombinationFactor(row.short, row.finalistShort), 1n);
       const portfolioLaunchForm = () => {
         const rows = state.pairRows.map((row) => ({ ...row }));
         const byPair = new Map(rows.map((row) => [row.pair, row]));
@@ -4680,8 +4872,8 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
         const container = query('#portfolio-pairs');
         if (!container) return;
         container.replaceChildren();
-        if (!state.pairRows.length) { const tableRow = document.createElement('tr'); const cell = document.createElement('td'); cell.colSpan = 3; cell.textContent = 'Нет пар с финалистами LONG или SHORT.'; tableRow.append(cell); container.append(tableRow); return; }
-        for (const row of state.pairRows) {
+        if (!state.pairRows.length) { const tableRow = document.createElement('tr'); const cell = document.createElement('td'); cell.colSpan = 4; cell.textContent = 'Нет пар с финалистами LONG или SHORT.'; tableRow.append(cell); container.append(tableRow); return; }
+        for (const row of portfolioSelectionHelpers.sortRows(state.pairRows, state.readiness?.finalist_history || {}, state.pairSort || 'alpha')) {
           const tableRow = document.createElement('tr');
           const pairCell = document.createElement('th'); pairCell.scope = 'row';
           const label = document.createElement('label'); label.className = 'check';
@@ -4689,8 +4881,9 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
           selected.addEventListener('change', () => { row.selected = selected.checked; updateControls(); });
           const name = document.createElement('span'); name.textContent = row.pair;
           const count = document.createElement('small'); count.className = 'portfolio-pair-count'; count.textContent = `FINALIST: LONG ${row.finalistLong} · SHORT ${row.finalistShort}`;
+          const historyCell = document.createElement('td'); historyCell.className = 'portfolio-pair-history'; historyCell.dataset.portfolioHistory = row.pair;
           const pairInfo = document.createElement('div'); pairInfo.className = 'portfolio-pair-info';
-          label.append(selected, name); pairInfo.append(label, count); pairCell.append(pairInfo); tableRow.append(pairCell);
+          label.append(selected, name); pairInfo.append(label, count); pairCell.append(pairInfo); tableRow.append(pairCell, historyCell);
           for (const [side, countValue] of [['LONG', row.long], ['SHORT', row.short]]) {
             const field = document.createElement('td');
             const input = document.createElement('input'); input.type = 'number'; input.min = '0'; input.max = String(side === 'LONG' ? row.finalistLong : row.finalistShort); input.step = '1'; input.value = String(countValue); input.dataset.portfolioPair = row.pair; input.dataset.portfolioSide = side; input.setAttribute('aria-label', `${row.pair}: максимум ${side}`);
@@ -4714,11 +4907,33 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
         const preparationState = state.readiness?.preparation?.state;
         if (formStatus && !state.locked) formStatus.textContent = launch.valid ? 'Кампания готова к фиксации.' : (launch.invalidPairLimits.length ? `Лимит превышает доступное число финалистов: ${launch.invalidPairLimits.join(', ')}.` : 'Заполните обязательные поля и исправьте недопустимые лимиты.');
         if (runButton) runButton.disabled = state.locked || !launch.valid;
+        const history = state.readiness?.finalist_history || {};
+        for (const row of launch.rows) {
+          const note = query('#portfolio-pairs')?.querySelector(`[data-portfolio-history="${typeof CSS !== 'undefined' && CSS.escape ? CSS.escape(row.pair) : row.pair}"]`);
+          if (note) {
+            const parts = portfolioSelectionHelpers.labelParts(portfolioSelectionHelpers.pairWindow(row, history));
+            const days = document.createElement('strong'); days.textContent = parts ? parts.days : '—';
+            note.replaceChildren(days, document.createTextNode(parts?.range ? ` · ${parts.range}` : ''));
+          }
+        }
+        const summaryNode = query('#portfolio-selection-summary');
+        if (summaryNode) {
+          const selection = portfolioSelectionHelpers.summary(launch.selectedPairs, history, launch.profiles);
+          summaryNode.textContent = selection.pairs
+            ? `Выбрано пар: ${selection.pairs} · финалистов: ${selection.finalists} · совместная история: ${portfolioSelectionHelpers.label(selection.window)} · расчёт ${portfolioSelectionHelpers.duration(selection.etaSeconds)} (оценка)`
+            : 'Выбрано пар: 0';
+        }
+        const combinationNode = query('#portfolio-combination-count');
+        if (combinationNode) {
+          const combinations = launch.selectedPairs.length ? portfolioCombinationCount(launch.selectedPairs) : 0n;
+          combinationNode.textContent = combinations === 0n ? '' : `Комбинаций финалистов: ${combinations.toLocaleString('ru-RU')} · отбор: MILP-фронтир по уровням банка — до «Максимум кандидатов» разных портфелей на профиль, каждый с точным расчётом`;
+        }
         const jobTerminal = terminal(state.job);
         if (prepareButton) { prepareButton.textContent = preparationState === 'READY' ? 'Готово' : (preparationState === 'ERROR' ? 'Повторить' : 'Подготовить данные финалистов'); prepareButton.disabled = state.locked || preparationState === 'READY' || preparationState === 'PREPARING'; }
-        if (newButton) newButton.disabled = preparationState === 'PREPARING' || !state.locked || !jobTerminal;
+        if (newButton) newButton.disabled = preparationState === 'PREPARING' || !jobTerminal;
         if (cancelButton) cancelButton.disabled = !state.activeJobId || jobTerminal || ['CANCEL_REQUESTED', 'CANCELLING'].includes(statusOf(state.job));
-        const stage2Ready = stage2Eligible();
+        renderStage2Candidates();
+        const stage2Ready = stage2Eligible() && state.stage2Campaign === state.job?.campaign_id && state.stage2Selected.size > 0;
         if (stage2Submit) {
           stage2Submit.disabled = !stage2Ready;
           stage2Submit.setAttribute('aria-disabled', String(!stage2Ready));
@@ -4726,8 +4941,8 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
         }
         if (state.job?.kind !== 'TESTER_SUBMISSION') {
           if (stage2State) setBadge('#portfolio-stage2-state', stage2Ready ? 'READY' : 'DISABLED', stage2Ready ? 'ready' : 'pending');
-          if (stage2Reason) stage2Reason.textContent = stage2Ready
-            ? `Готово к тестированию: ${state.job.executables_count} портфелей.`
+          if (stage2Reason) stage2Reason.textContent = stage2Eligible()
+            ? `Выбрано портфелей для теста: ${state.stage2Selected.size} из ${state.stage2Candidates.length || state.job.executables_count}.`
             : 'Доступно после успешного расчёта и подтверждения состава портфелей.';
         }
       };
@@ -4743,6 +4958,10 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
         if (!job?.campaign_id || !succeeded) { if (summary) summary.textContent = 'Результаты появятся только после успешного завершения.'; if (exclusions) exclusions.replaceChildren(); return; }
         try {
           const result = await requestJson(`/api/v2/portfolio/campaigns/${encodeURIComponent(job.campaign_id)}/results`);
+          if (state.stage2Campaign !== job.campaign_id) { state.stage2Campaign = job.campaign_id; state.stage2Selected = new Set(); }
+          state.stage2Candidates = Array.isArray(result.candidates) ? result.candidates : [];
+          state.stage2Version += 1;
+          updateControls();
            const values = result.summary || result;
            const optimizerStatus = String(values?.optimizer_status || '').toUpperCase();
            if (optimizerStatus === 'PARTIAL') setBadge('#portfolio-result-state', 'PARTIAL', 'pending');
@@ -4887,6 +5106,50 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
           if (portfolioXlsx && result.workbook_available === true) { portfolioXlsx.href = `/api/v2/portfolio/campaigns/${encodeURIComponent(job.campaign_id)}/stage1.xlsx`; portfolioXlsx.hidden = false; }
         } catch (error) { if (summary) summary.textContent = `Результаты недоступны: ${portfolioErrorMessage(error)}`; }
       };
+      const renderStage2Candidates = () => {
+        const host = query('#portfolio-stage2-candidates');
+        if (!host) return;
+        // Rows belong to one Campaign; a different displayed Campaign shows nothing until its own rows load.
+        const rows = stage2Eligible() && state.stage2Campaign === state.job?.campaign_id ? state.stage2Candidates : [];
+        const token = rows.length ? `${state.stage2Campaign}:${state.stage2Version}` : '';
+        if (host.dataset.token === token) {
+          host.querySelectorAll('input[data-candidate-id]').forEach((box) => { box.checked = state.stage2Selected.has(box.dataset.candidateId); });
+          const all = host.querySelector('input[data-candidate-all]'); if (all) all.checked = rows.length > 0 && state.stage2Selected.size === rows.length;
+          return;
+        }
+        host.dataset.token = token;
+        host.replaceChildren();
+        if (!rows.length) return;
+        const number = (value, digits = 0) => (value === null || value === undefined || !Number.isFinite(Number(value)) ? '—' : Number(value).toLocaleString('ru-RU', { maximumFractionDigits: digits, minimumFractionDigits: digits }));
+        const table = document.createElement('table'); table.className = 'portfolio-stage2-table';
+        const caption = document.createElement('caption'); caption.className = 'sr-only'; caption.textContent = 'Портфели этапа 1 для теста'; table.append(caption);
+        const head = document.createElement('tr');
+        const allCell = document.createElement('th'); allCell.scope = 'col';
+        const all = document.createElement('input'); all.type = 'checkbox'; all.dataset.candidateAll = 'true'; all.setAttribute('aria-label', 'Выбрать все портфели');
+        all.addEventListener('change', () => { state.stage2Selected = new Set(all.checked ? rows.map((row) => row.candidate_id) : []); updateControls(); });
+        allCell.append(all); head.append(allCell);
+        for (const title of ['№', 'Профиль', 'Позиций', 'Банк, USDT', 'P30, USDT/30д', 'Банк DD, USDT', 'Стресс P95, USDT', 'Маржа, USDT', 'CDaR 20%, USDT']) {
+          const cell = document.createElement('th'); cell.scope = 'col'; cell.textContent = title; head.append(cell);
+        }
+        const thead = document.createElement('thead'); thead.append(head); table.append(thead);
+        const body = document.createElement('tbody');
+        rows.forEach((row, index) => {
+          const tableRow = document.createElement('tr');
+          const boxCell = document.createElement('td');
+          const box = document.createElement('input'); box.type = 'checkbox'; box.dataset.candidateId = row.candidate_id; box.checked = state.stage2Selected.has(row.candidate_id);
+          box.setAttribute('aria-label', `Выбрать портфель ${index + 1}`);
+          box.addEventListener('change', () => { if (box.checked) state.stage2Selected.add(row.candidate_id); else state.stage2Selected.delete(row.candidate_id); updateControls(); });
+          boxCell.append(box); tableRow.append(boxCell);
+          for (const value of [String(index + 1), row.profile || '—', number(row.positions), number(row.required_bank_usdt), number(row.p30_usdt_30d), number(row.historical_bank_usdt), number(row.stress_bank_usdt), number(row.margin_bank_usdt), number(row.cdar80_usdt, 2)]) {
+            const cell = document.createElement('td'); cell.textContent = value; tableRow.append(cell);
+          }
+          body.append(tableRow);
+        });
+        table.append(body);
+        const wrap = document.createElement('div'); wrap.className = 'portfolio-stage2-wrap'; wrap.append(table);
+        host.append(wrap);
+        all.checked = rows.length > 0 && state.stage2Selected.size === rows.length;
+      };
       const renderStage2 = (job) => {
         if (!stage2Progress || !stage2Results || !stage2State || !stage2Reason) return;
         if (job?.kind !== 'TESTER_SUBMISSION') {
@@ -4970,6 +5233,7 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
               state.activeJobId = ''; state.job = null; renderJob(null); setLocked(false);
               try { renderReadiness(await requestJson('/api/v2/portfolio/readiness')); } catch (_) { /* next refresh retains the server state. */ }
             }
+            else setLocked(false);
             updateControls();
           }
         } catch (_) { /* requestJson exposes the safe error while polling remains server-only. */ }
@@ -4978,7 +5242,7 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
       const recoverPortfolioJob = async (keepLocked = false) => {
         const active = await requestJson('/api/v2/portfolio/jobs/active'); const candidate = active.job;
         if (!candidate?.job_id) { state.activeJobId = ''; renderJob(null); if (!keepLocked) setLocked(false); window.clearInterval(state.poller); state.poller = 0; return; }
-        state.activeJobId = candidate.job_id; setLocked(true); await pollPortfolioJob(); if (!terminal(state.job)) startPortfolioPolling();
+        state.activeJobId = candidate.job_id; setLocked(!terminal(candidate)); await pollPortfolioJob(); if (terminal(state.job)) setLocked(false); else startPortfolioPolling();
       };
       const refreshPortfolio = async () => {
         if (state.refreshPromise) return state.refreshPromise;
@@ -5034,18 +5298,20 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
         }
       });
       stage2Submit?.addEventListener('click', async () => {
-        if (stage2Submit.disabled || !stage2Eligible()) return;
+        if (stage2Submit.disabled || !stage2Eligible() || state.stage2Campaign !== state.job?.campaign_id || !(state.stage2Selected.size > 0)) return;
         const campaignId = state.job.campaign_id;
-        const count = state.job.executables_count;
+        // Artifact order is kept; the checkboxes only choose which portfolios run.
+        const selectedIds = state.stage2Candidates.map((row) => row.candidate_id).filter((id) => state.stage2Selected.has(id));
+        const count = selectedIds.length;
         stage2Submit.disabled = true;
         stage2Submit.setAttribute('aria-disabled', 'true');
-        const confirmed = window.confirm(`Передать тестеру ${count} портфелей кампании ${campaignId}?`);
+        const confirmed = window.confirm(`Отправить на тест ${count} портфелей кампании ${campaignId}?`);
         if (!confirmed) { updateControls(); return; }
         try {
           const result = await requestJson(`/api/v2/portfolio/campaigns/${encodeURIComponent(campaignId)}/tester-submissions`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ confirmed: true, campaign_id: campaignId }),
+            body: JSON.stringify({ confirmed: true, campaign_id: campaignId, candidate_ids: selectedIds }),
           });
           if (!result.job_id) throw new Error('Не удалось создать задание передачи тестеру.');
           state.activeJobId = result.job_id;
@@ -5071,9 +5337,17 @@ if (typeof globalThis !== 'undefined') globalThis.testerCollectionUiHelpers = te
         try { const result = await requestJson(`${portfolioJobEndpoint}${encodeURIComponent(state.activeJobId)}/cancel`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }); renderJob(result.job || { ...state.job, status: result.status || 'CANCEL_REQUESTED' }); }
         catch (error) { if (formStatus) formStatus.textContent = portfolioErrorMessage(error); await pollPortfolioJob(); }
       });
-      newButton?.addEventListener('click', async () => { if (!terminal(state.job)) return; state.activeJobId = ''; state.job = null; state.settingsChanged = false; renderJob(null); setLocked(false); try { renderReadiness(await requestJson('/api/v2/portfolio/readiness')); if (formStatus) formStatus.textContent = 'Новая кампания готова.'; } catch (error) { if (formStatus) formStatus.textContent = portfolioErrorMessage(error); } });
+      newButton?.addEventListener('click', async () => { if (!terminal(state.job)) return; state.activeJobId = ''; state.job = null; state.stage2Candidates = []; state.stage2Selected = new Set(); state.stage2Campaign = ''; state.stage2Version += 1; state.settingsChanged = false; renderJob(null); setLocked(false); try { renderReadiness(await requestJson('/api/v2/portfolio/readiness')); if (formStatus) formStatus.textContent = 'Новая кампания готова.'; } catch (error) { if (formStatus) formStatus.textContent = portfolioErrorMessage(error); } });
       ['aggressive', 'balanced', 'conservative'].forEach((profile) => query(`#portfolio-profile-${profile}`)?.addEventListener('change', updateControls));
       query('#portfolio-select-all')?.addEventListener('click', () => { state.pairRows.forEach((row) => { row.selected = true; }); renderPairs(); updateControls(); });
+      query('#portfolio-select-n')?.addEventListener('click', () => {
+        const input = query('#portfolio-select-n-value'); const count = Number(input?.value);
+        if (!Number.isSafeInteger(count) || count < 1) { input?.setAttribute('aria-invalid', 'true'); input?.focus(); return; }
+        input?.removeAttribute('aria-invalid');
+        state.pairRows.forEach((row) => Object.assign(row, portfolioSelectionHelpers.limitRow(row, count)));
+        renderPairs(); updateControls();
+      });
+      query('#portfolio-pair-sort')?.addEventListener('change', (event) => { state.pairSort = event.target.value; renderPairs(); updateControls(); });
       query('#portfolio-select-maximum')?.addEventListener('click', () => { state.pairRows.forEach((row) => { row.long = Math.max(0, Number(row.finalistLong) || 0); row.short = Math.max(0, Number(row.finalistShort) || 0); row.selected = row.long > 0 || row.short > 0; }); renderPairs(); updateControls(); });
       query('#portfolio-select-none')?.addEventListener('click', () => { state.pairRows.forEach((row) => { row.selected = false; }); renderPairs(); updateControls(); });
       query('#portfolio-profiles')?.querySelectorAll('input').forEach((input) => { input.addEventListener('input', updateControls); input.addEventListener('change', updateControls); });

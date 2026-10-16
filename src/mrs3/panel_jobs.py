@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import base64
 from datetime import datetime, timezone
+import errno
 import hashlib
 import json
 import os
@@ -10,6 +12,7 @@ from pathlib import Path
 from threading import RLock
 import tempfile
 import time
+from typing import Any
 from uuid import uuid4
 
 
@@ -20,14 +23,82 @@ _TRANSITIONS = {
     "RUNNING": {"CANCELLING", "COMMITTED", "FAILED"},
     "CANCELLING": {"CANCELLED", "FAILED"},
 }
-_WINDOWS_REPLACE_RETRIES = 5
-_WINDOWS_REPLACE_RETRY_DELAY_SECONDS = 0.1
+_WINDOWS_REPLACE_RETRIES = 10
+_WINDOWS_REPLACE_RETRY_DELAY_SECONDS = 0.05
 _WINDOWS_TRANSIENT_REPLACE_ERRORS = frozenset({5, 32, 33})
+_UNSUPPORTED_DIRECTORY_FSYNC_ERRORS = frozenset({
+    errno.EINVAL,
+    getattr(errno, "ENOTSUP", errno.EINVAL),
+    getattr(errno, "EOPNOTSUPP", errno.EINVAL),
+    getattr(errno, "ENOSYS", errno.EINVAL),
+})
+# Runtime values written once and then only read. They are shared by reference
+# between runtime copies instead of being JSON round-tripped on every progress
+# update (a frozen portfolio Campaign is tens of megabytes). Callers must copy
+# before mutating a shared value; an in-place edit would change registry state.
+_SHARED_RUNTIME_KEYS = frozenset({"campaign"})
+_JOURNAL_RECOVERY_FAILED = (
+    "JOB_JOURNAL_RECOVERY_FAILED: preserve the journal and recovery sidecar "
+    "for manual recovery before restarting Panel"
+)
+
+
+def _copy_runtime(value: dict) -> dict:
+    shared = {key: value[key] for key in _SHARED_RUNTIME_KEYS if key in value}
+    copied = json.loads(json.dumps({key: item for key, item in value.items() if key not in shared}))
+    copied.update(shared)
+    return copied
+
+
+def _encode_journal_recovery(previous: bytes, intended: bytes) -> bytes:
+    record = {
+        "format": 2,
+        "previous": base64.b64encode(previous).decode("ascii"),
+        "intended": base64.b64encode(intended).decode("ascii"),
+    }
+    return json.dumps(record, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def _fsync_directory(path: Path) -> None:
+    if os.name == "nt":
+        return
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    except OSError as error:
+        if error.errno in _UNSUPPORTED_DIRECTORY_FSYNC_ERRORS:
+            return
+        raise
+    try:
+        try:
+            os.fsync(descriptor)
+        except OSError as error:
+            if error.errno not in _UNSUPPORTED_DIRECTORY_FSYNC_ERRORS:
+                raise
+    finally:
+        os.close(descriptor)
+
+
+def _write_journal_recovery(backup: Path, previous: bytes, intended: bytes) -> None:
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "wb", dir=backup.parent, prefix=f".{backup.name}.", delete=False
+        ) as handle:
+            handle.write(_encode_journal_recovery(previous, intended))
+            handle.flush()
+            os.fsync(handle.fileno())
+            temporary = Path(handle.name)
+        os.rename(temporary, backup)
+        temporary = None
+        _fsync_directory(backup.parent)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 class PanelJobError(ValueError):
-    def __init__(self, code: str):
-        super().__init__(code)
+    def __init__(self, code: str, message: str | None = None):
+        super().__init__(message or code)
         self.code = code
 
 
@@ -124,6 +195,7 @@ class PanelJobRegistry:
             pass
 
     def _load(self) -> dict[str, dict]:
+        self._recover_in_place_backup()
         try:
             data = json.loads(self.journal.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -139,35 +211,152 @@ class PanelJobRegistry:
         self._journal_dirty = len(loaded) != len(data)
         return loaded
 
+    @property
+    def _journal_recovery_path(self) -> Path:
+        return self.journal.with_name(f"{self.journal.name}.recovery")
+
+    def _remove_journal_recovery(self, backup: Path) -> None:
+        try:
+            backup.unlink(missing_ok=True)
+        except OSError:
+            return
+        try:
+            _fsync_directory(self.journal.parent)
+        except OSError:
+            # A durable journal and either state of this sidecar are recoverable.
+            pass
+
+    def _recover_in_place_backup(self) -> None:
+        backup = self._journal_recovery_path
+        if not backup.exists():
+            return
+        if backup.is_symlink() or self.journal.is_symlink():
+            raise PanelJobError("JOB_JOURNAL_RECOVERY_FAILED", _JOURNAL_RECOVERY_FAILED)
+        try:
+            record = json.loads(backup.read_text(encoding="utf-8"))
+            if not isinstance(record, dict):
+                raise ValueError("journal recovery record has an unsupported format")
+            record_format = record.get("format")
+            previous_bytes = base64.b64decode(record["previous"], validate=True)
+            previous = json.loads(previous_bytes.decode("utf-8"))
+            if not isinstance(previous, dict):
+                raise ValueError("journal recovery payload must be an object")
+            intended_bytes = None
+            intended_sha256 = None
+            if record_format == 2:
+                intended_bytes = base64.b64decode(record["intended"], validate=True)
+                intended = json.loads(intended_bytes.decode("utf-8"))
+                if not isinstance(intended, dict):
+                    raise ValueError("intended journal recovery payload must be an object")
+            elif record_format == 1:
+                intended_sha256 = record.get("intended_sha256")
+                if (
+                    not isinstance(intended_sha256, str)
+                    or len(intended_sha256) != 64
+                    or any(character not in "0123456789abcdef" for character in intended_sha256)
+                ):
+                    raise ValueError("legacy journal recovery record has no valid intended digest")
+            else:
+                raise ValueError("journal recovery record has an unsupported format")
+            try:
+                current_bytes = self.journal.read_bytes()
+            except FileNotFoundError:
+                current_bytes = None
+            current_is_intended = intended_bytes is not None and current_bytes == intended_bytes
+            if current_bytes is not None and intended_sha256 is not None:
+                current_is_intended = hashlib.sha256(current_bytes).hexdigest() == intended_sha256
+            if current_bytes == previous_bytes or current_is_intended:
+                self._remove_journal_recovery(backup)
+                return
+            mode = "r+b" if self.journal.exists() else "xb"
+            with self.journal.open(mode) as destination:
+                destination.seek(0)
+                destination.write(previous_bytes)
+                destination.truncate()
+                destination.flush()
+                os.fsync(destination.fileno())
+            if self.journal.read_bytes() != previous_bytes:
+                raise OSError("journal recovery did not restore the saved bytes")
+            if json.loads(self.journal.read_text(encoding="utf-8")) != previous:
+                raise OSError("journal recovery payload did not validate")
+            _fsync_directory(self.journal.parent)
+            self._remove_journal_recovery(backup)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, KeyError, TypeError) as error:
+            raise PanelJobError("JOB_JOURNAL_RECOVERY_FAILED", _JOURNAL_RECOVERY_FAILED) from error
+
     def _save(self) -> None:
         self._journal_dirty = True
         self.journal.parent.mkdir(parents=True, exist_ok=True)
+        self._recover_in_place_backup()
         temporary: Path | None = None
         # Portfolio Campaign inputs live in their own verified gzip snapshot.
         # Keep the in-process compatibility copy for old callers, but never
         # write that payload into the shared journal.
-        persisted = json.loads(json.dumps(self.jobs))
-        for job in persisted.values():
+        persisted: dict[str, Any] = {}
+        for job_id, job in self.jobs.items():
             runtime = job.get("runtime")
-            if isinstance(runtime, dict) and isinstance(runtime.get("campaign_snapshot"), dict):
-                runtime.pop("campaign", None)
+            if isinstance(runtime, dict) and "campaign" in runtime and isinstance(runtime.get("campaign_snapshot"), dict):
+                # The frozen Campaign is never serialized here, not even to be dropped.
+                job = {**job, "runtime": {key: value for key, value in runtime.items() if key != "campaign"}}
+            persisted[job_id] = job
+        encoded = json.dumps(persisted, sort_keys=True, separators=(",", ":")).encode("utf-8")
         try:
-            with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=self.journal.parent, delete=False) as handle:
-                json.dump(persisted, handle, sort_keys=True, separators=(",", ":"))
+            with tempfile.NamedTemporaryFile("wb", dir=self.journal.parent, delete=False) as handle:
+                handle.write(encoded)
                 handle.flush()
                 os.fsync(handle.fileno())
                 temporary = Path(handle.name)
             for attempt in range(_WINDOWS_REPLACE_RETRIES):
                 try:
                     os.replace(temporary, self.journal)
-                    break
                 except PermissionError as error:
                     if (
                         getattr(error, "winerror", None) not in _WINDOWS_TRANSIENT_REPLACE_ERRORS
-                        or attempt + 1 == _WINDOWS_REPLACE_RETRIES
                     ):
                         raise
+                    if attempt + 1 == _WINDOWS_REPLACE_RETRIES:
+                        if not self.journal.is_file() or self.journal.is_symlink():
+                            raise
+                        try:
+                            self._recover_in_place_backup()
+                            previous_bytes = self.journal.read_bytes()
+                            previous = json.loads(previous_bytes.decode("utf-8"))
+                            if not isinstance(previous, dict):
+                                raise OSError("existing Panel journal is not a JSON object")
+                            backup = self._journal_recovery_path
+                            _write_journal_recovery(backup, previous_bytes, encoded)
+                            with self.journal.open("r+b") as destination:
+                                destination.seek(0)
+                                destination.write(encoded)
+                                destination.truncate()
+                                destination.flush()
+                                os.fsync(destination.fileno())
+                            written = self.journal.read_bytes()
+                            if written != encoded or json.loads(written.decode("utf-8")) != persisted:
+                                raise OSError("in-place journal write did not validate")
+                            self._remove_journal_recovery(backup)
+                        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+                            try:
+                                self._recover_in_place_backup()
+                            except PanelJobError:
+                                pass
+                            raise
+                        try:
+                            temporary.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                        try:
+                            _fsync_directory(self.journal.parent)
+                        except OSError:
+                            # The journal is durable; any leftover staging file is ignored on recovery.
+                            pass
+                        temporary = None
+                        break
                     time.sleep(_WINDOWS_REPLACE_RETRY_DELAY_SECONDS)
+                else:
+                    temporary = None
+                    _fsync_directory(self.journal.parent)
+                    break
             temporary = None
             self._journal_dirty = False
         finally:
@@ -212,7 +401,11 @@ class PanelJobRegistry:
     def _fingerprint(kind: str, request: dict) -> str:
         return hashlib.sha256((kind + json.dumps(request, sort_keys=True, separators=(",", ":"))).encode()).hexdigest()
 
-    def submit(self, kind: str, request: dict, idempotency_key: str, resource_keys: tuple[str, ...] = (), *, job_id: str | None = None) -> dict:
+    def submit(
+        self, kind: str, request: dict, idempotency_key: str, resource_keys: tuple[str, ...] = (), *,
+        job_id: str | None = None, runtime: dict | None = None,
+    ) -> dict:
+        """Create a job; an optional controller runtime is persisted in the same journal write."""
         with self.lock:
             if not self._valid_submit(kind, request, idempotency_key, resource_keys):
                 raise PanelJobError("INVALID_REQUEST")
@@ -240,6 +433,10 @@ class PanelJobRegistry:
                 job["campaign_id"] = request["campaign_id"]
             if request.get("retest") is True:
                 job["retest"] = True
+            if runtime is not None:
+                if not isinstance(runtime, dict):
+                    raise PanelJobError("INVALID_REQUEST")
+                job["runtime"] = _copy_runtime(runtime)
             self.jobs[job["job_id"]] = job
             try:
                 self._save()
@@ -420,7 +617,7 @@ class PanelJobRegistry:
             if runtime is not None:
                 if not isinstance(runtime, dict):
                     raise PanelJobError("INVALID_REQUEST")
-                candidate["runtime"] = json.loads(json.dumps(runtime))
+                candidate["runtime"] = _copy_runtime(runtime)
             if skip_save_if_unchanged and candidate == job and not self._journal_dirty:
                 return self._copy(job)
             job.clear()
@@ -437,7 +634,7 @@ class PanelJobRegistry:
             if job is None:
                 raise PanelJobError("NOT_FOUND")
             value = job.get("runtime", {})
-            return json.loads(json.dumps(value)) if isinstance(value, dict) else {}
+            return _copy_runtime(value) if isinstance(value, dict) else {}
 
     def recover_interrupted(self) -> bool:
         """Durably project every nonterminal job to the existing restart state."""
