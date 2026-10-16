@@ -181,10 +181,30 @@ centre, shift depth). The remote session delivers facts and a parquet export
 only; reconciliation with the local analysis DBs and final conclusions are
 done locally. Prompt:
 [plateau OOS study](docs/superpowers/plans/2026-10-14-plateau-oos-study-prompt.md).
-The remote study is running (2026-10-14). Start of the next local session:
-[local continuation plan](docs/superpowers/plans/2026-10-14-local-continuation-plan.md)
-— CSV Direct merge first; acceptance and reconciliation of the study export,
-conclusions, the 7.5% grid mechanics and plateau v4 follow in that order.
+The remote study delivered facts and an export (2026-10-15):
+[remote facts](docs/reports/2026-10-14-plateau-oos-facts.md). A local study on
+that export ([stable zones](docs/reports/2026-10-15-plateau-zones-local-study.md))
+found that the current plateau adds nothing to the economic filter, while the
+neighbourhood median of PnL30/Ulcer predicts forward quality and risk.
+Validation (2026-10-15..16,
+[plateau v4 validation plan](docs/superpowers/plans/2026-10-15-plateau-v4-validation-plan.md),
+scripts `scripts/plateau_research/`): real MRS3 tick tests of 1 419 strategies
+28 days forward and 958 runs on their training windows. Admitting a pair/TF
+only when its best 2-order v4 structure scores > 20 with training DD <= 6%
+gave about 10-11%/month at a fixed lot with 1-3% losing strategies; scores
+<= 10 gave about 3%/month with 20% losing. Not better than the plain
+structure: first order 0.5-0.6% on liquid pairs, 3-order/deep/wide order sets,
+diverse twins, INCOME lots ([ADR-0076](docs/decisions/0076-mrs3-equal-lots-only.md)),
+the A/B filter. Within a pair the forward return is not predictable, the risk
+is. Draft rules in the plan: READY v4, risk categories (training DD <= 2 /
+2-3.5 / 3.5-6%), ranking and the optimizer finalist per category, removal of
+Pareto/legacy ranks, 20-day periodic MRS2 CSV runs merged per period in CSV
+Direct with a data repository journal. Separate 21-day periods scored as the
+mean of per-period scores were not worse than one window (section A12a).
+Test sets and results stay local, not committed. Next: remote handoff (merge
+the BingX candle work, tester-format parquet packing, Source v6 -> period CSV
+generator with a check against real tester CSVs), threshold calibration, then
+the implementation specification. Out-of-time recheck around 2026-11-12.
 User decision 2026-10-12: one PerformanceDB per exchange with an
 `schema_info.exchange` marker (protocol v2 §4.1); the CSV Direct analysis DB
 (branch `feat/csv-direct-analysis`) must also record the exchange from the run
