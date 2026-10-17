@@ -162,7 +162,7 @@ def simulate_mrs2(minutes: MinuteBars, start_ms: int, end_ms: int, *, timeframe:
                   ticks: bool = False, retry_check: str = "close",
                   buy_after_exit: str = "retry", sell_after_entry: str = "tick_retry",
                   strict_cross: bool = True, filter_close: bool = False,
-                  exit_filter: bool = True) -> tuple[Cycle, ...]:
+                  exit_filter: bool = True, buy_retry_check: str = "close") -> tuple[Cycle, ...]:
     """MRS2 LONG trades on [start_ms, end_ms) with the tester's order placement rules (spec «Simulator»)."""
     if not len(minutes.timestamps):
         return ()
@@ -300,7 +300,7 @@ def simulate_mrs2(minutes: MinuteBars, start_ms: int, end_ms: int, *, timeframe:
         elif retry[0] is not None and pending_bar is None:
             waiting = retry[0]
             low_ref = lows[i] if retry_check == "low" else closes[i]
-            high_ref = highs[i] if retry_check == "low" else closes[i]
+            high_ref = highs[i] if buy_retry_check == "high" else closes[i]
             # placeable once it no longer crosses the market (same strictness as `crossing`)
             if (in_position and waiting > low_ref - edge) or (not in_position and waiting < high_ref + edge):
                 order, retry[0] = waiting, None     # placed after this candle, can fill from the next one
