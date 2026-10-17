@@ -156,8 +156,11 @@ def price_tick(minutes: MinuteBars) -> float:
 
 def simulate_mrs2(minutes: MinuteBars, start_ms: int, end_ms: int, *, timeframe: str, open_len: int, open_mult: float,
                   close_len: int, tick: float, settings: RunSettings = RunSettings(),
-                  start_rule: str = "bar", replace_delay_min: float = 1.0,
-                  sell_rebar: str = "keep", buy_rebar: str = "tick", fill: str = "cross") -> tuple[Cycle, ...]:
+                  start_rule: str = "minute1", replace_delay_min: float = 1.0,
+                  sell_rebar: str = "keep", buy_rebar: str = "place", fill: str = "cross",
+                  ticks: bool = False, retry_check: str = "close",
+                  buy_after_exit: str = "retry", sell_after_entry: str = "tick_retry",
+                  strict_cross: bool = True) -> tuple[Cycle, ...]:
     """MRS2 LONG trades on [start_ms, end_ms) with the tester's order placement rules (spec «Simulator»)."""
     if not len(minutes.timestamps):
         return ()
@@ -170,14 +173,17 @@ def simulate_mrs2(minutes: MinuteBars, start_ms: int, end_ms: int, *, timeframe:
     buys, sells = buy_bar.tolist(), sell_bar.tolist()
     ts = minutes.timestamps.tolist()
     lows, highs, closes = minutes.lows.tolist(), minutes.highs.tolist(), minutes.closes.tolist()
+    opens = minutes.opens.tolist()
     first_bar = int(starts[0])
     half = tick / 2
+    # crossing the market: strictly below it for a sell, strictly above it for a buy ("equal" rests)
+    edge = half if strict_cross in (True, "1", "true") else -half
 
     def sell_at(price: float, market: float) -> float:     # a sell below the market rests one tick above it
-        return price if price > market + half else round((market + tick) / tick) * tick
+        return price if price > market - edge else round((market + tick) / tick) * tick
 
     def buy_at(price: float, market: float) -> float:      # post-only buy above the market rests one tick below it
-        return price if price < market - half else round((market - tick) / tick) * tick
+        return price if price < market + edge else round((market - tick) / tick) * tick
 
     def _replace(current: float | None, bar: int, holding: bool, at_market: float | None) -> float | None:
         """Order re-placed at a bar start; kept when the distance filter or a missing MA forbids placing."""
@@ -186,12 +192,27 @@ def simulate_mrs2(minutes: MinuteBars, start_ms: int, end_ms: int, *, timeframe:
         price = sells[bar] if holding else buys[bar]
         if price != price:
             return current
-        crossing = price <= at_market + half if holding else price >= at_market - half
-        if crossing and current is not None and (sell_rebar if holding else buy_rebar) == "keep":
-            return current            # a re-placement that would cross the market leaves the previous order
+        crossing = price <= at_market - edge if holding else price >= at_market + edge
+        if crossing and not holding and buy_rebar == "place":
+            retry[0] = None
+            return price              # the bar-start buy is placed at its MA price even above the market
+        post_only_wait = not holding and buy_rebar == "retry"
+        if crossing and (post_only_wait or (current is not None and (sell_rebar if holding else buy_rebar) == "keep")):
+            # a re-placement that would cross the market leaves the previous order; the new price is retried
+            # after every candle and placed once the market trades below it (sell) / above it (buy)
+            retry[0] = price
+            return current
+        retry[0] = None
         return sell_at(price, at_market) if holding else buy_at(price, at_market)
 
+    retry: list[float | None] = [None]
+    exit_retry: float | None = None
     trade_from = (start_ms // tf_ms + 1) * tf_ms if start_rule == "bar" else start_ms - 1
+    if start_rule == "minute1":
+        # first orders are placed after the period's second minute candle (start + 1 min) when it exists;
+        # otherwise at the first bar start after the period start
+        first_minute = start_ms + MINUTE_MS
+        trade_from = first_minute if first_minute in set(ts[: min(len(ts), 20000)]) else (start_ms // tf_ms + 1) * tf_ms
     cycles: list[Cycle] = []
     in_position = False
     order: float | None = None
@@ -201,6 +222,9 @@ def simulate_mrs2(minutes: MinuteBars, start_ms: int, end_ms: int, *, timeframe:
     entry_price = 0.0
     pending_bar: int | None = None
     replace_delay_ms = int(float(replace_delay_min) * MINUTE_MS)
+    # order_limit_fill_plus_tick: a limit fills only when the price trades at least one tick beyond it
+    beyond = tick if fill == "plus_tick" else 0.0
+    ticks = ticks in (True, "1", "true", "True")
     for i, t in enumerate(ts):
         if t <= trade_from:
             market = closes[i]
@@ -223,18 +247,56 @@ def simulate_mrs2(minutes: MinuteBars, start_ms: int, end_ms: int, *, timeframe:
             order = _replace(order, pending_bar, in_position, market)
             pending_bar = None
         filled = False
-        if order is not None:
-            if not in_position and lows[i] <= order + 1e-9 and (fill != "touch" or highs[i] >= order - 1e-9):
+        if ticks and pending_bar is not None and order is not None:
+            # 4 ticks per minute: the open tick of the bar's first candle meets the previous order, then the
+            # order is re-placed against that tick and the rest of the candle (high, low, close) meets the new one
+            o = opens[i]
+            if not in_position and o <= order - beyond + 1e-9:
                 in_position, entry_ms, entry_price, filled = True, t, order, True
                 price = sells[bar]
                 order = sell_at(price, closes[i]) if price == price else None
-            elif in_position and highs[i] >= order - 1e-9 and (fill != "touch" or lows[i] <= order + 1e-9):
+            elif in_position and o >= order + beyond - 1e-9:
                 cycles.append(Cycle(entry_ms, entry_price, settings.maker_fee, t, order, settings.maker_fee))
                 in_position, filled = False, True
                 price = buys[bar]
                 order = buy_at(price, closes[i]) if price == price else None
+            else:
+                order = _replace(order, pending_bar, in_position, o)
+            pending_bar = None
+        if order is not None and not filled:
+            if not in_position and lows[i] <= order - beyond + 1e-9 and (fill != "touch" or highs[i] >= order - 1e-9):
+                in_position, entry_ms, entry_price, filled = True, t, order, True
+                price = sells[bar]
+                if price != price:
+                    order = None
+                elif sell_after_entry == "retry" and price <= closes[i] - edge:
+                    order, exit_retry = None, price    # retried after each candle until the market is below it
+                elif sell_after_entry == "tick_retry" and price <= closes[i] - edge:
+                    # a plain limit sell below the market rests one tick above it and is moved to the MA price
+                    # once a candle closes below that price
+                    order, exit_retry = sell_at(price, closes[i]), price
+                else:
+                    order = sell_at(price, closes[i])
+            elif in_position and highs[i] >= order + beyond - 1e-9 and (fill != "touch" or lows[i] <= order + 1e-9):
+                cycles.append(Cycle(entry_ms, entry_price, settings.maker_fee, t, order, settings.maker_fee))
+                in_position, filled = False, True
+                price = buys[bar]
+                if price != price:
+                    order = None
+                elif buy_after_exit == "retry" and price >= closes[i] + edge:
+                    order, exit_retry = None, price    # post-only buy above the market is retried until it rests
+                else:
+                    order = buy_at(price, closes[i])
         if filled:
             pending_bar = None         # the opposite order was just placed from this bar's prices
+            retry[0] = exit_retry
+            exit_retry = None
+        elif retry[0] is not None and pending_bar is None:
+            waiting = retry[0]
+            low_ref = lows[i] if retry_check == "low" else closes[i]
+            high_ref = highs[i] if retry_check == "low" else closes[i]
+            if (in_position and waiting > low_ref + half) or (not in_position and waiting < high_ref - half):
+                order, retry[0] = waiting, None     # placed after this candle, can fill from the next one
         market = closes[i]
     if in_position:
         cycles.append(Cycle(entry_ms, entry_price, settings.maker_fee, None, None, None))

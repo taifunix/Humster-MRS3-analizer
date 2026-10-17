@@ -78,11 +78,19 @@ def test_a_sell_order_below_the_market_rests_one_tick_above_the_last_price():
     assert cycles[0].exit_price == pytest.approx(105.01) and cycles[0].exit_ms == ms("2026-08-01T02:31:00")
 
 
-def test_no_orders_before_the_first_bar_start_of_the_period():
-    data = flat("2026-08-01T00:00:00", 180, lambda i: 100.0 if i < 125 or i > 128 else 98.0)
-    late = simulate_mrs2(data, ms("2026-08-01T02:00:00"), ms("2026-08-01T03:00:00"), timeframe="1h", open_len=2,
-                         open_mult=0.99, close_len=2, tick=0.01)
-    assert late == ()   # the dip lies in the period's first bar: the tester places orders from the next bar
+def test_first_orders_follow_the_second_minute_candle_or_the_next_bar():
+    # KORU 2026-08-28: with a candle at start + 1 min the tester trades inside the first bar;
+    # REGN 2026-08-08: without it, the first orders come at the next bar start.
+    dip = lambda i: 100.0 if i < 125 or i > 128 else 98.0          # noqa: E731  (dip at 02:05–02:08)
+    with_minute = flat("2026-08-01T00:00:00", 180, dip)
+    early = simulate_mrs2(with_minute, ms("2026-08-01T02:00:00"), ms("2026-08-01T03:00:00"), timeframe="1h",
+                          open_len=2, open_mult=0.99, close_len=2, tick=0.01)
+    assert early and early[0].open_ms == ms("2026-08-01T02:05:00")
+    rows = [(i, *(dip(i),) * 4) for i in range(180) if i != 121]       # no candle at 02:01
+    without_minute = bars("2026-08-01T00:00:00", rows)
+    late = simulate_mrs2(without_minute, ms("2026-08-01T02:00:00"), ms("2026-08-01T03:00:00"), timeframe="1h",
+                         open_len=2, open_mult=0.99, close_len=2, tick=0.01)
+    assert late == ()
 
 
 def test_period_replays_a_trade_at_the_fixed_lot_with_fees():
@@ -124,3 +132,23 @@ def test_monthly_returns_chain_month_end_margin_balances():
     assert result.monthly_returns["2026_07"] == pytest.approx(10.0)
     assert result.monthly_returns["2026_08"] == pytest.approx(0.0)
     assert [key for key, _ in month_starts(ms("2026-07-24"), ms("2026-09-17"))] == ["2026_07", "2026_08", "2026_09"]
+
+
+def test_a_sell_replacement_below_the_market_waits_until_the_market_drops_below_it():
+    # The tester keeps the old sell when the new bar's price is below the market, retries after every candle,
+    # places the new price once a candle closes below it, and fills it only on a later candle
+    # (SNOW 2026-07-24/27, 2026-08-05/06 trade lists).
+    rows = [(i, 100.0, 100.0, 100.0, 100.0) for i in range(120)]            # bars 00:00, 01:00 at 100
+    rows += [(120 + i, 99.4, 99.4, 99.4, 99.4) for i in range(5)]             # 02:00–02:04 above the buy
+    rows += [(125, 99.4, 99.4, 98.9, 99.0)]                                   # 02:05 buy at 99.00 fills
+    rows += [(126 + i, 99.0, 99.0, 99.0, 99.0) for i in range(54)]            # rest of the hour at 99
+    rows += [(180, 99.6, 99.6, 99.6, 99.6)]                                   # 03:00 market 99.6
+    rows += [(181, 99.6, 99.7, 99.5, 99.5)]                                   # still above the new 99.47
+    rows += [(182, 99.2, 99.2, 99.1, 99.1)]                                   # closes below: new sell placed
+    rows += [(183, 99.2, 99.5, 99.2, 99.4)]                                   # back up: the new sell fills
+    data = bars("2026-08-01T00:00:00", rows)
+    cycles = simulate_mrs2(data, ms("2026-08-01T00:00:00"), ms("2026-08-01T04:00:00"), timeframe="1h", open_len=2,
+                           open_mult=0.99, close_len=1, tick=0.01)
+    # sell for 03:00 = ohlc4 of bar 02:00 (99.4, 99.4, 98.9, 99.0) × 1.003 = 99.47; old sell (bar 02:00) = 100.30
+    assert cycles[0].entry_price == pytest.approx(99.0) and cycles[0].open_ms == ms("2026-08-01T02:05:00")
+    assert cycles[0].exit_ms == ms("2026-08-01T03:03:00") and cycles[0].exit_price == pytest.approx(99.47)
