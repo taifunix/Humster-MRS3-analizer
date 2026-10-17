@@ -1,66 +1,94 @@
-# MRS2 history store and sampled tester runs (draft for discussion)
+# MRS2 trade store, history simulation and sampled tester runs
 
-**Status:** Draft, details to be agreed with the user
+**Status:** Active (stage 1 next); decision [ADR-0078](../decisions/0078-mrs2-trade-store.md)
 **Date:** 2026-10-17
-**Builds on:** [MRS2 period CSV generator](2026-10-16-mrs2-period-csv-generator.md), [ADR-0077](../decisions/0077-mrs2-base-limit-fill-plus-tick.md)
+**Related:** [MRS2 simulator and period generator](2026-10-16-mrs2-period-csv-generator.md) (simulator rules, metrics, tester config), [ADR-0077](../decisions/0077-mrs2-base-limit-fill-plus-tick.md) (`order_limit_fill_plus_tick = true`)
 
 ## Goal
 
-Replace the fixed 20-day period CSVs (needed only because the tester's CSV mode
-returns no trades) with a per-pair history of simulator trades from which any
-window can be analysed, and run the real tester only on a deterministic,
-analysis-driven sample of points for the latest ~20 days.
+One store for MRS2 analysis: per-pair history of trades for the full grid
+(simulator for history, real tester for a sampled latest window), hourly
+margin-balance series, and a DuckDB catalog. Any window can be analysed, READY
+for MRS3 is computed from the store deterministically, and tester jobs are
+generated and executed from it automatically.
 
-## Evidence that supports the scheme (2026-10-17)
+## Non-goals
 
-Slicing one continuous simulation into 20-day windows versus a fresh simulation
-of each window (the tester's semantics: flat start, market close at the end),
-all 3780 grid points:
+- PerformanceDB (MRS3 results) and its imports.
+- Migrating Source v6, materialization or old analysis databases.
+- SHORT, exchanges other than Bybit (the layout keeps an exchange level).
 
-| Pair | Windows | Trades exact | PnL in tolerance | DD | Ulcer 15 % | All | Rank corr. |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| KORU | 3 | 95.3 % | 97.0 % | 98.1 % | 99.9 % | 95.7 % | 1.000 |
-| SNOW | 3 | 100 % | 100 % | 100 % | 95.7 % | 95.7 % | 1.000 |
-| XOM | 2 | 99.4 % | 99.4 % | 100 % | 93.6 % | 93.0 % | 1.000 |
+## Layout (store root on the server)
 
-Differences come only from window boundaries (a position or an order state
-carried across). Training on several 20-day periods keeps working on sliced
-history; official windows can be re-simulated fresh in seconds.
+```
+<store>/
+  catalog.duckdb
+  trades/<exchange>/<SYMBOL>/<source>_<start>_<end>_<engine>.parquet
+  hourly/<exchange>/<SYMBOL>/<source>_<start>_<end>_<engine>.parquet
+  jobs/<job_id>/...            (tester job packages and results)
+```
 
-## Proposed scheme
+Minute candles stay in `<bot_root>/tester/data/<exchange>/<SYMBOL>/` (tester
+format, automatic top-up).
 
-1. **History.** Per pair, the simulator runs the full grid (3780 points) from
-   `listing + WarmupDays` to `today − 20 days`, and separately the latest
-   20-day window (fresh start). Output per pair and run: `trades.parquet`
-   (point id, entry/exit ms, prices, size, fees, funding; ~40 B per trade,
-   about 1–2 GB for the whole base) and optionally an hourly margin-balance
-   series per point (~2 KB per point and 20 days). Minute candles stay in the
-   tester data folder; the minute equity of any point is rebuilt from trades +
-   candles exactly as the simulator computes it.
-2. **Windows on demand.** Analysis slices the history into windows of any length
-   (fast, vectorised), or re-simulates a window fresh when tester semantics are
-   required (READY, CSV Direct export). CSVs in the tester format are produced on
-   demand, not stored in advance.
-3. **Sampled tester runs for the latest window.** A deterministic, versioned
-   rule picks per pair the points worth a real run (for example: passes a loose
-   economic filter on the simulator's latest window and history, or ranks in the
-   top N %), plus their cube neighbours (shift × Open × Close) so zone scores are
-   complete. The rule version and a hash of the selection are journalled.
-4. **Tester jobs.** The tester's parameter mining is a Cartesian product, so the
-   sample is covered by a minimal set of rectangular blocks (TF × multipliers ×
-   Open range × Close range), one config per block, deterministic for the same
-   input. A job queue runs blocks one by one: install config and strategy, run
-   with the HTML trade table only, parse trades into the same `trades.parquet`
-   format, delete the HTML, restore the tester's own files. States
-   `queued / running / done / failed`; restart resumes; done jobs are never rerun.
-5. **Merge.** The latest window gets tester trades for the sampled points and
-   simulator trades for the rest (source per point is stored). Each new window
-   also re-measures simulator versus tester agreement.
+### Grid registry (catalog)
+
+`point_id` (stable integer) ↔ side, TF, shift bp, open length, close length,
+MA type and source. The registry is append-only.
+
+### Trade segment (Parquet, ZSTD)
+
+One row per trade: `point_id` (int32), `entry_ms`, `exit_ms` (int64; exit
+NULL = open at the segment end), `entry_price`, `exit_price`, `qty` (float64),
+`fee_in`, `fee_out`, `funding` (float64), `exit_kind` (limit / market_end).
+Segment metadata (also in the catalog): exchange, symbol, source, start, end,
+engine version, run settings (lot, fees, slippage, funding, warm-up,
+`limit_fill_plus_tick`), price tick, qty step, data days used, SHA-256.
+
+### Hourly series (Parquet, ZSTD)
+
+Per point and UTC hour of the segment: margin balance close, min, max (float32).
+Rebuildable from candles + trades; used for windowed MaxDD and Ulcer.
+
+### Catalog tables
+
+`segments` (active / superseded), `points`, `runs` (engine and rule versions,
+settings), `jobs` (tester queue: block definition, state, executor, result
+segment), `ready` (READY outputs with inputs' hashes and rule version).
+
+## Stages
+
+1. **Store and history simulation.** Segment writer and reader, hourly cache,
+   catalog, a CLI that simulates a pair's full history to `today − 20 days` and
+   the latest 20-day window (fresh start), pairs in registry priority order,
+   parallel with `duckdb_import.workers`. Acceptance: windowed metrics from the
+   store equal the simulator's per-window results; a pair's history writes and
+   reads back bit-identically; idempotent reruns.
+2. **Window analysis and READY.** Window metrics (PnL, trades, WinRate, MaxDD,
+   Ulcer, monthly) from segments + hourly series, vectorised; plateau v4 zone
+   scores over the last 2–3 windows; READY JSON (EQUAL only) with provenance.
+3. **Sampled tester runs.** Selection rule (versioned; base: top 10–20 % by the
+   simulator plus cube neighbours), rectangular block cover, job queue with
+   states, executor (local tester first), HTML trade-table parsing into
+   `tester` segments, restore of the tester's own files.
+4. **Panel.** Mode switch (simulation / tester), per-pair periods, progress,
+   journal; screener in simulation mode (to be agreed).
+
+## Evidence base (2026-10-17)
+
+- Slicing a continuous simulation into 20-day windows vs fresh window runs:
+  KORU, SNOW, XOM 93–96 % of points within all tolerances, rank correlation
+  1.000 (PnL, DD, Ulcer).
+- Selection: top 10 % by the simulator with cube neighbours (about 28 % of the
+  grid) contains 99 % of the tester's top-10 % points (5 pairs, full tester grids
+  with `order_limit_fill_plus_tick = true`); PURR is the weakest (94.8 %).
+- Simulator vs tester on those grids: XOM 99.1, FLY 97.3, SNOW 95.6, PURR 83.9,
+  KORU 73.5 % of points within all tolerances; rank correlation 0.97–1.00.
 
 ## Open questions
 
-- Selection rule and thresholds; the share of good points lost by the sample is
-  to be measured on full tester grids (5 pairs, `order_limit_fill_plus_tick=true`).
-- Whether hourly series are stored or always rebuilt.
-- CSV Direct: load from the trade store directly or keep CSV export only.
-- Data repository layout for the trade store and the job journal.
+- Selection thresholds per stage 3 (to be calibrated on more full tester grids).
+- Hourly cache granularity is fixed at one hour (Ulcer rule); daily summaries can
+  be added later if analysis needs them.
+- Store location and backup on the server; remote executor sync (Syncthing or
+  SSH) only if the tester load requires it.

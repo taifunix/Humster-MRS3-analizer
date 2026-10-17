@@ -1,6 +1,6 @@
 # MRS2 period CSV generator (simulator, tester `reports_history` format)
 
-**Status:** Active, implementation in progress (branch `wip/period-csv-generator`)
+**Status:** Simulator rules, metrics and tester-config sections are active. The period-CSV output (fixed 20-day CSVs, CSV Direct) is superseded by [ADR-0078](../decisions/0078-mrs2-trade-store.md) and [the trade store spec](2026-10-17-mrs2-history-store-and-tester-sampling.md).
 **Date:** 2026-10-16
 **Plan:** [plateau v4 validation](../superpowers/plans/2026-10-15-plateau-v4-validation-plan.md) — P2 (periods), A12a (separate periods), «Итоговые правила READY v4»
 **Handoff:** [remote handoff, part C](../superpowers/plans/2026-10-16-remote-handoff-bingx-parquet-source-v6-csv.md)
