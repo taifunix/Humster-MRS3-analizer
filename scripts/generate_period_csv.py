@@ -65,7 +65,8 @@ def prepare_pair(symbol: str, listing: date, out: str, data_root: str, cache: st
                  from_day: date | None, timeframes: Sequence[str]) -> tuple[list[tuple[date, date]], list[dict]]:
     """Download missing days, cut the periods, write the tester config of the last one; return the simulated periods."""
     settings = RunSettings()
-    base = {"pair": symbol, "side": "LONG", "listing_date": listing.isoformat(), "generator": GENERATOR_VERSION}
+    base = {"pair": symbol, "side": "LONG", "listing_date": listing.isoformat(), "generator": GENERATOR_VERSION,
+            "limit_fill_plus_tick": settings.limit_fill_plus_tick}
     first = first_period_day(listing, settings.warmup_days, from_day)
     periods = split_periods(first, end_day)
     if not periods:
@@ -97,6 +98,7 @@ def simulate_one(symbol: str, listing: date, start: date, end: date, out: str, d
     """One pair × one period with the simulator: reports_history.csv + run_snapshot in the period folder."""
     settings = RunSettings()
     record = {"pair": symbol, "side": "LONG", "listing_date": listing.isoformat(), "generator": GENERATOR_VERSION,
+              "limit_fill_plus_tick": settings.limit_fill_plus_tick,
               "start": start.isoformat(), "end": end.isoformat(), "source": "simulator"}
     folder = Path(out) / symbol / f"{start.isoformat()}_{end.isoformat()}"
     if folder.exists():

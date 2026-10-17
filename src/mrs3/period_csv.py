@@ -16,7 +16,7 @@ from typing import Iterable, Mapping, Sequence
 
 from .mrs2_simulator import DAY_MS, MinuteBars, PeriodResult, RunSettings, load_minutes, month_starts, simulate_mrs2, simulate_period
 
-GENERATOR_VERSION = "mrs2-sim-1"
+GENERATOR_VERSION = "mrs2-sim-2"
 SHIFTS_BP = (70, 90, 110, 140, 170, 200, 230, 270, 310, 350, 390, 430, 470, 510, 550)
 TIMEFRAMES = ("15m", "30m", "45m", "1h", "2h", "3h", "4h")
 MA_LENGTHS = (2, 3, 4, 5, 6, 7)
@@ -153,7 +153,8 @@ def build_tester_config(template: Mapping, symbol: str, start: date, end: date, 
     document.update(name_comment=name, InitialBalance=settings.lot, StartDate=f"{start.isoformat()}T00:00:00",
                     EndDate=f"{end.isoformat()}T00:00:00", WarmupDays=settings.warmup_days, MakerFee=settings.maker_fee,
                     TakerFee=settings.taker_fee, SlippagePercent=settings.slippage, FundingRate=settings.funding_rate,
-                    FundingIntervalHours=settings.funding_interval_hours, UpdateData=True, LimitOrderVolumeCheck=False)
+                    FundingIntervalHours=settings.funding_interval_hours, UpdateData=True, LimitOrderVolumeCheck=False,
+                    order_limit_fill_plus_tick=settings.limit_fill_plus_tick)
     document["report"]["enable_html_report"] = False
     for entry in document["parameter_mining"]:
         field = entry["name"]

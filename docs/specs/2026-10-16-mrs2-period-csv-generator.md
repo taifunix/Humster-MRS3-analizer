@@ -75,12 +75,26 @@ rows exactly. Rules:
 - TF bars on the full minute grid (a minute without trades is a flat candle at
   the previous close); order price = SMA(ohlc4) of the closed bars ×
   multiplier, rounded to the price tick; limit orders fill at their price.
-- Orders are placed at every TF bar start and right after each fill; a candle at
-  the bar's first minute still meets the previous order; trading starts after
-  the first bar start of the period.
-- Close (sell) order priced at or below the market → placed one tick above the
-  last price; post-only open (buy) order priced at or above the market → rests
-  one tick below it; `distance_filter = 0.3` %.
+- Orders are re-placed by the clock at every TF bar start, also across bars
+  without any trade (at the last traded price); a candle at the bar's first
+  minute still meets the previous order, the new one is placed after it against
+  that candle's close.
+- Crossing the market is strict (a price equal to the market is not crossing).
+  At a bar start a sell priced below the market leaves the previous sell in
+  place; the new price is retried after every candle and placed once a candle
+  closes below it (it can fill from the next candle). A bar-start buy is placed
+  at its MA price even above the market.
+- After an entry the sell is placed right away: below the market it rests one
+  tick above the entry candle's close and is moved to the MA price once a candle
+  closes below that price. After an exit the post-only buy priced above the
+  market is not placed; it is retried after every candle until a candle closes
+  above it.
+- First orders of a period: after the candle at start + 1 minute when it
+  exists, otherwise at the first bar start after the period start.
+- `distance_filter = 0.3` %: no (re)placement while the close-MA price is less
+  than 0.3 % above the open-MA price (the previous order stays).
+- `order_limit_fill_plus_tick` (tester option) is supported: with it a limit
+  fills only when the price trades at least one tick beyond its level.
 - Fixed lot: size = `floor(10000 / entry price / qty step) · qty step`; fees
   maker on limit fills; funding `size · price · 0.00025` at 00/08/16 UTC while
   in a position; a position open at `EndDate` closes at market on the last
@@ -93,10 +107,11 @@ rows exactly. Rules:
   last curve point, empty without trades.
 
 Reference gate (10 pairs, 27 000 points, tolerances PnL 0.5 pp or 10 %, DD
-0.5 pp, trades ±1, Ulcer 15 %): 77.5 % of points within all tolerances; trades
-exact 80 %; rank correlation of PnL, DD, Ulcer ≈ 0.99; UPI top-10 % overlap per
-pair 74–95 %. Further rule work improves the tail; it does not change the
-output format.
+0.5 pp, trades ±1, Ulcer 15 %), 2026-10-17: about 86 % of points within all
+tolerances (XOM 99, REGN 96, LLY 93, CXMT 93, SNOW 91, IONQ 83, RDW 82, CLSK 81,
+FLY 77, PURR 73 %); KORU 2026-08-28…09-17 (new pair) 64 %; exact trade lists on
+188 tester HTML runs 144. The rules came from trade-level diffs against tester
+HTML trade tables and an independent review.
 
 ## Output
 

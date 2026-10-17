@@ -88,6 +88,7 @@ def test_snapshot_and_tester_config_describe_the_fixed_lot_run():
     assert (config["StartDate"], config["EndDate"], config["WarmupDays"], config["InitialBalance"]) == (
         "2026-09-20T00:00:00", "2026-10-16T00:00:00", 4, 10_000.0)
     assert config["LimitOrderVolumeCheck"] is False and config["report"]["enable_html_report"] is False
+    assert config["order_limit_fill_plus_tick"] is True        # ADR-0077 standard
     assert config["reports_history"]["ulcer_index"] is True
     mining = {entry["name"].split("]")[-1]: entry for entry in config["parameter_mining"]}
     assert len(mining[".mrs2.ma_long.multiplier"]["values"]) == 15

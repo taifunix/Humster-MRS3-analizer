@@ -152,3 +152,16 @@ def test_a_sell_replacement_below_the_market_waits_until_the_market_drops_below_
     # sell for 03:00 = ohlc4 of bar 02:00 (99.4, 99.4, 98.9, 99.0) × 1.003 = 99.47; old sell (bar 02:00) = 100.30
     assert cycles[0].entry_price == pytest.approx(99.0) and cycles[0].open_ms == ms("2026-08-01T02:05:00")
     assert cycles[0].exit_ms == ms("2026-08-01T03:03:00") and cycles[0].exit_price == pytest.approx(99.47)
+
+
+def test_plus_tick_standard_needs_a_trade_one_tick_beyond_the_limit():
+    # ADR-0077: order_limit_fill_plus_tick is the standard; touching the buy level does not fill it.
+    def touch(i):
+        return 100.0 if i < 150 else 99.0                      # trades exactly at the 99.00 buy, never below
+    data = flat("2026-08-01T00:00:00", 240, touch)
+    args = dict(timeframe="1h", open_len=2, open_mult=0.99, close_len=2, tick=0.01)
+    assert simulate_mrs2(data, ms("2026-08-01T00:00:00"), ms("2026-08-01T04:00:00"), **args) == ()
+    from mrs3.mrs2_simulator import RunSettings
+    touched = simulate_mrs2(data, ms("2026-08-01T00:00:00"), ms("2026-08-01T04:00:00"),
+                            settings=RunSettings(limit_fill_plus_tick=False), **args)
+    assert touched and touched[0].entry_price == pytest.approx(99.0)
