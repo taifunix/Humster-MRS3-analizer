@@ -1,8 +1,7 @@
 """READY v4 from the MRS2 trade store: zone scores over the last periods, 2-order structures, EQUAL MRS3 JSON.
 
-Contract: docs/specs/2026-10-17-mrs2-history-store-and-tester-sampling.md («Stage 2 contract», READY v4).
-Thresholds are provisional (rule `ready-v4-store-1`): fitted on daily-scale Source v6 curves, to be recalibrated
-on store data.
+Contract: docs/specs/2026-10-17-mrs2-history-store-and-tester-sampling.md («Stage 2 contract», READY v4;
+«READY v4 threshold calibration» for the evidence behind these numbers). Rule `ready-v4-store-1`.
 """
 
 from __future__ import annotations
@@ -39,7 +38,7 @@ class ReadyRule:
     min_shift_bp: int = 70
     pool: int = 6
     ratio: float = 1.5
-    admit_score: float = 20.0
+    admit_score: float = 30.0        # calibrated on the store, see «READY v4 threshold calibration»
     max_dd: float = 6.0
     low_dd: float = 2.0
     moderate_dd: float = 3.5

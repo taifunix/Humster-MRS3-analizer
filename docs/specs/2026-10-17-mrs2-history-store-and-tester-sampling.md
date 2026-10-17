@@ -568,6 +568,128 @@ The card **MRS2 STORE** sits on the Testing screen after the runner cards.
 - `tests/test_ready_store.py` covers tester mode (`TESTER_PENDING`, then READY
   from the tester segment).
 
+## READY v4 threshold calibration (2026-10-17)
+
+The thresholds in `ReadyRule` were provisional (fitted on daily-scale Source v6
+curves). After the stage 1 full-registry simulator run (242 pairs, 1,018
+segments), they were recalibrated on the store itself.
+
+**Method: walk-forward over the whole store**
+(`scripts/plateau_research/store_threshold_study.py`). For every pair with
+≥ 3 active simulator segments (198 of 242), and every cut `k` from the third
+segment onward: train the *current* structure-finding rule (zone score, best
+2-order structure per TF; score and training DD are the production formula —
+means of the two orders' own period figures) on the up-to-3 periods before
+`k`; then measure the **true combined curve** of the chosen 2 orders over
+period `k` (summed hourly close/low/high, shared base = 2 × lot — not the
+mean-of-orders approximation used for training, since that is what a real
+2-order structure experiences). 198 pairs, 544 cuts, 3,782 (pair, cut, TF)
+candidates, collected with a permissive rule (no score/DD gate) and only
+gated afterwards during analysis.
+
+**Finding 1 — DD thresholds transfer unchanged.** Bucketing admitted
+candidates (score > 20, the old cutoff) by training DD band:
+
+| train DD | n | pairs | fwd ret30 | fwd DD p90 | fwd DD median | loss |
+| --- | --- | --- | --- | --- | --- | --- |
+| 0–2 % | 15 | 7 | 11.5 | 3.5 | 2.3 | 7 % |
+| 2–3.5 % | 100 | 21 | 4.7 | 6.5 | 2.7 | 16 % |
+| 3.5–6 % | 146 | 40 | 3.2 | 12.1 | 3.9 | 36 % |
+| 6–8 % | 99 | 35 | −3.6 | 24.3 | 7.9 | 56 % |
+| 8–12 % | 95 | 45 | −5.1 | 19.7 | 9.0 | 51 % |
+| > 12 % | 130 | — | ≤ −1.4 | 17–24 | 7–9 | 43–52 % |
+
+There is a sharp cliff between the 3.5–6 % and 6–8 % bands (loss rate jumps
+from 36 % to 56 %, forward return flips sign) and no further degradation
+above 8 %. The current bands (`low_dd=2`, `moderate_dd=3.5`, `max_dd=6`) sit
+exactly on that cliff and are kept unchanged. The worry that minute/hourly
+sampling would inflate DD enough to need new boundaries did not hold up: it
+only showed up in one earlier single-pair pilot (XOM only admitted, SNOW/PURR
+rejected on DD 6.6–8.3 %) — on the full registry the same absolute bands
+separate real forward risk well.
+
+**Finding 2 — the score threshold needed raising, with no comparable cliff.**
+Jointly with `max_dd = 6` (the actual production admission rule:
+`score > admit_score and dd <= max_dd`), two weightings:
+- **candidate-weighted** — one row per (pair, cut, TF); this is what a casual
+  summary first shows, but 78 % of (pair, cut) groups pass more than one TF,
+  and those TF candidates are not independent (same underlying forward price
+  path: on multi-candidate groups they agree on win/loss only 79 % of the
+  time), so this weighting lets prolific pairs dominate the average;
+- **pair-weighted** — one row per pair (its own candidates averaged first,
+  then every pair counts once), which does not have that bias.
+
+| `admit_score` | pairs | cand ret30 | cand loss | pair ret30 | pair loss |
+| --- | --- | --- | --- | --- | --- |
+| 0 (DD gate only) | 107 | 1.3 | 36.7 % | 0.9 | 40.6 % |
+| 20 (old) | 51 | 4.2 | 26.8 % | 2.7 | 33.8 % |
+| 25 | 43 | 5.4 | 21.5 % | 4.2 | 25.4 % |
+| **30 (new)** | 35 | 6.6 | 17.9 % | 5.6 | 20.0 % |
+| 40 | 28 | 8.2 | 14.0 % | 6.7 | 19.8 % |
+| 60 | 15 | 11.2 | 4.1 % | 9.5 | 13.3 % |
+
+Unlike DD, this is a smooth trade-off with no cliff — matches the real
+tick-test correlation already on record (score ↔ future return ≈ 0.05–0.08,
+score ↔ future DD ≈ −0.25…−0.38 in the [plateau v4 plan](../superpowers/plans/2026-10-15-plateau-v4-validation-plan.md)):
+raw return is barely predictable by score at all; the DD gate does most of
+the work, score adds a modest, monotone lift. `admit_score: 20 → 30` was
+chosen as a data-backed, moderate step: the loss rate drops by about a third
+under either weighting (26.8 → 17.9 %, or pair-weighted 33.8 → 20.0 %) and
+mean forward return improves markedly (4.2 → 6.6, or pair-weighted
+2.7 → 5.6), while keeping most of the breadth (35 of 51 pairs at the old
+cutoff). Raising further (40, 60) keeps the loss rate falling but shrinks the
+admitted set sharply (28, then 15 pairs) with pair-weighted return barely
+moving past 40; 30 was judged the better breadth/quality point under either
+weighting, not a threshold implied by the data itself the way the DD cliff
+is.
+
+**Confirmation: 6 real MRS3 tick tests.**
+(`scripts/plateau_research/mrs3_ticktest_confirm.py`) Picked across
+categories and the old/new score boundary (20→30): one clear `low`, one
+`moderate`, one `high`, one just-above-30 winner, one just-above-30 but
+near the DD ceiling (loser), one rejected (score < 10, loser). Built real
+EQUAL-lot MRS3 2-order strategies (`structure_document` + `generate_strategy`,
+the same code `build_ready` uses) and ran them on the real tester over their
+exact historical forward period (`order_limit_fill_plus_tick = true`,
+`WarmupDays = 4`); the bot's files were restored byte-identical every time
+(`tester_jobs._backup/_restore`).
+
+| pair | TF | proxy score | proxy DD | proxy PnL30 | real PnL30 | proxy MaxDD | real MaxDD | same loss sign |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| XLFUSDT | 2h | 103.9 | 1.6 | 23.5 | 23.5 | 1.6 | 1.6 | yes |
+| REGNUSDT | 15m | 231.2 | 3.4 | 17.8 | 14.4 | 4.3 | 4.2 | yes |
+| MOUSDT | 30m | 154.7 | 4.7 | 21.3 | 18.9 | 1.5 | 1.1 | yes |
+| LLYUSDT | 45m | 25.7 | 2.0 | 7.1 | 7.1 | 1.8 | 1.7 | yes |
+| IONQUSDT | 4h | 25.3 | 5.6 | −1.7 | −1.1 | 8.9 | 8.9 | yes |
+| PLTRUSDT | 15m | 10.0 | 3.7 | −2.4 | −2.4 | 3.3 | 3.3 | yes |
+
+(6 cases, one real tester run each; not a weighting-sensitive sample — too
+small for candidate-vs-pair weighting to matter, each case is its own pair.)
+
+Loss/profit direction agreed on 6 of 6; MaxDD% matched within 0.4 pp; PnL30%
+matched closely (within 0.6 pp on 4 of 6, within 3.4 pp on the other 2 —
+qty-step rounding from splitting one lot across two orders instead of
+summing two independent lots). The near-cutoff winner (LLY, score 25.7,
+DD 2.0 %) and the near-cutoff loser with DD close to the ceiling (IONQ,
+score 25.3, DD 5.6 %) both landed exactly as their DD suggested, supporting
+finding 1 (DD, not score, carries most of the discrimination near this
+boundary) and giving confidence that the proxy's DD% (which finding 1 is
+based on) tracks real combined execution closely.
+
+**Decision.** `ReadyRule.admit_score: 20.0 → 30.0`; `low_dd`, `moderate_dd`,
+`max_dd` unchanged. Evidence: `tests/test_ready_store.py`
+(`test_admit_score_threshold_is_calibrated_at_30` plus the existing suite,
+fixtures adjusted for the new boundary), the walk-forward study
+(`data/ready_threshold_study.parquet`, not committed — local artifact) and
+the 6-case tick-test confirmation (`data/mrs3_ticktest_confirm.json`, not
+committed).
+
+**Independent review:** `CODE_REVIEW_PASS` (one major methodology finding —
+the candidate-weighting bias above, fixed by reporting both weightings; one
+minor — the tick-test runner now writes its results file after every case and
+keeps earlier cases' results if a later one fails to parse, instead of losing
+all of them).
+
 ## Evidence base (2026-10-17)
 
 - Slicing a continuous simulation into 20-day windows vs fresh window runs:

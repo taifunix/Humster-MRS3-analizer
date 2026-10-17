@@ -41,17 +41,17 @@ def test_zone_score_is_the_median_of_the_26_cube_neighbours():
 
 
 def test_best_structure_prefers_score_then_lower_drawdown_and_needs_active_points():
-    flat = features(np.full(len(IDS), 30.0))
+    flat = features(np.full(len(IDS), 35.0))
     [best] = best_structures([flat, flat, flat])
     assert (best["timeframe"], best["close_ma"]) == ("15m", 2)
     assert [(o["shift_bp"], o["open_ma"]) for o in best["orders"]] == [(70, 2), (110, 2)]   # 110 >= 1.5 x 70
-    assert best["score"] == pytest.approx(30.0) and best["dd"] == pytest.approx(0.9) and best["admitted"]
+    assert best["score"] == pytest.approx(35.0) and best["dd"] == pytest.approx(0.9) and best["admitted"]
 
     quiet = np.array([0 if p.shift_bp == 70 else 5 for p in TF15])
-    [best] = best_structures([features(np.full(len(IDS), 30.0), trades=quiet), flat, flat])
+    [best] = best_structures([features(np.full(len(IDS), 35.0), trades=quiet), flat, flat])
     assert [o["shift_bp"] for o in best["orders"]] == [90, 140]         # 70 has no trade in the newest period
 
-    risky = features(np.full(len(IDS), 30.0), dd=np.full(len(IDS), 7.0))
+    risky = features(np.full(len(IDS), 35.0), dd=np.full(len(IDS), 7.0))
     [best] = best_structures([risky, flat])                            # DD = max over periods of the order mean
     assert best["dd"] == pytest.approx(7.0) and not best["admitted"]
 
@@ -93,7 +93,7 @@ def _store_with_periods(root: Path, symbol: str, count: int, upi: float) -> Trad
 
 
 def test_ready_folder_manifest_and_catalog_are_deterministic(tmp_path: Path):
-    store = _store_with_periods(tmp_path / "store", "GOODUSDT", 3, 30.0)
+    store = _store_with_periods(tmp_path / "store", "GOODUSDT", 3, 35.0)
     _store_with_periods(tmp_path / "store", "YOUNGUSDT", 1, 30.0)
     template = json.loads((REPO / "templates/exchanges/Bybit/mrs3-strategy.json").read_text(encoding="utf-8"))
     summary = build_ready(store, ["GOODUSDT", "YOUNGUSDT", "GOODUSDT"], tmp_path / "r1", template)
@@ -129,9 +129,9 @@ def test_ready_folder_manifest_and_catalog_are_deterministic(tmp_path: Path):
 
 def test_periods_are_restricted_to_their_common_grid_points():
     from mrs3.ready_store import common_points
-    newest = features(np.full(len(IDS), 30.0))
+    newest = features(np.full(len(IDS), 35.0))
     extra = point_id("15m", 750, 2, 2)                                  # off the production grid
-    older = PeriodFeatures(np.r_[IDS[::-1][:-10], extra], np.r_[np.full(len(IDS) - 10, 30.0), 99.0],
+    older = PeriodFeatures(np.r_[IDS[::-1][:-10], extra], np.r_[np.full(len(IDS) - 10, 35.0), 99.0],
                            np.r_[np.full(len(IDS) - 10, 1.0), 1.0], np.full(len(IDS) - 9, 5))
     first, second = common_points([newest, older])
     assert list(first.point_ids) == list(second.point_ids) == sorted(IDS[10:])
@@ -156,3 +156,10 @@ def test_tester_mode_takes_the_newest_period_from_the_tester_segment(tmp_path: P
     assert summary["ready_pairs"] == 1 and manifest["latest_source"] == "tester"
     assert manifest["pairs"][0]["periods"][-1]["segment_id"] == record["segment_id"]
     assert manifest["pairs"][0]["structures"][0]["score"] == pytest.approx(0.5 * 40 + 0.3 * 30 + 0.2 * 30)
+
+
+def test_admit_score_threshold_is_calibrated_at_30():
+    # docs/specs/2026-10-17-mrs2-history-store-and-tester-sampling.md, «READY v4 threshold calibration»
+    # (walk-forward study on the full store + 6 real MRS3 tick tests, 2026-10-17): raising admit_score from the
+    # provisional 20 to 30 cut the forward loss rate from 26.8% to 17.9% at the same DD ceiling (max_dd=6%).
+    assert ReadyRule().admit_score == 30.0

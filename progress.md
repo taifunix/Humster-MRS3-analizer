@@ -34,15 +34,24 @@ Contract: [MRS2 trade store](docs/specs/2026-10-17-mrs2-history-store-and-tester
   (history, tester plan/run/import, READY; simulation/tester mode).
 - **Verification:**
   `.venv\Scripts\python.exe -m pytest -p no:cacheprovider tests/test_trade_store.py tests/test_trade_windows.py tests/test_ready_store.py tests/test_tester_jobs.py tests/test_panel_store.py tests/test_mrs2_simulator.py tests/test_period_csv.py tests/test_panel_static_ui.py`.
+- **Full history run (2026-10-17):** all 242 registry pairs, 1,018 segments,
+  0 failed, ~2h12m on 15 processes; store 4.6 GB. Pushed as `c9e86a9` on
+  `wip/period-csv-generator`.
+- **READY v4 threshold calibration (2026-10-17):** walk-forward study over the
+  whole store (198 pairs, 544 cuts, 3,782 candidates) plus 6 real MRS3 tick
+  tests — see [MRS2 trade store](docs/specs/2026-10-17-mrs2-history-store-and-tester-sampling.md)
+  («READY v4 threshold calibration»). DD bands (2/3.5/6 %) kept unchanged: a
+  sharp forward-outcome cliff sits right at 6–8 %, so they transfer from the
+  daily-scale study without change. `admit_score` raised 20 → 30 (loss rate
+  26.8 % → 17.9 % at the same DD ceiling); no comparable cliff exists for
+  score, so this is a judged, data-backed step, not an implied cutoff. The 6
+  tick tests agreed with the simulator proxy on loss direction (6/6) and
+  MaxDD% (within 0.4 pp).
 - **Next:**
-  - run the full simulator history of all 242 registry pairs into
-    `trade_store.root` (user decision 2026-10-17);
-  - recalibrate the READY v4 thresholds on store data, since the minute-level
-    MaxDD of 20-day periods is above the daily-scale ceiling of 6 %;
   - agree the screener simulation mode with the user;
+  - rebuild READY from the store with the new threshold across the registry;
   - one commit when the user confirms.
-- **Blockers:** none for the code. The READY thresholds are provisional, and
-  the pilot admits only XOM.
+- **Blockers:** none.
 
 ## Merge of origin/main into the BingX line (2026-10-16)
 
