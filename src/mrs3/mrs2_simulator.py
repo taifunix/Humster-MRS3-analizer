@@ -65,6 +65,21 @@ class Cycle:
     exit_fee_rate: float | None
 
 
+@dataclass(frozen=True, slots=True)
+class LedgerRow:
+    """One accounted trade of a period: fixed-lot quantity, fees and funding; `market_end` = closed on the last candle."""
+
+    entry_ms: int
+    exit_ms: int
+    entry_price: float
+    exit_price: float
+    qty: float
+    fee_in: float
+    fee_out: float
+    funding: float
+    exit_kind: str
+
+
 @dataclass(slots=True)
 class PeriodResult:
     final_balance: float
@@ -77,6 +92,7 @@ class PeriodResult:
     monthly_returns: dict[str, float] = field(default_factory=dict)
     path: list[tuple[int, float]] = field(default_factory=list)
     marked_final: float = 0.0          # margin balance at the end before the forced market close
+    ledger: list[LedgerRow] = field(default_factory=list)
 
 
 # -- data ---------------------------------------------------------------------
@@ -350,18 +366,21 @@ def simulate_period(cycles: Sequence[Cycle], minutes: MinuteBars, start_ms: int,
         lo = int(np.searchsorted(stamps, cycle.open_ms, "left"))
         hi = int(np.searchsorted(stamps, segment_end, "left"))
         next_funding = 0
+        funding_paid = 0.0
         for index in range(lo, hi):
             stamp = int(stamps[index])
             while next_funding < len(funding) and funding[next_funding] <= stamp:
                 mark = _last_close_before(stamps, closes, funding[next_funding])
                 if mark is not None:
                     balance -= qty * mark[1] * settings.funding_rate
+                    funding_paid += qty * mark[1] * settings.funding_rate
                 next_funding += 1
             path.append((stamp, balance + qty * (float(closes[index]) - cycle.entry_price)))
         while next_funding < len(funding):
             mark = _last_close_before(stamps, closes, funding[next_funding])
             if mark is not None:
                 balance -= qty * mark[1] * settings.funding_rate
+                funding_paid += qty * mark[1] * settings.funding_rate
             next_funding += 1
         if closes_inside:
             gross = qty * (cycle.exit_price - cycle.entry_price)
@@ -370,6 +389,8 @@ def simulate_period(cycles: Sequence[Cycle], minutes: MinuteBars, start_ms: int,
             balance += gross - fee_out
             result.fees += fee_out
             result.trades.append(gross)
+            result.ledger.append(LedgerRow(cycle.open_ms, cycle.exit_ms, cycle.entry_price, cycle.exit_price, qty,
+                                           fee_in, fee_out, funding_paid, "limit"))
             path.append((cycle.exit_ms, balance))
             flat_from = cycle.exit_ms
             continue
@@ -384,6 +405,8 @@ def simulate_period(cycles: Sequence[Cycle], minutes: MinuteBars, start_ms: int,
         balance += gross - fee_out
         result.fees += fee_out
         result.trades.append(gross)
+        result.ledger.append(LedgerRow(cycle.open_ms, last[0], cycle.entry_price, price, qty, fee_in, fee_out,
+                                       funding_paid, "market_end"))
         path.append((last[0], balance))
         break
     result.final_balance = balance

@@ -228,6 +228,7 @@ from .panel_testing import (
     expected_screener_runs,
     mrs3_tester_config_template,
 )
+from .panel_store import StoreTaskError, StoreTaskService
 from .screener.config import ScreenerConfig, load_screener_config
 from .screener.errors import ScreenerEvaluationError
 from .screener.evaluate import PairVerdict, evaluate_and_record, evaluate_pairs, export_verdicts_csv
@@ -2703,6 +2704,19 @@ class PanelController:
     def bingx_download_status(self) -> dict[str, object]:
         with self._bingx_lock:
             return json.loads(json.dumps(self._bingx_state))
+
+    # -- MRS2 trade store (docs/specs/2026-10-17-mrs2-history-store-and-tester-sampling.md, stage 4): history
+    # simulation, tester jobs and READY run as store CLI child processes, one at a time.
+
+    _store_task_lock = threading.Lock()
+
+    def store_tasks(self) -> StoreTaskService:
+        with self._store_task_lock:            # one service per controller: one store task at a time
+            service = getattr(self, "_store_task_service", None)
+            if service is None:
+                service = StoreTaskService(Path(__file__).resolve().parents[2], self.default_config)
+                self._store_task_service = service
+        return service
 
     def _bingx_symbols_for_fill(self, payload: Mapping[str, object]) -> tuple[str, ...]:
         """API symbols for a BingX fill; every day of StartDate−1 … EndDate must already be local.
@@ -10503,6 +10517,12 @@ class _PanelHandler(BaseHTTPRequestHandler):
             self._headers(200, f"{content_type}; charset=utf-8", len(payload))
             self.wfile.write(payload)
             return
+        if parsed.path == "/api/v2/store/status":
+            try:
+                self._json(200, self.server.controller.store_tasks().status())
+            except StoreTaskError as error:
+                self._json(400, {"error": str(error)})
+            return
         if parsed.path == "/api/v2/bootstrap":
             self._json(200, self.server.controller.panel_bootstrap())
             return
@@ -10934,6 +10954,25 @@ class _PanelHandler(BaseHTTPRequestHandler):
             return
         self._json(200, result)
 
+    def _store_post(self, endpoint: str) -> None:
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            document = json.loads(self.rfile.read(length).decode("utf-8")) if 0 < length <= 65_536 else {}
+            if not isinstance(document, dict):
+                raise StoreTaskError("тело запроса: JSON-объект")
+            service = self.server.controller.store_tasks()
+            if endpoint == "/api/v2/store/stop":
+                result = service.stop()
+            else:
+                result = service.start(str(document.get("action", "")), document)
+        except StoreTaskError as error:
+            self._json(400, {"error": str(error)})
+            return
+        except (ValueError, UnicodeDecodeError):
+            self._json(400, {"error": "тело запроса: JSON-объект"})
+            return
+        self._json(200, result)
+
     def do_POST(self) -> None:
         if not self._has_local_host():
             self._json(403, {"error": "local Host header required"})
@@ -10941,6 +10980,9 @@ class _PanelHandler(BaseHTTPRequestHandler):
         endpoint = urlparse(self.path).path
         if endpoint == self._PERFORMANCE_V2_EXPORT:
             self._export_method_not_allowed()
+            return
+        if endpoint in ("/api/v2/store/start", "/api/v2/store/stop"):
+            self._store_post(endpoint)
             return
         direct_retest_endpoint = endpoint if endpoint in {
             "/api/v2/strategies/performance-v2/retest/start",

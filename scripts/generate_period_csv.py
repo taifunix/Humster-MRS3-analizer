@@ -18,10 +18,9 @@ from typing import Sequence
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-import openpyxl  # noqa: E402
-
 from mrs3.minute_data import ensure_days, instrument, last_archived_day  # noqa: E402
 from mrs3.mrs2_simulator import RunSettings  # noqa: E402
+from mrs3.trade_history import pair_order  # noqa: E402
 from mrs3.period_csv import (  # noqa: E402
     GENERATOR_VERSION, TIMEFRAMES, csv_bytes, first_period_day, grid, has_warmup_data, header, journal_append,
     load_minutes, ms_of, run_snapshot, sha256, simulate_rows, split_periods, strategy_document, build_tester_config,
@@ -31,34 +30,6 @@ from mrs3.period_csv import (  # noqa: E402
 REPO = Path(__file__).resolve().parents[1]
 STRATEGY_TEMPLATE = REPO / "templates" / "strategies" / "source-v6-mrs2" / "long.json"
 CONFIG_TEMPLATE = REPO / "templates" / "tester" / "mrs2" / "config_tester_long.json"
-VERDICT_RANK = {"GO": 0, "CHECK": 1, None: 2, "": 2, "STOP": 3}
-
-
-def pair_order(registry: Path) -> list[tuple[str, date]]:
-    """Pairs with their listing day: screening verdict GO, CHECK, none, STOP; inside a group by 7-day turnover."""
-    workbook = openpyxl.load_workbook(registry, read_only=True, data_only=True)
-    try:
-        pairs = workbook["Пары"]
-        head = [cell for cell in next(pairs.iter_rows(min_row=1, max_row=1, values_only=True))]
-        listing = {}
-        for row in pairs.iter_rows(min_row=2, values_only=True):
-            if row[0]:
-                value = row[head.index("Дата листинга на Bybit (UTC)")]
-                listing[str(row[0]).strip().upper()] = value.date() if isinstance(value, datetime) else None
-        screening = {}
-        if "Скрининг" in workbook.sheetnames:
-            sheet = workbook["Скрининг"]
-            shead = list(next(sheet.iter_rows(min_row=1, max_row=1, values_only=True)))
-            for row in sheet.iter_rows(min_row=2, values_only=True):
-                if row[0] and (row[shead.index("Сторона")] in (None, "LONG")):
-                    volume = row[shead.index("Объём 7д, USDT")] if "Объём 7д, USDT" in shead else None
-                    screening[str(row[0]).strip().upper()] = (row[shead.index("Вердикт")], float(volume or 0))
-    finally:
-        workbook.close()
-    def key(symbol: str):
-        verdict, volume = screening.get(symbol, (None, 0.0))
-        return (VERDICT_RANK.get(verdict, 2), -volume, symbol)
-    return [(symbol, listing[symbol]) for symbol in sorted(listing, key=key) if listing[symbol] is not None]
 
 
 def prepare_pair(symbol: str, listing: date, out: str, data_root: str, cache: str, end_day: date,

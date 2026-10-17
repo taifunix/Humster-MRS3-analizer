@@ -67,7 +67,24 @@ from the configured root folder; nested folders are not searched.
 # One-time rebuild of all ten dated columns after interrupted/partial initialization
 .\scripts\calculate_bybit_base_lots.cmd --rebuild-history
 
+# MRS2 history in the trade store (trade_store.root in config.local.json)
+.\.venv\Scripts\python.exe scripts\simulate_history.py --pairs XOMUSDT,SNOWUSDT
+.\.venv\Scripts\python.exe scripts\tester_jobs.py plan --pairs XOMUSDT
+.\.venv\Scripts\python.exe scripts\tester_jobs.py run --limit 1
+.\.venv\Scripts\python.exe scripts\tester_jobs.py import --pairs XOMUSDT
+.\.venv\Scripts\python.exe scripts\ready_from_store.py --out <new folder> --latest-source simulator
 ```
+
+Хранилище MRS2 ([спецификация](docs/specs/2026-10-17-mrs2-history-store-and-tester-sampling.md))
+держит историю пар по 20-дневным периодам: сделки, часовой маржин-баланс и
+точные метрики каждой точки сетки, посчитанные симулятором на минутных свечах
+тестера (недостающие дни докачиваются). Последний период можно проверить
+настоящим тестером на отобранных точках: исполнитель подменяет конфиг и
+стратегию тестера только на время прогона и восстанавливает их побайтно.
+В панели те же действия собраны в карточке «MRS2 STORE» на вкладке
+«Тестирование» с выбором режима последнего периода (симуляция или тестер).
+Пороги READY v4 из хранилища предварительные: их нужно перекалибровать на
+данных хранилища до использования в продакшене.
 
 В панели источники MRS2 разделены на CSV и DuckDB. На вкладке «Кандидаты
 стратегий» выберите ровно один вход: проверенный `source-pack` или

@@ -231,6 +231,7 @@ const panelRequestErrorHelpers = (() => {
     '/api/v2/surfaces/',
     '/api/v2/testing/screener/',
     '/api/v2/testing/bingx/',
+    '/api/v2/store/',
   ];
   const safeStringEndpoints = new Set(['/api/v2/settings/analysis-profile', '/api/v2/testing/local/fill']);
   const allowsSafeString = (endpoint) => (
@@ -5435,6 +5436,79 @@ if (typeof globalThis !== 'undefined') globalThis.portfolioSelectionHelpers = po
        loadPortfolioSettings.state = state; state.load = load;
     }
     if (force || !loadPortfolioSettings.state.document) loadPortfolioSettings.state.load();
+  }
+
+  // MRS2 trade store (docs/specs/2026-10-17-mrs2-history-store-and-tester-sampling.md, stage 4): one store CLI task at
+  // a time; the mode decides whether the newest period comes from the simulator or from the imported tester segment.
+  const storeCard = document.querySelector('#store-local');
+  if (storeCard) {
+    const storeEl = (id) => document.querySelector(`#store-${id}`);
+    let storeTimer = null;
+    const syncStoreMode = () => {
+      const tester = storeEl('mode')?.value === 'tester';
+      storeCard.querySelectorAll('[data-tester-only]').forEach((button) => { button.disabled = !tester; });
+    };
+    const storeCell = (value) => { const cell = document.createElement('td'); cell.textContent = value ?? '—'; return cell; };
+    const renderStore = (status) => {
+      const task = status?.task || {};
+      const badge = storeEl('badge');
+      if (badge) {
+        badge.textContent = String(task.state || 'idle').toUpperCase();
+        badge.className = `state-badge ${task.state === 'failed' ? 'state-error' : task.state === 'running' ? 'state-pending' : 'state-ready'}`;
+      }
+      const last = (task.results || []).slice(-1)[0];
+      const text = task.state === 'running' && task.stopping ? 'Остановка после текущего задания тестера…'
+        : task.state === 'running' ? `Выполняется: ${task.action}…`
+        : task.state === 'done' ? `Готово: ${task.action}.`
+          : task.state === 'failed' ? `Ошибка: ${task.action} (код ${task.returncode}).` : 'Задача не запускалась.';
+      const statusLine = storeEl('status');
+      if (statusLine) statusLine.textContent = last ? `${text} ${JSON.stringify(last)}` : text;
+      const log = storeEl('log');
+      if (log) { log.hidden = !(task.log || []).length; log.textContent = (task.log || []).slice(-40).join('\n'); }
+      const body = storeEl('pairs-body');
+      if (body && status?.store) {
+        body.replaceChildren(...(status.store.pairs || []).map((pair) => {
+          const row = document.createElement('tr');
+          const jobs = Object.entries(pair.jobs || {}).map(([state, count]) => `${state} ${count}`).join(', ');
+          row.append(storeCell(pair.pair), storeCell(pair.periods), storeCell(pair.first), storeCell(pair.end),
+            storeCell(pair.latest_tested ? 'есть' : (pair.tester_segments ? 'старый' : 'нет')), storeCell(jobs || '—'));
+          return row;
+        }));
+      }
+      return task.state === 'running';
+    };
+    const storeMessage = (error, fallback) => { const line = storeEl('status'); if (line) line.textContent = error?.message || fallback; };
+    const pollStore = async () => {
+      try {
+        const running = renderStore(await requestJson('/api/v2/store/status'));
+        clearTimeout(storeTimer);
+        if (running) storeTimer = setTimeout(pollStore, 2000);
+      } catch (error) { storeMessage(error, 'Статус недоступен.'); }
+    };
+    const startStore = async (action) => {
+      const payload = {
+        action,
+        mode: storeEl('mode')?.value || 'simulation',
+        pairs: storeEl('pairs')?.value || '',
+        end_day: storeEl('end-date')?.value || '',
+        download: storeEl('download')?.checked !== false,
+        limit: Number(storeEl('run-limit')?.value || 0),
+      };
+      try {
+        renderStore(await requestJson('/api/v2/store/start', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) }));
+        pollStore();
+      } catch (error) { storeMessage(error, 'Запуск не удался.'); }
+    };
+    ['history', 'plan', 'run', 'import', 'ready'].forEach((action) => {
+      storeEl(action)?.addEventListener('click', () => startStore(action));
+    });
+    storeEl('stop')?.addEventListener('click', async () => {
+      try { renderStore(await requestJson('/api/v2/store/stop', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })); }
+      catch (error) { storeMessage(error, 'Остановка не удалась.'); }
+    });
+    storeEl('mode')?.addEventListener('change', syncStoreMode);
+    syncStoreMode();
+    pollStore();
   }
 
   loadSafeDefaults();

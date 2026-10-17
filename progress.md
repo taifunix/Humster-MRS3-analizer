@@ -1,12 +1,48 @@
 # MRS3 Current Status
 
-Last updated: 2026-10-16
+Last updated: 2026-10-17
 
 This file is a current-status snapshot, not a session log. Earlier progress notes remain in Git history; feature contracts and detailed evidence belong in the linked specs, reports, and plans.
 
 Use [PRD.md](PRD.md) for the feature registry and [docs/README.md](docs/README.md)
 for the documentation map. Read the linked contract only for the active task;
 do not treat this file as a replacement for a feature specification.
+
+## MRS2 trade store (2026-10-17, branch `wip/period-csv-generator`, uncommitted)
+
+Contract: [MRS2 trade store](docs/specs/2026-10-17-mrs2-history-store-and-tester-sampling.md) (stages 1–4 with evidence), decisions
+[ADR-0078](docs/decisions/0078-mrs2-trade-store.md) and
+[ADR-0077](docs/decisions/0077-mrs2-base-limit-fill-plus-tick.md).
+
+- **Stage 1** (reviewed, `CODE_REVIEW_PASS`): `trade_store.py`,
+  `trade_history.py`, CLI `scripts/simulate_history.py`.
+  - History is stored as P2-period segments plus the latest 20-day window.
+  - Every segment is three immutable Parquet files and a DuckDB catalog.
+  - Missing candle days block a segment (`MISSING_DAYS`).
+  - Superseded plans are reactivated.
+- **Stage 2** (reviewed, `CODE_REVIEW_PASS`): `trade_windows.py`,
+  `ready_store.py`, CLI `scripts/ready_from_store.py`.
+  - Window metrics from whole segments: a one-segment window equals the
+    simulator; MaxDD and Ulcer within 1e-3.
+  - READY v4 `ready-v4-store-1` (EQUAL only).
+- **Stage 3** (validated on the real tester, reviewed, `CODE_REVIEW_PASS`):
+  `tester_sampling.py`, `tester_jobs.py`, CLI `scripts/tester_jobs.py`.
+  - XOM: 827 sampled points, 27 jobs, about 540 s.
+  - The tester files were restored byte-identical.
+  - Tester and simulator agree on 99.8 % of the points.
+- **Stage 4** (reviewed, `CODE_REVIEW_PASS`): `panel_store.py`, Panel card MRS2 STORE
+  (history, tester plan/run/import, READY; simulation/tester mode).
+- **Verification:**
+  `.venv\Scripts\python.exe -m pytest -p no:cacheprovider tests/test_trade_store.py tests/test_trade_windows.py tests/test_ready_store.py tests/test_tester_jobs.py tests/test_panel_store.py tests/test_mrs2_simulator.py tests/test_period_csv.py tests/test_panel_static_ui.py`.
+- **Next:**
+  - run the full simulator history of all 242 registry pairs into
+    `trade_store.root` (user decision 2026-10-17);
+  - recalibrate the READY v4 thresholds on store data, since the minute-level
+    MaxDD of 20-day periods is above the daily-scale ceiling of 6 %;
+  - agree the screener simulation mode with the user;
+  - one commit when the user confirms.
+- **Blockers:** none for the code. The READY thresholds are provisional, and
+  the pilot admits only XOM.
 
 ## Merge of origin/main into the BingX line (2026-10-16)
 

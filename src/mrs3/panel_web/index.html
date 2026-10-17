@@ -118,6 +118,26 @@
               <p class="card-status" role="status" aria-live="polite">Удалённый runner ещё не проверен.</p>
             </div>
           </article>
+          <article id="store-local" class="panel-card runner-card">
+            <div class="card-heading">
+              <div><span class="card-index">MRS2 STORE</span><h2>История MRS2: симулятор, тестер, READY</h2></div>
+              <span id="store-badge" class="state-badge state-ready">IDLE</span>
+            </div>
+            <div class="card-body">
+              <p class="helper">Хранилище сделок MRS2: история пар по 20-дневным периодам считается симулятором, последний период можно проверить настоящим тестером на отобранных точках. Одна задача за раз; работа идёт отдельным процессом.</p>
+              <div class="field-grid">
+                <div class="field-group"><label for="store-mode">Режим последнего периода</label><select id="store-mode"><option value="simulation">Симуляция</option><option value="tester">Тестер</option></select></div>
+                <div class="field-group"><label for="store-end-date">Конец (пусто — последний архивный день)</label><input id="store-end-date" type="date"></div>
+                <div class="field-group"><label for="store-run-limit">Заданий тестера за запуск (0 — все)</label><input id="store-run-limit" type="number" min="0" step="1" value="0"></div>
+              </div>
+              <div class="field-group"><label for="store-pairs">Пары (пусто — все пары реестра или хранилища)</label><textarea id="store-pairs" rows="2" placeholder="XOMUSDT, SNOWUSDT"></textarea></div>
+              <div class="field-group"><label class="check" for="store-download"><input id="store-download" type="checkbox" checked><span>Докачивать недостающие дни свечей</span></label></div>
+              <div class="button-row"><button type="button" id="store-history" class="button button-primary">Посчитать историю</button><button type="button" id="store-plan" class="button button-secondary" data-tester-only>План тестера</button><button type="button" id="store-run" class="button button-secondary" data-tester-only>Запустить тестер</button><button type="button" id="store-import" class="button button-secondary" data-tester-only>Импорт тестера</button><button type="button" id="store-ready" class="button button-primary">Собрать READY</button><button type="button" id="store-stop" class="button button-secondary">Стоп</button></div>
+              <p id="store-status" class="card-status" role="status" aria-live="polite">Задача не запускалась.</p>
+              <pre id="store-log" class="helper" hidden></pre>
+              <div class="table-wrap"><table class="store-table"><thead><tr><th scope="col">Пара</th><th scope="col">Периодов</th><th scope="col">С</th><th scope="col">По</th><th scope="col">Тестер</th><th scope="col">Задания</th></tr></thead><tbody id="store-pairs-body"></tbody></table></div>
+            </div>
+          </article>
         </div>
       </section>
 

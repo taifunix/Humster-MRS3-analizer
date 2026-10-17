@@ -139,6 +139,9 @@
     "workers": 16,
     "transaction_batch_size": 250
   },
+  "trade_store": {
+    "root": "data/trade_store"
+  },
   "panel_workflow": {
     "listing_dates_path": "input/dates.xlsx",
     "algorithm_version": "0.7-canonical-phase1",
