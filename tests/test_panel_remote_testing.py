@@ -2,11 +2,9 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-import shutil
 
 import pytest
 
-import mrs3.panel as panel_module
 from mrs3.panel_remote_testing import (
     RemoteRunnerConfig,
     RemoteRunnerConfigError,
@@ -14,7 +12,6 @@ from mrs3.panel_remote_testing import (
     load_remote_runner_config,
     prepare_request,
 )
-from mrs3.panel import PanelController, PanelTestingError
 
 
 def _config(**overrides: object) -> dict[str, object]:
@@ -211,127 +208,6 @@ def test_prepare_request_rejects_invalid_inputs(kwargs: dict[str, object]) -> No
 
     with pytest.raises(ValueError, match="invalid remote testing request"):
         prepare_request(**values)
-
-
-def test_panel_controller_remote_status_and_prepare_do_not_leak_connection_data(tmp_path) -> None:
-    secret = "correct horse battery staple"
-    config = tmp_path / "config.local.json"
-    config.write_text(json.dumps({"remote_runner": _config(password=secret)}), encoding="utf-8")
-    controller = PanelController(tmp_path, config)
-
-    status = controller.remote_testing_status()
-    request = controller.remote_testing_prepare(
-        {"symbols": "BTCUSDT, ETHUSDT", "side": "LONG", "start": "2026-07-15", "end": "2026-08-06"}
-    )
-
-    encoded = json.dumps({"status": status, "request": request})
-    assert status["configured"] is True
-    assert request["report_archive_folder"] == "BTC_ETH_2026-07-15_2026-08-06"
-    assert secret not in encoded
-    assert "runner.example.test" not in encoded
-
-
-def test_panel_controller_remote_fill_uses_side_templates_without_connection_leakage(
-    tmp_path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    calls: list[dict[str, object]] = []
-
-    class FakeRemoteService:
-        def __init__(self, _document):
-            pass
-
-        def fill(self, request, *, tester_template, strategy_template, max_parallel_runs):
-            calls.append({
-                "request": request,
-                "tester_template": tester_template,
-                "strategy_template": strategy_template,
-                "max_parallel_runs": max_parallel_runs,
-            })
-            return {"state": "FILLED", "strategy_name": "safe"}
-
-        def start(self):
-            calls.append({"started": True})
-            return {"state": "STARTED"}
-
-    monkeypatch.setattr(panel_module, "RemoteTestingService", FakeRemoteService)
-    config = tmp_path / "config.local.json"
-    config.write_text(json.dumps({
-        "remote_runner": _config(),
-        "tester_runner": {
-            "bot_root": str(tmp_path / "hb"), "executable": "hb_c.exe",
-            "base_url": "http://127.0.0.1:8087", "port": 8087,
-            "strategy_dir": "settings_strategy", "report_dir": "tester/report/my_test",
-            "wizard_result": "tester/wizard_result.json", "wizard_progress": "tester/wizard_progress.json",
-            "tester_config": "config_tester.json", "inbox_root": str(tmp_path / "inbox"),
-            "max_parallel_submissions": 7,
-        },
-    }), encoding="utf-8")
-    repo_root = Path(__file__).parents[1]
-    for relative_path in panel_module._TEMPLATES["SHORT"]:
-        source = repo_root / relative_path
-        target = tmp_path / relative_path
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(source, target)
-    controller = PanelController(tmp_path, config)
-
-    result = controller.remote_testing_fill({
-        "symbols": "BTCUSDT", "side": "SHORT", "start": "2026-07-15", "end": "2026-08-06",
-    })
-
-    assert result == {"state": "FILLED", "strategy_name": "safe"}
-    assert calls[0]["request"]["side"] == "SHORT"
-    assert calls[0]["max_parallel_runs"] == 7
-    assert "mrs2.ma_short" in calls[0]["tester_template"]
-    assert '"use_short"' in calls[0]["strategy_template"]
-    assert "runner.example.test" not in json.dumps(result)
-    assert controller.remote_testing_start() == {"state": "STARTED"}
-    assert calls[-1] == {"started": True}
-
-
-def test_panel_controller_remote_fill_fails_closed_when_worker_config_is_invalid(
-    tmp_path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    class FakeRemoteService:
-        def __init__(self, _document):
-            pass
-
-        def fill(self, **_kwargs):
-            pytest.fail("remote upload must not start")
-
-    monkeypatch.setattr(panel_module, "RemoteTestingService", FakeRemoteService)
-    config = tmp_path / "config.local.json"
-    config.write_text(json.dumps({
-        "remote_runner": _config(),
-        "tester_runner": {
-            "bot_root": str(tmp_path / "hb"), "executable": "hb_c.exe",
-            "base_url": "http://127.0.0.1:8087", "port": 8087,
-            "strategy_dir": "settings_strategy", "report_dir": "tester/report/my_test",
-            "wizard_result": "tester/wizard_result.json", "wizard_progress": "tester/wizard_progress.json",
-            "tester_config": "config_tester.json", "inbox_root": str(tmp_path / "inbox"),
-            "max_parallel_submissions": True,
-        },
-    }), encoding="utf-8")
-
-    with pytest.raises(PanelTestingError, match="invalid tester configuration"):
-        PanelController(tmp_path, config).remote_testing_fill({
-            "symbols": "BTCUSDT", "side": "LONG", "start": "2026-07-15", "end": "2026-08-06",
-        })
-
-
-def test_remote_start_is_rejected_until_this_controller_fills_the_config(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
-    class FakeRemoteService:
-        def __init__(self, _document):
-            pass
-
-        def start(self):
-            pytest.fail("must not start before fill")
-
-    monkeypatch.setattr(panel_module, "RemoteTestingService", FakeRemoteService)
-    config = tmp_path / "config.local.json"
-    config.write_text(json.dumps({"remote_runner": _config()}), encoding="utf-8")
-
-    with pytest.raises(Exception, match="invalid testing request"):
-        PanelController(tmp_path, config).remote_testing_start()
 
 
 def test_check_paths_uses_one_injected_plink_argv_and_returns_only_labels() -> None:

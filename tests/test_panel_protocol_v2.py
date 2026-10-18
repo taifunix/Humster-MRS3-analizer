@@ -47,9 +47,6 @@ def test_a_v1_database_refuses_every_mrs3_flow_before_rendering(tmp_path: Path, 
         lambda: controller.strategies_tester_runs_start({}),
         lambda: controller.strategies_fresh_generate({"analysis_run_id": "a" * 64}),
         lambda: controller.strategies_fresh_generate_runs({"analysis_run_id": "a" * 64}),
-        lambda: controller.start_analysis_strategies(
-            {"run_id": "R1", "selected_scopes": [{"symbol": "BTCUSDT", "side": "LONG", "timeframe": "1h"}]}
-        ),
         lambda: controller.strategies_tester_start(
             {"analysis_run_id": "a" * 64, "start_date": "2026-01-01", "end_date": "2026-01-31"}
         ),
@@ -175,35 +172,6 @@ def test_retry_refuses_a_job_rendered_before_protocol_v2(tmp_path: Path, monkeyp
     controller.strategies_tester_retry({"job_id": _failed_tester_job(controller, controller._protocol_v2_runtime(target))})
 
     assert retried == ["strategies.tester.retry"]
-
-
-def test_legacy_tester_run_launches_only_protocol_v2_strategies(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    controller = _controller(tmp_path, seed=False)
-    use_protocol_v2_target(monkeypatch, check_launch=True)
-    strategies = tmp_path / "legacy-strategies"
-    strategies.mkdir()
-    strategy = protocol_v2_template(exchange="Bybit", my_fix_balance=10000.0)
-    strategy["basic"]["use_fix"] = False  # type: ignore[index]
-    (strategies / "old.json").write_text(json.dumps(strategy), encoding="utf-8")
-
-    bot_config = tmp_path / "bot-tester.json"
-    monkeypatch.setattr(panel_module.RunnerConfig, "from_json", lambda _path: SimpleNamespace(tester_config=bot_config))
-    request = {"config": str(tmp_path / "config.json"), "strategies": str(strategies), "output_csv": str(tmp_path / "out.csv")}
-
-    with pytest.raises(EvaluationProtocolError, match="basic.use_fix"):
-        controller._build_command("tester-run", request)
-    strategy["basic"]["use_fix"] = True  # type: ignore[index]
-    (strategies / "old.json").write_text(json.dumps(strategy), encoding="utf-8")
-    # The bot tester config is checked too.
-    bot_config.write_text(json.dumps({"InitialBalance": 1000, "LimitOrderVolumeCheck": False}), encoding="utf-8")
-    with pytest.raises(EvaluationProtocolError, match="InitialBalance"):
-        controller._build_command("tester-run", request)
-    bot_config.write_text(json.dumps({"InitialBalance": 10000, "LimitOrderVolumeCheck": False}), encoding="utf-8")
-    controller._build_command("tester-run", request)
-    # A resumed run would reuse an older frozen config snapshot.
-    (tmp_path / ".out.tester-config.snapshot").write_text("{}", encoding="utf-8")
-    with pytest.raises(EvaluationProtocolError, match="snapshot"):
-        controller._build_command("tester-run", request)
 
 
 def test_bingx_launches_use_the_bingx_templates(tmp_path: Path) -> None:

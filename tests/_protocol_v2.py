@@ -41,7 +41,6 @@ def use_protocol_v2_target(monkeypatch, exchange: str = "Bybit", *, check_launch
         monkeypatch.setattr(PanelController, "_require_protocol_v2_manifest", lambda _self, _manifest, _target: None)
         monkeypatch.setattr(PanelController, "_require_protocol_v2_runs", lambda _self, _target: None)
         monkeypatch.setattr(PanelController, "_require_protocol_v2_tester_template", lambda _self, _target: None)
-        monkeypatch.setattr(PanelController, "_require_protocol_v2_legacy_run", lambda _self, _payload, _strategies: None)
     return target
 
 

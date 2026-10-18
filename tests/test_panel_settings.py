@@ -5,11 +5,10 @@ import hashlib
 import json
 from pathlib import Path
 import threading
-from types import SimpleNamespace
 
 import pytest
 
-from mrs3.panel import PanelController, PanelTestingError, create_panel_server
+from mrs3.panel import PanelController, create_panel_server
 
 
 def _runner_config() -> dict[str, object]:
@@ -207,25 +206,6 @@ def test_settings_save_without_surface_path_preserves_configured_surface_path(pa
     assert json.loads(config.read_text(encoding="utf-8"))["panel"]["path_defaults"]["surface_target_path"] == configured
 
 
-def test_analysis_path_requires_configured_database_file(tmp_path: Path) -> None:
-    config = tmp_path / "config.local.json"
-    config.write_text(json.dumps({"panel_paths": {"analysis_root": "data/Analysis"}}), encoding="utf-8")
-    controller = PanelController(tmp_path, config)
-
-    with pytest.raises(ValueError, match="analysis_duckdb_path must be configured"):
-        controller._analysis_path()
-
-
-def test_analysis_path_resolves_configured_database_file(tmp_path: Path) -> None:
-    config = tmp_path / "config.local.json"
-    config.write_text(json.dumps({
-        "duckdb_import": {"analysis_duckdb_path": "data/Analysis/run.duckdb"},
-    }), encoding="utf-8")
-    controller = PanelController(tmp_path, config)
-
-    assert controller._analysis_path() == (tmp_path / "data/Analysis/run.duckdb").resolve()
-
-
 @pytest.mark.parametrize(
     "content", ["", "{not-json", json.dumps([]), json.dumps({"tester_runner": []})]
 )
@@ -399,7 +379,6 @@ def test_save_preserves_unknown_keys_formats_and_prior_backup_and_reload_persist
     assert status == 200
     assert body["valid"] is True
     assert body["settings"]["panel"]["default_root"] == "static"
-    assert PanelController(root, config).panel_default_root() == "static"
 
 
 def test_save_path_defaults_updates_local_and_remote_runtime_paths(panel_http) -> None:
@@ -465,30 +444,6 @@ def test_panel_restart_endpoint_rejects_active_jobs(tmp_path: Path) -> None:
     controller = PanelController(tmp_path, config)
     job = controller.panel_job_submit({"kind": "test.job", "request": {}, "idempotency_key": "restart-test", "resource_keys": []})
     controller._panel_jobs.transition(job["job_id"], "RUNNING")
-    launched: list[bool] = []
-    server = create_panel_server("127.0.0.1", 0, controller, restart_launcher=lambda: launched.append(True))
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
-    try:
-        status, _ = _request(connection, "POST", "/api/v2/panel/restart", {})
-        assert status == 409
-        assert launched == []
-    finally:
-        connection.close()
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=2)
-
-
-@pytest.mark.parametrize("job_attribute", ("_import_job", "_import_preflight_job"))
-def test_panel_restart_endpoint_rejects_active_legacy_import_jobs(
-    tmp_path: Path, job_attribute: str,
-) -> None:
-    config = tmp_path / "config.local.json"
-    config.write_text(json.dumps(_runner_config()), encoding="utf-8")
-    controller = PanelController(tmp_path, config)
-    setattr(controller, job_attribute, SimpleNamespace(running=True))
     launched: list[bool] = []
     server = create_panel_server("127.0.0.1", 0, controller, restart_launcher=lambda: launched.append(True))
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -746,53 +701,13 @@ def test_jobs_endpoint_has_stable_job_errors_and_accepts_queued_job(panel_http) 
     assert body["job"]["state"] == "QUEUED"
 
 
-def test_v2_local_testing_status_is_redacted(panel_http) -> None:
-    root, _, connection = panel_http
-
-    status, body = _request(connection, "GET", "/api/v2/testing/local/status")
-
-    assert status == 200
-    assert body["preflight_ok"] is False
-    assert str(root) not in json.dumps(body)
-
-
-def test_v2_local_testing_fill_rejects_unconfigured_runner(panel_http) -> None:
-    _, _, connection = panel_http
-
-    status, body = _request(
-        connection, "POST", "/api/v2/testing/local/fill",
-        {"symbols": "CXUSDT", "side": "LONG", "start": "2026-07-15", "end": "2026-08-06"},
-    )
-
-    assert status == 400
-    assert body == {"error": "invalid settings"}
-
-
-def test_v2_local_testing_fill_reports_already_prepared_files(panel_http, monkeypatch) -> None:
-    _, _, connection = panel_http
-
-    def already_prepared(self, payload):
-        del self, payload
-        raise PanelTestingError("TESTER_FILES_PREPARED")
-
-    monkeypatch.setattr(PanelController, "local_testing_fill", already_prepared)
-
-    status, body = _request(
-        connection, "POST", "/api/v2/testing/local/fill",
-        {"symbols": "CXUSDT", "side": "LONG", "start": "2026-07-15", "end": "2026-08-06"},
-    )
-
-    assert status == 409
-    assert body == {"error": "TESTER_FILES_PREPARED"}
-
-
 def test_static_settings_markup_remains_semantic_with_portfolio_screen() -> None:
     from mrs3 import panel as panel_module
 
     html = (Path(panel_module.__file__).parent / "panel_web" / "index.html").read_text(encoding="utf-8")
     assert '<section id="settings"' in html
     assert '<form' in html
-    assert 'for="settings-default-root"' in html
-    assert 'id="settings-default-root"' in html
+    # The legacy single-page panel and its «Default panel» switch were removed in Panel rework stage 1a.
+    assert 'id="settings-default-root"' not in html
     assert 'aria-live="polite"' in html
     assert '<section id="portfolio"' in html

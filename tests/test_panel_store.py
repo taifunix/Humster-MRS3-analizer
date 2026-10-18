@@ -153,7 +153,7 @@ def test_static_shell_has_the_store_card():
     html = (root / "index.html").read_text(encoding="utf-8")
     js = (root / "app.js").read_text(encoding="utf-8")
     testing = html.split('<section id="testing"', 1)[1].split('<section id="source-db"', 1)[0]
-    assert testing.index('id="runner-remote"') < testing.index('id="store-local"')
+    assert 'id="runner-remote"' not in testing and 'id="screener-local"' not in testing
     for name in ("mode", "pairs", "end-date", "run-limit", "download", "history", "plan", "run", "import", "ready",
                  "stop", "status", "log", "pairs-body"):
         assert f'id="store-{name}"' in testing

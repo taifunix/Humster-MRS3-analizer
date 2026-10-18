@@ -6,22 +6,17 @@ import json
 from pathlib import Path
 import subprocess
 
-from openpyxl import Workbook
-import pandas as pd
 import pytest
 
 from mrs3.panel_testing import (
     LocalTestingService,
-    expected_screener_runs,
     render_strategy,
     render_tester_config,
 )
 import mrs3.panel_testing as panel_testing_module
 from mrs3.locking import TesterTargetBusyError, TesterTargetLock
-from mrs3.panel import PanelController, PanelTestingError
+from mrs3.panel import PanelTestingError
 from mrs3.runner.config import RunnerConfig
-from mrs3.screener.registry import ScreeningRow, write_screening_results
-from mrs3.screener.render import render_screener_tester_config
 
 
 def test_canonical_strategy_templates_are_tracked_by_mode() -> None:
@@ -50,12 +45,10 @@ def test_mrs2_testing_templates_share_one_hundred_usdt_fixed_balance() -> None:
         )
         assert strategy["basic"]["my_fix_balance"] == 100.0
 
-        for suffix in ("", "_screen"):
-            tester = json.loads(
-                (root / "templates" / "tester" / "mrs2" / f"config_tester_{side}{suffix}.json")
-                .read_text(encoding="utf-8")
-            )
-            assert tester["InitialBalance"] == 100.0
+        tester = json.loads(
+            (root / "templates" / "tester" / "mrs2" / f"config_tester_{side}.json").read_text(encoding="utf-8")
+        )
+        assert tester["InitialBalance"] == 100.0
 
 
 def test_render_tester_config_updates_dates_and_symbols_from_long_template() -> None:
@@ -220,39 +213,6 @@ def test_local_testing_prepare_uses_canonical_template_and_configured_workers(tm
     assert "parameter_mining" in rendered
 
 
-def test_local_testing_prepare_accepts_screener_template_and_renderer_override(
-    tmp_path: Path,
-) -> None:
-    config = _runner_config(tmp_path)
-    service = LocalTestingService(config, Path(__file__).parents[1])
-
-    prepared = service.prepare(
-        side="LONG",
-        symbols=("CXUSDT", "BABAUSDT"),
-        start="2026-08-01",
-        end="2026-09-18",
-        output_dir=config.inbox_root / "panel-testing",
-        template_override=(
-            "templates/tester/mrs2/config_tester_long_screen.json",
-            render_screener_tester_config,
-        ),
-    )
-
-    rendered = json.loads(prepared.tester_config.read_text(encoding="utf-8"))
-    mining = rendered["parameter_mining"]
-    total_combos = 1
-    for entry in mining:
-        total_combos *= len(entry["values"])
-    assert total_combos == 304 * 2
-    symbol_entry = next(e for e in mining if e["name"] == "settings[*].basic.symbol")
-    assert symbol_entry["end"] == 2.0
-    # The strategy side is unaffected by the config-template override — it
-    # still comes from _TEMPLATES[side][1], the same as RUNNER 01.
-    files = tuple(prepared.strategy_source.glob("*.json"))
-    strategy = json.loads(files[0].read_text(encoding="utf-8"))
-    assert strategy["basic"]["use_long"] is True
-
-
 def test_local_testing_prepare_rejects_config_template_path_escaping_repo_root(
     tmp_path: Path,
 ) -> None:
@@ -268,14 +228,6 @@ def test_local_testing_prepare_rejects_config_template_path_escaping_repo_root(
             output_dir=config.inbox_root / "panel-testing",
             template_override=("../../../../etc/passwd", render_tester_config),
         )
-
-
-def test_expected_screener_runs_rejects_config_template_path_escaping_repo_root(
-    tmp_path: Path,
-) -> None:
-    repo_root = Path(__file__).parents[1]
-    with pytest.raises(PanelTestingError, match="invalid tester configuration"):
-        expected_screener_runs(repo_root, "../../../../etc/passwd", ("AUSDT",))
 
 
 def test_local_testing_prepare_default_kwargs_render_exactly_like_runner01(
@@ -308,80 +260,6 @@ def test_local_testing_prepare_default_kwargs_render_exactly_like_runner01(
     rendered_explicit = prepared_explicit.tester_config.read_text(encoding="utf-8")
 
     assert rendered_omitted == rendered_none == rendered_explicit
-
-
-def test_expected_screener_runs_multiplies_static_combos_by_symbol_count() -> None:
-    repo_root = Path(__file__).parents[1]
-    total = expected_screener_runs(
-        repo_root,
-        "templates/tester/mrs2/config_tester_long_screen.json",
-        ("AUSDT", "BUSDT", "CUSDT"),
-    )
-    assert total == 304 * 3
-
-
-def test_expected_screener_runs_rejects_empty_symbols() -> None:
-    repo_root = Path(__file__).parents[1]
-    with pytest.raises(PanelTestingError, match="invalid tester configuration"):
-        expected_screener_runs(
-            repo_root, "templates/tester/mrs2/config_tester_long_screen.json", ()
-        )
-
-
-def test_expected_screener_runs_rejects_missing_symbol_entry(tmp_path: Path) -> None:
-    template = tmp_path / "screen.json"
-    template.write_text(
-        json.dumps(
-            {
-                "parameter_mining": [
-                    {"name": "settings[*].mrs2.ma_long.len", "values": ["4"]},
-                ]
-            }
-        ),
-        encoding="utf-8",
-    )
-    with pytest.raises(PanelTestingError, match="invalid tester configuration"):
-        expected_screener_runs(tmp_path, "screen.json", ("AUSDT",))
-
-
-def test_expected_screener_runs_rejects_duplicate_symbol_entries(tmp_path: Path) -> None:
-    template = tmp_path / "screen.json"
-    template.write_text(
-        json.dumps(
-            {
-                "parameter_mining": [
-                    {"name": "settings[*].basic.symbol", "values": ["AUSDT"]},
-                    {"name": "settings[*].basic.symbol", "values": ["BUSDT"]},
-                ]
-            }
-        ),
-        encoding="utf-8",
-    )
-    with pytest.raises(PanelTestingError, match="invalid tester configuration"):
-        expected_screener_runs(tmp_path, "screen.json", ("AUSDT",))
-
-
-def test_expected_screener_runs_rejects_symbol_without_usdt_suffix() -> None:
-    repo_root = Path(__file__).parents[1]
-    with pytest.raises(PanelTestingError, match="invalid tester configuration"):
-        expected_screener_runs(
-            repo_root, "templates/tester/mrs2/config_tester_long_screen.json", ("BTC",)
-        )
-
-
-def test_expected_screener_runs_wraps_missing_template_file(tmp_path: Path) -> None:
-    with pytest.raises(PanelTestingError, match="invalid tester configuration"):
-        expected_screener_runs(tmp_path, "missing_screen.json", ("AUSDT",))
-
-
-def test_expected_screener_runs_short_template() -> None:
-    repo_root = Path(__file__).parents[1]
-    total = expected_screener_runs(
-        repo_root,
-        "templates/tester/mrs2/config_tester_short_screen.json",
-        ("AUSDT",),
-    )
-    assert total == 304
 
 
 def test_local_testing_prepare_uses_isolated_directory_without_deleting_workspace_files(
@@ -937,407 +815,6 @@ def test_local_fill_does_not_mutate_when_initial_stop_is_unconfirmed(tmp_path: P
     assert (config.bot_root / ".mrs3-tester-target.lock").is_file()
 
 
-def test_panel_controller_exposes_local_testing_preflight_without_paths(tmp_path: Path) -> None:
-    config = _runner_config(tmp_path)
-    document = {
-        "tester_runner": {
-            "bot_root": str(config.bot_root), "executable": "hb_c.exe",
-            "base_url": config.base_url, "port": config.port,
-            "strategy_dir": "settings_strategy", "report_dir": "tester/report/my_test",
-            "wizard_result": "tester/wizard_result.json", "wizard_progress": "tester/wizard_progress.json",
-            "tester_config": "tester/tester_config.json", "inbox_root": str(config.inbox_root),
-        }
-    }
-    config_path = tmp_path / "config.local.json"
-    config_path.write_text(json.dumps(document), encoding="utf-8")
-
-    status = PanelController(tmp_path, config_path).local_testing_status()
-
-    assert status["preflight_ok"] is True
-    assert str(config.bot_root) not in json.dumps(status)
-
-
-def test_panel_controller_fills_one_local_strategy_and_tester_config(tmp_path: Path) -> None:
-    config = _runner_config(tmp_path)
-    document = {"tester_runner": {
-        "bot_root": str(config.bot_root), "executable": "hb_c.exe", "base_url": config.base_url, "port": config.port,
-        "strategy_dir": "settings_strategy", "report_dir": "tester/report/my_test", "wizard_result": "tester/wizard_result.json",
-        "wizard_progress": "tester/wizard_progress.json", "tester_config": "tester/tester_config.json", "inbox_root": str(config.inbox_root),
-    }}
-    config_path = tmp_path / "config.local.json"
-    config_path.write_text(json.dumps(document), encoding="utf-8")
-
-    prepared = PanelController(tmp_path, config_path).local_testing_fill({
-        "symbols": "CXUSDT, BABAUSDT", "side": "SHORT", "start": "2026-07-15", "end": "2026-08-06",
-    })
-
-    assert prepared["side"] == "SHORT"
-    assert prepared["symbols"] == ["CXUSDT", "BABAUSDT"]
-    assert str(config.bot_root) not in json.dumps(prepared)
-    assert config.tester_config.is_file()
-    assert tuple(config.strategy_dir.glob("*.json"))
-
-
-def test_panel_controller_reports_when_local_tester_files_are_already_prepared(tmp_path: Path) -> None:
-    config = _runner_config(tmp_path)
-    document = {"tester_runner": {
-        "bot_root": str(config.bot_root), "executable": "hb_c.exe", "base_url": config.base_url, "port": config.port,
-        "strategy_dir": "settings_strategy", "report_dir": "tester/report/my_test", "wizard_result": "tester/wizard_result.json",
-        "wizard_progress": "tester/wizard_progress.json", "tester_config": "tester/tester_config.json", "inbox_root": str(config.inbox_root),
-    }}
-    config_path = tmp_path / "config.local.json"
-    config_path.write_text(json.dumps(document), encoding="utf-8")
-    controller = PanelController(tmp_path, config_path)
-    request = {"symbols": "CXUSDT", "side": "LONG", "start": "2026-07-15", "end": "2026-08-06"}
-
-    controller.local_testing_fill(request)
-
-    with pytest.raises(PanelTestingError, match="TESTER_FILES_PREPARED"):
-        controller.local_testing_fill(request)
-
-
-def test_panel_controller_reports_when_another_local_tester_owner_holds_the_lock(tmp_path: Path) -> None:
-    config = _runner_config(tmp_path)
-    document = {"tester_runner": {
-        "bot_root": str(config.bot_root), "executable": "hb_c.exe", "base_url": config.base_url, "port": config.port,
-        "strategy_dir": "settings_strategy", "report_dir": "tester/report/my_test", "wizard_result": "tester/wizard_result.json",
-        "wizard_progress": "tester/wizard_progress.json", "tester_config": "tester/tester_config.json", "inbox_root": str(config.inbox_root),
-    }}
-    config_path = tmp_path / "config.local.json"
-    config_path.write_text(json.dumps(document), encoding="utf-8")
-    external_owner = TesterTargetLock(config.bot_root).acquire()
-    request = {"symbols": "CXUSDT", "side": "LONG", "start": "2026-07-15", "end": "2026-08-06"}
-
-    try:
-        with pytest.raises(PanelTestingError, match="TESTER_FILES_PREPARED"):
-            PanelController(tmp_path, config_path).local_testing_fill(request)
-    finally:
-        external_owner.release()
-
-
-def test_panel_controller_rejects_non_boolean_report_cleanup_request(tmp_path: Path) -> None:
-    config = _runner_config(tmp_path)
-    document = {"tester_runner": {
-        "bot_root": str(config.bot_root), "executable": "hb_c.exe", "base_url": config.base_url, "port": config.port,
-        "strategy_dir": "settings_strategy", "report_dir": "tester/report/my_test", "wizard_result": "tester/wizard_result.json",
-        "wizard_progress": "tester/wizard_progress.json", "tester_config": "tester/tester_config.json", "inbox_root": str(config.inbox_root),
-    }}
-    config_path = tmp_path / "config.local.json"
-    config_path.write_text(json.dumps(document), encoding="utf-8")
-
-    with pytest.raises(Exception, match="invalid testing request"):
-        PanelController(tmp_path, config_path).local_testing_fill({
-            "symbols": "CXUSDT", "side": "LONG", "start": "2026-07-15", "end": "2026-08-06",
-            "delete_old_reports": "yes",
-        })
-
-
-def _tester_runner_document(config: RunnerConfig) -> dict[str, object]:
-    return {"tester_runner": {
-        "bot_root": str(config.bot_root), "executable": "hb_c.exe", "base_url": config.base_url, "port": config.port,
-        "strategy_dir": "settings_strategy", "report_dir": "tester/report/my_test", "wizard_result": "tester/wizard_result.json",
-        "wizard_progress": "tester/wizard_progress.json", "tester_config": "tester/tester_config.json", "inbox_root": str(config.inbox_root),
-    }}
-
-
-def test_local_screener_status_matches_local_testing_status(tmp_path: Path) -> None:
-    config = _runner_config(tmp_path)
-    config_path = tmp_path / "config.local.json"
-    config_path.write_text(json.dumps(_tester_runner_document(config)), encoding="utf-8")
-    controller = PanelController(tmp_path, config_path)
-
-    screener_status = controller.local_screener_status()
-    testing_status = controller.local_testing_status()
-    assert {key: value for key, value in screener_status.items() if key != "disk_free_bytes"} == {
-        key: value for key, value in testing_status.items() if key != "disk_free_bytes"
-    }
-    for status in (screener_status, testing_status):
-        disk_free_bytes = status["disk_free_bytes"]
-        assert type(disk_free_bytes) is int and disk_free_bytes >= 0
-
-
-@pytest.mark.parametrize(
-    "raw,expected",
-    [
-        ("AUSDT, BUSDT", ("AUSDT", "BUSDT")),
-        ("AUSDT BUSDT\nCUSDT", ("AUSDT", "BUSDT", "CUSDT")),
-        (["AUSDT", "BUSDT"], ("AUSDT", "BUSDT")),
-    ],
-)
-def test_local_screener_request_splits_symbols(raw: object, expected: tuple[str, ...]) -> None:
-    request = PanelController._local_screener_request(
-        {"symbols": raw, "side": "LONG", "start": "2026-08-01", "end": "2026-09-18"}
-    )
-    assert request["symbols"] == expected
-
-
-def test_local_screener_request_rejects_empty_symbols() -> None:
-    with pytest.raises(PanelTestingError, match="invalid testing request"):
-        PanelController._local_screener_request({"symbols": "   ", "side": "LONG"})
-
-
-def test_panel_controller_fills_screener_long_uses_screening_grid(tmp_path: Path) -> None:
-    config = _runner_config(tmp_path)
-    config_path = tmp_path / "config.local.json"
-    config_path.write_text(json.dumps(_tester_runner_document(config)), encoding="utf-8")
-    controller = PanelController(tmp_path, config_path)
-
-    result = controller.local_screener_fill({
-        "symbols": "AUSDT\nBUSDT", "side": "long", "start": "2026-08-01", "end": "2026-09-18",
-    })
-
-    assert result["side"] == "LONG"
-    assert result["expected_runs"] == 304 * 2
-    rendered = json.loads(config.tester_config.read_text(encoding="utf-8"))
-    mining = rendered["parameter_mining"]
-    total = 1
-    for entry in mining:
-        total *= len(entry["values"])
-    assert total == 304 * 2
-    symbol_entry = next(e for e in mining if e["name"] == "settings[*].basic.symbol")
-    assert symbol_entry["end"] == 2.0
-
-
-def test_panel_controller_screener_fill_succeeds_when_expected_runs_preview_fails(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # expected_screener_runs re-reads/re-parses the template after fill has
-    # already staged it; a failure there must not undo an otherwise-successful
-    # fill (see the "Files are already staged" comment in local_screener_fill).
-    config = _runner_config(tmp_path)
-    config_path = tmp_path / "config.local.json"
-    config_path.write_text(json.dumps(_tester_runner_document(config)), encoding="utf-8")
-    controller = PanelController(tmp_path, config_path)
-
-    def _boom(*args: object, **kwargs: object) -> int:
-        raise PanelTestingError("invalid tester configuration")
-
-    monkeypatch.setattr("mrs3.panel.expected_screener_runs", _boom)
-
-    result = controller.local_screener_fill({
-        "symbols": "AUSDT", "side": "long", "start": "2026-08-01", "end": "2026-09-18",
-    })
-
-    assert "expected_runs" not in result
-    assert config.tester_config.exists()
-
-
-def test_panel_controller_fills_screener_short_uses_short_template(tmp_path: Path) -> None:
-    config = _runner_config(tmp_path)
-    config_path = tmp_path / "config.local.json"
-    config_path.write_text(json.dumps(_tester_runner_document(config)), encoding="utf-8")
-    controller = PanelController(tmp_path, config_path)
-
-    result = controller.local_screener_fill({
-        "symbols": "AUSDT", "side": "SHORT", "start": "2026-08-01", "end": "2026-09-18",
-    })
-
-    assert result["side"] == "SHORT"
-    rendered = json.loads(config.tester_config.read_text(encoding="utf-8"))
-    assert any(
-        entry["name"] == "settings[*].mrs2.ma_short.multiplier" for entry in rendered["parameter_mining"]
-    )
-    strategy_files = tuple(config.strategy_dir.glob("*.json"))
-    strategy = json.loads(strategy_files[0].read_text(encoding="utf-8"))
-    assert strategy["basic"]["use_short"] is True
-
-
-def test_panel_controller_screener_fill_rejects_symbol_without_usdt_suffix(tmp_path: Path) -> None:
-    config = _runner_config(tmp_path)
-    config_path = tmp_path / "config.local.json"
-    config_path.write_text(json.dumps(_tester_runner_document(config)), encoding="utf-8")
-    controller = PanelController(tmp_path, config_path)
-
-    with pytest.raises(PanelTestingError, match="USDT"):
-        controller.local_screener_fill({
-            "symbols": "CXBTC", "side": "LONG", "start": "2026-08-01", "end": "2026-09-18",
-        })
-
-
-def test_panel_controller_screener_and_runner01_share_the_tester_lock(tmp_path: Path) -> None:
-    config = _runner_config(tmp_path)
-    config_path = tmp_path / "config.local.json"
-    config_path.write_text(json.dumps(_tester_runner_document(config)), encoding="utf-8")
-    controller = PanelController(tmp_path, config_path)
-
-    controller.local_screener_fill({
-        "symbols": "AUSDT", "side": "LONG", "start": "2026-08-01", "end": "2026-09-18",
-    })
-
-    with pytest.raises(PanelTestingError, match="TESTER_FILES_PREPARED"):
-        controller.local_testing_fill({
-            "symbols": "CXUSDT", "side": "LONG", "start": "2026-07-15", "end": "2026-08-06",
-        })
-
-
-def _write_screener_evaluation_fixture(tmp_path: Path, config: RunnerConfig) -> Path:
-    dates_path = tmp_path / "dates.xlsx"
-    pd.DataFrame([["AUSDT", "2020-01-01"]]).to_excel(dates_path, index=False, header=False)
-
-    row = {
-        "StartDate": "2026-08-01 00:00:00",
-        "EndDate": "2026-08-31 00:00:00",
-        "TotalPnLPercent": 30,
-        "MaxDrawdownPercent": 5,
-        "TotalTrades": 20,
-        "WinRate": 80,
-        "settings[*].basic.symbol": "AUSDT",
-        "settings[*].basic.time_frame": "1h",
-        "settings[*].mrs2.ma_close_long.len": "2",
-        "settings[*].mrs2.ma_long.len": "4",
-        "settings[*].mrs2.ma_long.multiplier": "0.99",
-    }
-    pd.DataFrame([row]).to_csv(
-        config.report_dir / "reports_history.csv", index=False, encoding="utf-8-sig"
-    )
-
-    document = _tester_runner_document(config)
-    document["panel_workflow"] = {"listing_dates_path": str(dates_path)}
-    document["screener"] = {
-        "expected_combos_per_pair": 1,
-        "go_min_good": 1,
-        "stop_best_pnl30": 1,
-        "good_pnl30": 1,
-        "big_min_good": 1,
-        "big_shift_bp": 1,
-    }
-    config_path = tmp_path / "config.local.json"
-    config_path.write_text(json.dumps(document), encoding="utf-8")
-    return config_path
-
-
-def test_local_screener_evaluate_returns_serialized_verdicts(tmp_path: Path) -> None:
-    config = _runner_config(tmp_path)
-    config_path = _write_screener_evaluation_fixture(tmp_path, config)
-    controller = PanelController(tmp_path, config_path)
-
-    result = controller.local_screener_evaluate()
-
-    assert result["big_shift_bp"] == 1
-    assert result["verdicts"] == [
-        {
-            "symbol": "AUSDT",
-            "side": "LONG",
-            "verdict": "GO",
-            "big_shift": True,
-            "n_reports": 1,
-            "n_unique_combos": 1,
-            "n_good": 1,
-            "n_good_big_shift": 1,
-            "best_pnl30": "30",
-            "best_timeframe": "1h",
-            "best_shift_bp": 100,
-            "best_close_len": "2",
-            "best_dd_pct": "5",
-            "effective_days": "30",
-            "window_start": "2026-08-01 00:00:00",
-            "window_end": "2026-08-31 00:00:00",
-        }
-    ]
-    json.dumps(result)  # must be JSON-serializable end to end
-
-
-def test_local_screener_export_returns_downloadable_csv(tmp_path: Path) -> None:
-    config = _runner_config(tmp_path)
-    config_path = _write_screener_evaluation_fixture(tmp_path, config)
-    controller = PanelController(tmp_path, config_path)
-
-    filename, data = controller.local_screener_export()
-
-    assert filename == "screener_verdicts.csv"
-    text = data.decode("utf-8-sig")
-    assert "AUSDT" in text
-    assert "GO" in text
-
-
-def _build_liquidity_registry(tmp_path: Path, symbols: list[str]) -> Path:
-    workbook = Workbook()
-    pairs = workbook.active
-    pairs.title = "Пары"
-    pairs.append(["Пара", "Дата листинга на Bybit (UTC)"])
-    for symbol in symbols:
-        pairs.append([symbol, "2020-01-01"])
-    path = tmp_path / "registry.xlsx"
-    workbook.save(path)
-    return path
-
-
-def _config_with_registry(config: RunnerConfig, registry_path: Path) -> dict[str, object]:
-    document = _tester_runner_document(config)
-    document["screener"] = {"liquidity_registry_path": str(registry_path)}
-    return document
-
-
-def test_local_screener_registry_pairs_returns_unscreened_symbols(tmp_path: Path) -> None:
-    config = _runner_config(tmp_path)
-    registry_path = _build_liquidity_registry(tmp_path, ["AUSDT", "BUSDT"])
-    write_screening_results(
-        registry_path,
-        (
-            ScreeningRow(
-                symbol="AUSDT", side="LONG", verdict="GO", big_shift=True,
-                n_good=9, n_good_big_shift=9,
-                window_start="2026-08-01", window_end="2026-09-18",
-            ),
-        ),
-    )
-    config_path = tmp_path / "config.local.json"
-    config_path.write_text(json.dumps(_config_with_registry(config, registry_path)), encoding="utf-8")
-    controller = PanelController(tmp_path, config_path)
-
-    assert controller.local_screener_registry_pairs("long") == {"symbols": ["BUSDT"]}
-    assert controller.local_screener_registry_pairs("SHORT") == {"symbols": ["AUSDT", "BUSDT"]}
-
-
-def test_local_screener_registry_pairs_rejects_invalid_side(tmp_path: Path) -> None:
-    config = _runner_config(tmp_path)
-    registry_path = _build_liquidity_registry(tmp_path, ["AUSDT"])
-    config_path = tmp_path / "config.local.json"
-    config_path.write_text(json.dumps(_config_with_registry(config, registry_path)), encoding="utf-8")
-    controller = PanelController(tmp_path, config_path)
-
-    with pytest.raises(PanelTestingError, match="invalid testing request"):
-        controller.local_screener_registry_pairs("BOTH")
-
-
-def test_local_screener_registry_pairs_requires_configured_registry(tmp_path: Path) -> None:
-    config = _runner_config(tmp_path)
-    config_path = tmp_path / "config.local.json"
-    config_path.write_text(json.dumps(_tester_runner_document(config)), encoding="utf-8")
-    controller = PanelController(tmp_path, config_path)
-
-    with pytest.raises(PanelTestingError, match="liquidity registry is not configured"):
-        controller.local_screener_registry_pairs("LONG")
-
-
-def test_local_screener_evaluate_redacts_local_paths_from_error_messages(tmp_path: Path) -> None:
-    # No reports_history*.csv written -> evaluate.py's error embeds report_dir,
-    # a local bot-root path; the panel must never leak that to the client.
-    config = _runner_config(tmp_path)
-    config_path = tmp_path / "config.local.json"
-    config_path.write_text(json.dumps(_tester_runner_document(config)), encoding="utf-8")
-    controller = PanelController(tmp_path, config_path)
-
-    with pytest.raises(PanelTestingError) as excinfo:
-        controller.local_screener_evaluate()
-
-    message = str(excinfo.value)
-    assert str(config.bot_root) not in message
-    assert str(tmp_path) not in message
-
-
-def test_local_screener_evaluate_preserves_screener_config_error_message(tmp_path: Path) -> None:
-    config = _runner_config(tmp_path)
-    document = _tester_runner_document(config)
-    document["screener"] = {"go_min_good": 0}  # ScreenerConfig requires a positive integer.
-    config_path = tmp_path / "config.local.json"
-    config_path.write_text(json.dumps(document), encoding="utf-8")
-    controller = PanelController(tmp_path, config_path)
-
-    with pytest.raises(PanelTestingError, match="go_min_good"):
-        controller.local_screener_evaluate()
-
-
 def test_runner_config_rejects_report_directory_link_before_report_cleanup(tmp_path: Path) -> None:
     config = _runner_config(tmp_path)
     alias = config.report_dir.parent / "report-alias"
@@ -1402,7 +879,7 @@ CURRENT_TESTER_KEYS = [
 
 @pytest.mark.parametrize(
     "name",
-    ["config_tester_long.json", "config_tester_short.json", "config_tester_long_screen.json", "config_tester_short_screen.json"],
+    ["config_tester_long.json", "config_tester_short.json"],
 )
 def test_mrs2_tester_templates_use_the_current_tester_format_and_core_report_profile(name: str) -> None:
     # docs/specs/2026-10-16-mrs2-tester-config-current-format.md

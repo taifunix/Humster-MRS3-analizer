@@ -131,8 +131,9 @@ def test_panel_keeps_runs_backend_but_hides_legacy_run_controls() -> None:
     assert "strategies.tester.runs" not in web_source
     assert 'id="tester-start"' in panel_html
     assert "SINGLE_MODE" in panel_html
-    assert panel_source.count("async function analysisShortlist()") == 1
-    assert panel_source.count("async function analysisStrategies()") == 1
+    # The legacy single-page panel that carried these was removed in Panel rework stage 1a.
+    assert "async function analysisShortlist()" not in panel_source
+    assert "async function analysisStrategies()" not in panel_source
 
 
 def test_generation_validation_does_not_poison_the_next_request(tmp_path: Path) -> None:

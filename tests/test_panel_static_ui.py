@@ -327,7 +327,6 @@ def test_static_shell_starts_with_all_accordions_collapsed_and_status_in_header(
 
     assert not re.search(r"<details\b[^>]*\bopen(?:\s|>)", html)
     assert "details.open = true" not in _read("app.js")
-    assert "disk_free_bytes" in _read("app.js")
     header = html.split('<header class="topbar">', 1)[1].split("</header>", 1)[0]
     assert 'id="panel-reload"' in header
     assert "'/api/v2/panel/restart'" in js
@@ -367,104 +366,6 @@ def test_static_shell_does_not_claim_unverified_artifacts() -> None:
     assert "CXUSDT В· SHORT</th><td>1h" not in html
 
 
-def test_testing_screen_has_two_independent_runner_cards_without_ssh_fields() -> None:
-    html = _read("index.html")
-    js = _read("app.js")
-
-    assert 'id="runner-local"' in html
-    assert 'id="runner-remote"' in html
-    for runner in ("local", "remote"):
-        assert f'id="{runner}-pair"' in html
-        assert f'id="{runner}-side"' in html
-        assert f'id="{runner}-start-date"' in html
-        assert f'id="{runner}-end-date"' in html
-    assert 'id="local-paths"' in html
-    assert 'id="remote-paths"' not in html
-    assert "runner" in html
-    assert 'id="panel-reload"' in html
-    assert 'name="host"' not in html
-    assert 'name="user"' not in html
-    assert "ssh" not in html.lower()
-    assert 'id="remote-paths"' not in html
-    local = html.split('id="runner-local"', 1)[1].split('id="runner-remote"', 1)[0]
-    assert 'id="local-delete-old-reports"' in local
-    assert 'type="checkbox"' in local
-    assert 'class="check"' in local
-    assert '<span>Удалить старые отчеты перед стартом</span>' in local
-    assert 'id="local-fill"' in local
-    assert local.index('id="local-check"') < local.index('id="local-fill"') < local.index('id="local-start"')
-    assert "delete_old_reports: document.querySelector('#local-delete-old-reports')?.checked === true" in js
-    assert "result.tester_status" in js
-
-
-def test_screener_card_precedes_runners_and_spans_the_testing_grid() -> None:
-    html = _read("index.html")
-    css = _read("app.css")
-    testing = html.split('<section id="testing"', 1)[1].split('<section id="source-db"', 1)[0]
-
-    assert testing.index('id="screener-local"') < testing.index('id="runner-local"')
-    assert testing.index('id="runner-local"') < testing.index('id="runner-remote"')
-    assert "#screener-local { grid-column: 1 / -1; }" in css
-
-
-def test_screener_table_groups_good_counts_and_best_passing_point_accessibly() -> None:
-    html = _read("index.html")
-    assert '<table class="screener-verdicts-table">' in html
-    table = html.split('<table class="screener-verdicts-table">', 1)[1].split("</table>", 1)[0]
-    head = table.split("<thead>", 1)[1].split("</thead>", 1)[0]
-
-    assert table.count("<caption") == 1
-    assert head.count("<tr>") == 2
-    assert '<th scope="colgroup" colspan="2">Хорошие точки</th>' in head
-    assert '<th scope="colgroup" colspan="5">Лучшая проходная точка</th>' in head
-    assert head.count('scope="col"') == 12
-    assert 'id="screener-big-shift-heading"' in head
-    assert '>Большой сдвиг</th>' in head
-    assert '<abbr title="MA close">MA</abbr>' in head
-    assert 'id="screener-verdicts-legend"' in html
-    assert "Прочерк означает, что ни одна точка не прошла экономический гейт." in html
-
-
-def test_screener_table_has_its_own_compact_twelve_column_layout() -> None:
-    html = _read("index.html")
-    css = _read("app.css")
-
-    assert 'class="shortlist-table screener-verdicts-table"' not in html
-    table = html.split('<table class="screener-verdicts-table">', 1)[1].split("</table>", 1)[0]
-    columns = table.split("<colgroup>", 1)[1].split("</colgroup>", 1)[0]
-
-    assert columns.count("<col") == 12
-    assert '.screener-verdicts-table { min-width: 860px; table-layout: fixed; }' in css
-    assert ".screener-verdicts-table th, .screener-verdicts-table td { padding: 9px 6px; }" in css
-
-
-def test_screener_ui_helpers_format_dynamic_threshold_and_display_metrics() -> None:
-    js = _read("app.js")
-    script = js.split("const ORDER_BUCKETS", 1)[0] + """
-const h = globalThis.screenerUiHelpers;
-const checks = {
-  configuredThreshold: h.bigShiftHeading(110) === 'Сдвиг ≥ 1,1%',
-  changedThreshold: h.bigShiftHeading(150) === 'Сдвиг ≥ 1,5%',
-  missingThreshold: h.bigShiftHeading(undefined) === 'Большой сдвиг',
-  malformedThreshold: h.bigShiftHeading('not-a-number') === 'Большой сдвиг',
-  stringThreshold: h.bigShiftHeading('110') === 'Большой сдвиг',
-  booleanThreshold: h.bigShiftHeading(true) === 'Большой сдвиг',
-  zeroThreshold: h.bigShiftHeading(0) === 'Большой сдвиг',
-  fractionalThreshold: h.bigShiftHeading(110.5) === 'Большой сдвиг',
-  arrayThreshold: h.bigShiftHeading([110]) === 'Большой сдвиг',
-  roundedPnl30: h.displayMetric('15.3223880597067', 0) === '15',
-  roundedDd: h.displayMetric('4.49253767343284', 1) === '4,5',
-  roundedDays: h.displayMetric('45.5779652777777', 0) === '46',
-  absentMetric: h.displayMetric(null, 1) === '—',
-};
-if (!h || Object.values(checks).some((value) => !value)) process.exit(1);
-"""
-    completed = subprocess.run(("node", "-e", script), capture_output=True, text=True)
-
-    assert completed.returncode == 0, completed.stderr or completed.stdout
-    assert "cell(screenerUiHelpers.displayMetric(verdict.effective_days, 0))" in js
-
-
 def test_source_surfaces_and_strategies_screens_have_approved_workflow_cards() -> None:
     html = _read("index.html")
 
@@ -490,23 +391,17 @@ def test_settings_semantic_ids_and_static_js_use_v2_testing_endpoints() -> None:
 
     assert '<section id="settings"' in html
     assert '<form' in html
-    assert 'for="settings-default-root"' in html
-    assert 'id="settings-default-root"' in html
+    assert 'id="settings-default-root"' not in html
     assert 'id="settings-import-workers"' in html
     assert 'id="settings-workers-save"' in html
     assert "Общий лимит рабочих процессов" in html
     assert "operational.import_workers" in js
     assert "operational: { import_workers:" in js
     assert 'aria-live="polite"' in html
-    assert 'value="legacy"' in html
-    assert 'value="static"' in html
     assert "requestJson('/api/v2/bootstrap')" in js
-    assert "requestJson('/api/v2/testing/local/status')" in js
-    assert "requestJson('/api/v2/testing/remote/status')" in js
-    assert "requestJson('/api/v2/testing/local/fill'" in js
-    assert "error.code === 'TESTER_FILES_PREPARED'" in js
-    assert "Файлы уже подготовлены. Если что-то изменилось, сначала нажмите Стоп." in js
-    assert '`/api/v2/testing/local/${action}`' in js
+    # Screener and runners were removed in Panel rework stage 1a; the Panel start no longer requests them.
+    assert "/api/v2/testing/" not in js
+    assert "/api/v2/settings/analysis-profile" not in js
     assert "/api/ui/" not in js
     assert "duckdb-direct" not in js
     assert "title.tabIndex = -1" in js
@@ -515,67 +410,11 @@ def test_settings_semantic_ids_and_static_js_use_v2_testing_endpoints() -> None:
     assert "requestJson('/api/v2/settings/reload')" in js
 
 
-def test_analysis_profile_is_one_flat_card_with_explicit_controls() -> None:
-    html = _read("index.html")
-    js = _read("app.js")
-
-    profile = html.split('id="analysis-profile-card"', 1)[1].split('</details>', 1)[0]
-    assert profile.count("<details") == 0
-    assert "Вход и версия" not in profile
-    assert "Импорт workers/batch" not in profile
-    for label in (
-        "Экономические фильтры",
-        "История и ограничения выборки",
-        "Ожидаемая частота сделок",
-        "Соседние точки и плато",
-        "Отбор READY-кандидатов",
-        "Конструкция ордеров",
-    ):
-        assert label in profile
-    for label in (
-        "Граница shift для абсолютного минимума сделок, bp",
-        "Минимум сделок при shift ≤ границы",
-        "Минимум сделок при shift > границы",
-        "Базовая минимальная частота сделок в день:",
-        "Минимальный PnL/DD",
-        "Радиус MA для проверки соседних точек, ±",
-        "Минимальная однородность всего плато",
-        "Допуск равноценности PnL и PnL/DD",
-        "BASE 1ORD: минимум точек в плато",
-        "BASE 1ORD: минимум событий плато за 30 дней",
-        "Максимум BASE 1ORD на пару/сторону/TF",
-        "Multi-order: минимум точек в каждом плато",
-        "Multi-order: минимум событий каждого плато за 30 дней",
-        "Диапазон меньшего shift: от",
-        "Диапазон меньшего shift: до",
-        "Минимальное расстояние до следующего ордера, bp",
-    ):
-        assert label in js
-    assert 'id="analysis-profile-reload"' in profile
-    assert 'id="analysis-profile-save"' in profile
-    assert 'id="analysis-listing-dates-path"' in profile
-    assert 'id="analysis-listing-dates-browse"' in profile
-    assert "Файл дат листинга" in profile
-    assert "'/api/v2/settings/analysis-profile'" in js
-    assert "remoteRequest('/api/browse', { kind: 'dates', multiple: false })" in js
-    assert "listing_dates_path: value('analysis-listing-dates-path').trim()" in js
-    assert "function analysisProfilePayload()" in js
-    assert "Целочисленные поля профиля должны быть заполнены целыми числами." in js
-    assert "if (!/^-?\\d+$/.test(raw))" in js
-    assert "lower_max_exclusive_bp: Number(pair.lower_max_exclusive_bp)" in js
-    assert "'envelope_min'" in js
-    assert "'base_slots'" in js
-    assert "analysis-canonical-shifts" not in js
-    assert "analysis-isolated" not in js
-    assert "analysis-target-dd" not in js
-
-
 def test_every_path_save_button_uses_the_settings_save_endpoint() -> None:
     html = _read("index.html")
     js = _read("app.js")
 
-    for button_id in ("local-paths-save",):
-        assert f'id="{button_id}"' in html
+    assert 'id="local-paths-save"' not in html
     assert 'id="remote-paths-save"' not in html
     assert "savePathDefaults" in js
     for path_key in ("local_reports_root", "local_source_db_root", "local_merge_target"):
@@ -2446,15 +2285,6 @@ def test_surface_and_analysis_paths_have_editable_descriptive_names_and_saves() 
     assert "normalImportAuthorized" in js
 
 
-def test_settings_analysis_profile_edits_listing_dates_workflow_path() -> None:
-    html = _read("index.html")
-    js = _read("app.js")
-
-    assert 'id="analysis-listing-dates-path"' in html
-    assert "result.listing_dates_path" in js
-    assert "listing_dates_path: value('analysis-listing-dates-path').trim()" in js
-
-
 def test_shortlist_has_one_grouped_renderer_and_shared_candidate_state() -> None:
     js = _read("app.js")
 
@@ -2526,6 +2356,7 @@ def test_request_error_helper_allows_only_declared_safe_string_endpoints() -> No
 const allows = globalThis.panelRequestErrorHelpers.allowsSafeString;
 console.log(JSON.stringify({
   profile: allows('/api/v2/settings/analysis-profile'),
+  testing: allows('/api/v2/testing/local/fill'),
   fresh: allows('/api/v2/strategies/fresh/analyze'),
   arbitrary: allows('/api/v2/settings/arbitrary'),
 }));
@@ -2535,7 +2366,8 @@ console.log(JSON.stringify({
 
     assert completed.returncode == 0, completed.stderr
     assert json.loads(completed.stdout) == {
-        "profile": True,
+        "profile": False,
+        "testing": False,
         "fresh": True,
         "arbitrary": False,
     }
@@ -3005,15 +2837,6 @@ def test_performance_v2_window_analysis_keeps_missing_values_as_dash() -> None:
     assert "performanceV2StrategyDetails(null);" in js
     assert "status === 'invalid_duration'" in js
     assert "Эквивалент 30 дней — математический эквивалент исходного окна при постоянной ставке; это не прогноз, не tick-test и не PnL MRS3." in js
-
-
-def test_testing_screen_does_not_expose_remote_runner_paths() -> None:
-    html = _read("index.html")
-
-    testing = html.split('id="runner-remote"', 1)[1].split('</article>', 1)[0]
-    assert 'id="remote-paths"' not in testing
-    for field in ("remote-bot-root", "remote-runner-root", "remote-reports-root", "remote-reports-archive-root"):
-        assert f'id="{field}"' not in html
 
 
 def test_settings_does_not_render_or_submit_remote_runner_path() -> None:

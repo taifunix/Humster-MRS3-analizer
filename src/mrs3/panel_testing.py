@@ -41,7 +41,6 @@ class TesterRunClient(Protocol):
 _SYMBOL = re.compile(r"^[A-Z0-9]{2,32}$")
 # BingX API symbols, e.g. NCSKPANW2USD-USDT (docs/specs/2026-10-10-bingx-data-downloader.md).
 _BINGX_SYMBOL = re.compile(r"^[A-Z0-9]{2,40}-USDT$")
-_SCREENER_USDT_SUFFIX = re.compile(r"USDT$")
 EXCHANGES = ("bybit", "bingx")
 # BingX mode: tester reads data only from tester/data/bingx and uses BingX fees.
 _BINGX_TESTER_SETTINGS = {"MakerFee": 0.00012, "TakerFee": 0.0003, "UpdateData": False}
@@ -91,57 +90,6 @@ def _find_unique_symbol_entry(mining: list) -> dict:
     if len(targets) != 1:
         raise PanelTestingError("invalid tester configuration")
     return targets[0]
-
-
-def expected_screener_runs(
-    repo_root: Path,
-    config_template_path: str,
-    symbols: tuple[str, ...] | list[str],
-    *,
-    exchange: str = "bybit",
-) -> int:
-    """Total tester runs a screener config template would submit for `symbols`.
-
-    Reads the template's own `parameter_mining` list lengths (not a hardcoded
-    304) so this stays correct if the screening grid ever changes. Mirrors
-    render_screener_tester_config's USDT-suffix requirement so this preview
-    count can't accept a symbol list the actual render/fill would reject —
-    this function is also called standalone, before any fill, for the panel's
-    live run-count preview.
-    """
-    if not symbols:
-        raise PanelTestingError("invalid tester configuration")
-    clean_symbols = tuple(symbol.strip().upper() for symbol in symbols)
-    pattern = _symbol_pattern(exchange)
-    if (
-        len(set(clean_symbols)) != len(clean_symbols)
-        or any(not pattern.fullmatch(symbol) for symbol in clean_symbols)
-        or any(not _SCREENER_USDT_SUFFIX.search(symbol) for symbol in clean_symbols)
-    ):
-        raise PanelTestingError("invalid tester configuration")
-    try:
-        template = _resolve_repo_path(repo_root, config_template_path).read_text(encoding="utf-8")
-    except OSError:
-        raise PanelTestingError("invalid tester configuration") from None
-    try:
-        document = json.loads(_without_trailing_commas(template))
-    except (TypeError, ValueError, json.JSONDecodeError):
-        raise PanelTestingError("invalid tester configuration") from None
-    if not isinstance(document, dict):
-        raise PanelTestingError("invalid tester configuration")
-    mining = document.get("parameter_mining")
-    if not isinstance(mining, list) or not mining:
-        raise PanelTestingError("invalid tester configuration")
-    symbol_entry = _find_unique_symbol_entry(mining)
-    combos_per_symbol = 1
-    for entry in mining:
-        if entry is symbol_entry:
-            continue
-        values = entry.get("values") if isinstance(entry, dict) else None
-        if not isinstance(values, list) or not values:
-            raise PanelTestingError("invalid tester configuration")
-        combos_per_symbol *= len(values)
-    return combos_per_symbol * len(symbols)
 
 
 def _without_trailing_commas(text: str) -> str:

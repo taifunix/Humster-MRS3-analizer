@@ -1,6 +1,6 @@
 # MRS3 Current Status
 
-Last updated: 2026-10-17
+Last updated: 2026-10-18
 
 This file is a current-status snapshot, not a session log. Earlier progress notes remain in Git history; feature contracts and detailed evidence belong in the linked specs, reports, and plans.
 
@@ -8,7 +8,35 @@ Use [PRD.md](PRD.md) for the feature registry and [docs/README.md](docs/README.m
 for the documentation map. Read the linked contract only for the active task;
 do not treat this file as a replacement for a feature specification.
 
-## MRS2 trade store (2026-10-17, branch `wip/period-csv-generator`, uncommitted)
+## Panel rework stage 1a (2026-10-18, branch `wip/period-csv-generator`, uncommitted)
+
+Contract: [Panel for the simulation workflow](docs/specs/2026-10-18-panel-simulation-workflow.md)
+(«Stage 1 contract», «Stage 1a evidence»); companion draft
+[pair registry](docs/specs/2026-10-18-pair-registry.md).
+
+- **Removed and disconnected:** SCREENER 01, RUNNER 01/02 with their BingX
+  mode (`/api/v2/testing/*`, `src/mrs3/screener/`,
+  `scripts/build_bingx_screening_sheet.py`, `config_tester_*_screen.json`);
+  the analysis profile (`/api/v2/settings/analysis-profile`,
+  `analysis_profile.py`); the legacy single-page panel (`/legacy`,
+  `PANEL_HTML`, «Default panel», every non-`v2` `/api/...` route) with the
+  controller methods, constructor parameters and job state only they used.
+- **Kept:** every `/api/v2/*` route, `/api/artifact` (Performance v2 failure
+  report), `LocalTestingService` (portfolio stage 2), `panel_remote_testing`
+  (remote Source DB until 1b).
+- **Verification:** see the spec section «Stage 1a evidence». It covers the
+  focused panel suites, the full suite against the 42-failure baseline and the
+  independent review (`CODE_REVIEW_PASS` after fixes). The changes stay
+  uncommitted until the whole rework is done.
+- **Next:** stage 1b — the MRS3 tick test reads READY from the trade store;
+  then remove the old fresh analysis/shortlist, Source DB and surfaces screens;
+  three-screen shell.
+- **Blockers:** none. Orphan processes from the stuck «Посчитать историю»
+  task (PIDs 19204, 2532) still need to be ended by the user or a Panel
+  restart; `gh auth login --web` is needed before the sync repository (registry
+  stage 5).
+
+## MRS2 trade store (2026-10-17, branch `wip/period-csv-generator`, committed)
 
 Contract: [MRS2 trade store](docs/specs/2026-10-17-mrs2-history-store-and-tester-sampling.md) (stages 1–4 with evidence), decisions
 [ADR-0078](docs/decisions/0078-mrs2-trade-store.md) and
@@ -47,10 +75,9 @@ Contract: [MRS2 trade store](docs/specs/2026-10-17-mrs2-history-store-and-tester
   score, so this is a judged, data-backed step, not an implied cutoff. The 6
   tick tests agreed with the simulator proxy on loss direction (6/6) and
   MaxDD% (within 0.4 pp).
-- **Next:**
-  - agree the screener simulation mode with the user;
-  - rebuild READY from the store with the new threshold across the registry;
-  - one commit when the user confirms.
+- **Next:** rebuild READY from the store with the new threshold across the
+  registry (the screener simulation mode is moot: the screener was removed in
+  Panel rework stage 1a). Committed as `c9e86a9` and `7551d7a`.
 - **Blockers:** none.
 
 ## Merge of origin/main into the BingX line (2026-10-16)

@@ -209,31 +209,13 @@ const portfolioResultHelpers = (() => {
 })();
 if (typeof globalThis !== 'undefined') globalThis.portfolioResultHelpers = portfolioResultHelpers;
 
-const screenerUiHelpers = (() => {
-  const fallbackBigShiftHeading = 'Большой сдвиг';
-  const bigShiftHeading = (value) => {
-    if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 1) return fallbackBigShiftHeading;
-    return `Сдвиг ≥ ${String(value / 100).replace('.', ',')}%`;
-  };
-  const displayMetric = (value, fractionDigits) => {
-    if (value === null || value === undefined || value === '') return '—';
-    const number = Number(value);
-    if (!Number.isFinite(number)) return '—';
-    return number.toFixed(fractionDigits).replace('.', ',');
-  };
-  return { bigShiftHeading, displayMetric };
-})();
-if (typeof globalThis !== 'undefined') globalThis.screenerUiHelpers = screenerUiHelpers;
-
 const panelRequestErrorHelpers = (() => {
   const safeStringPrefixes = [
     '/api/v2/strategies/fresh/',
     '/api/v2/surfaces/',
-    '/api/v2/testing/screener/',
-    '/api/v2/testing/bingx/',
     '/api/v2/store/',
   ];
-  const safeStringEndpoints = new Set(['/api/v2/settings/analysis-profile', '/api/v2/testing/local/fill']);
+  const safeStringEndpoints = new Set([]);
   const allowsSafeString = (endpoint) => (
     safeStringEndpoints.has(endpoint) || safeStringPrefixes.some((prefix) => endpoint.startsWith(prefix))
   );
@@ -846,99 +828,9 @@ if (typeof globalThis !== 'undefined') globalThis.portfolioSelectionHelpers = po
     return value.toLowerCase().endsWith('.duckdb') ? value.replace(/[\\/][^\\/]*$/, '') : value;
   }
 
-  const analysisProfileStatus = document.querySelector('#analysis-profile-status');
-  const analysisProfileValue = (profile, section, key, fallback = '') => profile?.[section]?.[key] ?? fallback;
-  const analysisProfileInput = (container, id, label, value, options = {}) => {
-    if (!container) return;
-    const group = document.createElement('div'); group.className = 'field-group';
-    const control = document.createElement('input'); control.id = id; control.type = options.type || 'number';
-    control.step = options.step || 'any'; control.min = options.min || '';
-    control.value = Array.isArray(value) ? value.join(', ') : String(value);
-    const title = document.createElement('label'); title.htmlFor = id; title.textContent = label;
-    group.append(title, control);
-    if (options.help) { const help = document.createElement('small'); help.className = 'helper'; help.textContent = options.help; group.append(help); }
-    container.append(group);
-  };
-  const analysisProfilePairs = (container, prefix, values, label, fields) => {
-    Object.entries(values || {}).forEach(([key, value]) => {
-      const group = document.createElement('div'); group.className = 'field-group analysis-profile-pair';
-      const title = document.createElement('label'); title.textContent = label(key);
-      group.append(title);
-      const pair = value && typeof value === 'object' ? value : { value };
-      for (const field of fields) {
-        const fieldLabels = { max_bp: 'Граница shift, bp', value: 'Значение', lower_min_bp: 'Диапазон меньшего shift: от', lower_max_exclusive_bp: 'Диапазон меньшего shift: до', min_gap_bp: 'Минимальное расстояние до следующего ордера, bp' };
-        const fieldLabel = fieldLabels[field] || 'Значение';
-        const fieldGroup = document.createElement('div'); fieldGroup.className = 'analysis-profile-pair-value';
-        const fieldTitle = document.createElement('small'); fieldTitle.className = 'helper'; fieldTitle.textContent = fieldLabel;
-        const control = document.createElement('input'); control.type = 'number'; control.step = 'any'; control.value = String(pair[field]);
-        control.dataset.analysisProfilePair = prefix; control.dataset.key = key; control.dataset.field = field;
-        control.setAttribute('aria-label', `${label(key)}: ${fieldLabel}`); fieldGroup.append(fieldTitle, control); group.append(fieldGroup);
-      }
-      container?.append(group);
-    });
-  };
-  function renderAnalysisProfile(profile) {
-    const sections = ['eligibility', 'frequency', 'economics', 'geometry', 'plateau', 'ready', 'structures'];
-    sections.forEach((section) => { const container = document.querySelector(`#analysis-profile-${section}`); if (container) container.replaceChildren(); });
-    const eligibility = document.querySelector('#analysis-profile-eligibility');
-    analysisProfileInput(eligibility, 'analysis-history-days', 'Минимальная длительность истории, дней', analysisProfileValue(profile, 'eligibility', 'min_history_days'), { min: '1' });
-    analysisProfileInput(eligibility, 'analysis-floor-boundary', 'Граница shift для абсолютного минимума сделок, bp', analysisProfileValue(profile, 'eligibility', 'floor_boundary_bp'));
-    analysisProfileInput(eligibility, 'analysis-floor-low', 'Минимум сделок при shift ≤ границы', analysisProfileValue(profile, 'eligibility', 'floor_at_or_below'), { min: '0' });
-    analysisProfileInput(eligibility, 'analysis-floor-high', 'Минимум сделок при shift > границы', analysisProfileValue(profile, 'eligibility', 'floor_above'), { min: '0' });
-    const frequency = document.querySelector('#analysis-profile-frequency');
-    analysisProfileInput(frequency, 'analysis-min-events', 'Минимум событий в точке', analysisProfileValue(profile, 'eligibility', 'min_point_events'), { min: '1' });
-    analysisProfilePairs(frequency, 'base-rates', analysisProfileValue(profile, 'eligibility', 'base_rates', {}), (key) => `Базовая минимальная частота сделок в день: ${key}`, ['value']);
-    analysisProfilePairs(frequency, 'shift-factors', analysisProfileValue(profile, 'eligibility', 'shift_factors', []), () => 'Коэффициент для диапазона shift', ['max_bp', 'value']);
-    const economics = document.querySelector('#analysis-profile-economics');
-    analysisProfileInput(economics, 'analysis-min-pnl', 'Минимальный PnL, %', analysisProfileValue(profile, 'economics', 'min_pnl_pct'));
-    analysisProfileInput(economics, 'analysis-min-win-rate', 'Минимальный win rate, %', analysisProfileValue(profile, 'economics', 'min_win_rate_pct'));
-    analysisProfileInput(economics, 'analysis-max-dd', 'Максимальная просадка, %', analysisProfileValue(profile, 'economics', 'max_dd_pct'));
-    analysisProfileInput(economics, 'analysis-min-efficiency', 'Минимальный PnL/DD', analysisProfileValue(profile, 'economics', 'min_efficiency'));
-    const geometry = document.querySelector('#analysis-profile-geometry');
-    analysisProfileInput(geometry, 'analysis-ma-radius', 'Радиус MA для проверки соседних точек, ±', analysisProfileValue(profile, 'geometry', 'ma_neighbor_radius'), { min: '0' });
-    const plateau = document.querySelector('#analysis-profile-plateau');
-    for (const [id, label, key] of [['core-link', 'Минимальная связь CORE', 'core_link_min'], ['envelope', 'Минимальная однородность всего плато', 'envelope_min'], ['supported-link', 'Минимальная связь SUPPORTED', 'supported_link_min'], ['equivalent', 'Допуск равноценности PnL и PnL/DD', 'equivalent_tolerance']]) analysisProfileInput(plateau, `analysis-${id}`, label, analysisProfileValue(profile, 'plateau', key));
-    const ready = document.querySelector('#analysis-profile-ready');
-    for (const [id, label, key] of [['base-points', 'BASE 1ORD: минимум точек в плато', 'base_min_points'], ['base-events', 'BASE 1ORD: минимум событий плато за 30 дней', 'base_min_events_per_month'], ['base-slots', 'Максимум BASE 1ORD на пару/сторону/TF', 'base_slots'], ['multi-points', 'Multi-order: минимум точек в каждом плато', 'multi_min_points'], ['multi-events', 'Multi-order: минимум событий каждого плато за 30 дней', 'multi_min_events_per_month']]) analysisProfileInput(ready, `analysis-${id}`, label, analysisProfileValue(profile, 'ready', key), { min: '0' });
-    const structures = document.querySelector('#analysis-profile-structures');
-    analysisProfileInput(structures, 'analysis-max-orders', 'Максимум ордеров', analysisProfileValue(profile, 'structures', 'max_orders'), { min: '1' });
-    analysisProfilePairs(structures, 'gap-rules', analysisProfileValue(profile, 'structures', 'gap_rules', []), () => 'Правило минимального gap', ['lower_min_bp', 'lower_max_exclusive_bp', 'min_gap_bp']);
-  }
-  const analysisProfilePairPayload = (selector, fields) => Object.fromEntries([...document.querySelectorAll(`[data-analysis-profile-pair="${selector}"]`)].reduce((entries, control) => {
-    const value = entries.get(control.dataset.key) || {}; value[control.dataset.field] = control.value; entries.set(control.dataset.key, value); return entries;
-  }, new Map()));
-  function analysisProfilePayload() {
-    const value = (id) => document.querySelector(`#${id}`)?.value || '';
-    const integer = (id) => {
-      const raw = value(id).trim();
-      if (!/^-?\d+$/.test(raw)) throw new Error('Целочисленные поля профиля должны быть заполнены целыми числами.');
-      return Number(raw);
-    };
-    const shiftFactors = Object.values(analysisProfilePairPayload('shift-factors', ['max_bp', 'value'])).map((pair) => ({ max_bp: Number(pair.max_bp), value: pair.value }));
-    const gapRules = Object.values(analysisProfilePairPayload('gap-rules', ['lower_min_bp', 'lower_max_exclusive_bp', 'min_gap_bp'])).map((pair) => ({ lower_min_bp: Number(pair.lower_min_bp), lower_max_exclusive_bp: Number(pair.lower_max_exclusive_bp), min_gap_bp: Number(pair.min_gap_bp) }));
-    return { listing_dates_path: value('analysis-listing-dates-path').trim(), profile: {
-      eligibility: { min_history_days: integer('analysis-history-days'), base_rates: Object.fromEntries(Object.entries(analysisProfilePairPayload('base-rates', ['value'])).map(([key, pair]) => [key, pair.value])), shift_factors: shiftFactors, floor_boundary_bp: integer('analysis-floor-boundary'), floor_at_or_below: integer('analysis-floor-low'), floor_above: integer('analysis-floor-high'), min_point_events: integer('analysis-min-events') },
-      economics: { min_pnl_pct: value('analysis-min-pnl'), min_win_rate_pct: value('analysis-min-win-rate'), max_dd_pct: value('analysis-max-dd'), min_efficiency: value('analysis-min-efficiency') },
-      geometry: { ma_neighbor_radius: integer('analysis-ma-radius') },
-      plateau: { core_link_min: value('analysis-core-link'), envelope_min: value('analysis-envelope'), supported_link_min: value('analysis-supported-link'), equivalent_tolerance: value('analysis-equivalent') },
-      ready: { base_min_points: integer('analysis-base-points'), base_min_events_per_month: integer('analysis-base-events'), base_slots: integer('analysis-base-slots'), multi_min_points: integer('analysis-multi-points'), multi_min_events_per_month: integer('analysis-multi-events') },
-      structures: { gap_rules: gapRules, max_orders: integer('analysis-max-orders') },
-    } };
-  }
-  async function reloadAnalysisProfile() {
-    const result = await requestJson('/api/v2/settings/analysis-profile');
-    renderAnalysisProfile(result.profile);
-    const listingDates = document.querySelector('#analysis-listing-dates-path');
-    if (listingDates) listingDates.value = result.listing_dates_path || '';
-    return result;
-  }
-
   async function loadSafeDefaults() {
     try {
       const bootstrap = await requestJson('/api/v2/bootstrap');
-      const root = bootstrap.defaults?.panel?.default_root;
-      const selector = document.querySelector('#settings-default-root');
-      if (selector && (root === 'legacy' || root === 'static')) selector.value = root;
       for (const [name, value] of Object.entries(bootstrap.defaults?.panel?.path_defaults || {})) {
         const input = document.querySelector(`[name="${name}"]`);
         if (input && typeof value === 'string') input.value = value;
@@ -996,29 +888,8 @@ if (typeof globalThis !== 'undefined') globalThis.portfolioSelectionHelpers = po
       await loadSurfaceCatalog();
       const connection = document.querySelector('.connection-status');
       if (connection) connection.lastChild.textContent = 'LOCAL BACKEND CONNECTED';
-      const local = await requestJson('/api/v2/testing/local/status');
-      const target = document.querySelector('#runner-local .card-status');
-      if (target) target.textContent = local.preflight_ok
-        ? `Runner ready · ${Math.floor((local.disk_free_bytes || 0) / 1024 ** 3)} GB free`
-        : 'Runner preflight is not ready.';
-      const screenerStatus = document.querySelector('#screener-status');
-      if (screenerStatus) screenerStatus.textContent = local.preflight_ok
-        ? `Runner ready · ${Math.floor((local.disk_free_bytes || 0) / 1024 ** 3)} GB free`
-        : 'Runner preflight is not ready.';
     } catch (_) {
       if (status) status.textContent = 'Backend connection is unavailable.';
-    }
-  }
-
-  async function loadRemoteStatus() {
-    try {
-      const remote = await requestJson('/api/v2/testing/remote/status');
-      const target = document.querySelector('#runner-remote .card-status');
-      if (target) target.textContent = remote.configured
-        ? `Удалённый runner настроен (${remote.auth_method}).`
-        : 'Удалённый runner не настроен.';
-    } catch (_) {
-      if (status) status.textContent = 'Статус удалённого runner недоступен.';
     }
   }
 
@@ -1027,321 +898,6 @@ if (typeof globalThis !== 'undefined') globalThis.portfolioSelectionHelpers = po
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
     });
   }
-
-  const remoteCardStatus = (message) => {
-    const target = document.querySelector('#runner-remote .card-status');
-    if (target) target.textContent = message;
-  };
-  const remoteFill = document.querySelector('#remote-fill');
-  if (remoteFill) remoteFill.addEventListener('click', async () => {
-    const value = (id) => document.querySelector(id)?.value || '';
-    try {
-      const result = await remoteRequest('/api/v2/testing/remote/fill', {
-        symbols: value('#remote-pair'), side: value('#remote-side'),
-        start: value('#remote-start-date'), end: value('#remote-end-date'),
-      });
-      remoteCardStatus(`config_tester.json заполнен: ${result.strategy_name}, ${result.symbols.join(', ')}.`);
-    } catch (_) {
-      if (status) status.textContent = 'Не удалось заполнить удалённый config_tester.json.';
-    }
-  });
-  const remoteCheck = document.querySelector('#remote-check');
-  if (remoteCheck) remoteCheck.addEventListener('click', async () => {
-    try {
-      const result = await remoteRequest('/api/v2/testing/remote/check-paths');
-      const available = Object.values(result.paths || {}).filter(Boolean).length;
-      const diskFreeBytes = Number(result.disk_free_bytes);
-      const disk = diskFreeBytes > 0 ? `${Math.floor(diskFreeBytes / 1024 ** 3)} GB свободно` : 'диск недоступен';
-      remoteCardStatus(`Проверено каталогов: ${available} / 5 · ${disk}.`);
-    } catch (_) { remoteCardStatus('Проверить пути удалённого runner не удалось.'); }
-  });
-  let remoteProgressPoller = 0;
-  const refreshRemoteProgress = async () => {
-    try {
-      const progress = await requestJson('/api/v2/testing/remote/progress');
-      if (progress.total) remoteCardStatus(`Тестирование: ${progress.current} / ${progress.total} (${progress.percent}%).`);
-    } catch (_) { /* Keep the last known status while a remote job is active. */ }
-  };
-  for (const [id, action, message] of [
-    ['#remote-start', 'start', 'Удалённый bot запущен.'],
-    ['#remote-stop', 'stop', 'Удалённый bot остановлен.'],
-  ]) {
-    const button = document.querySelector(id);
-    if (!button) continue;
-    button.addEventListener('click', async () => {
-      try {
-        await remoteRequest(`/api/v2/testing/remote/${action}`);
-        remoteCardStatus(message);
-        if (action === 'start') {
-          refreshRemoteProgress();
-          if (remoteProgressPoller) clearInterval(remoteProgressPoller);
-          remoteProgressPoller = setInterval(refreshRemoteProgress, 1000);
-        } else if (remoteProgressPoller) { clearInterval(remoteProgressPoller); remoteProgressPoller = 0; }
-      } catch (_) {
-        if (status) status.textContent = `Не удалось выполнить удалённую операцию: ${action}.`;
-      }
-    });
-  }
-
-  // BingX mode (docs/specs/2026-10-10-bingx-data-downloader.md, stage 2):
-  // «Режим BingX» prepares files with bingx: true; «Докачать данные BingX»
-  // (active only in BingX mode) first tops up data in the background.
-  for (const prefix of ['screener', 'local']) {
-    const mode = document.querySelector(`#${prefix}-bingx`);
-    const download = document.querySelector(`#${prefix}-bingx-download`);
-    if (!mode || !download) continue;
-    const sync = () => {
-      download.disabled = !mode.checked;
-      if (!mode.checked) download.checked = false;
-    };
-    mode.addEventListener('change', sync);
-    sync();
-  }
-  const bingxDownloadChecked = (prefix) => document.querySelector(`#${prefix}-bingx`)?.checked === true
-    && document.querySelector(`#${prefix}-bingx-download`)?.checked === true;
-
-  async function runBingxTopUp(request, report) {
-    await requestJson('/api/v2/testing/bingx/download', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(request),
-    });
-    report('Докачка данных BingX запущена.');
-    for (;;) {
-      await new Promise((resolve) => setTimeout(resolve, 1000));
-      const state = await requestJson('/api/v2/testing/bingx/status');
-      if (state.state === 'running') {
-        report(`Докачка BingX: обработано ${state.processed}. ${state.last_message || ''}`.trim());
-        continue;
-      }
-      if (state.state === 'done') {
-        report(`Данные BingX готовы. ${(state.summary || []).join('; ')}`);
-        return true;
-      }
-      const errors = (state.errors || []).map((item) => [item.pair, item.day, item.message].filter(Boolean).join(' ')).join('; ');
-      report(`Докачка BingX завершилась с ошибками, файлы не подготовлены: ${errors}`);
-      return false;
-    }
-  }
-
-  const localFill = document.querySelector('#local-fill');
-  if (localFill) localFill.addEventListener('click', async () => {
-    const value = (id) => document.querySelector(id)?.value || '';
-    const bingx = document.querySelector('#local-bingx')?.checked === true;
-    const localStatus = (message) => {
-      const target = document.querySelector('#runner-local .card-status');
-      if (target) target.textContent = message;
-    };
-    try {
-      const request = {
-        symbols: value('#local-pair'), side: value('#local-side'),
-        start: value('#local-start-date'), end: value('#local-end-date'),
-        delete_old_reports: document.querySelector('#local-delete-old-reports')?.checked === true,
-        bingx,
-      };
-      if (bingxDownloadChecked('local') && !(await runBingxTopUp(request, localStatus))) return;
-      const result = await requestJson('/api/v2/testing/local/fill', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(request),
-      });
-      const target = document.querySelector('#runner-local .card-status');
-      if (target) target.textContent = result.reports_cleared
-        ? `Файлы подготовлены, старые отчеты удалены: ${result.strategy_name}, ${result.symbols.join(', ')}.`
-        : `Файлы подготовлены: ${result.strategy_name}, ${result.symbols.join(', ')}.`;
-    } catch (error) {
-      const target = document.querySelector('#runner-local .card-status');
-      if (target) target.textContent = error.code === 'TESTER_FILES_PREPARED'
-        ? 'Файлы уже подготовлены. Если что-то изменилось, сначала нажмите Стоп.'
-        : (bingx && String(error?.message || '').startsWith('BingX:')
-          ? error.message
-          : 'Не удалось подготовить файлы. Проверьте runner и настройки тестера.');
-    }
-  });
-
-  const localCheck = document.querySelector('#local-check');
-  if (localCheck) localCheck.addEventListener('click', loadSafeDefaults);
-  for (const [id, action, message] of [
-    ['#local-start', 'start', 'Локальный tester получил команду запуска.'],
-    ['#local-stop', 'stop', 'Локальный bot остановлен.'],
-  ]) {
-    const button = document.querySelector(id);
-    if (!button) continue;
-    button.addEventListener('click', async () => {
-      try {
-        const result = await requestJson(`/api/v2/testing/local/${action}`, {
-          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
-        });
-        const target = document.querySelector('#runner-local .card-status');
-        if (target) target.textContent = action === 'start' && result.tester_status
-          ? `${message} Статус tester: ${result.tester_status}.`
-          : message;
-      } catch (_) {
-        if (status) status.textContent = `Не удалось выполнить: ${action}.`;
-      }
-    });
-  }
-
-  function screenerStatus(message) {
-    const target = document.querySelector('#screener-status');
-    if (target) target.textContent = message;
-  }
-
-  let screenerVerdicts = [];
-  let screenerBigShiftBp;
-
-  function renderScreenerVerdicts() {
-    const body = document.querySelector('#screener-verdicts-body');
-    const empty = document.querySelector('#screener-verdicts-empty');
-    const bigShiftHeading = document.querySelector('#screener-big-shift-heading');
-    if (!body) return;
-    if (bigShiftHeading) bigShiftHeading.textContent = screenerUiHelpers.bigShiftHeading(screenerBigShiftBp);
-    body.replaceChildren();
-    for (const verdict of screenerVerdicts) {
-      const row = document.createElement('tr');
-      const cell = (value) => {
-        const td = document.createElement('td');
-        td.textContent = value === null || value === undefined || value === '' ? '—' : String(value);
-        return td;
-      };
-      row.append(
-        cell(verdict.symbol), cell(verdict.side), cell(verdict.verdict),
-        cell(verdict.big_shift ? 'да' : 'нет'), cell(verdict.n_good), cell(verdict.n_good_big_shift),
-        cell(verdict.best_timeframe), cell(verdict.best_shift_bp), cell(verdict.best_close_len),
-        cell(screenerUiHelpers.displayMetric(verdict.best_pnl30, 0)),
-        cell(screenerUiHelpers.displayMetric(verdict.best_dd_pct, 1)),
-        cell(screenerUiHelpers.displayMetric(verdict.effective_days, 0)),
-      );
-      body.append(row);
-    }
-    if (empty) empty.hidden = screenerVerdicts.length > 0;
-    const transfer = document.querySelector('#screener-transfer');
-    if (transfer) transfer.disabled = !screenerVerdicts.some((v) => v.verdict === 'GO');
-  }
-
-  const screenerCheck = document.querySelector('#screener-check');
-  if (screenerCheck) screenerCheck.addEventListener('click', loadSafeDefaults);
-
-  const screenerFill = document.querySelector('#screener-fill');
-  if (screenerFill) screenerFill.addEventListener('click', async () => {
-    const value = (id) => document.querySelector(id)?.value || '';
-    try {
-      const request = {
-        symbols: value('#screener-pairs'), side: value('#screener-side'),
-        start: value('#screener-start-date'), end: value('#screener-end-date'),
-        delete_old_reports: document.querySelector('#screener-delete-old-reports')?.checked === true,
-        bingx: document.querySelector('#screener-bingx')?.checked === true,
-      };
-      if (bingxDownloadChecked('screener') && !(await runBingxTopUp(request, screenerStatus))) return;
-      const result = await requestJson('/api/v2/testing/screener/fill', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(request),
-      });
-      const expected = document.querySelector('#screener-expected-runs');
-      if (expected) expected.textContent = Number.isFinite(result.expected_runs)
-        ? `Ожидаемое число прогонов: ${result.expected_runs}.`
-        : 'Ожидаемое число прогонов недоступно.';
-      screenerStatus(result.reports_cleared
-        ? `Файлы подготовлены, старые отчеты удалены: ${result.strategy_name}, ${result.symbols.join(', ')}.`
-        : `Файлы подготовлены: ${result.strategy_name}, ${result.symbols.join(', ')}.`);
-    } catch (error) {
-      screenerStatus(error.code === 'TESTER_FILES_PREPARED'
-        ? 'Файлы уже подготовлены. Если что-то изменилось, сначала нажмите Стоп.'
-        : (error?.message || 'Не удалось подготовить файлы скрининга.'));
-    }
-  });
-
-  for (const [id, action, message] of [
-    ['#screener-start', 'start', 'Локальный tester получил команду запуска.'],
-    ['#screener-stop', 'stop', 'Локальный bot остановлен.'],
-  ]) {
-    const button = document.querySelector(id);
-    if (!button) continue;
-    button.addEventListener('click', async () => {
-      try {
-        const result = await requestJson(`/api/v2/testing/screener/${action}`, {
-          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
-        });
-        screenerStatus(action === 'start' && result.tester_status
-          ? `${message} Статус tester: ${result.tester_status}.`
-          : message);
-      } catch (error) {
-        screenerStatus(error?.message || `Не удалось выполнить: ${action}.`);
-      }
-    });
-  }
-
-  const screenerEvaluate = document.querySelector('#screener-evaluate');
-  if (screenerEvaluate) screenerEvaluate.addEventListener('click', async () => {
-    try {
-      const result = await requestJson('/api/v2/testing/screener/evaluate', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
-      });
-      screenerBigShiftBp = result.big_shift_bp;
-      screenerVerdicts = Array.isArray(result.verdicts) ? result.verdicts : [];
-      renderScreenerVerdicts();
-      screenerStatus(`Оценено пар: ${screenerVerdicts.length}.`);
-    } catch (error) {
-      screenerStatus(error?.message || 'Не удалось оценить папку отчётов.');
-    }
-  });
-
-  const screenerExport = document.querySelector('#screener-export');
-  if (screenerExport) screenerExport.addEventListener('click', async (event) => {
-    event.preventDefault();
-    try {
-      const response = await fetch(screenerExport.href);
-      if (!response.ok) {
-        const result = await response.json().catch(() => ({}));
-        throw new Error(typeof result.error === 'string' ? result.error : 'экспорт вердиктов не удался');
-      }
-      const disposition = response.headers.get('Content-Disposition') || '';
-      const filenameMatch = disposition.match(/filename=(?:"([^"]+)"|([^;]+))/i);
-      const filename = filenameMatch?.[1] || filenameMatch?.[2]?.trim() || 'screener_verdicts.csv';
-      const url = URL.createObjectURL(await response.blob());
-      Object.assign(document.createElement('a'), { href: url, download: filename }).click();
-      URL.revokeObjectURL(url);
-      screenerStatus('Вердикты скачаны.');
-    } catch (error) {
-      screenerStatus(error?.message || 'Не удалось скачать вердикты.');
-    }
-  });
-
-  const screenerLoadUnscreened = document.querySelector('#screener-load-unscreened');
-  if (screenerLoadUnscreened) screenerLoadUnscreened.addEventListener('click', async () => {
-    try {
-      const side = document.querySelector('#screener-side')?.value || '';
-      const result = await requestJson(`/api/v2/testing/screener/registry-pairs?side=${encodeURIComponent(side)}`);
-      const textarea = document.querySelector('#screener-pairs');
-      if (textarea) {
-        const existing = new Set(
-          (textarea.value || '').split(/[,\s]+/).map((entry) => entry.trim().toUpperCase()).filter(Boolean),
-        );
-        const additions = (Array.isArray(result.symbols) ? result.symbols : []).filter((symbol) => !existing.has(symbol));
-        if (additions.length) {
-          textarea.value = [...(textarea.value ? [textarea.value] : []), ...additions].join(', ');
-        }
-        screenerStatus(additions.length
-          ? `Добавлено пар из реестра: ${additions.length}.`
-          : 'В реестре нет новых неотскринированных пар для этой стороны.');
-      }
-    } catch (error) {
-      screenerStatus(error?.message || 'Не удалось загрузить пары из реестра.');
-    }
-  });
-
-  const screenerTransfer = document.querySelector('#screener-transfer');
-  if (screenerTransfer) screenerTransfer.addEventListener('click', () => {
-    const includeCheck = document.querySelector('#screener-transfer-include-check')?.checked === true;
-    const wanted = includeCheck ? new Set(['GO', 'CHECK']) : new Set(['GO']);
-    const chosen = screenerVerdicts
-      .filter((v) => wanted.has(v.verdict))
-      .sort((a, b) => Number(b.n_good || 0) - Number(a.n_good || 0));
-    if (!chosen.length) return;
-    const pairInput = document.querySelector('#local-pair');
-    const sideSelect = document.querySelector('#local-side');
-    if (pairInput) pairInput.value = chosen.map((v) => v.symbol).join(', ');
-    if (sideSelect) sideSelect.value = chosen[0].side;
-    screenerStatus(`Передано в RUNNER 01: ${chosen.length} пар.`);
-  });
 
   function sourceStatus(card, message) {
     const target = card?.querySelector('.progress-block p, .card-status');
@@ -1562,10 +1118,6 @@ if (typeof globalThis !== 'undefined') globalThis.portfolioSelectionHelpers = po
     } catch (_) { sourceStatus(card, 'Пути не сохранены. Проверьте значения.'); }
   };
   const bindPathSave = (button, card, values) => button?.addEventListener('click', () => savePathDefaults(card, values()));
-  bindPathSave(document.querySelector('#local-paths-save'), document.querySelector('#runner-local'), () => ({
-    local_bot_root: inputValue('local-bot-root'), local_runner_root: inputValue('local-runner-root'),
-    local_reports_root: inputValue('local-reports-root'), local_output_root: inputValue('local-output-root'),
-  }));
   document.querySelector('#analysis-target-save')?.addEventListener('click', () => {
     const value = inputValue('analysis-target');
     const target = value.endsWith('.analysis-v6.duckdb') ? value.replace(/[\\/][^\\/]*$/, '') : value;
@@ -1583,7 +1135,7 @@ if (typeof globalThis !== 'undefined') globalThis.portfolioSelectionHelpers = po
     local_merge_target: inputValue('merge-target'),
   }));
   if (remoteSourceCard) {
-    const [check, , start] = remoteSourceCard.querySelectorAll('.button-row button');
+    const [, , start] = remoteSourceCard.querySelectorAll('.button-row button');
     let remoteSourceJob = '';
     let remoteSourceTarget = '';
     let remoteSourcePoller = 0;
@@ -1626,12 +1178,6 @@ if (typeof globalThis !== 'undefined') globalThis.portfolioSelectionHelpers = po
         }
       } catch (_) { remoteSourceStatus('Статус удалённого импорта недоступен.'); }
     };
-    if (check) check.addEventListener('click', async () => {
-      try {
-        const result = await remoteRequest('/api/v2/testing/remote/check-paths');
-        remoteSourceStatus(`Каталогов доступно: ${Object.values(result.paths || {}).filter(Boolean).length} / 5.`);
-      } catch (_) { remoteSourceStatus('Проверить удалённые пути не удалось.'); }
-    });
     if (start) start.addEventListener('click', async () => {
       try {
         const request = {
@@ -4664,7 +4210,7 @@ if (typeof globalThis !== 'undefined') globalThis.portfolioSelectionHelpers = po
     }
   });
   const settingsPayload = () => ({ panel: {
-    default_root: document.querySelector('#settings-default-root')?.value || 'static',
+    default_root: 'static',
     path_defaults: {
       local_runner_root: document.querySelector('#settings-local-runner')?.value || '',
        local_source_db_root: document.querySelector('#settings-source-root')?.value || '',
@@ -4708,33 +4254,6 @@ if (typeof globalThis !== 'undefined') globalThis.portfolioSelectionHelpers = po
       await loadSafeDefaults();
       if (settingsStatus) settingsStatus.textContent = 'Общий лимит рабочих процессов сохранён.';
     } catch (_) { if (settingsStatus) settingsStatus.textContent = 'Общий лимит рабочих процессов не сохранён.'; }
-  });
-  document.querySelector('#analysis-profile-reload')?.addEventListener('click', async () => {
-    try {
-      await reloadAnalysisProfile();
-      if (analysisProfileStatus) analysisProfileStatus.textContent = 'Профиль анализа загружен из config.local.json.';
-    } catch (_) { if (analysisProfileStatus) analysisProfileStatus.textContent = 'Не удалось загрузить профиль анализа. Проверьте config.local.json.'; }
-  });
-  document.querySelector('#analysis-listing-dates-browse')?.addEventListener('click', async () => {
-    try {
-      const result = await remoteRequest('/api/browse', { kind: 'dates', multiple: false });
-      const selected = Array.isArray(result.paths) ? result.paths[0] : '';
-      if (selected) document.querySelector('#analysis-listing-dates-path').value = selected;
-      if (analysisProfileStatus) analysisProfileStatus.textContent = selected ? 'Файл выбран. Нажмите «Сохранить».' : 'Выбор файла отменён.';
-    } catch (error) {
-      if (analysisProfileStatus) analysisProfileStatus.textContent = error?.message || 'Не удалось выбрать файл дат листинга.';
-    }
-  });
-  document.querySelector('#analysis-profile-save')?.addEventListener('click', async () => {
-    try {
-      const result = await remoteRequest('/api/v2/settings/analysis-profile', analysisProfilePayload());
-      renderAnalysisProfile(result.profile);
-      const listingDates = document.querySelector('#analysis-listing-dates-path');
-      if (listingDates) listingDates.value = result.listing_dates_path || '';
-      if (analysisProfileStatus) analysisProfileStatus.textContent = 'Профиль анализа сохранён в config.local.json.';
-    } catch (error) {
-      if (analysisProfileStatus) analysisProfileStatus.textContent = error?.message || 'Профиль не сохранён: проверьте значения.';
-    }
   });
   function portfolioErrorMessage(error) {
     return error?.code ? `${error.code}: ${portfolioReasonHelpers.humanize(error.message || '')}`.trim() : portfolioReasonHelpers.humanize(error?.message || 'Не удалось выполнить запрос.');
@@ -5512,10 +5031,6 @@ if (typeof globalThis !== 'undefined') globalThis.portfolioSelectionHelpers = po
   }
 
   loadSafeDefaults();
-  reloadAnalysisProfile().catch(() => {
-    if (analysisProfileStatus) analysisProfileStatus.textContent = 'Профиль анализа пока недоступен.';
-  });
-  loadRemoteStatus();
   recoverJobs();
   loadTesterCollection();
   recoverSplitJobs();
