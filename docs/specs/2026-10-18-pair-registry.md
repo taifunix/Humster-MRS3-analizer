@@ -1,9 +1,10 @@
 # Pair registry: one source of truth per exchange pair
 
-**Status:** Draft for user approval (2026-10-18), revision 3 after the user's
-review (sync scope, weekday liquidity with a configurable window, optimizer
+**Status:** Approved by the user 2026-10-18 (revision 3 after the user's
+review: sync scope, weekday liquidity with a configurable window, optimizer
 reads computed liquidity only, button instead of a scheduler, automatic new
-listings, per-pair filter settings). No implementation yet.
+listings, per-pair filter settings). Stage 1 implemented (see «Stage 1
+evidence»); stages 2–5 pending.
 **Replaces (when done):** the hand-maintained `bybit_tradfi_liquidity.xlsx`
 (sheets «Пары», «По дням», «Оборот 30д», «Скрининг», «Скрининг BingX») and the
 `Actual` sheet of the base-lot export as sources of truth.
@@ -419,6 +420,186 @@ compatible «Пары» sheet (same columns as today) so nothing breaks mid-way.
 
 Each stage: spec details first, TDD, `.venv` tests on drive C, independent
 review, then a commit.
+
+## Stage 1 contract: registry core and reference (2026-10-18)
+
+**Module.** Package `mrs3.pair_registry`:
+- `store`: schema and connection;
+- `bybit` and `bingx`: fetch and normalise;
+- `refresh`: change detection and journal;
+- `history`: sufficiency;
+- CLI `python -m mrs3.pair_registry refresh [--exchange bybit|bingx|all]
+  [--config config.local.json]`.
+
+**Configuration.** A `pair_registry` section in `config.local.json`. Every key
+has a default. A missing config file or a malformed section is refused with a
+clear error:
+- `root` (`data/pair_registry`) holds `registry.duckdb`;
+- `universe.bybit.symbol_types` (`stock`, `ETF`, `commodity`);
+- `universe.bybit.exclude` (`SPXUSDT`, `XAUTUSDT`);
+- `universe.bingx.prefixes` (`NCSK`, `NCSI`, `NCCO`);
+- `universe.bingx.exclude` (empty).
+
+**Tables.**
+- **`pairs`**, key (exchange, symbol). The symbol is the human ticker.
+  - Status values:
+    - `TRADING`;
+    - `SUSPENDED`: BingX status 25, stored but out of the working list;
+    - `DELISTED`: left the exchange list.
+  - Reference fields:
+    - `api_symbol`, display name, base asset, symbol type, contract type,
+      settle coin;
+    - listing and delivery time;
+    - BingX `api_open`/`api_close`;
+    - tick, min/max price, price scale;
+    - qty step, min/max order qty, max market qty, min notional;
+    - min/max leverage, leverage step;
+    - funding interval and caps;
+    - maker/taker fee (BingX record);
+    - full name.
+
+    Numbers are stored as canonical decimal text, so change detection is
+    exact.
+  - Also stored: `first_seen` and `updated_at`.
+- **`pair_changes`**: one row per event, kind `listed` / `delisted` / `field`
+  (field, old, new) with time. A pair that comes back is a `field` change of
+  `status`.
+- **`risk_tiers`** (Bybit): one snapshot per (exchange, symbol, UTC day). A
+  second refresh on the same day replaces that day's snapshot.
+- **`journal`**: run id, step, exchange, status, counts, start, end, error.
+
+**Refresh rules.**
+- One exchange at a time, in one transaction.
+- An empty instrument list is refused, so a broken API answer never delists
+  the universe.
+- Pairs of the exchange that are missing from the list become `DELISTED` with
+  a `delisted` change. Their rows and history stay.
+- A re-run with the same data writes no change rows. One changed field writes
+  exactly one `field` row.
+- The BingX human ticker follows «BingX names and data».
+- BingX `tradeMinQuantity` is not stored: it is the minimum notional divided by
+  the live price. In the first live run it moved on 80 contracts between two
+  refreshes, which made the refresh non-idempotent. The stable reference is
+  `min_notional` (`tradeMinUSDT`).
+- Every refresh is journaled: a failure while fetching or normalising,
+  including a ticker collision, writes a FAILED row too. With `--exchange all`
+  a failure of one exchange never stops the other. The CLI always prints a
+  summary and returns 1 if anything failed.
+- A contract of a configured prefix that the ticker rule cannot read (not
+  upper-case letters and digits) is left out and listed in the summary as
+  `unreadable_symbols` (none on 2026-10-18).
+- Known edges of the ticker rule, kept as specified (review 2026-10-18):
+  - `NCCOXAU2TRY-USDT` (gold priced in TRY) reads as `XAUUSDT`;
+  - a bare `USD` tail is not stripped (`NCCOXAGJPYUSD-USDT` → `XAGJPYUSDUSDT`);
+  - if BingX ever lists a second contract with the same human ticker (e.g.
+    `NCCOXAU2USD-USDT`), the whole BingX refresh is refused until the user
+    adds one of them to `universe.bingx.exclude`. Refusing is preferred to a
+    silent rename.
+- Two BingX contracts with the same human ticker refuse the refresh; both are
+  named in the error.
+
+**History sufficiency** (`history.sufficiency(listing_ms, today)`):
+- days since the listing day;
+- `research_from` = listing day + 4 + 20 days;
+- `ready_from` = listing day + 4 + 40 days;
+- status «мало истории (N дней)» / «можно исследовать» / «READY возможен».
+
+**Acceptance.**
+- Unit tests with recorded API shapes: universe filters, ticker rule,
+  collision refusal, idempotent re-run, one change row per changed field,
+  delisting, empty-list refusal, risk-tier day snapshot, sufficiency boundaries.
+- A live refresh of both exchanges loads the whole Bybit TradFi universe and
+  the BingX TradFi list. A second live run writes no change rows.
+
+## Stage 1 evidence (2026-10-18)
+
+- **Tests:** `tests/test_pair_registry.py`, 27 cases. They cover:
+  - universe filters for both exchanges;
+  - the BingX ticker rule (`AMD`, `TMF`, `SOFTBANK`, `GOLD`, `US500`, `F`);
+  - collision refusal;
+  - statuses and reference fields;
+  - an idempotent re-run with one change row per changed field;
+  - delisting and coming back;
+  - empty-list refusal;
+  - risk-tier day snapshots;
+  - exchange separation;
+  - sufficiency boundaries;
+  - settings defaults and overrides;
+  - the CLI, including one exchange failing while the other completes, journaled
+    fetch and normalisation failures, malformed or missing configuration.
+- **Independent review:** `CODE_REVIEW_PASS` after fixes (CLI isolation per
+  exchange, journal coverage, settings validation, unreadable BingX symbols).
+- **Live** (`python -m mrs3.pair_registry refresh`, registry in
+  `data/pair_registry`):
+  - Bybit: 274 TradFi pairs and 8,240 risk tiers.
+  - BingX: 605 TradFi contracts, 369 `TRADING` and 236 `SUSPENDED`.
+  - A second run wrote 0 change rows on both exchanges. Before the fix it
+    wrote 80 on BingX: `min_order_qty`, see the refresh rules.
+
+## Stage 2 contract: weekday liquidity, LOT_MODEL_V2 (2026-10-18)
+
+Decision: [ADR-0079](../decisions/0079-lot-model-v2-weekday-liquidity.md).
+
+**Module.** `mrs3.pair_registry.liquidity`.
+- `day_facts(rows)`: the facts of one day from the tester's minute day file,
+  read with the `minute_capacity` reader:
+  - turnover;
+  - positive minutes;
+  - active 15-minute bins;
+  - the minute turnovers, for `V25`.
+- `window_row(days, k, step, window_weekdays)`: the `LOT_MODEL_V2` window
+  ending on the last day:
+  - the last N weekdays (Monday–Friday UTC);
+  - `V25` = type-7 Q25 of positive minute turnover over those days;
+  - `A15` = active bins / (N × 96);
+  - `L = V25 × A15`;
+  - base lot = `floor_to_step(K × L, step)`.
+
+  All of it is Decimal and identical to the V1 formulas on the same days.
+- `refresh_liquidity(con, exchange, symbols, data_root, today, settings)`:
+  - For every TRADING pair, builds the day rows of the last
+    `window_weekdays + 10` calendar days that have a file. Weekend days are
+    stored with `weekend = true`.
+  - Writes the window row ending on the latest weekday that has a file, when
+    all N weekdays of that window have files. Otherwise it records
+    `LIQUIDITY_MODEL_WINDOW_UNAVAILABLE` with the missing days.
+  - Re-running on the same files is idempotent: rows are keyed by (exchange,
+    symbol, day), and a file hash is stored per day row.
+
+**Tables.**
+- **`liquidity_days`** (exchange, symbol, day): weekend flag, turnover,
+  positive minutes, active bins, file hash.
+- **`liquidity`** (exchange, symbol, as-of day):
+  - model version;
+  - window days (JSON list) and window length;
+  - positive minutes, active bins, total bins;
+  - `V25`, `A15`, `L`, `K`, step and base lot, as decimal text;
+  - status `READY` / `LIQUIDITY_MODEL_WINDOW_UNAVAILABLE` and the missing days.
+
+**Settings** (`pair_registry.liquidity`):
+- `window_weekdays` (7, from 3 to 20);
+- `k` (9);
+- `round_down_usdt` (10, whole);
+- `data_root` (default `<tester_runner.bot_root>/tester/data/bybit`).
+
+**Reader for consumers.** `pair_registry.read_liquidity(con, exchange,
+symbol)` returns the latest READY row (`L`, `K`, step, base lot, model version,
+as-of day) or None. The optimizer and the base-lot export switch to it in
+registry stage 4 («switch the consumers»). Until then V1 keeps working.
+
+**CLI.** `python -m mrs3.pair_registry liquidity [--exchange bybit]
+[--symbols …]`.
+
+**Acceptance.**
+- Unit tests:
+  - weekday selection across a weekend;
+  - Q25/A15/L/lot equal to V1 on the same weekday files;
+  - the window length setting;
+  - a missing weekday gives UNAVAILABLE;
+  - a weekend file never enters the window;
+  - idempotent re-run.
+- A live run on the registry's Bybit TRADING pairs, with counts of READY and
+  UNAVAILABLE pairs.
 
 ## Decisions taken (2026-10-18)
 

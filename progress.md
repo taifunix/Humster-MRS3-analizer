@@ -8,7 +8,24 @@ Use [PRD.md](PRD.md) for the feature registry and [docs/README.md](docs/README.m
 for the documentation map. Read the linked contract only for the active task;
 do not treat this file as a replacement for a feature specification.
 
-## Panel rework stage 1b, part A (2026-10-18, branch `wip/period-csv-generator`)
+## Pair registry stage 1 (2026-10-18, branch `wip/period-csv-generator`)
+
+Contract: [pair registry](docs/specs/2026-10-18-pair-registry.md) («Stage 1
+contract», «Stage 1 evidence»).
+
+- `mrs3.pair_registry`: DuckDB `registry.duckdb` holding:
+  - `pairs`, `pair_changes`, `risk_tiers` and `journal`;
+  - the Bybit and BingX reference refresh;
+  - history sufficiency;
+  - the CLI `python -m mrs3.pair_registry refresh`.
+- Live: Bybit 274 TradFi pairs with 8,240 risk tiers; BingX 605 TradFi
+  contracts (369 trading, 236 suspended). A second run writes no change rows.
+- **Verification:** `tests/test_pair_registry.py` (27). Independent review
+  `CODE_REVIEW_PASS` after fixes.
+- **Next:** registry stage 2, weekday liquidity `LOT_MODEL_V2`
+  ([ADR-0079](docs/decisions/0079-lot-model-v2-weekday-liquidity.md)).
+
+## Panel rework stage 1b, part A (2026-10-18, branch `wip/period-csv-generator`, committed `135b607`)
 
 Contract: [Panel for the simulation workflow](docs/specs/2026-10-18-panel-simulation-workflow.md)
 («Stage 1b contract», «Stage 1b evidence, part A»).
