@@ -115,6 +115,10 @@ class StoreTaskService:
             raise StoreTaskError("в config не задан trade_store.root")
         return Path(root)
 
+    def store_root(self) -> Path:
+        """The configured trade store root (`trade_store.root`); StoreTaskError when it is not set."""
+        return self._store_root()
+
     def command(self, action: str, payload: Mapping[str, object]) -> list[str]:
         """argv of the store CLI for an action (validated; no shell)."""
         if action not in ACTIONS:

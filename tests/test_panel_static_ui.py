@@ -535,8 +535,9 @@ def test_normal_test_and_import_card_is_unified_and_numbered() -> None:
     assert "7. CHECK & RETEST" in js
     card = html.split("3. Test and Import to Performance DB", 1)[1].split("</details>", 1)[0]
     assert card.count('class="progress-block"') == 1
-    assert card.count('role="status"') == 2
+    assert card.count('role="status"') == 3                       # + the store READY status (stage 1b)
     assert 'id="tester-collection-status" class="card-status" role="status" aria-live="polite"' in card
+    assert 'id="store-ready-status" class="card-status" role="status" aria-live="polite"' in card
     assert "const v2CardOrder" in js
     assert "performanceV2WindowTitle) performanceV2WindowTitle.textContent = '5. A/B" in js
 
@@ -2177,6 +2178,7 @@ const context = {
   generateStatus(status) { visible.status = status; },
   requestJson() { return new Promise((resolve) => { releaseBatch = resolve; }); },
   generatedBatchAnalysisId: '',
+  storeReadyBatchChosen: false,
 };
 vm.createContext(context);
 vm.runInContext(source.slice(helperStart, helperEnd), context, { filename: 'app.js' });
@@ -3906,3 +3908,19 @@ def test_portfolio_stage2_lists_candidates_with_checkboxes_and_sends_selection()
     assert "host.dataset.token === token" in portfolio
     new_calculation = portfolio.split("newButton?.addEventListener('click'", 1)[1].split(chr(10), 1)[0]
     assert "state.stage2Candidates = []" in new_calculation and "state.stage2Selected = new Set()" in new_calculation
+
+
+def test_test_and_import_card_prepares_a_store_ready_batch() -> None:
+    # Panel rework stage 1b: card 3 starts the tick test on a trade-store READY folder.
+    html = _read("index.html")
+    js = _read("app.js")
+    card = html.split("<b>3. Test and Import to Performance DB</b>", 1)[1].split("</details>", 1)[0]
+    for element in ('id="store-ready-folder"', 'id="store-ready-refresh"', 'id="store-ready-prepare"', 'id="store-ready-status"'):
+        assert element in card
+    assert card.index('id="store-ready-prepare"') < card.index('id="tester-start"')
+    assert "requestJson('/api/v2/strategies/store-ready/catalog')" in js
+    assert "remoteRequest('/api/v2/strategies/store-ready/prepare', { ready })" in js
+    handler = js.split("document.querySelector('#store-ready-prepare')", 1)[1].split("loadStoreReadyFolders();", 1)[0]
+    assert "generatedBatchAnalysisId = result.analysis_run_id;" in handler
+    assert "setTesterReadyCount(result.strategy_count);" in handler
+    assert "'/api/v2/strategies/store-ready/'," in js.split("const safeStringPrefixes", 1)[1].split("];", 1)[0]

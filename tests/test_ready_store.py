@@ -56,6 +56,18 @@ def test_best_structure_prefers_score_then_lower_drawdown_and_needs_active_point
     assert best["dd"] == pytest.approx(7.0) and not best["admitted"]
 
 
+def test_structure_orders_carry_the_zone_facts_of_the_newest_period():
+    # Panel rework stage 1b: the tick-test manifest needs per-order zone facts (point + present cube neighbours).
+    newest = features(np.full(len(IDS), 35.0), trades=np.array([p.open_len for p in TF15]))
+    older = features(np.full(len(IDS), 35.0), trades=np.full(len(IDS), 9))
+    [best] = best_structures([newest, older, older])
+    assert [(o["shift_bp"], o["open_ma"]) for o in best["orders"]] == [(70, 2), (110, 2)]
+    # (70, 2, 2) is a corner: 7 neighbours, zone = shifts {70, 90} x Open MA {2, 3} x Close MA {2, 3};
+    # (110, 2, 2) has shifts {90, 110, 140} around it: 11 neighbours. Trades are the newest period's only.
+    assert [(o["zone_points"], o["trades"], o["zone_trades"]) for o in best["orders"]] == [(7, 2, 20), (11, 2, 30)]
+    assert all(type(o[key]) is int for o in best["orders"] for key in ("zone_points", "trades", "zone_trades"))
+
+
 def test_combined_score_weights_the_newest_period_most():
     rising = features([10.0 + p.shift_bp / 10 for p in TF15])
     falling = features([70.0 - p.shift_bp / 10 for p in TF15])
@@ -112,6 +124,7 @@ def test_ready_folder_manifest_and_catalog_are_deterministic(tmp_path: Path):
     [item] = good["structures"]
     assert (item["category"], item["best_in_category"], item["pair_rank"]) == ("low", True, 1)
     assert [o["shift_bp"] for o in item["orders"]] == [70, 110]
+    assert [(o["zone_points"], o["trades"], o["zone_trades"]) for o in item["orders"]] == [(7, 5, 40), (11, 5, 60)]
     strategy = json.loads((tmp_path / "r1" / "strategies" / f"{item['strategy']}.json").read_text(encoding="utf-8"))
     entries = strategy["mrs3"]["ma_long"] if "ma_long" in strategy["mrs3"] else next(
         value for key, value in strategy["mrs3"].items() if isinstance(value, list))

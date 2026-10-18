@@ -8,7 +8,34 @@ Use [PRD.md](PRD.md) for the feature registry and [docs/README.md](docs/README.m
 for the documentation map. Read the linked contract only for the active task;
 do not treat this file as a replacement for a feature specification.
 
-## Panel rework stage 1a (2026-10-18, branch `wip/period-csv-generator`, uncommitted)
+## Panel rework stage 1b, part A (2026-10-18, branch `wip/period-csv-generator`)
+
+Contract: [Panel for the simulation workflow](docs/specs/2026-10-18-panel-simulation-workflow.md)
+(«Stage 1b contract», «Stage 1b evidence, part A»).
+
+- The «Test and Import» card runs the MRS3 tick test on a trade-store READY
+  folder. `store_ready_tick` re-renders the folder for the active PerformanceDB
+  and writes the generation manifest the tester expects. Its per-order zone
+  facts come from `ready_store.zone_facts`.
+- Real run: store READY → preparation → real SINGLE_MODE tick test (7/7) →
+  import into a temporary protocol v2 PerformanceDB (7 strategies, 14 orders,
+  14 plateaus). The tester files were byte-identical afterwards.
+- Fixed: the tick-test service deleted non-JSON files from the tester strategy
+  folder. It now clears only root `*.json` files.
+- **Verification:** all `tests/test_panel*.py`, `tests/test_store_ready_tick.py`,
+  `tests/test_ready_store.py`, `tests/test_single_mode_handoff.py`,
+  `tests/runner`, `tests/test_trade_store.py` and `tests/test_tester_jobs.py`
+  pass, apart from the two baseline failures and the flaky portfolio stage-2
+  test.
+- **Next:** stage 1b part B, which removes the old fresh analysis/shortlist,
+  Source DB and surfaces screens; then the three-screen shell.
+- **Blockers / user actions:**
+  - The active PerformanceDB is protocol v1, so the Panel refuses MRS3 tick
+    tests until a protocol v2 database is created and activated.
+  - `tester_runner.strategy_dir` in the local config was corrected to
+    `tester/settings_strategy`.
+
+## Panel rework stage 1a (2026-10-18, branch `wip/period-csv-generator`, committed `914c28c`)
 
 Contract: [Panel for the simulation workflow](docs/specs/2026-10-18-panel-simulation-workflow.md)
 («Stage 1 contract», «Stage 1a evidence»); companion draft
@@ -26,8 +53,8 @@ Contract: [Panel for the simulation workflow](docs/specs/2026-10-18-panel-simula
   (remote Source DB until 1b).
 - **Verification:** see the spec section «Stage 1a evidence». It covers the
   focused panel suites, the full suite against the 42-failure baseline and the
-  independent review (`CODE_REVIEW_PASS` after fixes). The changes stay
-  uncommitted until the whole rework is done.
+  independent review (`CODE_REVIEW_PASS` after fixes). Committed as
+  `914c28c`.
 - **Next:** stage 1b — the MRS3 tick test reads READY from the trade store;
   then remove the old fresh analysis/shortlist, Source DB and surfaces screens;
   three-screen shell.

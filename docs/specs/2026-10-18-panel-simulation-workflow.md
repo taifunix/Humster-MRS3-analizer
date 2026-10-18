@@ -1,7 +1,8 @@
 # Panel for the simulation workflow: three screens, obsolete parts removed
 
 **Status:** Approved by the user 2026-10-18 («вноси эти правки и начинай с
-этапа 1»). Stage 1a implemented (see «Stage 1a evidence»); 1b and stages 2–5
+этапа 1»). Stage 1a implemented (see «Stage 1a evidence»); stage 1b part A
+(tick test from a store READY folder) implemented; 1b part B and stages 2–5
 pending.
 **Depends on:** [pair registry](2026-10-18-pair-registry.md) (pairs, decisions,
 settings, finalists, sync), [MRS2 trade store](2026-10-17-mrs2-history-store-and-tester-sampling.md)
@@ -212,6 +213,165 @@ Acceptance: the kept functions work as before (their tests pass); removed
 routes answer 404; the Panel start no longer requests removed services; the
 full suite has no new failures against the known baseline.
 
+## Stage 1b contract: the MRS3 tick test from a store READY folder
+
+**Goal.** The «Test and Import» card runs the SINGLE_MODE tick test on the
+strategies of a READY folder built from the trade store
+(`<trade store>/ready/<name>/`, written by `ready_from_store`). With this
+path working, the old fresh analysis and shortlist can be removed. Only after
+that are the Source DB and surfaces screens removed.
+
+**Non-goals.**
+- No change to the tester run, the report collection or the Performance v2
+  import.
+- No new READY rule: `ready-v4-store-1` is unchanged.
+- No BingX: that is stage 5.
+- Finalist retest keeps working on what PerformanceDB already stores.
+
+**Why an adapter.** Everything after the launch reads only the generation
+manifest that `validate_strategy_manifest` accepts:
+- `format_version 1`, `analysis_run_id`, `event_mode`;
+- the signed hash, the strategy JSON hashes and the count;
+- `candidate_identity_to_strategy_names` and `candidate_diagnostics` (one
+  entry per order: `order_id`, `plateau_id`, `plateau_point_count`,
+  `base_point_trades`, `plateau_total_trades`).
+
+Nothing downstream reads surface or shortlist fields. The strategies
+themselves must meet protocol v2 for the active PerformanceDB.
+
+**Inputs and outputs.**
+- `build_ready` additionally records three zone facts for every order of a
+  structure, all from the newest period:
+  - `zone_points`: the 26-neighbour cube that the score uses;
+  - `trades`: the trades of the order's own point;
+  - `zone_trades`: the trades of the point plus its neighbours that are
+    present.
+
+  The change is additive. `inputs_sha256`, the `ready_id` and the selection
+  stay the same.
+- **New module `store_ready_tick`.**
+  - `list_ready_folders(store_root)`: the READY folders that have a
+    `ready_manifest.json`, each with its name, rule version, exchange,
+    pair/READY/strategy counts and whether it can be tested.
+  - `prepare_tick_batch(ready_dir, out_root, template, evaluation)`:
+    1. Re-renders every admitted structure into an EQUAL MRS3 strategy, with
+       the same code `build_ready` uses and the template of the active
+       PerformanceDB. Strategy names are the same as in the READY folder.
+    2. Applies protocol v2 to each strategy.
+    3. Writes `<out_root>/<analysis_run_id>/strategies/*.json` and
+       `strategy_manifest.json` atomically.
+  - `analysis_run_id` is the SHA-256 of the READY manifest bytes, the template
+    bytes and the target base/exchange. Preparing the same folder for the same
+    target again reuses the existing batch.
+  - The candidate identity is `<exchange>/<pair>/<timeframe>/<structure_id>`.
+  - Per order, the diagnostics are:
+    - `plateau_id = zone:<pair>:<point_id>`: the pair is included because a
+      point id does not name the pair, and the import keys plateaus by
+      (`analysis_run_id`, `plateau_id`);
+    - `plateau_point_count = zone_points + 1`;
+    - `base_point_trades = trades`;
+    - `plateau_total_trades = zone_trades`.
+
+    These are honest zone facts, not shortlist plateaus. Only the Pareto
+    selection stages read them, and those are retired in stage 4.
+  - A folder without zone facts, written before this change, is refused:
+    «пересоберите READY».
+- **Panel.**
+  - `GET /api/v2/strategies/store-ready/catalog` lists the folders of the
+    configured `trade_store.root`.
+  - `POST /api/v2/strategies/store-ready/prepare {"ready": "<folder name>"}`
+    prepares the batch into `Output/store-ready/` and returns
+    `analysis_run_id`, the strategy count and the pair counts.
+  - The existing `strategies.tester.start` runs it unchanged.
+  - `_fresh_strategy_manifest` also finds batches under `Output/store-ready/`,
+    so the card restores the last batch after a restart.
+- **UI.** Card 3 gets a «READY из хранилища» picker and a «Подготовить»
+  button, which sets the batch the tester starts.
+
+**Invariants.**
+- A folder name is a plain child of `<store>/ready/`: no path from the
+  client, no symlinks.
+- The prepared files never overwrite another batch.
+- A refused strategy (protocol v2) fails the whole preparation, and nothing
+  is published.
+
+**Acceptance evidence.**
+- Unit tests:
+  - zone facts;
+  - re-rendered names equal the READY names;
+  - the manifest passes `validate_strategy_manifest` and the tick-test
+    diagnostics check;
+  - protocol v2 is applied;
+  - a repeat run is idempotent;
+  - old folders and unsafe names are refused.
+- Panel route tests.
+- A run on the real store and the real tester for a few strategies, then the
+  import into PerformanceDB.
+
+## Stage 1b evidence, part A: the tick test from a store READY folder (2026-10-18)
+
+**Code**
+- `ready_store.zone_facts` and the per-order zone facts in `best_structures`.
+- `store_ready_tick` (catalog, folder resolution, batch preparation).
+- Panel routes `GET /api/v2/strategies/store-ready/catalog` and
+  `POST /api/v2/strategies/store-ready/prepare`, plus the
+  `Output/store-ready/` restore in `_fresh_strategy_manifest`.
+- Card 3 picker.
+
+**Tests**
+- `tests/test_store_ready_tick.py`, `tests/test_panel_store_ready.py`.
+- New cases in `tests/test_ready_store.py` and
+  `tests/test_panel_static_ui.py`.
+
+**Real run.** The chain ran through the Panel controller:
+1. A READY folder from the real trade store: XLFUSDT and LLYUSDT, giving
+   7 strategies of XLFUSDT.
+2. Preparation of the batch.
+3. The real SINGLE_MODE tick test over 2026-09-17…2026-10-17: 7/7 reports,
+   `COMMITTED`.
+4. Inbox verification.
+5. Performance v2 import into a **temporary** protocol v2 PerformanceDB:
+   `COMMITTED`, 7 strategies, 14 orders, 14 plateaus with
+   `plateau_id = zone:XLFUSDT:<point>`.
+
+The tester files were byte-identical before and after.
+
+**Found and fixed in the same part**
+- **Data loss in the tick-test service.** `_clear_strategy_directory` emptied
+  the whole tester strategy folder, but capture/restore saves only root
+  `*.json` files. A user's file (`ADA.json111`) was deleted and never
+  restored; it was put back from a backup taken before the run.
+  - Clearing now removes only root `*.json` files and refuses a JSON-named
+    directory or link.
+  - Tests: `test_strategy_cleanup_removes_only_root_json_files` and
+    `test_strategy_cleanup_refuses_a_json_named_directory`.
+  - The second real run kept the file.
+- **Local configuration** (not in the repository). `tester_runner.strategy_dir`
+  still named the legacy `settings_strategy`. The current bot reads only
+  `tester/settings_strategy` (user, 2026-10-18), so the first real run tested
+  a stale strategy and stalled. The local config now names the current folder.
+  The validator still accepts the legacy folder; refusing it is a separate
+  change, because many runner tests use it.
+
+**Independent review:** `CODE_REVIEW_PASS` after fixes. Five minor findings
+were fixed and are covered by tests:
+1. A damaged READY folder is flagged and does not break the catalog.
+2. Preparation runs under a lock; `OSError` answers 409 and a self-check
+   failure answers 500.
+3. The early POST routes, including `store/start|stop`, require
+   `application/json` (415 otherwise).
+4. A late batch restore can no longer overwrite a batch just prepared.
+5. `ADAPTER_VERSION` carries a note to bump it when the rendering code changes.
+
+Two non-blocking notes stay open:
+- order field types are checked only as keys;
+- an `OSError` outside the batch folder is also reported as «files busy».
+
+**Open.** The active PerformanceDB of this machine is protocol v1, so the
+Panel refuses every MRS3 tick test with `DATABASE_PROTOCOL_V1` until a
+protocol v2 database is created and activated (Settings, PerformanceDB). This
+is not caused by stage 1b.
+
 ## Stage 1a evidence (2026-10-18)
 
 - **Static checks:** `import mrs3.panel` works; `node --check
@@ -249,7 +409,7 @@ full suite has no new failures against the known baseline.
 ## Order of work
 
 1. Remove the obsolete screens and their backend (1a, 1b above); three-screen
-   shell. ✅ 1a done (2026-10-18, reviewed); ⏳ 1b and the shell.
+   shell. ✅ 1a done (2026-10-18, reviewed); ✅ 1b part A done; ⏳ 1b part B and the shell.
 2. ⏳ Registry stages 1–3 ([pair registry](2026-10-18-pair-registry.md)).
 3. ⏳ «Пары и стратегии»: exchange switch, actions with plan dialogs, task area
    with progress/ETA/errors, views, pair card.

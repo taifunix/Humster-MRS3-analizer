@@ -110,6 +110,36 @@ def zone_scores(point_ids: np.ndarray, values: np.ndarray) -> np.ndarray:
     return out
 
 
+def zone_facts(point_ids: np.ndarray, trades: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Per point: how many of its 26 cube neighbours (the zone of `zone_scores`) are present, and the trades of
+    the point plus those neighbours. Feeds the per-order diagnostics of a tick-test batch (Panel rework stage 1b)."""
+    params = [point_params(int(pid)) for pid in point_ids]
+    shift_index = {shift: index for index, shift in enumerate(SHIFTS_BP)}
+    counts = np.zeros(len(point_ids), dtype=np.int64)
+    sums = np.zeros(len(point_ids), dtype=np.int64)
+    size = (len(SHIFTS_BP), len(MA_LENGTHS), len(MA_LENGTHS))
+    for timeframe in sorted({param[0] for param in params}):
+        rows = [index for index, param in enumerate(params) if param[0] == timeframe]
+        cells = [(shift_index[params[i][1]], params[i][2] - MA_LENGTHS[0], params[i][3] - MA_LENGTHS[0]) for i in rows]
+        present = np.zeros(size, dtype=np.int64)
+        cube = np.zeros(size, dtype=np.int64)
+        for i, cell in zip(rows, cells):
+            present[cell] = 1
+            cube[cell] = int(trades[i])
+        padded_present, padded = np.pad(present, 1), np.pad(cube, 1)
+        neighbours = np.zeros(size, dtype=np.int64)
+        totals = cube.copy()
+        for a, b, c in itertools.product((-1, 0, 1), repeat=3):
+            if (a, b, c) == (0, 0, 0):
+                continue
+            window = (slice(1 + a, 1 + a + size[0]), slice(1 + b, 1 + b + size[1]), slice(1 + c, 1 + c + size[2]))
+            neighbours += padded_present[window]
+            totals += padded[window]
+        for i, cell in zip(rows, cells):
+            counts[i], sums[i] = neighbours[cell], totals[cell]
+    return counts, sums
+
+
 def best_structures(periods: Sequence[PeriodFeatures], rule: ReadyRule = ReadyRule()) -> list[dict]:
     """The best 2-order structure per TF from periods given newest first (same point set in every period)."""
     point_ids = periods[0].point_ids
@@ -142,6 +172,7 @@ def best_structures(periods: Sequence[PeriodFeatures], rule: ReadyRule = ReadyRu
                 if timeframe not in best_per_tf or key < best_per_tf[timeframe][0]:
                     best_per_tf[timeframe] = (key, value, dd, close, (first, second))
     out = []
+    zone_points, zone_trades = zone_facts(point_ids, periods[0].trades) if best_per_tf else (None, None)
     for timeframe in TIMEFRAMES:
         if timeframe not in best_per_tf:
             continue
@@ -149,7 +180,9 @@ def best_structures(periods: Sequence[PeriodFeatures], rule: ReadyRule = ReadyRu
         out.append({"timeframe": timeframe, "close_ma": close, "score": value, "dd": dd,
                     "admitted": value > rule.admit_score and dd <= rule.max_dd,
                     "orders": [{"shift_bp": params[i][1], "open_ma": params[i][2], "point_id": int(point_ids[i]),
-                                "score": float(score[i])} for i in members]})
+                                "score": float(score[i]), "zone_points": int(zone_points[i]),
+                                "trades": int(periods[0].trades[i]), "zone_trades": int(zone_trades[i])}
+                               for i in members]})
     return out
 
 

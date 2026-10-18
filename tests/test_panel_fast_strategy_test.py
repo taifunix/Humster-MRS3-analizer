@@ -218,8 +218,8 @@ def test_strategy_cleanup_uses_the_validated_resolved_directory(tmp_path: Path, 
     strategy_dir.mkdir(parents=True)
     calls = []
 
-    def capture_clear(path: Path, *, expected: Path) -> None:
-        calls.append((path, expected))
+    def capture_clear(path: Path, *, expected: Path, only_json: bool = False) -> None:
+        calls.append((path, expected, only_json))
 
     monkeypatch.setattr(fast_strategy_module, "_clear_directory", capture_clear)
 
@@ -229,6 +229,35 @@ def test_strategy_cleanup_uses_the_validated_resolved_directory(tmp_path: Path, 
     assert calls[0][0] is not calls[0][1]
     assert calls[0][0] == strategy_dir.resolve()
     assert calls[0][1] == bot_root.resolve() / "tester" / "settings_strategy"
+    assert calls[0][2] is True
+
+
+def test_strategy_cleanup_removes_only_root_json_files(tmp_path: Path) -> None:
+    # Found in the stage 1b real tick test (2026-10-18): clearing deleted a user's non-JSON file
+    # (`ADA.json111`) that capture/restore never saved, so it was lost. Only root *.json files are
+    # what the tester reads and what capture/restore manage.
+    bot_root = tmp_path / "bot"
+    strategy_dir = bot_root / "tester" / "settings_strategy"
+    (strategy_dir / "notes").mkdir(parents=True)
+    (strategy_dir / "old.json").write_text("{}", encoding="utf-8")
+    (strategy_dir / "OTHER.JSON").write_text("{}", encoding="utf-8")
+    (strategy_dir / "ADA.json111").write_text("keep", encoding="utf-8")
+    (strategy_dir / "notes" / "inner.json").write_text("keep", encoding="utf-8")
+
+    _clear_strategy_directory(strategy_dir, bot_root=bot_root)
+
+    assert sorted(path.relative_to(strategy_dir).as_posix() for path in strategy_dir.rglob("*")) == [
+        "ADA.json111", "notes", "notes/inner.json",
+    ]
+
+
+def test_strategy_cleanup_refuses_a_json_named_directory(tmp_path: Path) -> None:
+    bot_root = tmp_path / "bot"
+    strategy_dir = bot_root / "tester" / "settings_strategy"
+    (strategy_dir / "trap.json").mkdir(parents=True)
+    with pytest.raises(FastStrategyTestError, match="protected"):
+        _clear_strategy_directory(strategy_dir, bot_root=bot_root)
+    assert (strategy_dir / "trap.json").is_dir()
 
 
 def test_runtime_directory_cleanup_unlinks_symlink_like_entry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -343,7 +372,7 @@ def test_strategy_cleanup_unlinks_symlink_child_without_touching_external_target
     _clear_strategy_directory(strategy_dir, bot_root=bot_root)
 
     assert protected.read_text(encoding="utf-8") == "{}"
-    assert list(strategy_dir.iterdir()) == []
+    assert list(strategy_dir.iterdir()) == [link]          # not a root *.json entry: left alone
 
 
 def test_fast_writer_starts_from_template_and_preserves_unrelated_keys(tmp_path: Path) -> None:

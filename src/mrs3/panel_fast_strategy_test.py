@@ -153,7 +153,9 @@ def parse_initial_balance(value: object) -> float:
     return balance
 
 
-def _clear_directory(path: Path, *, expected: Path) -> None:
+def _clear_directory(path: Path, *, expected: Path, only_json: bool = False) -> None:
+    """Empty a runtime directory; with `only_json` remove just its root ``*.json`` files (the tester strategy
+    folder: other entries belong to the user and capture/restore never saves them)."""
     if path.is_symlink():
         raise FastStrategyTestError("refusing to clear a symlink runtime path")
     resolved = path.resolve()
@@ -165,7 +167,15 @@ def _clear_directory(path: Path, *, expected: Path) -> None:
     else:
         resolved.mkdir(parents=True, exist_ok=True)
     deadline = time.monotonic() + _WINDOWS_FILE_RELEASE_SECONDS
-    for entry in tuple(resolved.iterdir()):
+
+    def removable(entry: Path) -> bool:
+        return not only_json or entry.suffix.casefold() == ".json"
+
+    if only_json:
+        for entry in resolved.iterdir():
+            if removable(entry) and (entry.is_symlink() or not entry.is_file()):
+                raise FastStrategyTestError(f"strategy folder has a protected JSON entry: {entry.name}")
+    for entry in tuple(entry for entry in resolved.iterdir() if removable(entry)):
         while True:
             try:
                 info = entry.stat(follow_symlinks=False)
@@ -185,7 +195,7 @@ def _clear_directory(path: Path, *, expected: Path) -> None:
                 if getattr(error, "winerror", None) not in {32, 33} or time.monotonic() >= deadline:
                     raise
                 time.sleep(0.1)
-    while remaining := tuple(resolved.iterdir()):
+    while remaining := tuple(entry for entry in resolved.iterdir() if removable(entry)):
         if time.monotonic() >= deadline:
             raise FastStrategyTestError(
                 f"runtime directory could not be cleared: {resolved} ({remaining[0].name})"
@@ -201,7 +211,7 @@ def _clear_strategy_directory(path: Path, *, bot_root: Path) -> None:
         raise FastStrategyTestError("refusing to clear unexpected strategy path") from error
     for expected in (root / "tester" / "settings_strategy", root / "settings_strategy"):
         if resolved == expected:
-            _clear_directory(resolved, expected=expected)
+            _clear_directory(resolved, expected=expected, only_json=True)
             return
     raise FastStrategyTestError("refusing to clear unexpected strategy path")
 

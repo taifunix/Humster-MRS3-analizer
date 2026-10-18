@@ -214,6 +214,7 @@ const panelRequestErrorHelpers = (() => {
     '/api/v2/strategies/fresh/',
     '/api/v2/surfaces/',
     '/api/v2/store/',
+    '/api/v2/strategies/store-ready/',
   ];
   const safeStringEndpoints = new Set([]);
   const allowsSafeString = (endpoint) => (
@@ -1784,11 +1785,12 @@ if (typeof globalThis !== 'undefined') globalThis.portfolioSelectionHelpers = po
     const node = document.querySelector('#tester-status');
     if (node) node.textContent = message;
   };
+  let storeReadyBatchChosen = false;   // a batch prepared on this page wins over the restored one
   const restoreGeneratedBatch = async () => {
     const restoreGenerationRevision = freshShortlistState.generationRevision;
     try {
       const batch = await requestJson('/api/v2/strategies/fresh/batch');
-      if (!freshShortlistState.isGenerationCurrent(restoreGenerationRevision)) return;
+      if (!freshShortlistState.isGenerationCurrent(restoreGenerationRevision) || storeReadyBatchChosen) return;
       if (!Number.isSafeInteger(batch.strategy_count) || batch.strategy_count < 0) {
         console.warn('READY JSON batch metadata has an invalid strategy count.');
         return;
@@ -1806,6 +1808,65 @@ if (typeof globalThis !== 'undefined') globalThis.portfolioSelectionHelpers = po
     }
   };
   restoreGeneratedBatch();
+  // Stage 1b (docs/specs/2026-10-18-panel-simulation-workflow.md): a trade-store READY folder becomes the batch
+  // that the unchanged SINGLE_MODE tester starts.
+  const storeReadySelect = document.querySelector('#store-ready-folder');
+  const storeReadyStatus = (message) => {
+    const node = document.querySelector('#store-ready-status');
+    if (node) node.textContent = message;
+  };
+  const storeReadyOption = (value, text, disabled = false) => {
+    const option = document.createElement('option');
+    option.value = value;
+    option.textContent = text;
+    option.disabled = disabled;
+    return option;
+  };
+  const loadStoreReadyFolders = async () => {
+    if (!storeReadySelect) return;
+    try {
+      const catalog = await requestJson('/api/v2/strategies/store-ready/catalog');
+      const folders = Array.isArray(catalog.folders) ? catalog.folders : [];
+      storeReadySelect.replaceChildren(...(folders.length
+        ? folders.map((folder) => storeReadyOption(
+          String(folder.name),
+          folder.testable === true
+            ? `${folder.name} · пар READY ${folder.ready_pairs} · стратегий ${folder.strategies}`
+            : `${folder.name} · ${folder.reason || 'нельзя тестировать'}`,
+          folder.testable !== true,
+        ))
+        : [storeReadyOption('', 'Папок READY нет')]));
+      const first = folders.find((folder) => folder.testable === true);
+      if (first) storeReadySelect.value = String(first.name);
+      storeReadyStatus(folders.length ? '' : 'Соберите READY в карточке MRS2 STORE.');
+    } catch (error) {
+      storeReadyStatus(`Список READY недоступен: ${error?.message || 'ошибка запроса'}.`);
+    }
+  };
+  document.querySelector('#store-ready-refresh')?.addEventListener('click', loadStoreReadyFolders);
+  const storeReadyPrepare = document.querySelector('#store-ready-prepare');
+  storeReadyPrepare?.addEventListener('click', async () => {
+    const ready = storeReadySelect?.value || '';
+    if (!ready) { storeReadyStatus('Выберите папку READY.'); return; }
+    storeReadyStatus('Подготовка…');
+    storeReadyPrepare.disabled = true;
+    try {
+      const result = await remoteRequest('/api/v2/strategies/store-ready/prepare', { ready });
+      if (typeof result.analysis_run_id !== 'string' || !/^[0-9a-f]{64}$/.test(result.analysis_run_id)) {
+        throw new Error('нет идентификатора пакета');
+      }
+      storeReadyBatchChosen = true;
+      generatedBatchAnalysisId = result.analysis_run_id;
+      setTesterReadyCount(result.strategy_count);
+      storeReadyStatus(`Готово к тесту: стратегий ${result.strategy_count}, пар ${result.ready_pairs}`
+        + `${result.reused ? ' (пакет уже был подготовлен)' : ''}.`);
+    } catch (error) {
+      storeReadyStatus(`Подготовка не удалась: ${error?.message || 'ошибка запроса'}.`);
+    } finally {
+      storeReadyPrepare.disabled = false;
+    }
+  });
+  loadStoreReadyFolders();
   const generateFresh = document.querySelector('#shortlist-generate');
   if (generateFresh) generateFresh.addEventListener('click', async () => {
     if (freshShortlistState.generateBusy) return;

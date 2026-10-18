@@ -147,6 +147,7 @@ from .panel_testing import (
     mrs3_tester_config_template,
 )
 from .panel_store import StoreTaskError, StoreTaskService
+from .store_ready_tick import StoreReadyError, list_ready_folders, prepare_tick_batch, resolve_ready_folder
 from .fresh_analysis_strategies import (
     fresh_shortlist_response,
     generate_fresh_analysis_strategies,
@@ -1229,6 +1230,27 @@ class PanelController:
                 self._store_task_service = service
         return service
 
+    # -- MRS3 tick test from a store READY folder (docs/specs/2026-10-18-panel-simulation-workflow.md, «Stage 1b
+    # contract»): the folder is re-rendered for the active PerformanceDB and published as a generation manifest
+    # under Output/store-ready/, which the unchanged SINGLE_MODE tick test runs.
+
+    def store_ready_catalog(self) -> dict[str, object]:
+        return {"folders": list_ready_folders(self.store_tasks().store_root())}
+
+    _store_ready_lock = threading.Lock()
+
+    def store_ready_prepare(self, payload: Mapping[str, object]) -> dict[str, object]:
+        if set(payload) != {"ready"}:
+            raise StoreReadyError("запрос: только поле ready")
+        folder = resolve_ready_folder(self.store_tasks().store_root(), payload["ready"])
+        target = self._evaluation_target()
+        with self._store_ready_lock:                 # one preparation at a time: no race on the batch folder
+            result = prepare_tick_batch(folder, self.root / "Output" / "store-ready",
+                                        self._ready_strategy_template(target, "LONG"), target)
+        self._fresh_strategy_manifests[str(result["analysis_run_id"])] = Path(str(result["manifest_path"])).resolve()
+        return {"ready": folder.name, **{key: result[key] for key in
+                                         ("analysis_run_id", "strategy_count", "pairs", "ready_pairs", "reused")}}
+
     def _remote_testing_service(self) -> RemoteTestingService:
         if self._remote_testing_service_instance is not None:
             return self._remote_testing_service_instance
@@ -1915,7 +1937,13 @@ class PanelController:
                 and re.fullmatch(r"[0-9a-f]{64}-[0-9a-f]{32}", path.parent.name)
                 and (analysis_id is None or path.parent.parent.name == analysis_id)
             ]
-            candidates.extend(sorted(generated, key=lambda path: path.stat().st_mtime_ns, reverse=True))
+            store_ready = [
+                path for path in (self.root / "Output" / "store-ready").glob("*/strategy_manifest.json")
+                if path.is_file() and not path.is_symlink() and not path.parent.is_symlink()
+                and re.fullmatch(r"[0-9a-f]{64}", path.parent.name)
+                and (analysis_id is None or path.parent.name == analysis_id)
+            ]
+            candidates.extend(sorted([*generated, *store_ready], key=lambda path: path.stat().st_mtime_ns, reverse=True))
         except OSError:
             pass
         candidates.extend((
@@ -6357,6 +6385,12 @@ class _PanelHandler(BaseHTTPRequestHandler):
             except StoreTaskError as error:
                 self._json(400, {"error": str(error)})
             return
+        if parsed.path == "/api/v2/strategies/store-ready/catalog":
+            try:
+                self._json(200, self.server.controller.store_ready_catalog())
+            except (StoreTaskError, StoreReadyError) as error:
+                self._json(400, {"error": str(error)})
+            return
         if parsed.path == "/api/v2/bootstrap":
             self._json(200, self.server.controller.panel_bootstrap())
             return
@@ -6696,7 +6730,16 @@ class _PanelHandler(BaseHTTPRequestHandler):
             return
         self._json(200, result)
 
+    def _json_request(self) -> bool:
+        """Early POST routes accept only a JSON body (a cross-site form or text/plain POST is refused)."""
+        if self.headers.get("Content-Type", "").partition(";")[0].strip().casefold() != "application/json":
+            self._json(415, {"error": "Content-Type: application/json"})
+            return False
+        return True
+
     def _store_post(self, endpoint: str) -> None:
+        if not self._json_request():
+            return
         try:
             length = int(self.headers.get("Content-Length", "0"))
             document = json.loads(self.rfile.read(length).decode("utf-8")) if 0 < length <= 65_536 else {}
@@ -6715,6 +6758,32 @@ class _PanelHandler(BaseHTTPRequestHandler):
             return
         self._json(200, result)
 
+    def _store_ready_post(self) -> None:
+        if not self._json_request():
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            document = json.loads(self.rfile.read(length).decode("utf-8")) if 0 < length <= 65_536 else {}
+            if not isinstance(document, dict):
+                raise StoreReadyError("тело запроса: JSON-объект")
+            result = self.server.controller.store_ready_prepare(document)
+        except EvaluationProtocolError as error:
+            self._json(409, {"error": {"code": error.code, "message": str(error)}})
+            return
+        except (StoreTaskError, StoreReadyError) as error:
+            self._json(400, {"error": str(error)})
+            return
+        except StrategyBatchValidationError as error:
+            self._json(500, {"error": f"пакет не прошёл самопроверку: {error}"})
+            return
+        except OSError:
+            self._json(409, {"error": "файлы пакета заняты: повторите подготовку"})
+            return
+        except (ValueError, UnicodeDecodeError):
+            self._json(400, {"error": "тело запроса: JSON-объект"})
+            return
+        self._json(200, result)
+
     def do_POST(self) -> None:
         if not self._has_local_host():
             self._json(403, {"error": "local Host header required"})
@@ -6725,6 +6794,9 @@ class _PanelHandler(BaseHTTPRequestHandler):
             return
         if endpoint in ("/api/v2/store/start", "/api/v2/store/stop"):
             self._store_post(endpoint)
+            return
+        if endpoint == "/api/v2/strategies/store-ready/prepare":
+            self._store_ready_post()
             return
         direct_retest_endpoint = endpoint if endpoint in {
             "/api/v2/strategies/performance-v2/retest/start",
