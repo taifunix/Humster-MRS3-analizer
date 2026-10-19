@@ -173,4 +173,7 @@ def connect(root: Path) -> duckdb.DuckDBPyConnection:
             "select column_name from information_schema.columns where table_name = ?", [table]).fetchall()}
         if column not in present:
             con.execute(f"alter table {table} add column {column} {kind}")
+    from .records import ensure_schema          # stage 3 tables (decisions, settings, finalists, tests, pipeline)
+
+    ensure_schema(con)
     return con

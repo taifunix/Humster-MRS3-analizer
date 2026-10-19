@@ -22,8 +22,6 @@ import sys
 
 import numpy as np
 import pandas as pd
-import pyarrow as pa
-import pyarrow.compute as pc
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
@@ -31,30 +29,9 @@ sys.path.insert(0, str(ROOT / "src"))
 from mrs3.mrs2_simulator import DAY_MS  # noqa: E402
 from mrs3.ready_store import ReadyRule, best_structures, common_points, period_features  # noqa: E402
 from mrs3.trade_store import TradeStore  # noqa: E402
+from mrs3.pair_registry.track import combined_forward  # noqa: E402  (moved there in registry stage 3)
 
-LOT = 10_000.0
 PERMISSIVE = ReadyRule(admit_score=-1e18, max_dd=1e18)       # collect every TF candidate, gate nothing
-
-
-def combined_forward(hourly, metrics, a: int, b: int, days: float) -> dict:
-    """True combined curve of two points over one period: shared base 2x lot, hourly low/high summed."""
-    sub = hourly.filter(pc.is_in(hourly.column("point_id"), pa.array([a, b]))).to_pandas()
-    close = sub.pivot(index="hour_ms", columns="point_id", values="close").sort_index()
-    low = sub.pivot(index="hour_ms", columns="point_id", values="low").sort_index()
-    high = sub.pivot(index="hour_ms", columns="point_id", values="high").sort_index()
-    base = 2 * LOT
-    close_sum, low_sum, high_sum = (frame.sum(axis=1).to_numpy() for frame in (close, low, high))
-    peak_before = np.maximum.accumulate(np.r_[base, high_sum[:-1]]) if len(high_sum) else np.array([base])
-    maxdd = float(max(0.0, ((peak_before - low_sum) / peak_before * 100).max())) if len(low_sum) else 0.0
-    peaks_close = np.maximum.accumulate(np.r_[base, close_sum])[1:] if len(close_sum) else np.array([])
-    dd_close = np.clip((peaks_close - close_sum) / peaks_close * 100, 0, None) if len(peaks_close) else np.array([])
-    ulcer = float(np.sqrt((dd_close ** 2).mean())) if len(dd_close) else 0.0
-    final = float(close_sum[-1]) if len(close_sum) else base
-    pnl30 = (final - base) / base * 100 * 30 / days
-    rows = metrics.to_pandas().set_index("point_id")
-    trades = int(rows.loc[[a, b], "trades"].sum())
-    return {"fwd_pnl30": pnl30, "fwd_maxdd": maxdd, "fwd_ulcer": ulcer, "fwd_trades": trades,
-            "fwd_upi": pnl30 / max(ulcer, 0.25), "fwd_loss": final < base}
 
 
 def walk_forward(store: TradeStore, pairs: list[str]) -> pd.DataFrame:

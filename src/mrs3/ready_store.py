@@ -7,6 +7,7 @@ Contract: docs/specs/2026-10-17-mrs2-history-store-and-tester-sampling.md («Sta
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 import hashlib
 import itertools
 import json
@@ -22,7 +23,7 @@ from .lots import LotMethod, allocate_lots
 from .mrs2_simulator import DAY_MS
 from .period_csv import MA_LENGTHS, SHIFTS_BP, TIMEFRAMES
 from .strategy_json import generate_strategy
-from .trade_store import TradeStore, TradeStoreError, point_params, utc_now
+from .trade_store import TradeStore, TradeStoreError, point_params
 
 RULE_VERSION = "ready-v4-store-1"
 CATEGORIES = ("low", "moderate", "high")
@@ -243,15 +244,26 @@ def structure_document(symbol: str, item: Mapping) -> dict:
 
 
 def build_ready(store: TradeStore, symbols: Sequence[str], out_dir: Path, template: Mapping,
-                rule: ReadyRule = ReadyRule(), exchange: str = "bybit", latest_source: str = "simulator") -> dict:
-    """READY folder (strategies + manifest) for the pairs and one catalog `ready` row per pair."""
+                rule: ReadyRule = ReadyRule(), exchange: str = "bybit", latest_source: str = "simulator",
+                rules: Mapping[str, ReadyRule] | None = None) -> dict:
+    """READY folder (strategies + manifest) for the pairs and one catalog `ready` row per pair. `rules` gives a
+    pair its own rule (registry per-pair settings, stage 3); the entry records the effective parameters and the
+    overridden ones, and the inputs hash covers them."""
     entries = []
+    pair_rules: dict[str, ReadyRule] = {}
+    base = asdict(rule)
     for symbol in dict.fromkeys(symbols):
+        pair_rule = (rules or {}).get(symbol, rule)
+        pair_rules[symbol] = pair_rule
         try:
-            entries.append(pair_entry(store, symbol, rule, exchange, latest_source))
+            entry = pair_entry(store, symbol, pair_rule, exchange, latest_source)
         except Exception as error:  # one pair never stops the READY run
-            entries.append({"pair": symbol, "status": "ERROR", "error": f"{type(error).__name__}: {error}",
-                            "periods": [], "structures": [], "timeframes": []})
+            entry = {"pair": symbol, "status": "ERROR", "error": f"{type(error).__name__}: {error}",
+                     "periods": [], "structures": [], "timeframes": []}
+        effective = asdict(pair_rule)
+        entry["rule"] = effective
+        entry["overridden"] = sorted(key for key, value in effective.items() if base.get(key) != value)
+        entries.append(entry)
     best: dict[str, tuple[float, str, str]] = {}
     for entry in entries:
         for item in entry["structures"]:
@@ -270,11 +282,12 @@ def build_ready(store: TradeStore, symbols: Sequence[str], out_dir: Path, templa
             item["strategy"] = strategy["name"]
             (strategies / f"{strategy['name']}.json").write_text(
                 json.dumps(strategy, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        entry["inputs_sha256"] = inputs_sha256(entry, rule)
+        entry["inputs_sha256"] = inputs_sha256(entry, pair_rules[entry["pair"]])
     manifest = {"rule_version": RULE_VERSION, "rule": asdict(rule), "exchange": exchange, "latest_source": latest_source,
                 "pairs": entries}
     (Path(out_dir) / "ready_manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
                                                         encoding="utf-8")
+    built = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")
     with store.connect() as con:
         for entry in entries:
             if entry["status"] in ("ERROR", "TESTER_PENDING"):
@@ -283,8 +296,11 @@ def build_ready(store: TradeStore, symbols: Sequence[str], out_dir: Path, templa
             # the catalog keeps only what the pair's own inputs determine (no cross-pair `best_in_category`)
             payload = {**entry, "structures": [{key: value for key, value in item.items() if key != "best_in_category"}
                                                for item in entry["structures"]]}
-            con.execute("insert or ignore into ready values (?, ?, ?, ?, ?, ?, ?)",
-                        [ready_id, exchange, entry["pair"], RULE_VERSION, entry["inputs_sha256"], utc_now(),
+            # the same inputs give the same ready_id: a rebuild (e.g. after a per-pair override is reset) moves the
+            # row's time forward so the catalog's newest row per pair is the latest build (registry stage 3 review)
+            con.execute("insert into ready values (?, ?, ?, ?, ?, ?, ?) "
+                        "on conflict (ready_id) do update set created_utc = excluded.created_utc",
+                        [ready_id, exchange, entry["pair"], RULE_VERSION, entry["inputs_sha256"], built,
                          json.dumps(payload, ensure_ascii=False, sort_keys=True)])
     statuses = [entry["status"] for entry in entries]
     return {"pairs": len(entries), "ready_pairs": statuses.count("READY"), "errors": statuses.count("ERROR"),

@@ -23,6 +23,29 @@ REPO = Path(__file__).resolve().parents[1]
 TEMPLATE = REPO / "templates" / "exchanges" / "Bybit" / "mrs3-strategy.json"
 
 
+def registry_rules(config: Path) -> dict:
+    """Per-pair READY rules from the pair registry (stage 3) when it is configured and exists; else none."""
+    import duckdb
+
+    from mrs3.pair_registry.records import effective_ready_rules
+    from mrs3.pair_registry.store import DATABASE, RegistryError, load_registry_settings
+
+    try:
+        settings = load_registry_settings(config)
+    except RegistryError:
+        return {}
+    if not (settings.root / DATABASE).is_file():
+        return {}
+    # read-only: a READY build never writes to the registry; a registry locked by a writer, or stored overrides
+    # that no longer form a valid rule, stop the build loudly (registry stage 3 contract)
+    con = duckdb.connect(str(settings.root / DATABASE), read_only=True)
+    try:
+        tables = {row[0] for row in con.execute("select table_name from information_schema.tables").fetchall()}
+        return effective_ready_rules(con, "bybit") if "pair_settings" in tables else {}
+    finally:
+        con.close()
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--store", type=Path, default=None, help="store root; default: trade_store.root in the config")
@@ -48,7 +71,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             symbols = [row[0] for row in con.execute(
                 "select distinct symbol from segments where status = 'active' order by symbol").fetchall()]
     template = json.loads(TEMPLATE.read_text(encoding="utf-8"))
-    summary = build_ready(store, symbols, args.out, template, latest_source=args.latest_source)
+    summary = build_ready(store, symbols, args.out, template, latest_source=args.latest_source,
+                          rules=registry_rules(args.config))
     print(json.dumps({**summary, "out": str(args.out)}), flush=True)
     return 0
 

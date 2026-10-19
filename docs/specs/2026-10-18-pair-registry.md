@@ -3,8 +3,8 @@
 **Status:** Approved by the user 2026-10-18 (revision 3 after the user's
 review: sync scope, weekday liquidity with a configurable window, optimizer
 reads computed liquidity only, button instead of a scheduler, automatic new
-listings, per-pair filter settings). Stages 1–2 implemented (see the evidence
-sections); stages 3–5 pending.
+listings, per-pair filter settings). Stages 1–3 implemented (see the evidence
+sections); stages 4–5 pending.
 **Replaces (when done):** the hand-maintained `bybit_tradfi_liquidity.xlsx`
 (sheets «Пары», «По дням», «Оборот 30д», «Скрининг», «Скрининг BingX») and the
 `Actual` sheet of the base-lot export as sources of truth.
@@ -657,6 +657,161 @@ YYYY-MM-DD]`.
   hashes, reason column, contract matching the code).
 - **BingX liquidity** waits for the BingX minute data layer (panel stage 5).
   `refresh_liquidity` refuses any exchange other than Bybit.
+
+## Stage 3 contract: pipeline, tests, finalists, decisions, pair settings (2026-10-18)
+
+**Module.** `mrs3.pair_registry.records` handles the hand and imported rows;
+`mrs3.pair_registry.track` holds the walk-forward track record;
+`mrs3.pair_registry.pipeline` computes the state. The tables are created by
+`records.ensure_schema`, called from `connect`.
+
+**Hand rows** (append-only, synced in stage 5):
+- **`decisions`**: seq, exchange, symbol, side (`LONG` / `SHORT` / `ALL`),
+  decision (`INCLUDE` / `EXCLUDE` / `WATCH`), reason, author, time.
+  - The pair must exist; reason and author are required.
+  - The decision in force for a side is the latest row of that side or of
+    `ALL`.
+- **`pair_settings`**: seq, exchange, symbol, side, filter, parameter, value
+  (empty = reset to the common default), reason, author, time.
+  - Declared parameters of filter `ready_v4`, with type and range:
+    - `admit_score` (number, 0–1000);
+    - `max_dd`, `low_dd`, `moderate_dd` (number, 0.1–50);
+    - `min_trades` (whole, 1–1000);
+    - `min_shift_bp` (whole, 0–550);
+    - `pool` (whole, 2–20);
+    - `ratio` (number, 1–10).
+  - An unknown filter or parameter, a wrong type, an out-of-range value, or a
+    result that breaks `low_dd ≤ moderate_dd ≤ max_dd` is refused at entry.
+  - `effective_ready_rule(con, exchange, symbol)` returns the rule and the
+    overridden parameters: the latest row per parameter (side `LONG` or `ALL`)
+    over `ReadyRule()`.
+- **`finalists`**: seq, exchange, symbol, side, strategy, status (`FINALIST` /
+  `RESERVE` / `REJECTED` / `NONE`), user rank, source, time.
+  - The status in force is the latest row per strategy.
+  - `import_finalists(con, performance_db, exchange)` takes each strategy's
+    latest User Status from the PerformanceDB selection reviews (FINALIST,
+    RESERVE, REJECTED). It appends only changes, with source
+    `performance_db`.
+  - The newest review is authoritative (ties broken by review id). A strategy
+    whose newest status is no mark (ANALOG, FILTERED) gets `NONE` when the
+    registry still had it marked.
+
+**Imported tests** (`pair_tests`, keyed by source, so re-importing adds
+nothing):
+- `tester_sample`: every tester segment of the trade store (window start/end,
+  source `store:<segment>`);
+- `mrs3_tick`: every PerformanceDB strategy with a result (strategy name, test
+  window, PnL %, MaxDD %, trades, source `perfdb:<result id>`), for the
+  exchange of that result.
+
+**Track record** (`track.track_record(store, symbol, exchange, rule)`):
+- the walk-forward of `store_threshold_study.py` with the pair's effective
+  production rule: train on up to the three periods before a cut, measure the
+  admitted structures on the next period as a true combined curve;
+- returns the cuts tested, the cuts with an admitted structure, the admitted
+  candidates and the forward loss rate;
+- `combined_forward` moves from the study script into this module, and the
+  script imports it.
+
+**Pipeline** (`pipeline.compute_pipeline(con, store, exchange, as_of_day,
+machine, now_ms)`):
+- One row per (exchange, symbol, side LONG, as-of day) for every pair of the
+  exchange:
+  - machine and computation time;
+  - stage;
+  - active simulator periods, first and last period day;
+  - READY now from the latest store catalog row: status, rule version,
+    admitted count, best score / DD / category;
+  - latest tester window;
+  - tick-test count;
+  - FINALIST strategies;
+  - decision in force;
+  - history sufficiency status;
+  - track record: cuts, admitted cuts, forward loss rate, and the hash of
+    its inputs. It is recomputed only when the segments or the rule change.
+- Stage, first match wins: EXCLUDED → FINALIST → TICK → TESTER (a tester
+  segment of the newest simulator window) → READY → HISTORY (≥ 2 periods) →
+  NEW.
+- Journaled as step `pipeline`. Before computing it imports tests and
+  finalists.
+
+**READY with per-pair rules.**
+- `build_ready(…, rules=…)` takes a rule per pair. The manifest pair entry and
+  the catalog payload record the effective parameters and the overridden ones
+  (the inputs hash already covers the rule).
+- `ready_from_store` reads the effective rules from the registry **read-only**
+  when `pair_registry` is configured and the registry exists. The build stops
+  with an error when the registry is locked by a writer, or when stored
+  overrides no longer form a valid rule.
+- A rebuild with the same inputs moves the catalog row's time forward
+  (microsecond timestamps, upsert). After an override is reset, «READY now»
+  therefore shows the latest build again.
+- `effective_ready_rule` lists the explicitly stored overrides; the manifest's
+  `overridden` lists the parameters whose value differs from the common rule.
+
+**CLI.**
+- `python -m mrs3.pair_registry pipeline [--machine NAME]`;
+- `decide --symbol … --side … --decision … --reason … --author …`;
+- `setting --symbol … --side … --filter … --parameter … [--value …] --reason …
+  --author …`.
+
+**Acceptance.**
+- Unit tests:
+  - decision validation and the decision in force;
+  - setting validation including the DD ordering, reset to default and
+    the effective rule;
+  - finalists import with changes only;
+  - test import idempotence;
+  - stage rule order;
+  - track record on a synthetic store, with its reuse;
+  - `build_ready` with an overridden pair (manifest records it, inputs hash
+    changes);
+  - the CLI.
+- A live pipeline run over the registry with the real trade store and
+  PerformanceDB, with counts per stage.
+
+## Stage 3 evidence (2026-10-18)
+
+- **Tests:** `tests/test_pair_registry_records.py` (18). They cover:
+  - decision validation and the decision in force (side and `ALL`);
+  - settings validation, including the DD ordering, reset to default and
+    the effective rule;
+  - finalists import from real selection reviews (latest review wins, changes
+    only, ANALOG is not a mark);
+  - tick-test and tester-sample import idempotence;
+  - a protocol v1 database counts as Bybit;
+  - the stage rule;
+  - track record walk-forward and its reuse;
+  - pipeline rows and journal;
+  - `build_ready` with a per-pair override (manifest records it, inputs hash
+    changes);
+  - `ready_from_store` reading the registry overrides;
+  - the CLI.
+- **Exchange of a PerformanceDB:** `schema_info.exchange` (protocol v2). A
+  protocol v1 database has none, holds Bybit results only, and stores
+  `tester` in `strategy_results.exchange`; it is read as Bybit.
+- **Live** (`python -m mrs3.pair_registry pipeline`) over 274 Bybit pairs:
+  - First run: track records computed for the 198 pairs with ≥ 3 periods.
+  - Second run: 15 s, track records reused, 1,805 tick tests imported from
+    the PerformanceDB.
+  - Stages: TICK 9, READY 1, HISTORY 220, NEW 44.
+  - READY counts only pairs with a store READY catalog row; READY for the
+    whole registry is the next «Пересобрать READY» run.
+  - Track record: 35 pairs with admitted candidates, mean forward loss rate
+    0.20. GDXUSDT and INTCUSDT lose on every admitted cut, matching the
+    2026-10-17 study.
+- **Independent review:** `CODE_REVIEW_PASS` after fixes. The fixes:
+  - a rebuild moves the READY catalog row's time forward;
+  - a demoted finalist gets NONE;
+  - finalists of the LONG row count LONG strategies only;
+  - the DD ordering is checked for every side;
+  - `ready_from_store` reads the registry read-only;
+  - the reason is reported when the PerformanceDB is unavailable;
+  - CLI errors are returned as JSON.
+
+  Note: catalog rows written before stage 3 keep a payload without
+  `rule` / `overridden` when the same inputs are rebuilt, so readers must
+  allow for those fields being absent.
 
 ## Decisions taken (2026-10-18)
 

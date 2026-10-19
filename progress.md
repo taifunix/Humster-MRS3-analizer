@@ -8,7 +8,26 @@ Use [PRD.md](PRD.md) for the feature registry and [docs/README.md](docs/README.m
 for the documentation map. Read the linked contract only for the active task;
 do not treat this file as a replacement for a feature specification.
 
-## Pair registry stage 2: weekday liquidity, LOT_MODEL_V2 (2026-10-18, branch `wip/period-csv-generator`)
+## Pair registry stage 3: pipeline, tests, finalists, decisions, pair settings (2026-10-19, branch `wip/period-csv-generator`)
+
+Contract: [pair registry](docs/specs/2026-10-18-pair-registry.md) («Stage 3
+contract», «Stage 3 evidence»).
+
+- `records` holds the append-only decisions, per-pair READY thresholds
+  (`ready_v4`), finalists (imported from the PerformanceDB reviews) and
+  `pair_tests` (tester samples, MRS3 tick tests).
+- `track` computes the walk-forward track record. `pipeline` holds the stage
+  rule and the per-pair state.
+- READY builds read the per-pair rules read-only.
+- Live: 274 pairs, stages TICK 9 / READY 1 / HISTORY 220 / NEW 44; 1,805 tick
+  tests imported; track records for 198 pairs.
+- **Verification:** `tests/test_pair_registry_records.py` (21) plus the
+  registry, READY and store-READY suites (93 passed). Independent review
+  `CODE_REVIEW_PASS` after fixes.
+- **Next:** panel stage 3 (main screen) together with registry stage 4
+  (Panel screen, Excel, buttons, switch of the consumers).
+
+## Pair registry stage 2: weekday liquidity, LOT_MODEL_V2 (2026-10-18, branch `wip/period-csv-generator`, committed `3e57aac`)
 
 Contract: [pair registry](docs/specs/2026-10-18-pair-registry.md) («Stage 2
 contract», «Stage 2 evidence»), decision
