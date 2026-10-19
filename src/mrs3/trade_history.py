@@ -6,7 +6,9 @@ Contract: docs/specs/2026-10-17-mrs2-history-store-and-tester-sampling.md («Sta
 from __future__ import annotations
 
 from concurrent.futures import FIRST_COMPLETED, Executor, ProcessPoolExecutor, ThreadPoolExecutor, wait
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
+import json
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
 import uuid
@@ -26,6 +28,35 @@ ENGINE = GENERATOR_VERSION
 SOURCE = "simulator"
 LATEST_DAYS = PERIOD_DAYS
 VERDICT_RANK = {"GO": 0, "CHECK": 1, None: 2, "": 2, "STOP": 3}
+EXCHANGE_FOLDERS = {"bybit": "Bybit", "bingx": "BingX"}
+
+
+@dataclass(frozen=True)
+class BingXMinutes:
+    """What the plan step of a BingX pair needs to ensure and verify its minute days (Panel stage 5b): the data
+    folder, (api symbol, listing ms) per pair, the verification records known from the registry, the download
+    mode. `client` is for tests (None: a real BingX client in the worker)."""
+
+    data_root: str
+    pairs: Mapping[str, tuple[str, int]]
+    known: Mapping[str, Mapping[date, Mapping]] = field(default_factory=dict)
+    mode: str = "incremental"
+    client: object | None = None
+
+    def symbol_dir(self, symbol: str) -> str:
+        return str(Path(self.data_root) / self.pairs[symbol][0])
+
+
+def exchange_run_settings(repo_root: Path, exchange: str) -> RunSettings:
+    """The simulator settings of an exchange: Bybit keeps the reference `RunSettings()`; another exchange takes
+    its fees, slippage and funding from `templates/exchanges/<Exchange>/mrs3-tester.json`."""
+    if exchange == "bybit":
+        return RunSettings()
+    tester = json.loads((Path(repo_root) / "templates" / "exchanges" / EXCHANGE_FOLDERS[exchange]
+                         / "mrs3-tester.json").read_text(encoding="utf-8"))
+    return RunSettings(maker_fee=float(tester["MakerFee"]), taker_fee=float(tester["TakerFee"]),
+                       slippage=float(tester["SlippagePercent"]), funding_rate=float(tester["FundingRate"]),
+                       funding_interval_hours=int(tester["FundingIntervalHours"]))
 
 
 def pair_order(registry: Path) -> list[tuple[str, date]]:
@@ -86,18 +117,45 @@ def simulate_segment(minutes: MinuteBars, start: date, end: date, *, tick: float
 
 
 def prepare_pair(symbol: str, listing: date, data_root: str, end_day: date, download: bool, warmup_days: int,
-                 download_threads: int) -> tuple[list[tuple[date, date]], dict]:
-    """Plan the pair's segments and download the missing candle days of the plan."""
+                 download_threads: int, bingx: BingXMinutes | None = None
+                 ) -> tuple[list[tuple[date, date]], dict, frozenset[date] | None, list[dict]]:
+    """Plan the pair's segments and ensure the candle days of the plan.
+
+    Returns (plan, journal record, accepted days, verification records). Bybit: accepted days None (a day counts
+    when its file exists). BingX: the days `verify_bingx_days` accepted (without download: the days the registry
+    already accepts), and its new records for the main process to write."""
     plan = pair_segments(listing, end_day, warmup_days)
     record = {"pair": symbol, "listing_date": listing.isoformat(), "end_day": end_day.isoformat()}
     if not plan:
-        return [], {**record, "status": "NO_FULL_PERIOD"}
+        return [], {**record, "status": "NO_FULL_PERIOD"}, None, []
+    first, last = plan[0][0] - timedelta(days=warmup_days), end_day - timedelta(days=1)
+    if bingx is not None:
+        from .pair_registry.minute_days import ACCEPTED, verify_bingx_days
+
+        known = bingx.known.get(symbol, {})
+        if not download:
+            # no request: a recorded day counts only while its file is the one verified (or still absent)
+            accepted = frozenset(day for day, row in known.items() if row["status"] in ACCEPTED
+                                 and _file_sha(Path(bingx.symbol_dir(symbol)) / f"{symbol}{day.isoformat()}_1m.parquet")
+                                 == row["file_sha256"])
+            return plan, {**record, "status": "PLANNED", "segments": len(plan)}, accepted, []
+        api_symbol, launch_ms = bingx.pairs[symbol]
+        days = verify_bingx_days(Path(bingx.data_root), symbol, api_symbol, launch_ms, first, last, known=known,
+                                 client=bingx.client, mode=bingx.mode)
+        return plan, {**record, "status": "PLANNED", "segments": len(plan), "days_verified": len(days.records),
+                      "days_refused": {day.isoformat(): reason for day, reason in days.refused.items()}}, \
+            frozenset(days.accepted), days.records
     if not download:
-        return plan, {**record, "status": "PLANNED", "segments": len(plan)}
-    days = ensure_days(Path(data_root), symbol, plan[0][0] - timedelta(days=warmup_days), end_day - timedelta(days=1),
-                       workers=download_threads)
+        return plan, {**record, "status": "PLANNED", "segments": len(plan)}, None, []
+    days = ensure_days(Path(data_root), symbol, first, last, workers=download_threads)
     return plan, {**record, "status": "PLANNED", "segments": len(plan), "days_created": len(days["created"]),
-                  "days_failed": [day.isoformat() for day in days["failed"]]}
+                  "days_failed": [day.isoformat() for day in days["failed"]]}, None, []
+
+
+def _file_sha(path: Path) -> str | None:
+    import hashlib
+
+    return hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
 
 
 def missing_days(data_root: Path, symbol: str, first: date, end: date) -> list[date]:
@@ -108,16 +166,23 @@ def missing_days(data_root: Path, symbol: str, first: date, end: date) -> list[d
 
 
 def simulate_and_write(store_root: str, key: SegmentKey, data_root: str, tick: float, qty_step: float,
-                       points: Sequence[Point], settings: RunSettings, replace_unregistered: bool = False) -> dict:
+                       points: Sequence[Point], settings: RunSettings, replace_unregistered: bool = False,
+                       symbol_dir: str | None = None, accepted: frozenset[date] | None = None) -> dict:
     """Simulate one segment and write its files; returns the catalog record or a skip status.
 
-    Every candle day of the warm-up and the span must exist: a day lost to a failed download would otherwise be
-    stored as a quiet market under the segment's permanent id."""
+    Every candle day of the warm-up and the span must exist (Bybit) or be accepted by the minute verification
+    (BingX, `accepted`; a verified day without a file had no trades): a day lost to a failed download would
+    otherwise be stored as a quiet market under the segment's permanent id."""
     first = key.start - timedelta(days=settings.warmup_days)
-    absent = missing_days(Path(data_root), key.symbol, first, key.end)
+    folder = Path(symbol_dir) if symbol_dir else Path(data_root) / key.symbol
+    if accepted is None:
+        absent = missing_days(Path(data_root), key.symbol, first, key.end)
+    else:
+        absent = [first + timedelta(days=offset) for offset in range((key.end - first).days)
+                  if first + timedelta(days=offset) not in accepted]
     if absent:
         return {"status": "MISSING_DAYS", "days": [day.isoformat() for day in absent]}
-    minutes = load_minutes(Path(data_root) / key.symbol, key.symbol, ms_of(first), ms_of(key.end))
+    minutes = load_minutes(folder, key.symbol, ms_of(first), ms_of(key.end))
     if not has_warmup_data(minutes, key.start, settings.warmup_days):
         return {"status": "NO_WARMUP_DATA"}
     tables = simulate_segment(minutes, key.start, key.end, tick=tick, qty_step=qty_step, points=points,
@@ -148,13 +213,17 @@ def run_history(store: TradeStore, *, data_root: Path, pairs: Sequence[tuple[str
                 instruments: Mapping[str, tuple[float, float]], points: Sequence[Point], workers: int,
                 download: bool = True, settings: RunSettings = RunSettings(), exchange: str = "bybit",
                 engine: str = ENGINE, run_args: Mapping | None = None,
-                progress: Callable[[dict], None] | None = None) -> dict:
+                progress: Callable[[dict], None] | None = None, bingx: BingXMinutes | None = None,
+                on_minute_records: Callable[[list[dict]], None] | None = None) -> dict:
     """Bring every pair's planned segments into the store, pairs in the given priority order.
 
     Workers simulate and write segment files; only this process writes the catalog and the journal. Pairs are
     prepared lazily (at most PREPARE_IN_FLIGHT at a time) so the first pairs' segments start before later pairs
-    are even planned; download threads share the `workers` limit.
+    are even planned; download threads share the `workers` limit. BingX (`bingx`): the plan step verifies the
+    minute days; their records go to `on_minute_records` in this process.
     """
+    if (exchange == "bingx") != (bingx is not None):
+        raise ValueError("a BingX history run needs its minute description, and only BingX takes one")
     run_id = f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}-{uuid.uuid4().hex[:8]}"
     workers = max(1, workers)
     queue = list(dict.fromkeys(pairs))[::-1]          # duplicates dropped, popped from the end in priority order
@@ -182,7 +251,7 @@ def run_history(store: TradeStore, *, data_root: Path, pairs: Sequence[tuple[str
         while queue and len(pending) < workers and in_flight_prepares() < PREPARE_IN_FLIGHT:
             symbol, listing = queue.pop()
             pending[pool.submit(prepare_pair, symbol, listing, str(data_root), end_day, download, settings.warmup_days,
-                                download_threads)] = ("prepare", symbol, None)
+                                download_threads, bingx)] = ("prepare", symbol, None)
 
     try:
         with pool:
@@ -203,8 +272,11 @@ def run_history(store: TradeStore, *, data_root: Path, pairs: Sequence[tuple[str
                         report(symbol, kind, f"{type(error).__name__}: {error}")
                         continue
                     if kind == "prepare":
-                        plan, record = result
+                        plan, record, accepted, records = result
+                        if records and on_minute_records is not None:
+                            on_minute_records(records)
                         journal_append(journal, {**base, **record})
+                        symbol_dir = bingx.symbol_dir(symbol) if bingx is not None else None
                         known = store.statuses(exchange, symbol)
                         tick, qty_step = instruments[symbol]
                         for start, end in plan:
@@ -217,8 +289,8 @@ def run_history(store: TradeStore, *, data_root: Path, pairs: Sequence[tuple[str
                             else:
                                 # absent, or superseded with damaged files: simulate again and own the files
                                 pending[pool.submit(simulate_and_write, str(store.root), segment, str(data_root),
-                                                    tick, qty_step, points, settings, True)] = ("segment", symbol,
-                                                                                                segment)
+                                                    tick, qty_step, points, settings, True, symbol_dir,
+                                                    accepted)] = ("segment", symbol, segment)
                                 units["total"] += 1
                         units["done"] += 1
                         report(symbol, "plan")
@@ -249,4 +321,5 @@ def run_history(store: TradeStore, *, data_root: Path, pairs: Sequence[tuple[str
     return {"run_id": run_id, **counts}
 
 
-__all__ = ["ENGINE", "SOURCE", "missing_days", "pair_order", "pair_segments", "run_history", "simulate_segment"]
+__all__ = ["ENGINE", "SOURCE", "BingXMinutes", "exchange_run_settings", "missing_days", "pair_order",
+           "pair_segments", "run_history", "simulate_segment"]

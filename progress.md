@@ -8,6 +8,31 @@ Use [PRD.md](PRD.md) for the feature registry and [docs/README.md](docs/README.m
 for the documentation map. Read the linked contract only for the active task;
 do not treat this file as a replacement for a feature specification.
 
+## Panel stage 5b: BingX history and READY (2026-10-19, branch `wip/period-csv-generator`)
+
+Contract: [Panel for the simulation workflow](docs/specs/2026-10-18-panel-simulation-workflow.md)
+(«Stage 5b contract» and «Stage 5b evidence»),
+[ADR-0082](docs/decisions/0082-bingx-hourly-volume-noise.md).
+
+- `simulate_history.py --exchange bingx`:
+  - pairs, tick and qty from the registry;
+  - BingX fees from the BingX template;
+  - minute days verified in the plan step; a segment needs every day
+    accepted.
+- `ready_from_store.py --exchange bingx` and `pipeline --exchange bingx`.
+- Panel: «Посчитать историю» and «Пересобрать READY» work on BingX.
+- **The live run found a wrong rule.**
+  - BingX hourly volumes on older days differ from their minutes by up to
+    +0.048 %, while prices are exact. As a result 37 KOPN days were
+    `SUSPECT`.
+  - ADR-0082: prices exact, volume within 0.1 %.
+  - After the change: 7 of 7 segments; 146 days, 70 `OK` and 76
+    `VERIFIED_GAPS`.
+- **Verification:** broad suites 244 passed; independent review `CODE_REVIEW_FAIL` (MAJOR: a newer BingX READY folder entered the Bybit tick plan) fixed with tests; re-review `CODE_REVIEW_PASS` (open NITs: `prepare_tick_batch` does not compare the manifest exchange with the target — guard in 5c; the no-download path repeats `day_path`).
+- **Next:**
+  - 5c: BingX tester sampling and tick tests;
+  - 5d: BingX liquidity and the remaining Panel actions.
+
 ## Panel stage 5a: the minute data layer (2026-10-19, branch `wip/period-csv-generator`)
 
 Contract: [Panel for the simulation workflow](docs/specs/2026-10-18-panel-simulation-workflow.md)

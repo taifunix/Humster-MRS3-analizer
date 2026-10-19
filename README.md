@@ -93,6 +93,9 @@ Copy-Item config.local.json.example config.local.json
 .\.venv\Scripts\python.exe scripts\tester_jobs.py run --limit 1
 .\.venv\Scripts\python.exe scripts\tester_jobs.py import --pairs XOMUSDT
 .\.venv\Scripts\python.exe scripts\ready_from_store.py --out <new folder> --latest-source simulator
+# BingX: the same history and READY with verified BingX minute days (pairs, tick and qty from the pair registry)
+.\.venv\Scripts\python.exe scripts\simulate_history.py --exchange bingx --pairs KOPNUSDT
+.\.venv\Scripts\python.exe scripts\ready_from_store.py --exchange bingx --out <new folder>
 ```
 
 Хранилище MRS2 ([спецификация](docs/specs/2026-10-17-mrs2-history-store-and-tester-sampling.md))

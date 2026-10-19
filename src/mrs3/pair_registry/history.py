@@ -68,8 +68,9 @@ def listing_days(config_path: Path, exchange: str = "bybit",
     return {symbol: datetime.fromtimestamp(ms / 1000, timezone.utc).date() for symbol, ms in rows}
 
 
-def history_pairs(config_path: Path, on_busy: Callable[[str], None] | None = None) -> list[tuple[str, date]] | None:
-    """TRADING Bybit pairs of the registry with their listing day, the most liquid first (latest liquidity `L`
+def history_pairs(config_path: Path, on_busy: Callable[[str], None] | None = None,
+                  exchange: str = "bybit") -> list[tuple[str, date]] | None:
+    """TRADING pairs of the exchange in the registry with their listing day, the most liquid first (latest liquidity `L`
     descending, pairs without a READY window after them), then by symbol: the pair order of the history scripts
     (registry stage 4). None when there is no registry or a writer holds it (`on_busy` is told); the caller then
     falls back to the workbook."""
@@ -81,9 +82,9 @@ def history_pairs(config_path: Path, on_busy: Callable[[str], None] | None = Non
     with con:
         rows = con.execute(
             "select p.symbol, p.listing_ms, l.l from pairs p left join (select symbol, l, row_number() over "
-            "(partition by symbol order by as_of_day desc) as latest from liquidity where exchange = 'bybit' and "
+            "(partition by symbol order by as_of_day desc) as latest from liquidity where exchange = ? and "
             "status = 'READY') l on l.symbol = p.symbol and l.latest = 1 "
-            "where p.exchange = 'bybit' and p.status = 'TRADING' and p.listing_ms is not null").fetchall()
+            "where p.exchange = ? and p.status = 'TRADING' and p.listing_ms is not null", [exchange, exchange]).fetchall()
 
     def level(value: object) -> Decimal:
         try:

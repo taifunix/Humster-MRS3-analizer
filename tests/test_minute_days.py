@@ -331,3 +331,21 @@ def test_the_minute_data_settings(tmp_path: Path) -> None:
                       encoding="utf-8")
     with pytest.raises(RegistryError):
         load_registry_settings(config)
+
+
+def test_the_hourly_volume_may_exceed_its_minutes_only_by_the_measured_noise() -> None:
+    # ADR-0082: prices always match; BingX hour volumes drift from their minutes (measured at most +0.048 %)
+    from mrs3.pair_registry.minute_days import differing_hours
+
+    minutes = [m for index, m in enumerate(_full_day()) if index != 600]
+    rows = [[str(m["time"]), m["open"], m["high"], m["low"], m["close"], m["volume"], "0", "0", "0"] for m in minutes]
+    hours = _hours(minutes, DAY)
+    sixty = float(hours[10]["volume"])
+
+    def with_hour_10(**fields):
+        return [*hours[:10], {**hours[10], **{k: str(v) for k, v in fields.items()}}, *hours[11:]]
+
+    assert differing_hours(rows, with_hour_10(volume=sixty * 1.0005), DAY, _ms(LISTED)) == []   # +0.05 %: noise
+    assert differing_hours(rows, with_hour_10(volume=sixty * 0.9), DAY, _ms(LISTED)) == []      # minutes hold more
+    assert differing_hours(rows, with_hour_10(volume=sixty * 1.01), DAY, _ms(LISTED)) == [10]   # +1 %: lost trades
+    assert differing_hours(rows, with_hour_10(high=99), DAY, _ms(LISTED)) == [10]               # a price never drifts

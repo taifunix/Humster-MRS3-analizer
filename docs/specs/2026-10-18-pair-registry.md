@@ -331,6 +331,13 @@ verified, not assumed:
    (every hour equal) and on KOPN 2026-10-15, where 11 consecutive minutes
    (22:52–23:02) are absent but both hour candles equal the remaining minutes
    exactly: no trade was lost, it was an exchange pause.
+   **Amended by [ADR-0082](../decisions/0082-bingx-hourly-volume-noise.md)
+   (2026-10-19):**
+   - Prices are compared exactly.
+   - The hour's volume may exceed the sum of its minutes by at most 0.1 %.
+     BingX hourly volumes of older days are noisy aggregates, measured at
+     +0.048 % at most over 864 hours.
+   - More volume in the minutes than in the hour is no loss.
    - all hours equal → `VERIFIED_GAPS`: the missing minutes had no trades; the
      day is accepted, and the number and placement of the gaps are recorded
      (this is also how exchange-hours days, 391 candles, are recognised);

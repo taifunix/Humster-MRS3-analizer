@@ -158,7 +158,7 @@ def test_a_panel_write_exports_the_registry_to_the_sync_repository(tmp_path: Pat
 
 def test_plans_for_history_ready_tester_and_tick(tmp_path: Path, monkeypatch) -> None:
     service, _runner, _store = _world(tmp_path)
-    monkeypatch.setattr(service, "_history_end_day", lambda: date(2026, 9, 10))
+    monkeypatch.setattr(service, "_history_end_day", lambda exchange="bybit": date(2026, 9, 10))
     history = {item["key"]: item for item in service.plan("history", "bybit")["items"]}
     assert history["NEWUSDT"]["detail"].startswith("новая пара") and history["NEWUSDT"]["checked"]
     ready = {item["key"]: item for item in service.plan("ready", "bybit")["items"]}
@@ -173,7 +173,13 @@ def test_plans_for_history_ready_tester_and_tick(tmp_path: Path, monkeypatch) ->
     assert {item["key"] for item in tester} == {"GOODUSDT", "YOUNGUSDT"} and not any(item["checked"] for item in tester)
     tick = service.plan("tick", "bybit")
     assert tick["ready"] == "2026-10-18_simulation_120000" and len(tick["items"]) == 1 and tick["items"][0]["checked"]
-    assert service.plan("ready", "bingx")["disabled"].startswith("BingX")
+    monkeypatch.setattr(service, "_history_end_day", lambda exchange="bybit": date(2026, 9, 10) if exchange == "bybit"
+                        else (_ for _ in ()).throw(AssertionError("BingX end day expected")))
+    with pytest.raises(AssertionError, match="BingX end day"):                       # BingX takes its own end day
+        service.plan("history", "bingx")
+    assert service.plan("tester", "bingx")["disabled"].startswith("BingX")           # 5c
+    assert service.plan("tick", "bingx")["disabled"].startswith("BingX")
+    assert "disabled" not in service.plan("ready", "bingx")                         # 5b: history and READY
     assert service.plan("retest", "bybit")["options"] == {"include_reserve": False}
 
 
@@ -196,7 +202,14 @@ def test_runs_start_one_chain_task(tmp_path: Path) -> None:
     with pytest.raises(MainScreenError):
         service.run("history", "bybit", [])
     with pytest.raises(MainScreenError):
-        service.run("ready", "bingx", ["GOODUSDT"])
+        service.run("tester", "bingx", ["GOODUSDT"])
+    service.run("history", "bingx", ["amdusdt"])                                    # Panel stage 5b
+    steps = json.loads(Path(runner.started[-1][2][2]).read_text(encoding="utf-8"))["steps"]
+    assert [step["name"] for step in steps] == ["История", "Конвейер"]
+    assert all(step["argv"][-2:] == ["--exchange", "bingx"] for step in steps)
+    service.run("ready", "bingx", ["AMDUSDT"])
+    steps = json.loads(Path(runner.started[-1][2][2]).read_text(encoding="utf-8"))["steps"]
+    assert all(step["argv"][-2:] == ["--exchange", "bingx"] for step in steps)
     with pytest.raises(MainScreenError):
         service.run("explode", "bybit", [])
 
@@ -362,7 +375,7 @@ def test_history_plan_names_realigned_last_windows(tmp_path: Path, monkeypatch) 
     # the stored GOODUSDT windows (2026-07-01 .. 2026-08-30) are off the listing grid of 2026-06-01: the planned
     # windows that start inside the stored history are a recalculation, not new periods
     service, _runner, _store = _world(tmp_path)
-    monkeypatch.setattr(service, "_history_end_day", lambda: date(2026, 8, 31))
+    monkeypatch.setattr(service, "_history_end_day", lambda exchange="bybit": date(2026, 8, 31))
     detail = {item["key"]: item for item in service.plan("history", "bybit")["items"]}["GOODUSDT"]["detail"]
     assert detail == "пересчитать последние окна: 4 периода"
 
@@ -404,4 +417,17 @@ def test_tick_plan_takes_the_newest_ready_folder_by_its_manifest_time(tmp_path: 
     old = store.root / "ready" / "2026-10-18_simulation_120000" / "ready_manifest.json"
     stamp = (newer / "ready_manifest.json").stat().st_mtime
     os.utime(old, (stamp - 60, stamp - 60))
+    assert service.plan("tick", "bybit")["ready"] == "2026-10-18_ready_130000"
+    # review of Panel stage 5b: a newer BingX READY folder never stands in for the Bybit tick test
+    import shutil
+
+    from mrs3.store_ready_tick import list_ready_folders
+
+    bingx = store.root / "ready" / "2026-10-18_ready_140000"
+    shutil.copytree(newer, bingx)
+    manifest = json.loads((bingx / "ready_manifest.json").read_text(encoding="utf-8"))
+    (bingx / "ready_manifest.json").write_text(json.dumps({**manifest, "exchange": "bingx"}), encoding="utf-8")
+    os.utime(bingx / "ready_manifest.json", (stamp + 60, stamp + 60))
+    listed = {folder["name"]: folder for folder in list_ready_folders(store.root)}
+    assert listed["2026-10-18_ready_140000"]["testable"] and listed["2026-10-18_ready_140000"]["exchange"] == "bingx"
     assert service.plan("tick", "bybit")["ready"] == "2026-10-18_ready_130000"

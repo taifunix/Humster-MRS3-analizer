@@ -32,6 +32,9 @@ SUSPECT = "SUSPECT"
 REFETCHES = 3
 HOUR_MS = 3_600_000
 TOLERANCE = Decimal("1e-9")
+# BingX hourly volumes are not the exact sum of their minutes: +0.048 % at most over 864 hours of KOPN, complete hours
+# included (measured 2026-10-19, ADR-0082); prices always match. An hour may exceed its minutes by this share.
+VOLUME_NOISE = Decimal("0.001")
 RECORD_COLUMNS = ("exchange", "symbol", "day", "candles", "expected_minutes", "zero_volume_minutes", "missing_minutes",
                   "gap_ranges", "differing_hours", "status", "verified_ms", "file_sha256")
 
@@ -107,7 +110,9 @@ def _near(left: Decimal, right: Decimal) -> bool:
 
 
 def differing_hours(rows: Sequence[Sequence[str]], hours: Sequence[Mapping], day: date, launch_ms: int) -> list[int]:
-    """Hours whose candle is not the aggregate of the hour's minutes (open, close, high, low, volume)."""
+    """Hours whose candle is not the aggregate of the hour's minutes (ADR-0082): open, close, high and low equal; the
+    hour's volume exceeds the sum of its minutes by at most VOLUME_NOISE of the hour (more volume in the minutes
+    than in the hour is no lost trade); an hour without minutes has no candle or zero volume."""
     start = _day_start_ms(day)
     minutes: dict[int, list[Sequence[str]]] = {}
     for row in rows:
@@ -126,12 +131,15 @@ def differing_hours(rows: Sequence[Sequence[str]], hours: Sequence[Mapping], day
                 differ.append(hour)
                 continue
             expected = (Decimal(inside[0][1]), Decimal(inside[-1][4]), max(Decimal(row[2]) for row in inside),
-                        min(Decimal(row[3]) for row in inside), sum((Decimal(row[5]) for row in inside), Decimal(0)))
-            actual = tuple(Decimal(str(candle[name])) for name in ("open", "close", "high", "low", "volume"))
+                        min(Decimal(row[3]) for row in inside))
+            actual = tuple(Decimal(str(candle[name])) for name in ("open", "close", "high", "low"))
+            minutes_volume = sum((Decimal(row[5]) for row in inside), Decimal(0))
+            hour_volume = Decimal(str(candle["volume"]))
         except (KeyError, InvalidOperation, ValueError):
             differ.append(hour)
             continue
-        if not all(_near(left, right) for left, right in zip(expected, actual)):
+        prices_differ = not all(_near(left, right) for left, right in zip(expected, actual))
+        if prices_differ or hour_volume - minutes_volume > VOLUME_NOISE * abs(hour_volume):
             differ.append(hour)
     return differ
 

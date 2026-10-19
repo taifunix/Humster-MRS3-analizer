@@ -964,9 +964,12 @@ and «BingX minute verification». This contract fixes the code shape.
      00:00 to 23:59 UTC.
    - Every expected minute present → `OK`.
    - Otherwise one hourly klines request for the day:
-     - every hour equals the aggregate of its minutes (open of the first,
-       close of the last, max high, min low, sum of volume, at a relative
-       tolerance of 1e-9 with no absolute floor) → `VERIFIED_GAPS`;
+     - every hour equals the aggregate of its minutes → `VERIFIED_GAPS`:
+       - open of the first minute, close of the last, max high and min low
+         equal at a relative tolerance of 1e-9 with no absolute floor;
+       - the hour's volume exceeds the sum of its minutes by at most 0.1 %
+         ([ADR-0082](../decisions/0082-bingx-hourly-volume-noise.md),
+         2026-10-19; originally the volume had to be equal);
      - an hour with no minutes must have no candle or zero volume.
    - When an hour differs, the minutes are downloaded again (up to 3 times).
      If it still differs the day is `SUSPECT`.
@@ -1003,6 +1006,116 @@ and «BingX minute verification». This contract fixes the code shape.
 - a day already on disk is verified once;
 - Bybit delegates to `ensure_days`;
 - an unknown BingX pair is refused.
+
+## Stage 5b contract: BingX history and READY (2026-10-19)
+
+**History** (`trade_history.run_history`, `scripts/simulate_history.py
+--exchange bingx`):
+- **Pairs:** the `TRADING` BingX pairs of the registry. Their order follows
+  the latest READY liquidity `L`, as on Bybit (`history_pairs(config,
+  exchange)`), and an explicit `--pairs` takes listing days from the
+  registry. There is no workbook fallback for BingX.
+- **Contract parameters:** `tick_size` and `qty_step` from the registry
+  `pairs` row.
+  - A pair without them (or without an API symbol) is skipped with a
+    warning, so one incomplete row never blocks the others.
+  - A run with no usable pair is refused.
+- **Run settings:** the BingX fees from `templates/exchanges/BingX/
+  mrs3-tester.json` (maker 0.00012, taker 0.0003, plus the slippage and
+  funding of that template). Bybit keeps `RunSettings()`.
+- **End day:** the day after the last available BingX day (lag 9 h).
+- **Minute days:**
+  - In the plan step of a pair (a worker process), `verify_bingx_days`
+    covers the warm-up and the planned span, with the records known from the
+    registry and the configured download mode.
+  - With `--no-download`, nothing is requested. A day counts only when the
+    registry accepts it and its file is the verified one (same sha256, or
+    still absent for a verified no-trade day).
+  - A segment is simulated only when every day of its warm-up and span is
+    accepted; otherwise `MISSING_DAYS` with the days.
+  - Candles are read from `<bingx data root>/<api symbol>/`. A verified day
+    with no file has no trades.
+  - The worker returns the verification records. The main process writes
+    them to `minute_days` once at the end; when a writer holds the registry,
+    a warning is printed and the next run verifies again.
+- **Bybit** behaviour and segment identities are unchanged.
+
+**READY** (`scripts/ready_from_store.py --exchange bingx`):
+- the BingX strategy template, the per-pair rules of the BingX registry
+  rows, and `build_ready(..., exchange="bingx")`;
+- without `--pairs`, the pairs of that exchange in the store;
+- the strategies keep the human ticker. The API symbol is applied where the
+  tester needs it (5c).
+
+**Pipeline:** `python -m mrs3.pair_registry pipeline --exchange bingx`
+computes the BingX rows. No PerformanceDB is read for BingX until 5c.
+
+**Panel:**
+- On BingX, «Посчитать историю» and «Пересобрать READY» plan and run with
+  `--exchange bingx`, followed by the BingX pipeline.
+- The tick plan takes the newest READY folder of its own exchange only, so a
+  newer BingX folder never stands in for the Bybit tick test.
+- «Проверить тестером» and the tick test stay «BingX — этап 5» until 5c.
+
+**Acceptance:**
+- a BingX history run on a fake client and a temporary store writes BingX
+  segments (exchange `bingx`, the registry tick, the BingX fees in the
+  settings);
+- a refused day gives `MISSING_DAYS`;
+- verified no-trade days do not;
+- records are returned to the main process;
+- the script refuses a pair without tick or qty;
+- READY for BingX uses the BingX template and the exchange;
+- the Panel plans and runs history and READY for BingX, and tester and tick
+  stay disabled;
+- the Bybit history, READY and Panel suites are unchanged.
+
+## Stage 5b evidence (2026-10-19)
+
+- **Code:**
+  - `trade_history`: `BingXMinutes`, `exchange_run_settings`; the plan step
+    verifies BingX days, and `simulate_and_write` takes the accepted days
+    and the API-symbol folder;
+  - `scripts/simulate_history.py --exchange bingx`;
+  - `scripts/ready_from_store.py --exchange`;
+  - `history_pairs(..., exchange)`;
+  - CLI `pipeline --exchange`;
+  - Panel: history and READY enabled for BingX; tester, tick and retest
+    still «BingX — этап 5».
+- **Tests:**
+  - `tests/test_bingx_history.py`, 8 tests:
+    - a run writes BingX segments with the BingX fees;
+    - a refused day gives `MISSING_DAYS`, and a quiet day is accepted;
+    - without download, only registry-accepted days count;
+    - a BingX run needs its minute description;
+    - the run settings;
+    - the script refuses a pair without tick;
+    - the script runs from the registry and records the days;
+    - READY uses the BingX template.
+  - `test_panel_main.py` covers the BingX plans and chains (`--exchange
+    bingx` on both steps).
+  - Added after the independent review (`CODE_REVIEW_FAIL`: a MAJOR, a newer
+    BingX READY folder entered the Bybit tick plan):
+    - the Bybit tick plan ignores a newer BingX folder;
+    - the BingX history plan takes the BingX end day;
+    - a `workers=2` run (process pool) without download refuses a verified
+      day whose file was lost;
+    - READY without `--pairs` takes only its exchange;
+    - a pair without tick is skipped and the others run.
+  - `test_minute_days.py`, 20 tests, including the ADR-0082 volume rule.
+- **Live** (a copy of the registry, temporary store and data folder, all
+  removed):
+  - The first run of `simulate_history.py --exchange bingx --pairs KOPNUSDT
+    --timeframes 4h` refused 6 of 7 segments: 37 days were `SUSPECT` on
+    hourly volume noise alone (prices equal in all 864 hours). This led to
+    [ADR-0082](../decisions/0082-bingx-hourly-volume-noise.md).
+  - After the change:
+    - 7 segments written;
+    - 146 days: 70 `OK` and 76 `VERIFIED_GAPS`;
+    - `ready_from_store.py --exchange bingx`: manifest exchange `bingx`,
+      KOPN `NO_ADMITTED_STRUCTURE` (score 19 < 30);
+    - `pipeline --exchange bingx`: 610 pairs, KOPN at `HISTORY` with 7
+      periods.
 
 ## Stage 5a evidence (2026-10-19)
 
@@ -1046,8 +1159,10 @@ and «BingX minute verification». This contract fixes the code shape.
    finalist marks, Excel round trip, finalist retest (4a, 4b); A/B and the
    Pareto screen removed (4c) — 2026-10-19.
 5. ⏳ BingX in the trade store, READY, tester sampling and tick tests (see
-   «Stage 5 plan»): ✅ 5a, the minute data layer (2026-10-19); 5b–5d
-   pending.
+   «Stage 5 plan»):
+   - ✅ 5a, the minute data layer (2026-10-19);
+   - ✅ 5b, BingX history and READY (2026-10-19);
+   - 5c and 5d pending.
 
 **Deferred (user, 2026-10-19; not urgent).**
 - Retire the base-lot Excel export (`scripts/calculate_bybit_base_lots.py`,

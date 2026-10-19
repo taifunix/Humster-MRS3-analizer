@@ -36,7 +36,8 @@ from .ready_store import ReadyRule, inputs_sha256, pair_periods
 
 ACTIONS = ("sync", "history", "ready", "tester", "tick", "retest")
 EXCHANGES = ("bybit", "bingx")
-BINGX_PENDING = "BingX — этап 5: минутные данные BingX ещё не подключены"
+BINGX_PENDING = "BingX — этап 5: тестер и тик-тест BingX ещё не подключены"
+BINGX_READY_ACTIONS = ("sync", "history", "ready")       # Panel stage 5b; tester, tick and retest come in 5c
 
 
 class MainScreenError(ValueError):
@@ -641,7 +642,7 @@ class MainScreenService:
         if action not in ACTIONS:
             raise MainScreenError(f"неизвестное действие {action!r}")
         exchange = self._exchange(exchange)
-        if exchange == "bingx" and action in ("history", "ready", "tester", "tick"):
+        if exchange == "bingx" and action not in BINGX_READY_ACTIONS:
             return {"action": action, "exchange": exchange, "items": [], "disabled": BINGX_PENDING}
         builder = getattr(self, f"_plan_{action}")
         return {"action": action, "exchange": exchange, **builder(exchange)}
@@ -657,16 +658,19 @@ class MainScreenService:
     def _plan_sync(self, exchange: str) -> dict:
         return {"items": [], "note": "Обновить справочник обеих бирж, ликвидность, конвейер и книгу листингов."}
 
-    def _history_end_day(self) -> date:
+    def _history_end_day(self, exchange: str = "bybit") -> date:
+        """The day after the last day with minute data: the Bybit archive, or the BingX klines (both lag 9 h)."""
+        from .bingx_downloader import last_available_day
         from .minute_data import last_archived_day
 
-        return last_archived_day(datetime.now(timezone.utc)) + timedelta(days=1)
+        latest = last_available_day if exchange == "bingx" else last_archived_day
+        return latest(datetime.now(timezone.utc)) + timedelta(days=1)
 
     def _plan_history(self, exchange: str) -> dict:
         from .trade_history import pair_segments
 
         store = self._reader()
-        end_day = self._history_end_day()
+        end_day = self._history_end_day(exchange)
         items = []
         for symbol, listing_ms in self._trading_pairs(exchange):
             if listing_ms is None:
@@ -748,7 +752,9 @@ class MainScreenService:
         from .store_ready_tick import list_ready_folders, resolve_ready_folder
 
         root = self._store_root()
-        folders = [folder for folder in list_ready_folders(root) if folder.get("testable")]
+        # only this exchange's READY: a newer BingX folder never stands in for the Bybit tick test (Panel stage 5b)
+        folders = [folder for folder in list_ready_folders(root)
+                   if folder.get("testable") and (folder.get("exchange") or "bybit") == exchange]
         if not folders:
             return {"items": [], "note": "Нет папок READY: сначала «Пересобрать READY»."}
         manifests = {folder["name"]: resolve_ready_folder(root, folder["name"]) / "ready_manifest.json" for folder in folders}
@@ -770,7 +776,7 @@ class MainScreenService:
         if action not in ACTIONS:
             raise MainScreenError(f"неизвестное действие {action!r}")
         exchange = self._exchange(exchange)
-        if exchange == "bingx" and action != "sync":
+        if exchange == "bingx" and action not in BINGX_READY_ACTIONS:
             raise MainScreenError(BINGX_PENDING)
         if not isinstance(items, list) or any(not isinstance(item, str) or not item.strip() for item in items):
             raise MainScreenError("отметьте строки плана")
@@ -790,14 +796,16 @@ class MainScreenService:
             label, stop_file = "Синхронизировать", None
         elif action == "history":
             steps = [("История", [python, str(scripts / "simulate_history.py"), "--store", store_root, "--config", config,
-                                  "--pairs", pairs]),
-                     ("Конвейер", [python, "-m", "mrs3.pair_registry", "pipeline", "--config", config])]
+                                  "--pairs", pairs, "--exchange", exchange]),
+                     ("Конвейер", [python, "-m", "mrs3.pair_registry", "pipeline", "--config", config,
+                                   "--exchange", exchange])]
             label, stop_file = "Пересчитать историю", None
         elif action == "ready":
             out = Path(store_root) / "ready" / f"{self._today().isoformat()}_ready_{datetime.now(timezone.utc).strftime('%H%M%S')}"
             steps = [("READY", [python, str(scripts / "ready_from_store.py"), "--store", store_root, "--config", config,
-                                "--pairs", pairs, "--out", str(out), "--latest-source", "auto"]),
-                     ("Конвейер", [python, "-m", "mrs3.pair_registry", "pipeline", "--config", config])]
+                                "--pairs", pairs, "--out", str(out), "--latest-source", "auto", "--exchange", exchange]),
+                     ("Конвейер", [python, "-m", "mrs3.pair_registry", "pipeline", "--config", config,
+                                   "--exchange", exchange])]
             label, stop_file = "Пересобрать READY", None
         else:
             tester = str(scripts / "tester_jobs.py")

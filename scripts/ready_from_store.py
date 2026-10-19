@@ -21,9 +21,10 @@ from mrs3.trade_store import TradeStore  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[1]
 TEMPLATE = REPO / "templates" / "exchanges" / "Bybit" / "mrs3-strategy.json"
+TEMPLATES = {"bybit": TEMPLATE, "bingx": REPO / "templates" / "exchanges" / "BingX" / "mrs3-strategy.json"}
 
 
-def registry_rules(config: Path) -> dict:
+def registry_rules(config: Path, exchange: str = "bybit") -> dict:
     """Per-pair READY rules from the pair registry (stage 3) when it is configured and exists; else none."""
     import duckdb
 
@@ -41,7 +42,7 @@ def registry_rules(config: Path) -> dict:
     con = duckdb.connect(str(settings.root / DATABASE), read_only=True)
     try:
         tables = {row[0] for row in con.execute("select table_name from information_schema.tables").fetchall()}
-        return effective_ready_rules(con, "bybit") if "pair_settings" in tables else {}
+        return effective_ready_rules(con, exchange) if "pair_settings" in tables else {}
     finally:
         con.close()
 
@@ -55,6 +56,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--latest-source", choices=("simulator", "tester", "auto"), default="simulator",
                         help="newest period from the simulator, from the imported tester segment, or (auto) from the "
                              "tester segment when it exists")
+    parser.add_argument("--exchange", choices=("bybit", "bingx"), default="bybit")
     args = parser.parse_args(argv)
     store_root = args.store
     if store_root is None:
@@ -70,10 +72,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     else:
         with store.connect(read_only=True) as con:
             symbols = [row[0] for row in con.execute(
-                "select distinct symbol from segments where status = 'active' order by symbol").fetchall()]
-    template = json.loads(TEMPLATE.read_text(encoding="utf-8"))
-    summary = build_ready(store, symbols, args.out, template, latest_source=args.latest_source,
-                          rules=registry_rules(args.config),
+                "select distinct symbol from segments where status = 'active' and exchange = ? order by symbol",
+                [args.exchange]).fetchall()]
+    template = json.loads(TEMPLATES[args.exchange].read_text(encoding="utf-8"))
+    summary = build_ready(store, symbols, args.out, template, exchange=args.exchange, latest_source=args.latest_source,
+                          rules=registry_rules(args.config, args.exchange),
                           progress=lambda event: print(json.dumps(event, ensure_ascii=False), flush=True))
     print(json.dumps({**summary, "out": str(args.out)}), flush=True)
     return 0

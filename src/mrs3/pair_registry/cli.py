@@ -87,7 +87,8 @@ def _push(con: duckdb.DuckDBPyConnection, settings: RegistrySettings, message: s
         return {"error": f"{type(error).__name__}: {error}"}
 
 
-def _pipeline(con: duckdb.DuckDBPyConnection, config: Path, today: date, machine: str | None, skip_track: bool) -> dict:
+def _pipeline(con: duckdb.DuckDBPyConnection, config: Path, today: date, machine: str | None, skip_track: bool,
+              exchange: str = "bybit") -> dict:
     import os
     import socket
 
@@ -98,9 +99,10 @@ def _pipeline(con: duckdb.DuckDBPyConnection, config: Path, today: date, machine
     store_root = (document.get("trade_store") or {}).get("root")
     if not store_root:
         raise RegistryError("trade_store.root is not configured")
-    performance_db, why = _performance_db(Path(config))
+    # the PerformanceDB holds Bybit tick tests; BingX reads none until Panel stage 5c
+    performance_db, why = _performance_db(Path(config)) if exchange == "bybit" else (None, "BingX: Panel stage 5c")
     machine = machine or os.environ.get("COMPUTERNAME") or socket.gethostname()
-    outcome = compute_pipeline(con, TradeStore(Path(store_root)), "bybit", today, machine,
+    outcome = compute_pipeline(con, TradeStore(Path(store_root)), exchange, today, machine,
                                performance_db=performance_db, track=not skip_track)
     if performance_db is None:
         outcome = {**outcome, "performance_db": None, "performance_db_reason": why}
@@ -122,6 +124,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     sync_init = commands.add_parser("sync-init", help="create the local sync repository (git); with --remote, pull "
                                                       "and push go to that repository")
     sync_init.add_argument("--remote", default=None, help="URL of the private sync repository (created by the user)")
+    pipeline.add_argument("--exchange", choices=("bybit", "bingx"), default="bybit")
     workbook = commands.add_parser("workbook", help="write the listing workbook (sheets «Пары», «Пары_BingX»)")
     workbook.add_argument("--out", type=Path, default=None, help=f"default: <registry root>/{WORKBOOK_NAME}")
     for sub in (liquidity, pipeline, sync):
@@ -179,9 +182,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             return code
         if args.command == "pipeline":
             try:
-                result, code = {"bybit": _pipeline(con, args.config, today, args.machine or settings.machine, args.skip_track)}, 0
+                result, code = {args.exchange: _pipeline(con, args.config, today, args.machine or settings.machine,
+                                                         args.skip_track, args.exchange)}, 0
             except Exception as error:
-                result, code = {"bybit": {"error": f"{type(error).__name__}: {error}"}}, 1
+                result, code = {args.exchange: {"error": f"{type(error).__name__}: {error}"}}, 1
             if code == 0:
                 result["sync"] = _push(con, settings, "pipeline")
             _emit(result)
