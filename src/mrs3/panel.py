@@ -1142,6 +1142,48 @@ class PanelController:
         service = getattr(self, "_main_screen_service", None)
         return service is not None and service.task()["task"].get("state") == "running"
 
+    def _registry_finalist_decisions(self, connection: duckdb.DuckDBPyConnection) -> dict[int, tuple] | None:
+        """The pair-registry marks as finalist decisions of this PerformanceDB (ADR-0080): strategy_id -> (status,
+        rank, None), matched by strategy name; None without a registry (the selection reviews decide)."""
+        from .pair_registry.records import database_exchange, finalist_marks
+        from .pair_registry.store import DATABASE, RegistryError, load_registry_settings
+
+        from .pair_registry.records import registry_decides
+
+        try:
+            registry = load_registry_settings(self.default_config).root / DATABASE
+        except RegistryError:
+            return None
+        if not registry.is_file():
+            return None
+        exchange = database_exchange(connection)
+        try:
+            with duckdb.connect(str(registry), read_only=True) as con:
+                if not registry_decides(con, exchange):
+                    return None                  # before the one-time seed the reviews still decide
+                marks = finalist_marks(con, exchange)
+        except (duckdb.IOException, duckdb.ConnectionException) as error:
+            raise FinalistRetestError("REGISTRY_BUSY", "the pair registry is busy: retry") from error
+        except duckdb.Error as error:
+            raise FinalistRetestError("REGISTRY_UNAVAILABLE", "the pair registry cannot be read") from error
+        names = dict(connection.execute(
+            "select strategy_name, strategy_id from strategies where lifecycle_status = 'ACTIVE'").fetchall())
+        return {int(names[name]): (mark["status"], mark["user_rank"], None)
+                for name, mark in marks.items() if name in names}
+
+    def _registry_decides_for(self, target: Path) -> bool:
+        """True when the pair registry decides the finalists of this PerformanceDB's exchange (ADR-0080): then the
+        old review imports that set user decisions are refused, the marks are set in the «Стратегии» view."""
+        if not Path(target).is_file():
+            return False
+        try:
+            with duckdb.connect(str(target), read_only=True) as connection:
+                return self._registry_finalist_decisions(connection) is not None
+        except FinalistRetestError:
+            return True                          # registry busy or unreadable: refuse rather than write reviews
+        except duckdb.Error:
+            return False
+
     def _trade_store_root(self) -> Path:
         try:
             document = json.loads(self.default_config.read_text(encoding="utf-8"))
@@ -3269,7 +3311,7 @@ class PanelController:
         return filter_enabled, rank_enabled
 
     @staticmethod
-    def _bulk_retest_range(payload: Mapping[str, object], listing_dates: Mapping[str, object], connection: duckdb.DuckDBPyConnection, include_reserve: bool) -> tuple[str, str]:
+    def _bulk_retest_range(payload: Mapping[str, object], listing_dates: Mapping[str, object], connection: duckdb.DuckDBPyConnection, include_reserve: bool, decisions: Mapping[int, tuple] | None = None) -> tuple[str, str]:
         allowed = {"include_reserve", "clear_reports", "test_start", "test_end", "start_date", "end_date"}
         if set(payload).difference(allowed):
             raise FinalistRetestError("INVALID_REQUEST", "bulk retest request contains unsupported fields")
@@ -3286,7 +3328,7 @@ class PanelController:
             end = (datetime.now(timezone.utc).date() - timedelta(days=2)).isoformat()
             provisional = freeze_finalist_cohort(
                 connection, test_start="1970-01-01", test_end=end,
-                include_reserve=include_reserve, listing_dates=listing_dates,
+                include_reserve=include_reserve, listing_dates=listing_dates, decisions=decisions,
             )
             if not provisional.members:
                 raise FinalistRetestError("COHORT_EMPTY", "bulk retest cohort has no runnable members")
@@ -3330,10 +3372,11 @@ class PanelController:
         self._require_protocol_v2_tester_template(evaluation)
         tester_template = self._mrs3_tester_template(evaluation)
         with self._performance_v2_writer_lock, duckdb.connect(str(target), read_only=True) as connection:
-            start, end = self._bulk_retest_range(payload, listing_dates, connection, include_reserve)
+            decisions = self._registry_finalist_decisions(connection)
+            start, end = self._bulk_retest_range(payload, listing_dates, connection, include_reserve, decisions)
             current_cohort = freeze_finalist_cohort(
                 connection, test_start=start, test_end=end,
-                include_reserve=include_reserve, listing_dates=listing_dates,
+                include_reserve=include_reserve, listing_dates=listing_dates, decisions=decisions,
             )
         if not current_cohort.members:
             raise FinalistRetestError("COHORT_EMPTY", "bulk retest cohort has no runnable members")
@@ -3371,6 +3414,7 @@ class PanelController:
                 config.strategy_root.parent if config.strategy_root is not None else self.root / "Output",
                 test_start=start, test_end=end, include_reserve=include_reserve,
                 listing_dates=listing_dates, job_id=run_id, evaluation=evaluation,
+                decisions=decisions,             # the same registry marks as the cohort checked above
             )
         runtime = {
             "bulk_retest": True, "scope": batch.cohort.scope, "cohort_sha256": batch.cohort.cohort_sha256,
@@ -3419,10 +3463,11 @@ class PanelController:
         if not target.is_file():
             raise FinalistRetestError("PERFORMANCE_V2_NOT_FOUND", "Performance v2 database is unavailable")
         with self._performance_v2_writer_lock, duckdb.connect(str(target), read_only=True) as connection:
-            start, end = self._bulk_retest_range({}, listing_dates, connection, include_reserve)
+            decisions = self._registry_finalist_decisions(connection)
+            start, end = self._bulk_retest_range({}, listing_dates, connection, include_reserve, decisions)
             cohort = freeze_finalist_cohort(
                 connection, test_start=start, test_end=end,
-                include_reserve=include_reserve, listing_dates=listing_dates,
+                include_reserve=include_reserve, listing_dates=listing_dates, decisions=decisions,
             )
         return {
             "scope": cohort.scope,
@@ -4390,7 +4435,9 @@ class PanelController:
         if not target.is_file():
             raise FinalistRetestError("PERFORMANCE_V2_NOT_FOUND")
         with self._performance_v2_writer_lock, duckdb.connect(str(target), read_only=True) as connection:
-            current_members = current_effective_finalist_members(connection, include_reserve=include_reserve)
+            current_members = current_effective_finalist_members(
+                connection, include_reserve=include_reserve, decisions=self._registry_finalist_decisions(connection),
+            )
             if not current_members:
                 raise FinalistRetestError("COHORT_EMPTY", "there are no current effective finalists")
             instance = connection.execute("select value from schema_info where key='database_instance_id'").fetchone()[0]
@@ -4399,7 +4446,8 @@ class PanelController:
                 grouped.setdefault((str(member["symbol"]), str(member["side"])), []).append(member)
             specs: list[dict[str, object]] = []
             for (symbol, side), group_members in sorted(grouped.items()):
-                origin_runs = {str(member["selection_run_id"]) for member in group_members}
+                origin_runs = {str(member["selection_run_id"]) for member in group_members
+                               if member["selection_run_id"] is not None}       # registry marks have no origin run
                 request = retest_cohort_request(
                     SelectionRequest(symbol, side, ()), "current-effective-control",
                     {int(member["strategy_id"]): int(member["result_id"]) for member in group_members},
@@ -6037,6 +6085,11 @@ class _PanelHandler(BaseHTTPRequestHandler):
                 length = 0
             if length <= 0 or length > 20 * 1024 * 1024:
                 self._json(400, {"error": {"code": error_code, "message": "XLSX must be between 1 byte and 20 MiB"}})
+                return
+            if not endpoint.endswith("retest-tags-import") and self.server.controller._registry_decides_for(
+                    performance_v2_database_path(self.server.controller._performance_v2_config())):
+                self._json(409, {"error": {"code": "MARKS_IN_REGISTRY", "message":
+                                           "отметки финалистов ставятся в виде «Стратегии» (ADR-0080)"}})
                 return
             try:
                 if bulk_control_import_endpoint:

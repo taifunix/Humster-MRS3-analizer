@@ -551,6 +551,40 @@ PerformanceDB marks.
 
 The column choice is saved like the other views.
 
+**4b. Consumers of the marks.** With a registry, the marks in force (status
+other than NONE) are matched by strategy name to the ACTIVE strategies of the
+PerformanceDB.
+- Finalist retest: `freeze_finalist_cohort(decisions=…)` and
+  `current_effective_finalist_members(decisions=…)` take strategy_id →
+  (status, rank, None) from `PanelController._registry_finalist_decisions`
+  for the start, the plan and the control export.
+- Optimizer: `read_current_finalists(marks=…)` takes the FINALIST set from
+  the registry.
+  - The provenance is the mark row: `source="pair_registry"`, `mark_seq`,
+    `mark_source`, `mark_created_ms`, plus the strategy and result fields.
+    `selection_run_id` and `review_import_id` are empty.
+  - The finalist pairs come from the FINALIST marks.
+- The retest manifest freezes its cohort with the same decisions as the
+  cohort check before it.
+- The registry decides once it holds any finalist row of the exchange
+  (`records.registry_decides`). Before that, and without a registry, both
+  consumers read the PerformanceDB selection reviews exactly as before (the
+  same calls).
+- A busy registry gives `REGISTRY_BUSY` (retest) or
+  `PORTFOLIO_FINALISTS_UNAVAILABLE` (409, optimizer). An unreadable one gives
+  `REGISTRY_UNAVAILABLE` (retest) or 422 (optimizer).
+- While the registry decides, the old imports that set user decisions are
+  refused with 409 `MARKS_IN_REGISTRY`:
+  - selection review;
+  - user fields;
+  - the retest control workbook;
+  - aggregate.
+  The retest tags import stays. The A/B and Pareto cards themselves are
+  removed in 4c.
+- The retest outcome only moves each strategy to its new result; it holds no
+  decision. ADR-0080 lists a `retest` writer, but none is needed: after a
+  retest the marks are revised in the «Стратегии» view.
+
 **Acceptance (4a).**
 - Row union and join by name; metrics from a fixture PerformanceDB.
 - Toggles and «Причина» use the selection module's own rule functions.
@@ -560,6 +594,49 @@ The column choice is saved like the other views.
 - One-time migration only.
 - Static UI tests.
 - A live read of the real registry, store and PerformanceDB.
+
+## Stage 4b evidence: retest and optimizer read the registry marks (2026-10-19)
+
+**Code:**
+- `records.finalist_marks`;
+- the `decisions` parameter of `freeze_finalist_cohort` and
+  `current_effective_finalist_members`;
+- `portfolio.input`: `read_current_finalists(marks=…)`, `_registry_facts`,
+  `registry_finalist_provenance`;
+- `PanelController._registry_finalist_decisions` at every freeze call and
+  the control export;
+- `PortfolioPanelService`: `_registry_marks`, `_invoke_finalists`,
+  `_finalist_pairs`.
+
+**Review fixes.** The first review returned `CODE_REVIEW_FAIL`. The BLOCKER
+was that the manifest re-froze the cohort without the decisions. Fixed, and
+also:
+- the guard on the decision imports;
+- the reviews decide until the registry holds a mark of the exchange;
+- busy and unreadable registry errors kept apart;
+- one marks read per readiness check;
+- no origin-run lookups for registry members.
+
+The re-review returned `CODE_REVIEW_PASS`.
+
+**Tests:**
+- `tests/test_finalists_from_registry.py` (10): marks with provenance, the
+  retest cohort from decisions with the review fallback, optimizer rows from
+  marks, the provenance contract, and the Panel retest and optimizer wiring
+  with and without a registry.
+- Review tests: the manifest gets the same decisions; the reviews decide
+  until a mark of the exchange exists (another exchange's mark does not
+  count); a busy registry; the refused imports; one marks read.
+- The retest, optimizer-input, portfolio Panel, registry and «Стратегии»
+  suites have no new failures against HEAD:
+  - the 14 `test_portfolio_input` failures already fail on HEAD (the
+    `selection_review_imports` schema);
+  - `test_stage2_rejects_ambiguous_or_non_file_report` is the known flaky
+    test.
+
+**Live** (read only): the registry holds no marks, and the PerformanceDB has
+no selection reviews and no effective decisions. So nothing changes for the
+current data.
 
 ## Stage 4a evidence: the «Стратегии» view and marks in the registry (2026-10-19)
 

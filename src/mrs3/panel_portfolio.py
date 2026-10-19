@@ -1507,6 +1507,62 @@ class PortfolioPanelService:
         path = Path(str(value))
         return (root / path).resolve() if not path.is_absolute() else path.resolve()
 
+    def _registry_marks(self, database: Path) -> dict[str, dict[str, Any]] | None:
+        """The pair-registry finalist marks for this PerformanceDB's exchange (ADR-0080), or None without a registry
+        (the selection reviews decide). Only the production reader uses them."""
+        from .pair_registry.records import database_exchange, finalist_marks
+        from .pair_registry.store import DATABASE, RegistryError, load_registry_settings
+
+        from .pair_registry.records import registry_decides
+
+        if not self._uses_production_finalists_reader or not Path(database).is_file():
+            return None                          # a missing PerformanceDB fails in the reader, as before
+        try:
+            registry = load_registry_settings(self.root / "config.local.json").root / DATABASE
+        except RegistryError:
+            return None
+        if not registry.is_file():
+            return None
+        with duckdb.connect(str(database), read_only=True) as source:
+            exchange = database_exchange(source)
+        try:
+            with duckdb.connect(str(registry), read_only=True) as con:
+                if not registry_decides(con, exchange):
+                    return None                  # before the one-time seed the reviews still decide
+                return finalist_marks(con, exchange)
+        except (duckdb.IOException, duckdb.ConnectionException) as error:
+            raise PortfolioPanelError("PORTFOLIO_FINALISTS_UNAVAILABLE", "the pair registry is busy", status=409) from error
+        except duckdb.Error as error:
+            raise PortfolioPanelError("PORTFOLIO_FINALISTS_UNAVAILABLE", "the pair registry cannot be read",
+                                      status=422) from error
+
+    _NO_MARKS = object()
+
+    def _invoke_finalists(self, database: Path, pairs: Sequence[tuple[str, str]], include_series: bool,
+                          marks: Any = _NO_MARKS) -> Any:
+        if not self._uses_production_finalists_reader:
+            return _invoke(self.finalists_reader, database, pairs, include_series)
+        if marks is self._NO_MARKS:
+            marks = self._registry_marks(database)
+        if marks is None:                        # no registry: the selection reviews decide, exactly as before
+            return _invoke(self.finalists_reader, database, pairs, include_series)
+        return self.finalists_reader(database, pairs, include_series, marks=marks)
+
+    def _finalist_pairs(self, database: Path, marks: Any = _NO_MARKS) -> tuple[tuple[str, str], ...]:
+        """Pairs that can hold finalists: those of the registry FINALIST marks, else of the selection runs."""
+        if marks is self._NO_MARKS:
+            marks = self._registry_marks(database)
+        if marks is not None:
+            return tuple(sorted({(str(mark["symbol"]).upper(), str(mark["side"]).upper()) for mark in marks.values()
+                                 if mark["status"] == "FINALIST" and str(mark["side"]).upper() in {"LONG", "SHORT"}}))
+        with duckdb.connect(str(database), read_only=True) as connection:
+            pair_rows = connection.execute("select distinct symbol, side from selection_runs order by symbol, side").fetchall()
+        return tuple(
+            (str(symbol).strip().upper(), str(side).strip().upper())
+            for symbol, side in pair_rows
+            if str(side).strip().upper() in {"LONG", "SHORT"}
+        )
+
     def _current_finalist_metadata(
         self, document: Mapping[str, Any], *, require_result_ids: bool = False, rows_out: list | None = None,
     ) -> tuple[Path, list[str], dict[str, int], tuple[int, ...]]:
@@ -1515,14 +1571,9 @@ class PortfolioPanelService:
         if not database.is_file():
             raise PortfolioPanelError("PERFORMANCE_DB_UNAVAILABLE", "performance database is unavailable", status=422)
         _require_exchange_data(database)
-        with duckdb.connect(str(database), read_only=True) as connection:
-            pair_rows = connection.execute("select distinct symbol, side from selection_runs order by symbol, side").fetchall()
-        pair_keys = tuple(
-            (str(symbol).strip().upper(), str(side).strip().upper())
-            for symbol, side in pair_rows
-            if str(side).strip().upper() in {"LONG", "SHORT"}
-        )
-        rows = _invoke(self.finalists_reader, database, pair_keys, False)
+        marks = self._registry_marks(database)          # read once: the pairs and the rows see the same marks
+        pair_keys = self._finalist_pairs(database, marks)
+        rows = self._invoke_finalists(database, pair_keys, False, marks)
         finalists: dict[str, int] = {}
         result_ids: list[int] = []
         for index, row in enumerate(rows or ()):
@@ -1737,7 +1788,7 @@ class PortfolioPanelService:
             if maximum > 0
         )
         try:
-            loaded = _invoke(self.finalists_reader, database, pairs, True)
+            loaded = self._invoke_finalists(database, pairs, True)
             finalists_list = []
             weighted_input_rows = []
             weighted_fields = (

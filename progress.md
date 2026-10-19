@@ -8,7 +8,38 @@ Use [PRD.md](PRD.md) for the feature registry and [docs/README.md](docs/README.m
 for the documentation map. Read the linked contract only for the active task;
 do not treat this file as a replacement for a feature specification.
 
-## Panel rework stage 4a: the «Стратегии» view and finalist marks (2026-10-19, branch `wip/period-csv-generator`)
+## Panel rework stage 4b: retest and optimizer read the registry marks (2026-10-19, branch `wip/period-csv-generator`)
+
+Contract: [Panel for the simulation workflow](docs/specs/2026-10-18-panel-simulation-workflow.md)
+(«Stage 4 contract» 4b, «Stage 4b evidence»), [ADR-0080](docs/decisions/0080-finalist-marks-in-the-pair-registry.md).
+
+- With a registry, the finalist retest (start, plan, control export) and the
+  optimizer (finalist rows, pairs, provenance) read the registry marks,
+  matched by strategy name. Without a registry they read the PerformanceDB
+  reviews as before.
+- While the registry decides, the old imports that set user decisions are
+  refused (409 `MARKS_IN_REGISTRY`).
+- **Verification:**
+  - `tests/test_finalists_from_registry.py` (10).
+  - Retest, optimizer-input, portfolio Panel, registry and «Стратегии»
+    suites: 586 passed, 15 failed. Those 15 are the 14 `test_portfolio_input`
+    failures that already fail on HEAD plus the flaky stage 2 test.
+  - Live: no marks exist yet, so nothing changes.
+  - Independent review: the first pass returned `CODE_REVIEW_FAIL` (a
+    BLOCKER: the manifest froze without the decisions); fixed, and the
+    re-review returned `CODE_REVIEW_PASS`.
+- **Next:**
+  - 4c, removal of the A/B card and the Pareto/filters screen, with their
+    routes and the decision imports;
+  - the non-blocking re-review notes:
+    - a handler-level test of the 409 guard;
+    - an `include_series=True` test with marks;
+    - read the request body before the early 409;
+    - merge two imports;
+    - take the writer lock in `_registry_decides_for`.
+  - Then registry stage 5 (git sync) and Panel stage 5 (BingX).
+
+## Panel rework stage 4a: the «Стратегии» view and finalist marks (2026-10-19, branch `wip/period-csv-generator`, committed `39c3c6d`)
 
 Contract: [Panel for the simulation workflow](docs/specs/2026-10-18-panel-simulation-workflow.md)
 («Stage 4 contract», «Stage 4a evidence»), decision
@@ -35,9 +66,6 @@ Contract: [Panel for the simulation workflow](docs/specs/2026-10-18-panel-simula
 - **Next:**
   - 4b: the finalist retest and the optimizer read the registry marks;
   - 4c: remove the A/B card and the Pareto screen.
-- **Note:** until 4b, a mark set in the Panel is not yet seen by the retest
-  or the optimizer, which still read the PerformanceDB reviews.
-
 ## Pair registry stage 4: the consumers read the registry (2026-10-19, branch `wip/period-csv-generator`, committed `d2f18cd`)
 
 Contract: [pair registry](docs/specs/2026-10-18-pair-registry.md) («Stage 4

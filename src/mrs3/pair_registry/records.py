@@ -204,6 +204,23 @@ def current_finalists(con: duckdb.DuckDBPyConnection, exchange: str, symbol: str
     return [dict(zip(("symbol", "side", "strategy", "status", "user_rank"), row)) for row in rows]
 
 
+def registry_decides(con: duckdb.DuckDBPyConnection, exchange: str) -> bool:
+    """The registry decides the finalists of an exchange once it holds any finalist row of it (ADR-0080; before the
+    one-time seed the PerformanceDB reviews still decide)."""
+    return con.execute("select count(*) from finalists where exchange = ?", [exchange]).fetchone()[0] > 0
+
+
+def finalist_marks(con: duckdb.DuckDBPyConnection, exchange: str) -> dict[str, dict]:
+    """The marks in force by strategy name (status other than NONE) with their row: seq, source and time are the
+    provenance the finalist retest and the optimizer bind to (ADR-0080)."""
+    rows = con.execute("select seq, symbol, side, strategy, status, user_rank, source, created_ms from (select *, "
+                       "row_number() over (partition by strategy order by seq desc) as latest from finalists "
+                       "where exchange = ?) where latest = 1 and status <> 'NONE' order by strategy",
+                       [exchange]).fetchall()
+    return {row[3]: dict(zip(("seq", "symbol", "side", "strategy", "status", "user_rank", "source", "created_ms"), row))
+            for row in rows}
+
+
 def _performance(database: Path) -> duckdb.DuckDBPyConnection:
     return duckdb.connect(str(database), read_only=True)
 

@@ -1064,14 +1064,16 @@ def build_finalist_retest_manifest(
     tester_config: object = None,
     job_id: str | None = None,
     evaluation: EvaluationTarget | None = None,
+    decisions: Mapping[int, tuple[str | None, int | None, str | None]] | None = None,
 ) -> FinalistRetestBatch:
-    """Freeze and publish one native SINGLE_MODE manifest for the cohort."""
+    """Freeze and publish one native SINGLE_MODE manifest for the cohort (`decisions`: the registry marks)."""
     cohort = freeze_finalist_cohort(
         connection,
         test_start=test_start,
         test_end=test_end,
         include_reserve=include_reserve,
         listing_dates=listing_dates,
+        decisions=decisions,
     )
     if not cohort.members:
         raise FinalistRetestError("COHORT_EMPTY", "bulk retest cohort has no runnable members")
@@ -1283,8 +1285,10 @@ def freeze_finalist_cohort(
     include_reserve: bool = False,
     listing_dates: Mapping[str, object] | Path | None = None,
     warmup_hours: int = LISTING_WARMUP_HOURS,
+    decisions: Mapping[int, tuple[str | None, int | None, str | None]] | None = None,
 ) -> FinalistRetestCohort:
-    """Read and freeze the current effective finalist/reserve population."""
+    """Read and freeze the current effective finalist/reserve population. `decisions` (strategy_id -> status, rank,
+    origin) are the pair-registry marks (ADR-0080); without them the PerformanceDB selection reviews decide."""
     require_performance_v2_readable(connection)
     if type(include_reserve) is not bool or isinstance(warmup_hours, bool) or not isinstance(warmup_hours, int) or warmup_hours < 0:
         raise FinalistRetestError("INVALID_REQUEST", "bulk retest options are invalid")
@@ -1294,7 +1298,8 @@ def freeze_finalist_cohort(
         raise FinalistRetestError("INVALID_TEST_RANGE", "test_start must be before test_end")
     scope = "FINALIST_RESERVE" if include_reserve else "FINALIST"
     allowed = {"FINALIST", "RESERVE"} if include_reserve else {"FINALIST"}
-    decisions = effective_selection_decisions(connection)
+    if decisions is None:
+        decisions = effective_selection_decisions(connection)
     listings = _listing_map(listing_dates)
     rows = connection.execute(
         """
@@ -1351,8 +1356,9 @@ def current_effective_finalist_members(
     connection: duckdb.DuckDBPyConnection,
     *,
     include_reserve: bool = False,
+    decisions: Mapping[int, tuple[str | None, int | None, str | None]] | None = None,
 ) -> tuple[Mapping[str, object], ...]:
-    """Return the current effective finalist population for control export.
+    """Return the current effective finalist population for control export (`decisions`: the registry marks).
 
     This read-only view deliberately does not require a retest range or listing
     dates: those are inputs to a new retest freeze, while this export represents
@@ -1363,7 +1369,8 @@ def current_effective_finalist_members(
         raise PerformanceV2StoreError("Performance database does not have schema version 10, 11 or 12")
     if type(include_reserve) is not bool:
         raise FinalistRetestError("INVALID_REQUEST", "include_reserve must be a boolean")
-    decisions = effective_selection_decisions(connection)
+    if decisions is None:
+        decisions = effective_selection_decisions(connection)
     allowed = {"FINALIST", "RESERVE"} if include_reserve else {"FINALIST"}
     rows = connection.execute(
         """select s.strategy_id, s.strategy_name, s.symbol, s.side, s.current_result_id,

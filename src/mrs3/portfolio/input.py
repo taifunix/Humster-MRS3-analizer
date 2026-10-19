@@ -1229,6 +1229,48 @@ def _finalist_provenance(
     }
 
 
+def registry_finalist_provenance(
+    mark: Mapping[str, Any], strategy: Mapping[str, Any], result: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Provenance of a finalist marked in the pair registry (ADR-0080): the mark row and the strategy result."""
+    seq = mark.get("seq")
+    if isinstance(seq, bool) or not isinstance(seq, int) or seq <= 0:
+        raise PortfolioInputError("current finalist mark is unavailable", code=SOURCE_SNAPSHOT_UNAVAILABLE)
+    return {
+        "source": "pair_registry",
+        "mark_seq": seq,
+        "mark_source": _source_text(mark.get("source"), "mark_source"),
+        "mark_created_ms": _source_integer(mark.get("created_ms"), "mark_created_ms"),
+        "analysis_run_id": _source_text(strategy.get("analysis_run_id"), "analysis_run_id"),
+        "candidate_identity": _source_text(strategy.get("candidate_identity"), "candidate_identity"),
+        "strategy_created_at_utc": _source_timestamp(strategy.get("created_at_utc"), "strategy.created_at_utc"),
+        "strategy_updated_at_utc": _source_timestamp(strategy.get("updated_at_utc"), "strategy.updated_at_utc"),
+        "result_imported_at_utc": _source_timestamp(result.get("imported_at_utc"), "imported_at_utc"),
+    }
+
+
+def _registry_facts(
+    connection: duckdb.DuckDBPyConnection,
+    pair_values: Sequence[tuple[str, str]],
+    marks: Mapping[str, Mapping[str, Any]],
+) -> dict[tuple[str, str, int, int], dict[str, Any]]:
+    """Current-result facts of the ACTIVE strategies whose registry mark in force is FINALIST."""
+    facts: dict[tuple[str, str, int, int], dict[str, Any]] = {}
+    for strategy_id, name, symbol, side, result_id in connection.execute(
+        """select strategy_id, strategy_name, symbol, side, current_result_id from strategies
+            where lifecycle_status = 'ACTIVE' and current_result_id is not null"""
+    ).fetchall():
+        mark = marks.get(str(name))
+        if mark is None or mark.get("status") != "FINALIST" or (symbol, side) not in pair_values:
+            continue
+        facts[(str(symbol), str(side), _source_integer(strategy_id, "strategy_id"),
+               _source_integer(result_id, "result_id"))] = {
+            "user_status": "FINALIST", "user_rank": mark.get("user_rank"), "registry_mark": dict(mark),
+            "selection_run_id": None, "review_import_id": None,
+        }
+    return facts
+
+
 def _finalist_order(row: Mapping[str, Any]) -> dict[str, Any]:
     order_id = _source_integer(row.get("order_id"), "order_id")
     open_ma_len = _source_integer(row.get("open_ma_len"), "open_ma_len")
@@ -1326,12 +1368,19 @@ def read_current_finalists(
     database: str | Path,
     pairs: Sequence[tuple[str, str]],
     include_series: bool = True,
+    *,
+    marks: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> tuple[dict[str, Any], ...]:
     """Read current exact User Status=FINALIST facts without source writes.
 
     ``include_series`` is kept opt-in for callers that build an execution
     snapshot.  Metadata-only consumers such as Panel readiness can avoid
     touching the potentially very large action/equity tables.
+
+    ``marks`` are the pair-registry marks by strategy name (ADR-0080): with
+    them the FINALIST set and its provenance come from the registry, matched
+    to the ACTIVE strategies by name; without them the selection reviews
+    decide, as before.
     """
     pair_values = tuple(dict.fromkeys(_pair(pair) for pair in pairs))
     if not pair_values:
@@ -1345,7 +1394,10 @@ def read_current_finalists(
         with duckdb.connect(str(path), read_only=True) as connection:
             connection.execute("begin transaction")
             require_performance_v2_readable(connection)
-            facts, _selected, _lineage = _current_review_facts(connection, requests, allow_missing_pair=True)
+            if marks is None:
+                facts, _selected, _lineage = _current_review_facts(connection, requests, allow_missing_pair=True)
+            else:
+                facts = _registry_facts(connection, pair_values, marks)
             finalist_keys = [
                 key for key, fact in facts.items()
                 if key[:2] in pair_values and fact.get("user_status") == "FINALIST"
@@ -1362,6 +1414,8 @@ def read_current_finalists(
                         "user_rank": _user_rank(facts[key].get("user_rank")),
                         "selection_run_id": facts[key].get("selection_run_id"),
                         "review_import_id": facts[key].get("review_import_id"),
+                        **({"registry_mark_seq": facts[key]["registry_mark"]["seq"]}
+                           if "registry_mark" in facts[key] else {}),
                     }
                     for key in sorted(
                         finalist_keys,
@@ -1424,11 +1478,11 @@ def read_current_finalists(
             for order in order_rows:
                 strategy_id = _source_integer(order.get("strategy_id"), "strategy_id")
                 orders_by_strategy.setdefault(strategy_id, []).append(order)
-            run_ids = tuple(dict.fromkeys(
+            run_ids = () if marks is not None else tuple(dict.fromkeys(
                 _source_text(facts[key].get("selection_run_id"), "selection_run_id")
                 for key in finalist_keys
             ))
-            review_ids = tuple(dict.fromkeys(
+            review_ids = () if marks is not None else tuple(dict.fromkeys(
                 _source_text(facts[key].get("review_import_id"), "review_import_id")
                 for key in finalist_keys
             ))
@@ -1469,7 +1523,9 @@ def read_current_finalists(
                     for order in sorted(orders, key=lambda item: _source_integer(item.get("order_id"), "order_id"))
                 )
                 source_result = dict(source_result)
-                provenance = _finalist_provenance(facts, source, source_result, key, runs, reviews)
+                provenance = (registry_finalist_provenance(facts[key]["registry_mark"], source, source_result)
+                              if marks is not None else
+                              _finalist_provenance(facts, source, source_result, key, runs, reviews))
                 total_pnl = _source_decimal(source_result.get("total_pnl"), "total_pnl")
                 total_fees = _source_decimal(source_result.get("total_fees"), "total_fees", minimum=Decimal("0"))
                 max_drawdown = _source_decimal(source_result.get("max_drawdown"), "max_drawdown", minimum=Decimal("0"))
@@ -1540,8 +1596,9 @@ def read_current_finalists(
                         {"fixed_lot_base": fixed_base}
                         if (fixed_base := fixed_lot_base(source_result, side)) is not None else {}
                     ),
-                    "selection_run_id": provenance["selection_run_id"],
-                    "review_import_id": provenance["review_import_id"],
+                    "selection_run_id": provenance.get("selection_run_id"),
+                    "review_import_id": provenance.get("review_import_id"),
+                    **({"registry_mark_seq": provenance["mark_seq"]} if marks is not None else {}),
                     "source_provenance": provenance,
                 })
                 source_metadata = _decode_optimizer_source_metadata(
