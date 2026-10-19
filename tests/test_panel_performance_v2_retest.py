@@ -234,7 +234,7 @@ def test_current_control_export_is_read_only_until_review_and_preserves_outside_
         thread.join(timeout=2)
     with pytest.raises(FinalistRetestError, match="prepare.*cache|cache.*prepare"):
         controller.strategies_performance_v2_finalist_retest_export({"include_reserve": True})
-    assert controller.strategies_performance_v2_recalculate({"symbol": "BTCUSDT", "side": "LONG"}) == {"status": "READY"}
+    assert controller.strategies_performance_v2_recalculate_all()["status"] == "READY"
     reserve_filename, reserve_issued = controller.strategies_performance_v2_finalist_retest_export({"include_reserve": True})
     assert reserve_filename == "performance-v2-current-finalists-with-reserve.xlsx"
     reserve_sheet = load_workbook(BytesIO(reserve_issued))["Candidates"]
@@ -431,8 +431,7 @@ def test_current_control_export_import_keeps_multiple_pair_side_groups_local(tmp
                    values (?, ?, 'FINALIST', ?, null, null)""", [f"review-{run_id}", strategy_id, user_rank],
             )
 
-    controller.strategies_performance_v2_recalculate({"symbol": "BTCUSDT", "side": "LONG"})
-    controller.strategies_performance_v2_recalculate({"symbol": "ETHUSDT", "side": "SHORT"})
+    controller.strategies_performance_v2_recalculate_all()
     filename, issued = controller.strategies_performance_v2_finalist_retest_export({"include_reserve": False})
     assert filename == "performance-v2-current-finalists.xlsx"
     metadata, candidates, groups, failures = validate_combined_control_workbook(issued)

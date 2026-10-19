@@ -8,7 +8,38 @@ Use [PRD.md](PRD.md) for the feature registry and [docs/README.md](docs/README.m
 for the documentation map. Read the linked contract only for the active task;
 do not treat this file as a replacement for a feature specification.
 
-## Panel rework stage 4b: retest and optimizer read the registry marks (2026-10-19, branch `wip/period-csv-generator`)
+## Panel rework stage 4c: the A/B and Pareto screens removed (2026-10-19, branch `wip/period-csv-generator`)
+
+Contract: [Panel for the simulation workflow](docs/specs/2026-10-18-panel-simulation-workflow.md)
+(«Stage 4c contract and evidence»).
+
+- Removed with their routes, controller code and tests:
+  - the A/B card;
+  - the Pareto/filters card with filters 6–27 and their settings;
+  - the selection-XLSX user-fields import;
+  - the PerformanceDB export card.
+- PerformanceDB maintenance moved to «Настройки».
+- The two retest cards stay, renumbered 4 and 5.
+- **Verification:**
+  - Panel tests plus `test_performance_v2_selection_review`: 1,126 passed,
+    3 failed. All three already fail on HEAD (shell `previewtoken`, the
+    journal retry constant, the flaky stage 2 test).
+  - Independent review `CODE_REVIEW_PASS`; the MINOR findings were fixed and
+    the re-review returned `CODE_REVIEW_PASS`. Four recalculate checks were
+    ported to recalculate-all, and a 404 test covers every removed route.
+  - PerformanceDB, single-mode, registry, «Стратегии» and main-screen suites:
+    1,487 passed, 15 failed, all pre-existing:
+    - `equity_regime_selection` fails the same way on HEAD;
+    - `v5_read_compat`: 6, the same on HEAD;
+    - 4 Pareto Panel tests in `selection_review` were removed with the
+      feature, and the file then passes: 128.
+  - `test_portfolio_input`: the 14 known failures.
+- **Next:**
+  - registry stage 5 (git sync);
+  - Panel stage 5 (BingX);
+  - the deferred items in the panel spec «Order of work».
+
+## Panel rework stage 4b: retest and optimizer read the registry marks (2026-10-19, branch `wip/period-csv-generator`, committed `9c9c5d0`)
 
 Contract: [Panel for the simulation workflow](docs/specs/2026-10-18-panel-simulation-workflow.md)
 («Stage 4 contract» 4b, «Stage 4b evidence»), [ADR-0080](docs/decisions/0080-finalist-marks-in-the-pair-registry.md).
@@ -38,6 +69,20 @@ Contract: [Panel for the simulation workflow](docs/specs/2026-10-18-panel-simula
     - merge two imports;
     - take the writer lock in `_registry_decides_for`.
   - Then registry stage 5 (git sync) and Panel stage 5 (BingX).
+  - Deferred, not urgent (user, 2026-10-19): retire the base-lot Excel
+    export; let `load_listing_dates` read the registry and drop the
+    `pairs.xlsx` bridge. See the panel spec «Order of work».
+- **Local setup done (2026-10-19, not in git):**
+  - `panel_workflow.listing_dates_path` now points at the generated
+    `Data/pair_registry/pairs.xlsx`: 274 pairs, equal to the old workbook
+    for all 242 shared pairs.
+  - The registry holds 14 days of liquidity windows
+    (`liquidity --days 14`).
+- **32 pairs UNAVAILABLE in liquidity:** these are the new listings
+  (2026-09-18..10-13) that the old workbook lacked. No minute data has been
+  downloaded for them yet. «Пересчитать историю» for them downloads the
+  minutes; pairs with fewer than 7 weekdays since listing stay UNAVAILABLE
+  until they have them.
 
 ## Panel rework stage 4a: the «Стратегии» view and finalist marks (2026-10-19, branch `wip/period-csv-generator`, committed `39c3c6d`)
 

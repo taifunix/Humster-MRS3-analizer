@@ -2,22 +2,22 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import (
+    dataclass,
+)
 from datetime import datetime, timezone
-from decimal import Decimal, ROUND_HALF_UP, localcontext
+from decimal import (
+    Decimal,
+)
 from pathlib import Path
-import json
 import re
 from threading import RLock, Thread
-import tempfile
 import math
 from time import perf_counter
 from typing import Callable, Mapping
 from uuid import uuid4
 
 import duckdb
-import pandas as pd
-from urllib.parse import parse_qsl
 
 from .performance_v2_import import (
     PerformanceV2ImportRequest,
@@ -25,37 +25,15 @@ from .performance_v2_import import (
     _safe_phase_snapshot,
     import_performance_v2,
 )
-from .performance_v2_equity_regime import ALGORITHM_VERSION as EQUITY_REGIME_ALGORITHM_VERSION
-from .performance_v2_equity_regime_cache import EquityRegimeCacheError, equity_regime_source_revision
 from .performance_v2_store import (
     PerformanceV2Config,
-    PerformanceV2StoreError,
     performance_v2_database_path,
     require_performance_v2,
-    require_performance_v2_readable,
 )
-from .performance_v2_sizing import load_fixed_lot_bases
 from .performance_v2_windows import (
-    METRICS_VERSION,
     WindowMetrics,
-    _cached,
-    calendar_window_days,
     compare_window_pair_geometrically,
     get_or_calculate_window_pair,
-)
-from .performance_v2_selection import (
-    SelectionConfig,
-    SelectionRequest,
-    has_ma_fact_columns,
-    load_selection_candidates,
-    retest_cohort_request,
-    strategy_ma_kinds,
-    write_selection_workbook,
-)
-from .performance_v2_selection_review import (
-    effective_selection_decisions,
-    latest_user_reviews_by_strategy,
-    new_run_metadata,
 )
 
 
@@ -71,39 +49,8 @@ class PerformanceV2ApiError(ValueError):
         super().__init__(message or code)
 
 
-def _parse_api_timestamp(value: object, field: str) -> datetime:
-    if not isinstance(value, str) or not value:
-        raise PerformanceV2ApiError("INVALID_REQUEST", status=400, message=f"{field} must be UTC ISO-8601")
-    if not (value.endswith("Z") or value.endswith("+00:00")):
-        raise PerformanceV2ApiError("INVALID_REQUEST", status=400, message=f"{field} must be UTC ISO-8601")
-    text = value[:-1] + "+00:00" if value.endswith("Z") else value
-    try:
-        parsed = datetime.fromisoformat(text)
-    except ValueError as error:
-        raise PerformanceV2ApiError("INVALID_REQUEST", status=400, message=f"{field} must be UTC ISO-8601") from error
-    if parsed.tzinfo is None or parsed.utcoffset() != timezone.utc.utcoffset(parsed):
-        raise PerformanceV2ApiError("INVALID_REQUEST", status=400, message=f"{field} must be UTC ISO-8601")
-    return parsed.astimezone(timezone.utc)
 
 
-def _parse_window_payload(payload: Mapping[str, object]) -> tuple[int, Window, Window]:
-    if set(payload) != {"strategy_id", "window_a", "window_b"}:
-        raise PerformanceV2ApiError("INVALID_REQUEST", status=400, message="unsupported Performance v2 window fields")
-    strategy_id = payload["strategy_id"]
-    if isinstance(strategy_id, bool) or not isinstance(strategy_id, int) or strategy_id <= 0:
-        raise PerformanceV2ApiError("INVALID_REQUEST", status=400, message="strategy_id must be a positive integer")
-
-    windows: list[Window] = []
-    for name in ("window_a", "window_b"):
-        value = payload[name]
-        if not isinstance(value, (list, tuple)) or len(value) != 2:
-            raise PerformanceV2ApiError("INVALID_REQUEST", status=400, message=f"{name} must contain exactly two timestamps")
-        start = _parse_api_timestamp(value[0], f"{name}.start")
-        end = _parse_api_timestamp(value[1], f"{name}.end")
-        if start >= end:
-            raise PerformanceV2ApiError("INVALID_REQUEST", status=400, message=f"{name} start must be before end")
-        windows.append((start, end))
-    return strategy_id, windows[0], windows[1]
 
 
 def _canonical_utc(value: datetime) -> str:
@@ -115,292 +62,20 @@ def _is_duckdb_lock_error(error: duckdb.IOException) -> bool:
     return "could not set lock on file" in message or "conflicting lock is held" in message
 
 
-@dataclass(frozen=True, slots=True)
-class PerformanceV2ExportSelection:
-    statuses: tuple[str, ...] = ()
-    retest: bool = False
-    all_active: bool = False
 
 
-def parse_performance_v2_export_query(query: str) -> PerformanceV2ExportSelection:
-    pairs = parse_qsl(query, keep_blank_values=True)
-    allowed = {"status", "retest", "all_active"}
-    for key, _ in pairs:
-        if key not in allowed:
-            raise PerformanceV2ApiError("unknown_query_parameter", status=400, message="Unknown query parameter.")
-
-    values: dict[str, list[str]] = {key: [] for key in allowed}
-    for key, value in pairs:
-        values[key].append(value)
-    if len(values["all_active"]) > 1:
-        raise PerformanceV2ApiError("duplicate_query_parameter", status=400, message="Query parameter may not be repeated.")
-    if not any(values.values()):
-        raise PerformanceV2ApiError("missing_export_selection", status=400, message="At least one export selection is required.")
-    if values["all_active"] and values["all_active"][0] != "true":
-        raise PerformanceV2ApiError("invalid_query_flag", status=400, message="Boolean flags must be exactly 'true'.")
-    if values["all_active"] and (values["status"] or values["retest"]):
-        raise PerformanceV2ApiError("all_active_mixed_with_status", status=400, message="'all_active' cannot be combined with 'status'.")
-
-    statuses = values["status"]
-    invalid = next((value for value in statuses if value not in {"FINALIST", "RESERVE"}), None)
-    if invalid is not None:
-        raise PerformanceV2ApiError("invalid_export_status", status=400, message="Status must be one of FINALIST, RESERVE.")
-    if len(statuses) != len(set(statuses)):
-        raise PerformanceV2ApiError("duplicate_export_status", status=400, message="Each status may be selected only once.")
-    if len(values["retest"]) > 1:
-        raise PerformanceV2ApiError("duplicate_query_parameter", status=400, message="Query parameter may not be repeated.")
-    retest = bool(values["retest"])
-    if retest and values["retest"][0] != "1":
-        raise PerformanceV2ApiError("invalid_query_flag", status=400, message="Boolean flags must be exactly 'true'.")
-    return PerformanceV2ExportSelection(tuple(statuses), retest, bool(values["all_active"]))
 
 
-_EXPORT_MAX_ROWS = 100_000
 
 
-def _export_xlsx(
-    rows: list[tuple[object, ...]],
-    metadata: Mapping[int, tuple[str | None, int | None, bool]],
-    review_metadata: Mapping[str, str],
-    user_reviews: Mapping[int, Mapping[str, object]],
-    cached_candidates: Mapping[int, Mapping[str, object]],
-    equity_regime_snapshots: Mapping[int, str],
-) -> bytes:
-    """Reuse the agreed Pareto-and-filters workbook writer; filtering adds no XLSX schema."""
-    candidates: list[dict[str, object]] = []
-    for row in rows:
-        strategy_id = int(row[0])
-        status, rank, tagged = metadata.get(strategy_id, (None, None, False))
-        candidate = dict(cached_candidates.get(strategy_id, {}))
-        candidate.pop("equity_regime_json", None)
-        if strategy_id in equity_regime_snapshots:
-            candidate["equity_regime_json"] = equity_regime_snapshots[strategy_id]
-        candidate.update({
-            "strategy_id": strategy_id, "strategy_name": row[1], "symbol": row[2], "side": row[3],
-            "timeframe": row[4], "close_ma_len": row[5], "order_count": row[6], "result_id": row[25],
-            "effective_start_utc": row[31], "effective_end_utc": row[32],
-            # A FIXED result shows its drawdown as a fraction of the base B (protocol v2 §4.6).
-            "max_drawdown_pct": candidate["max_drawdown_pct"] if candidate.get("lot_mode") == "FIXED" else row[40],
-            "finalist": status in {"FINALIST", "RESERVE"},
-            "auto_status": status or "UNSELECTED", "auto_rank": rank, "final_rank": rank,
-            "prior_retest": tagged, "elimination_reason": None,
-        })
-        for number, offset in enumerate(range(7, 23, 4), start=1):
-            candidate.update({
-                f"order_{number}_open_ma_len": row[offset], f"order_{number}_lot_x": row[offset + 3],
-                f"order_{number}_shift_bp": row[offset + 2],
-            })
-        candidates.append(candidate)
-    request = SelectionRequest(str(rows[0][2]) if rows else "", str(rows[0][3]) if rows else "", ())
-    with tempfile.TemporaryDirectory() as directory:
-        path = write_selection_workbook(
-            pd.DataFrame(candidates), Path(directory) / "candidates.xlsx", request, review_metadata, user_reviews,
-        )
-        return path.read_bytes()
 
 
-def _export_cached_candidates(
-    connection: duckdb.DuckDBPyConnection,
-    rows: list[tuple[object, ...]],
-    config: SelectionConfig,
-) -> dict[int, Mapping[str, object]]:
-    cohorts: dict[tuple[str, str], list[tuple[int, int]]] = {}
-    for row in rows:
-        cohorts.setdefault((str(row[2]), str(row[3])), []).append((int(row[0]), int(row[25])))
-    candidates: dict[int, Mapping[str, object]] = {}
-    for (symbol, side), members in cohorts.items():
-        request = retest_cohort_request(SelectionRequest(symbol, side, ()), "performance-db-export", members)
-        for candidate in load_selection_candidates(connection, request, config, cache_only=True).to_dict(orient="records"):
-            candidates[int(candidate["strategy_id"])] = candidate
-    return candidates
 
 
-def _export_equity_regime_snapshots(
-    connection: duckdb.DuckDBPyConnection,
-    rows: list[tuple[object, ...]],
-    schema_version: int,
-) -> dict[int, str]:
-    """Return current, revision-matched assessments from each strategy's newest publication."""
-    if schema_version < 9 or not rows:
-        return {}
-    strategy_ids = sorted({int(row[0]) for row in rows})
-    published = connection.execute(
-            """with published as (
-                   select result.strategy_id, result.result_id_at_selection,
-                          result.equity_regime_json, runs.request_json,
-                          row_number() over (
-                              partition by result.strategy_id
-                              order by runs.created_at_utc desc, runs.selection_run_id desc
-                          ) as row_number
-                     from selection_results result
-                     join selection_runs runs using (selection_run_id)
-                     join strategies strategy
-                       on strategy.strategy_id = result.strategy_id
-                      and strategy.current_result_id = result.result_id_at_selection
-                    where result.strategy_id in (select unnest(?::bigint[]))
-               )
-               select strategy_id, result_id_at_selection, equity_regime_json, request_json
-                 from published where row_number = 1""",
-            [strategy_ids],
-        ).fetchall()
-    result_ids = sorted({int(result_id) for _, result_id, payload, _ in published if isinstance(payload, str)})
-    source_revisions: dict[int, str] = {}
-    if result_ids:
-        source_rows = connection.execute(
-            """select result_id, imported_at_utc, report_start_utc, report_end_utc,
-                      effective_start_utc, effective_end_utc, optimizer_source_metadata_json
-                 from strategy_results
-                where result_id in (select unnest(?::bigint[]))""",
-            [result_ids],
-        ).fetchall()
-        timestamp_fields = (
-            "imported_at_utc", "report_start_utc", "report_end_utc",
-            "effective_start_utc", "effective_end_utc",
-        )
-        for source_row in source_rows:
-            result_id = int(source_row[0])
-            metadata = dict(zip((
-                "result_id", *timestamp_fields, "optimizer_source_metadata_json",
-            ), source_row))
-            for field in timestamp_fields:
-                value = metadata[field]
-                if value is not None:
-                    if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
-                        continue
-                    metadata[field] = value.astimezone(timezone.utc)
-            try:
-                source_revisions[result_id] = equity_regime_source_revision(metadata)
-            except (EquityRegimeCacheError, TypeError, ValueError):
-                continue
-    snapshots: dict[int, str] = {}
-    for strategy_id, result_id, payload, request_json in published:
-        if not isinstance(payload, str):
-            continue
-        try:
-            request = json.loads(request_json)
-            snapshot = request.get("equity_regime_snapshot") if isinstance(request, dict) else None
-            sources = snapshot.get("sources") if isinstance(snapshot, dict) else None
-            source = sources.get(str(strategy_id)) if isinstance(sources, dict) else None
-            source_revision = source.get("source_revision") if isinstance(source, dict) else None
-            if (
-                not isinstance(snapshot, dict)
-                or set(snapshot) != {"algorithm_version", "sources"}
-                or snapshot.get("algorithm_version") != EQUITY_REGIME_ALGORITHM_VERSION
-                or not isinstance(sources, dict)
-                or not isinstance(source, dict)
-                or set(source) != {"result_id", "source_revision"}
-                or type(source.get("result_id")) is not int
-                or source["result_id"] != int(result_id)
-                or not isinstance(source_revision, str)
-                or re.fullmatch(r"[0-9a-f]{64}", source_revision) is None
-            ):
-                continue
-            if source_revisions.get(int(result_id)) != source_revision:
-                continue
-        except (EquityRegimeCacheError, TypeError, ValueError, json.JSONDecodeError):
-            continue
-        snapshots[int(strategy_id)] = payload
-    return snapshots
 
 
-def export_performance_v2(
-    database_path: Path,
-    selection: PerformanceV2ExportSelection,
-    *,
-    selection_config: SelectionConfig = SelectionConfig(),
-    now: datetime | None = None,
-) -> tuple[str, bytes]:
-    if not database_path.is_file():
-        raise PerformanceV2ApiError("PERFORMANCE_DB_UNAVAILABLE", status=503, message="PerformanceDB is unavailable.")
-    try:
-        with duckdb.connect(str(database_path), read_only=True) as connection:
-            schema_version = require_performance_v2_readable(connection)
-            decisions = effective_selection_decisions(connection)
-            retest_ids = {int(row[0]) for row in connection.execute("select strategy_id from strategy_tags where tag = 'RETEST'").fetchall()}
-            if selection.all_active:
-                selected_ids: set[int] | None = None
-            else:
-                selected_ids = {strategy_id for strategy_id, decision in decisions.items() if decision[0] in selection.statuses}
-                if selection.retest and selection.statuses:
-                    selected_ids.intersection_update(retest_ids)
-                elif selection.retest:
-                    selected_ids = set(retest_ids)
-            where = "where s.lifecycle_status = 'ACTIVE' and r.result_id = s.current_result_id and r.strategy_id = s.strategy_id"
-            params: list[object] = []
-            if selected_ids is not None:
-                if not selected_ids:
-                    return _export_filename(now), _export_xlsx([], {}, new_run_metadata(connection), {}, {}, {})
-                where += " and s.strategy_id in (select unnest(?::bigint[]))"
-                params.append(sorted(selected_ids))
-            order_columns = ", ".join(
-                f"o{number}.open_ma_len, o{number}.open_multiplier, o{number}.shift_bp, o{number}.lot_x"
-                for number in range(1, 5)
-            )
-            rows = connection.execute(
-                f"""select s.strategy_id, s.strategy_name, s.symbol, s.side, s.timeframe, s.close_ma_len, s.order_count,
-                           {order_columns}, s.lifecycle_status, s.current_result_id, r.result_id,
-                           r.report_start_utc, r.report_end_utc, r.reported_start_utc, r.reported_end_utc,
-                           r.listing_date_utc, r.effective_start_utc, r.effective_end_utc, r.exchange,
-                           r.commission_rate, r.initial_balance, r.final_balance, r.total_pnl, r.total_pnl_pct,
-                           r.max_drawdown, r.max_drawdown_pct, r.total_fees, r.total_trades, r.warmup_hours,
-                           r.excluded_trade_count, r.exclusion_reason
-                      from strategies s
-                      join strategy_results r on r.result_id = s.current_result_id and r.strategy_id = s.strategy_id
-                      left join strategy_orders o1 on o1.strategy_id = s.strategy_id and o1.order_id = 1
-                      left join strategy_orders o2 on o2.strategy_id = s.strategy_id and o2.order_id = 2
-                      left join strategy_orders o3 on o3.strategy_id = s.strategy_id and o3.order_id = 3
-                      left join strategy_orders o4 on o4.strategy_id = s.strategy_id and o4.order_id = 4
-                      {where}
-                     limit {_EXPORT_MAX_ROWS + 1}""", params,
-            ).fetchall()
-            if len(rows) > _EXPORT_MAX_ROWS:
-                raise PerformanceV2ApiError("EXPORT_ROW_LIMIT_EXCEEDED", status=413, message="Export exceeds 100000 rows.")
-            metadata = {
-                int(row[0]): (decisions.get(int(row[0]), (None, None, None))[0] if int(row[0]) in decisions else None,
-                              decisions.get(int(row[0]), (None, None, None))[1] if int(row[0]) in decisions else None,
-                              int(row[0]) in retest_ids)
-                for row in rows
-            }
-            review_metadata = new_run_metadata(connection)
-            user_reviews = latest_user_reviews_by_strategy(connection, [int(row[0]) for row in rows])
-            for row in rows:
-                strategy_id = int(row[0])
-                decision = decisions.get(strategy_id)
-                review = dict(user_reviews.get(strategy_id, {}))
-                review["user_status"] = None if decision is None else decision[0]
-                review["user_rank"] = None if decision is None else decision[1]
-                user_reviews[strategy_id] = review
-            cached_candidates = _export_cached_candidates(connection, rows, selection_config)
-            for strategy_id, ma_kind in strategy_ma_kinds(connection, [int(row[0]) for row in rows]).items():
-                cached_candidates[strategy_id] = {**cached_candidates.get(strategy_id, {}), "ma_kind": ma_kind}
-            equity_regime_snapshots = _export_equity_regime_snapshots(connection, rows, schema_version)
-            decision_order = {"FINALIST": 1, "RESERVE": 2}
-            rows.sort(key=lambda row: (
-                decision_order.get(metadata[int(row[0])][0], 3),
-                row[1] is None, str(row[1]) if row[1] is not None else "",
-                row[2] is None, str(row[2]) if row[2] is not None else "",
-                row[4] is None, str(row[4]) if row[4] is not None else "",
-                row[25] is None, str(row[25]) if row[25] is not None else "",
-                int(row[0]),
-            ))
-            return _export_filename(now), _export_xlsx(
-                rows, metadata, review_metadata, user_reviews, cached_candidates, equity_regime_snapshots,
-            )
-    except PerformanceV2ApiError:
-        raise
-    except PerformanceV2StoreError as error:
-        raise PerformanceV2ApiError(
-            "PERFORMANCE_V2_SCHEMA_INVALID", status=500, message=str(error),
-        ) from error
-    except (duckdb.Error, OSError) as error:
-        if isinstance(error, duckdb.IOException) and _is_duckdb_lock_error(error):
-            raise PerformanceV2ApiError("PERFORMANCE_DB_BUSY", status=409, message="PerformanceDB is busy.") from error
-        raise PerformanceV2ApiError("PERFORMANCE_DB_UNAVAILABLE", status=503, message="PerformanceDB is unavailable.") from error
 
 
-def _export_filename(now: datetime | None = None) -> str:
-    instant = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
-    return f"performance_v2_strategies_{instant.strftime('%Y%m%dT%H%M%SZ')}.xlsx"
 
 
 def _safe_cleanup_message(error: BaseException) -> str:
@@ -477,289 +152,20 @@ def _json_value(value: object) -> object:
     return value
 
 
-def _fixed_decimal(value: Decimal, places: int) -> str:
-    quantized = value.quantize(Decimal(1).scaleb(-places), rounding=ROUND_HALF_UP)
-    if quantized.is_zero():
-        quantized = quantized.copy_abs()
-    return format(quantized, "f")
 
 
-def _normalization_30d(
-    metrics: WindowMetrics,
-    report_start_utc: datetime | None = None,
-    report_end_utc: datetime | None = None,
-) -> dict[str, object]:
-    """Return the duration-normalized values without changing raw metrics."""
-    observed_days = calendar_window_days(metrics, report_start_utc, report_end_utc)
-    if observed_days is None:
-        return {
-            "period_days": 30,
-            "status": "invalid_duration",
-            "observed_days": None,
-            "growth_factor": None,
-            "return_pct": None,
-            "trade_rate": None,
-        }
-    with localcontext() as context:
-        context.prec = 34
-        context.rounding = ROUND_HALF_UP
-        result: dict[str, object] = {
-            "period_days": 30,
-            "status": "ok" if observed_days >= 1 else "too_short",
-            "observed_days": _fixed_decimal(observed_days, 6),
-            "growth_factor": None,
-            "return_pct": None,
-            "trade_rate": None,
-        }
-        if observed_days < 1:
-            return result
-
-        try:
-            growth = metrics.growth_factor
-            if growth is None:
-                raise ValueError("missing growth factor")
-            growth = growth if isinstance(growth, Decimal) else Decimal(str(growth))
-            if not growth.is_finite() or growth < 0:
-                raise ValueError("invalid growth factor")
-            if growth == 0:
-                result["growth_factor"] = "0.00000000"
-                result["return_pct"] = "-100.0000"
-            else:
-                growth_30d = (Decimal(30) * growth.ln() / observed_days).exp()
-                if not growth_30d.is_finite() or growth_30d >= Decimal("1e18"):
-                    raise ValueError("invalid 30-day growth factor")
-                result["growth_factor"] = _fixed_decimal(growth_30d, 8)
-                result["return_pct"] = _fixed_decimal((growth_30d - 1) * 100, 4)
-        except (ArithmeticError, TypeError, ValueError):
-            pass
-
-        trade_count = metrics.trade_count
-        if isinstance(trade_count, int) and not isinstance(trade_count, bool) and trade_count >= 0:
-            try:
-                result["trade_rate"] = _fixed_decimal(Decimal(trade_count) * 30 / observed_days, 4)
-            except (ArithmeticError, TypeError, ValueError):
-                pass
-        return result
 
 
-def resolve_active_strategy(
-    connection: duckdb.DuckDBPyConnection, strategy_id: int
-) -> tuple[int, int, dict[str, object]]:
-    """Resolve one ACTIVE strategy and its current result in one join."""
-    row = connection.execute(
-        """
-        select s.strategy_id, r.result_id, s.strategy_name, s.symbol, s.side,
-               s.timeframe, s.order_count, r.report_start_utc, r.report_end_utc
-          from strategies s
-          join strategy_results r
-            on r.result_id = s.current_result_id
-           and r.strategy_id = s.strategy_id
-         where s.strategy_id = ? and s.lifecycle_status = 'ACTIVE'
-        """,
-        [strategy_id],
-    ).fetchone()
-    if row is None:
-        raise PerformanceV2ApiError("PERFORMANCE_V2_NOT_FOUND", status=404, message="strategy is not available")
-    return int(row[0]), int(row[1]), {
-        "strategy_id": int(row[0]),
-        "strategy_name": str(row[2]),
-        "symbol": str(row[3]),
-        "side": str(row[4]),
-        "timeframe": str(row[5]),
-        "order_count": int(row[6]),
-        "result_id": int(row[1]),
-        "report_start_utc": row[7],
-        "report_end_utc": row[8],
-    }
 
 
-def performance_v2_catalog(connection: duckdb.DuckDBPyConnection) -> dict[str, object]:
-    """Return active strategies whose current result belongs to that strategy."""
-    rows = connection.execute(
-        """
-        select s.strategy_id, r.result_id, s.strategy_name, s.symbol, s.side,
-               s.timeframe, s.close_ma_len, s.order_count, r.report_start_utc, r.report_end_utc
-          from strategies s
-          join strategy_results r
-            on r.result_id = s.current_result_id
-           and r.strategy_id = s.strategy_id
-         where s.lifecycle_status = 'ACTIVE'
-         order by s.strategy_name, s.strategy_id
-        """
-    ).fetchall()
-    keys = ("strategy_id", "result_id", "strategy_name", "symbol", "side", "timeframe", "close_ma_len", "order_count", "report_start_utc", "report_end_utc")
-    strategies = [{key: _json_value(value) for key, value in zip(keys, row)} for row in rows]
-    orders_by_strategy: dict[int, list[dict[str, object]]] = {int(strategy["strategy_id"]): [] for strategy in strategies}
-    if orders_by_strategy:
-        placeholders = ", ".join("?" for _ in orders_by_strategy)
-        order_rows = connection.execute(
-            f"""
-            select strategy_id, order_id, open_ma_len, open_multiplier, shift_bp, lot_x
-              from strategy_orders
-             where strategy_id in ({placeholders})
-             order by strategy_id, order_id
-            """,
-            list(orders_by_strategy),
-        ).fetchall()
-        order_keys = ("order_id", "open_ma_len", "open_multiplier", "shift_bp", "lot_x")
-        for strategy_id, *values in order_rows:
-            orders_by_strategy[int(strategy_id)].append({key: _json_value(value) for key, value in zip(order_keys, values)})
-    for strategy in strategies:
-        strategy["current_result_id"] = strategy["result_id"]
-        strategy["orders"] = orders_by_strategy[int(strategy["strategy_id"])]
-    if strategies and has_ma_fact_columns(connection):
-        # Schema-v12 MA facts are added only when set, so a legacy catalog is unchanged.
-        by_id = {int(strategy["strategy_id"]): strategy for strategy in strategies}
-        for strategy_id, kind, source in connection.execute(
-            "select strategy_id, close_ma_type, close_ma_source from strategies"
-            " where close_ma_type is not null or close_ma_source is not null"
-        ).fetchall():
-            strategy = by_id.get(int(strategy_id))
-            if strategy is not None:
-                strategy.update({key: value for key, value in (("close_ma_type", kind), ("close_ma_source", source)) if value is not None})
-        orders_by_key = {
-            (int(strategy["strategy_id"]), int(order["order_id"])): order
-            for strategy in strategies for order in strategy["orders"]
-        }
-        for strategy_id, order_id, kind, source in connection.execute(
-            "select strategy_id, order_id, open_ma_type, open_ma_source from strategy_orders"
-            " where open_ma_type is not null or open_ma_source is not null"
-        ).fetchall():
-            order = orders_by_key.get((int(strategy_id), int(order_id)))
-            if order is not None:
-                order.update({key: value for key, value in (("open_ma_type", kind), ("open_ma_source", source)) if value is not None})
-    # Only FIXED results carry a lot mode, so a legacy catalog is unchanged.
-    fixed_bases = load_fixed_lot_bases(connection, [int(strategy["result_id"]) for strategy in strategies])
-    for strategy in strategies:
-        base = fixed_bases.get(int(strategy["result_id"]))
-        if base is not None:
-            strategy.update({"lot_mode": "FIXED", "lot_base": format(base.normalize(), "f")})
-    return {"strategies": strategies}
 
 
-def _window_document(
-    metrics: WindowMetrics,
-    report_start_utc: datetime | None = None,
-    report_end_utc: datetime | None = None,
-) -> dict[str, object]:
-    document = _json_value(asdict(metrics))  # type: ignore[assignment]
-    document["normalization_30d"] = _normalization_30d(metrics, report_start_utc, report_end_utc)
-    return document  # type: ignore[return-value]
 
 
-def _pair_document(
-    strategy_id: int,
-    result_id: int,
-    pair: tuple[WindowMetrics, WindowMetrics],
-    *,
-    report_start_utc: datetime | None = None,
-    report_end_utc: datetime | None = None,
-    compare_func: Callable[..., object] = compare_window_pair_geometrically,
-) -> dict[str, object]:
-    comparison = compare_func(pair[0], pair[1])
-    document: dict[str, object] = {
-        "strategy_id": strategy_id,
-        "result_id": result_id,
-        "window_a": _window_document(pair[0], report_start_utc, report_end_utc),
-        "window_b": _window_document(pair[1], report_start_utc, report_end_utc),
-        "comparison": _json_value(asdict(comparison)),
-    }
-    if report_start_utc is not None:
-        document["report_start_utc"] = _canonical_utc(report_start_utc)
-    if report_end_utc is not None:
-        document["report_end_utc"] = _canonical_utc(report_end_utc)
-    return document
 
 
-def _read_persisted_window_pair(
-    database_path: Path,
-    strategy_id: int,
-    window_a: Window,
-    window_b: Window,
-) -> dict[str, object]:
-    """Read exact cache keys after a transaction conflict; never calculate."""
-    with duckdb.connect(str(database_path), read_only=True) as connection:
-        require_performance_v2(connection)
-        _, result_id, identity = resolve_active_strategy(connection, strategy_id)
-        pair = (
-            _cached(connection, result_id, window_a[0], window_a[1], METRICS_VERSION),
-            _cached(connection, result_id, window_b[0], window_b[1], METRICS_VERSION),
-        )
-        if pair[0] is None or pair[1] is None:
-            raise PerformanceV2ApiError(
-                "PERFORMANCE_V2_CACHE_CONFLICT",
-                status=409,
-                message="window cache transaction conflict",
-            )
-        return _pair_document(
-            strategy_id,
-            result_id,
-            (pair[0], pair[1]),
-            report_start_utc=identity["report_start_utc"],
-            report_end_utc=identity["report_end_utc"],
-        )
 
 
-def calculate_performance_v2_windows(
-    database_path: Path,
-    strategy_id: int,
-    window_a: Window,
-    window_b: Window,
-    *,
-    window_pair_func: Callable[..., tuple[WindowMetrics, WindowMetrics]] | None = None,
-    compare_func: Callable[..., object] | None = None,
-) -> dict[str, object]:
-    """Calculate/cache A and B in one write transaction for one active strategy."""
-    window_pair_func = window_pair_func or get_or_calculate_window_pair
-    compare_func = compare_func or compare_window_pair_geometrically
-    try:
-        connection = duckdb.connect(str(database_path), read_only=False)
-    except duckdb.IOException as error:
-        if _is_duckdb_lock_error(error):
-            raise PerformanceV2ApiError("PERFORMANCE_V2_LOCKED", status=409, message="Performance v2 database is locked") from error
-        raise
-    connection_open = True
-    try:
-        require_performance_v2(connection)
-        _, result_id, identity = resolve_active_strategy(connection, strategy_id)
-        try:
-            connection.execute("begin transaction")
-            pair = window_pair_func(connection, result_id, window_a, window_b)
-            connection.execute("commit")
-        except duckdb.TransactionException:
-            try:
-                connection.execute("rollback")
-            except duckdb.Error:
-                pass
-            finally:
-                connection.close()
-                connection_open = False
-            return _read_persisted_window_pair(database_path, strategy_id, window_a, window_b)
-        except duckdb.IOException as error:
-            try:
-                connection.execute("rollback")
-            except duckdb.Error:
-                pass
-            if _is_duckdb_lock_error(error):
-                raise PerformanceV2ApiError("PERFORMANCE_V2_LOCKED", status=409, message="Performance v2 database is locked") from error
-            raise
-        except BaseException:
-            try:
-                connection.execute("rollback")
-            except duckdb.Error:
-                pass
-            raise
-        return _pair_document(
-            strategy_id,
-            result_id,
-            pair,
-            report_start_utc=identity["report_start_utc"],
-            report_end_utc=identity["report_end_utc"],
-            compare_func=compare_func,
-        )
-    finally:
-        if connection_open:
-            connection.close()
 
 
 class LocalPerformanceV2Service:
@@ -1047,7 +453,4 @@ __all__ = [
     "LocalPerformanceV2Service",
     "PerformanceV2PanelRequest",
     "PerformanceV2PanelResult",
-    "calculate_performance_v2_windows",
-    "performance_v2_catalog",
-    "resolve_active_strategy",
 ]

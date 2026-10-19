@@ -595,6 +595,83 @@ PerformanceDB.
 - Static UI tests.
 - A live read of the real registry, store and PerformanceDB.
 
+## Stage 4c contract and evidence: the A/B and Pareto screens removed (2026-10-19)
+
+**Removed and disconnected.** Each item below lost its UI, its routes, its
+controller code and its tests.
+- **A/B Performance analysis card:**
+  - `POST /api/v2/strategies/performance-v2/windows`;
+  - `GET …/catalog`;
+  - `panel_performance_v2.calculate_performance_v2_windows` and
+    `performance_v2_catalog`, with their helpers.
+- **Pareto/filters card**, including the legacy filters 11–27:
+  - `…/selection`, `…/selection/preview`, `…/selection/export`,
+    `…/selection/write-rejected`, `…/selection-preview`,
+    `…/selection-cache-status`, the single-pair `…/recalculate`,
+    `…/selection-review-import`, `…/selection/aggregate-import`;
+  - the aggregate controller helpers.
+- **Filters 6–9 settings** on «Настройки» and `…/selection-settings`.
+- **«Восстановить User Status и User Rank из selection XLSX»** in the
+  finalist retest card and `…/selection-user-fields-import`. This import read
+  Pareto workbooks, and since ADR-0080 the marks are set in «Стратегии».
+- **Export card** and `GET/HEAD/OPTIONS …/export`, with
+  `panel_performance_v2.export_performance_v2` and its helpers. The
+  replacement is the «Excel» of «Стратегии».
+
+**Moved.** The PerformanceDB maintenance card is now on «Настройки», after
+«PerformanceDB и биржа».
+
+**HTTP.** With the export route gone:
+- HEAD and OPTIONS answer 404 on every path (403 without a local Host);
+- OPTIONS sends the JSON body, HEAD only the headers;
+- every removed route answers 404 — tested.
+
+**Kept.** The two retest cards, renumbered 4 and 5:
+- «4. Bulk RETEST current FINALIST», for the start status, IMPORT & REPLACE,
+  the control workbook and the equity filter;
+- «5. CHECK & RETEST», for the RETEST tags.
+
+The retest import step is still only there. `…/recalculate-all` and its
+progress stay; they are the «Посчитать метрики» of «Стратегии».
+
+**Not retired.** The domain modules `performance_v2_selection` and
+`performance_v2_selection_review` stay whole. The «Стратегии» view, the
+retest and the control workbook use parts of them; their now-unused
+functions (Pareto workbook writers and importers) are left for history and a
+later cleanup.
+
+**Tests.**
+- Deleted because they test removed functionality (four checks of kept
+  behaviour were ported, see the next items):
+  - 69 tests in `test_panel_performance_v2.py`;
+  - 20 static UI tests;
+  - 1 settings test;
+  - `test_panel_performance_v2_export.py` and
+    `test_performance_v2_equity_regime_export.py`.
+- Adapted to `recalculate-all`: the control-schema test (no longer compared
+  with the Pareto workbook), the v8 migration test and the two control-export
+  retest tests.
+- Ported from the single-pair recalculate to `recalculate-all` (review of
+  4c), because they covered kept behaviour:
+  - the writer lock is held while the cache is prepared;
+  - the real window workers run under the controller lock;
+  - equity cache errors map to typed API errors;
+  - only added or replaced current results are recalculated.
+- A route test asserts 404 for every removed route and method.
+- Independent review: `CODE_REVIEW_PASS`; its MINOR findings were fixed (the
+  ported tests, README, PRD rows, the route test, the dead export helper,
+  OPTIONS with a body, unused names) and the re-review returned
+  `CODE_REVIEW_PASS`.
+- New static assertions: the card layout, maintenance on «Настройки», and no
+  route of a removed screen in `app.js`.
+- Runs:
+  - all Panel tests plus `test_performance_v2_selection_review`: 1,126 passed,
+    3 failed. All three already fail on HEAD:
+    the `previewtoken` shell test, the journal retry constant, and the flaky
+    stage 2 test.
+  - PerformanceDB, single-mode, registry and main-screen suites: see
+    progress.
+
 ## Stage 4b evidence: retest and optimizer read the registry marks (2026-10-19)
 
 **Code:**
@@ -845,9 +922,18 @@ is not caused by stage 1b.
 3. ✅ «Пары и стратегии»: exchange switch, actions with plan dialogs, task area
    with progress/ETA/errors, views, pair card (2026-10-19, see «Stage 3
    evidence»).
-4. ⏳ «Стратегии» view: tick-test metrics, column chooser, filter toggles, ranks,
-   finalist marks, Excel round trip, finalist retest.
+4. ✅ «Стратегии» view: tick-test metrics, column chooser, filter toggles, ranks,
+   finalist marks, Excel round trip, finalist retest (4a, 4b); A/B and the
+   Pareto screen removed (4c) — 2026-10-19.
 5. ⏳ BingX in the trade store, READY, tester sampling and tick tests.
+
+**Deferred (user, 2026-10-19; not urgent).**
+- Retire the base-lot Excel export (`scripts/calculate_bybit_base_lots.py`,
+  the Actual sheet) with its README and spec mentions. Nothing else reads the
+  sheet: the optimizer and the «Ликвидность» view read the registry.
+- Let `loader.load_listing_dates` read the listing days from the registry
+  and drop the `pairs.xlsx` bridge. This changes the listing-date source
+  recorded by the PerformanceDB import, so it is a stage of its own.
 
 Each stage: spec details first, TDD, `.venv` tests on drive C, independent
 review, then one commit per stage (the user asked for per-stage commits on

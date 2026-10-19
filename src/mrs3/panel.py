@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections import OrderedDict
 from contextlib import contextmanager
 from copy import deepcopy
 import csv
@@ -40,19 +39,6 @@ _LOGGER = logging.getLogger(__name__)
 _RETEST_INBOX_PATH_UNAVAILABLE = "committed RETEST inbox path is unavailable"
 _RETEST_INBOX_MANIFEST_UNAVAILABLE = "committed RETEST inbox manifest is unavailable"
 _RETEST_INBOX_UNAVAILABLE = frozenset({_RETEST_INBOX_PATH_UNAVAILABLE, _RETEST_INBOX_MANIFEST_UNAVAILABLE})
-_RESEARCHED_SELECTION_KEYS = (
-    "researched_pnl_dd5_ratio", "researched_pnl_b_ratio",
-    "researched_b_abs", "researched_b_rel", "researched_dd5_abs", "researched_dd5_rel",
-    "researched_dd_abs", "researched_dd_rel", "researched_points_mean_ratio",
-    "researched_stage3_near_b_abs", "researched_stage3_near_b_rel",
-    "researched_stage3_near_dd5_abs", "researched_stage3_near_dd5_rel",
-    "researched_stage3_near_dd_abs", "researched_stage3_near_dd_rel",
-    "researched_stage3_near_points_ratio",
-    "researched_points_same_floor_ratio", "researched_points_cross_floor_ratio",
-    "researched_points_single_best_ratio", "researched_open_ma_delta",
-    "researched_close_ma_delta", "researched_hold_p95_ratio",
-    "researched_hold_median_ratio", "researched_hold_p95_veto_ratio",
-)
 
 
 def _open_regular_artifact(path: Path) -> tuple[BinaryIO, int]:
@@ -160,11 +146,6 @@ from .panel_performance_v2 import (
     PerformanceV2ApiError,
     PerformanceV2PanelRequest,
     _is_duckdb_lock_error,
-    calculate_performance_v2_windows,
-    export_performance_v2,
-    parse_performance_v2_export_query,
-    performance_v2_catalog,
-    _parse_window_payload,
 )
 from .performance_v2_store import (
     PerformanceV2Config,
@@ -196,7 +177,6 @@ from .performance_v2_selection import (
     SelectionRequest,
     SelectionStage,
     SelectionConfig,
-    finalist_reserved_strategy_ids,
     load_selection_candidates,
     load_selection_config,
     parse_selection_request,
@@ -204,12 +184,7 @@ from .performance_v2_selection import (
     run_selection,
     selection_cache_missing_strategy_ids,
     selection_cache_status,
-    selection_equity_facts_token,
     write_selection_workbook,
-    AllPairsPartition,
-    coordinate_all_pairs,
-    build_combined_selection_workbook,
-    validate_combined_selection_workbook,
     retest_cohort_request,
 )
 from .performance_v2_equity_regime import (
@@ -218,23 +193,11 @@ from .performance_v2_equity_regime import (
 )
 from .performance_v2_selection_review import (
     SelectionReviewError,
-    _selection_rows,
     apply_prior_rejected,
-    attach_rejection_reasons,
-    automatic_filter_rejected_ids,
     _current_equity_revisions,
     import_retest_tags,
-    import_selection_review,
-    import_combined_selection_workbook,
-    import_selection_user_fields,
-    latest_effective_finalists,
-    latest_user_reviews_by_strategy,
-    new_run_metadata,
-    persist_selection_snapshot,
     persist_selection_snapshots,
-    rejection_reason_label,
 )
-from .performance_v2_publication import publish_publication
 from .performance_v2_retest import build_retest_manifest, retest_status
 from .performance_v2_finalist_retest import (
     FinalistRetestError,
@@ -281,7 +244,6 @@ class PanelController:
         self.root = root.resolve()
         self.default_config = self._path(default_config)
         self._lock = threading.RLock()
-        self._selection_candidate_cache_lock = threading.RLock()
         self._performance_v2_writer_lock = threading.RLock()
         self._bulk_retest_import_lock = threading.RLock()
         self._bulk_retest_equity_filter_lock = threading.RLock()
@@ -297,7 +259,6 @@ class PanelController:
             "current_pair": None, "error": None,
         }
         self._performance_v2_schema_ready: set[tuple[str, int, int, int, int, int]] = set()
-        self._selection_candidate_cache: OrderedDict[tuple[object, ...], object] = OrderedDict()
         self._panel_jobs = PanelJobRegistry(self.root / ".panel-jobs.json", recover_on_load=False)
         self._report_collection_service: PanelReportCollection | None = None
         self._portfolio_service = PortfolioPanelService(
@@ -543,51 +504,6 @@ class PanelController:
         with self._lock:
             return save_panel_settings(self.default_config, self.root, payload)
 
-    def performance_v2_selection_settings(self, payload: Mapping[str, object] | None = None) -> dict[str, object]:
-        path = self.default_config.with_name("config.performance.json")
-        with self._lock:
-            try:
-                original = path.read_bytes()
-                document = json.loads(original)
-                if not isinstance(document, dict) or not isinstance(document.get("unified_performance_v2"), dict):
-                    raise ValueError("invalid performance config")
-                current_digest = sha256(original).hexdigest()
-                if payload is not None:
-                    if set(payload) != {"digest", "changes"} or not isinstance(payload.get("digest"), str):
-                        raise PerformanceV2ApiError("SELECTION_SETTINGS_INVALID", status=400)
-                    changes = payload.get("changes")
-                    if not isinstance(changes, dict) or not changes or not set(changes) <= set(_RESEARCHED_SELECTION_KEYS):
-                        raise PerformanceV2ApiError("SELECTION_SETTINGS_INVALID", status=400)
-                    if payload["digest"] != current_digest:
-                        raise PerformanceV2ApiError("SELECTION_SETTINGS_STALE", status=409)
-                    selected = document["unified_performance_v2"].setdefault("finalist_selection", {})
-                    if not isinstance(selected, dict):
-                        raise ValueError("invalid finalist selection config")
-                    for key, value in changes.items():
-                        if not isinstance(value, str):
-                            raise PerformanceV2ApiError("SELECTION_SETTINGS_INVALID", status=400)
-                        selected[key] = value
-                    rendered = (json.dumps(document, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
-                    with tempfile.NamedTemporaryFile(dir=path.parent, prefix=".performance-selection-", suffix=".json", delete=False) as temporary:
-                        temporary_path = Path(temporary.name)
-                        temporary.write(rendered)
-                        temporary.flush()
-                        os.fsync(temporary.fileno())
-                    try:
-                        load_selection_config(temporary_path)
-                        os.chmod(temporary_path, stat.S_IMODE(path.stat().st_mode))
-                        os.replace(temporary_path, path)
-                    finally:
-                        temporary_path.unlink(missing_ok=True)
-                    current_digest = sha256(rendered).hexdigest()
-                config = load_selection_config(path)
-                return {"digest": current_digest, "settings": {
-                    key: str(getattr(config, key)) for key in _RESEARCHED_SELECTION_KEYS
-                }}
-            except PerformanceV2ApiError:
-                raise
-            except (OSError, UnicodeDecodeError, json.JSONDecodeError, PerformanceV2SelectionError, ValueError) as error:
-                raise PerformanceV2ApiError("SELECTION_SETTINGS_INVALID", status=400) from error
 
     _PERFORMANCE_DATABASE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 
@@ -2945,36 +2861,6 @@ class PanelController:
         # panel job is the redacted public snapshot.
         return self._panel_jobs.get(job_id)
 
-    def performance_v2_catalog(self) -> dict[str, object]:
-        config = self._performance_v2_config()
-        target = performance_v2_database_path(config)
-        selection_config = _json_value(asdict(load_selection_config(self.default_config.with_name("config.performance.json"))))
-        if not target.is_file():
-            return {"strategies": [], "selection_config": selection_config}
-        try:
-            with self._performance_v2_writer_lock, duckdb.connect(str(target), read_only=True) as connection:
-                require_performance_v2_readable(connection)
-                catalog = performance_v2_catalog(connection)
-                pairs_with_runs: list[str] = []
-                for symbol in sorted({str(row["symbol"]) for row in catalog["strategies"]}):
-                    has_runs, finalists = latest_effective_finalists(connection, symbol)
-                    if has_runs:
-                        pairs_with_runs.append(symbol)
-                    for strategy in catalog["strategies"]:
-                        if strategy["symbol"] == symbol:
-                            strategy["is_latest_finalist"] = int(strategy["strategy_id"]) in finalists
-                catalog["selection_pairs_with_runs"] = pairs_with_runs
-                catalog["selection_config"] = selection_config
-                return catalog
-        except PerformanceV2ApiError:
-            raise
-        except PerformanceV2StoreError as error:
-            raise PerformanceV2ApiError("PERFORMANCE_V2_SCHEMA_INVALID", status=500, message=str(error)) from error
-        except (duckdb.Error, OSError) as error:
-            raise ValueError("Performance v2 database is unavailable") from error
-
-    def strategies_performance_v2_catalog(self) -> dict[str, object]:
-        return self.performance_v2_catalog()
 
     def _performance_v2_maintenance_target(self) -> tuple[Path, int]:
         try:
@@ -3218,97 +3104,6 @@ class PanelController:
             )
             result.pop("started_at", None)
             return result
-
-    def strategies_performance_v2_export(self, selection: object, *, now: datetime | None = None) -> tuple[str, bytes]:
-        try:
-            config = self._performance_v2_config()
-            target = performance_v2_database_path(config)
-        except (OSError, TypeError, ValueError) as error:
-            raise PerformanceV2ApiError("PERFORMANCE_DB_UNAVAILABLE", status=503, message="PerformanceDB is unavailable.") from error
-        with self._performance_v2_writer_lock:
-            return export_performance_v2(
-                target,
-                selection,
-                selection_config=load_selection_config(self.default_config.with_name("config.performance.json")),
-                now=now,
-            )
-
-    def performance_v2_windows(self, payload: Mapping[str, object]) -> dict[str, object]:
-        if not isinstance(payload, Mapping):
-            raise PerformanceV2ApiError("INVALID_REQUEST", status=400, message="request must be an object")
-        strategy_id, window_a, window_b = _parse_window_payload(payload)
-        config = self._performance_v2_config()
-        target = performance_v2_database_path(config)
-        if not target.is_file():
-            raise PerformanceV2ApiError("PERFORMANCE_V2_NOT_FOUND", status=404, message="Performance v2 database is unavailable")
-        self._ensure_performance_v2_schema(target)
-        with self._performance_v2_writer_guard(target):
-            return calculate_performance_v2_windows(target, strategy_id, window_a, window_b)
-
-    def strategies_performance_v2_windows(self, payload: Mapping[str, object]) -> dict[str, object]:
-        return self.performance_v2_windows(payload)
-
-    def _selection_request(self, payload: Mapping[str, object]) -> SelectionRequest:
-        """Parse an ordinary request or resolve a server-owned bulk cohort."""
-        if not isinstance(payload, Mapping):
-            raise PerformanceV2ApiError("INVALID_REQUEST", status=400, message="request must be an object")
-        raw_job = payload.get("bulk_retest_job_id")
-        if raw_job is None:
-            return parse_selection_request(payload)
-        if not isinstance(raw_job, str) or not raw_job.strip():
-            raise PerformanceV2SelectionError("RETEST_COHORT_INVALID")
-        expected = {"symbol", "side", "stages", "bulk_retest_job_id"}
-        if "finalists_only" in payload:
-            expected.add("finalists_only")
-        if set(payload) != expected:
-            # This route accepts exactly one server-owned handle.  In
-            # particular, cohort/strategy/result overrides must never reach
-            # the selection layer, even if they are hidden in a browser body.
-            raise PerformanceV2SelectionError("RETEST_COHORT_CLIENT_OVERRIDE")
-        base_payload = dict(payload)
-        base_payload.pop("bulk_retest_job_id", None)
-        request = parse_selection_request(base_payload)
-        try:
-            job = self._panel_jobs.get(raw_job.strip())
-            runtime = self._panel_jobs.runtime(raw_job.strip())
-        except PanelJobError as error:
-            raise PerformanceV2SelectionError("RETEST_COHORT_JOB_NOT_FOUND") from error
-        if (
-            job.get("state") != "COMMITTED"
-            or job.get("kind") != "strategies.performance.v2.finalist-retest"
-            or runtime.get("bulk_retest") is not True
-        ):
-            raise PerformanceV2SelectionError("RETEST_COHORT_JOB_NOT_COMMITTED")
-        raw_successes = runtime.get("successful_replacements")
-        if not isinstance(raw_successes, list):
-            result = job.get("result")
-            raw_successes = result.get("successful_replacements") if isinstance(result, Mapping) else None
-        pairs: dict[int, int] = {}
-        if isinstance(raw_successes, list):
-            for item in raw_successes:
-                if not isinstance(item, Mapping):
-                    continue
-                strategy_id = item.get("strategy_id")
-                result_id = item.get("new_result_id", item.get("result_id"))
-                if isinstance(strategy_id, int) and not isinstance(strategy_id, bool) and isinstance(result_id, int) and not isinstance(result_id, bool):
-                    pairs[strategy_id] = result_id
-        return retest_cohort_request(request, raw_job.strip(), pairs)
-
-    @staticmethod
-    def _selection_requires_equity(request: SelectionRequest) -> bool:
-        return any(PanelController._selection_equity_toggles(request))
-
-    @staticmethod
-    def _selection_equity_toggles(request: SelectionRequest) -> tuple[bool, bool]:
-        filter_enabled = any(
-            stage.id == "filter_equity_regime" and stage.enabled
-            for stage in request.stages
-        )
-        rank_enabled = any(
-            stage.id == "rank_robust_top_n" and stage.enabled and stage.method == "equity_quality_v1"
-            for stage in request.stages
-        )
-        return filter_enabled, rank_enabled
 
     @staticmethod
     def _bulk_retest_range(payload: Mapping[str, object], listing_dates: Mapping[str, object], connection: duckdb.DuckDBPyConnection, include_reserve: bool, decisions: Mapping[int, tuple] | None = None) -> tuple[str, str]:
@@ -4812,221 +4607,6 @@ class PanelController:
 
     strategies_performance_v2_bulk_retest_control_import = strategies_performance_v2_finalist_retest_control_import
 
-    def _performance_v2_selection_result(self, payload: Mapping[str, object]):
-        if not isinstance(payload, Mapping):
-            raise PerformanceV2ApiError("INVALID_REQUEST", status=400, message="request must be an object")
-        try:
-            request = self._selection_request(payload)
-            selection_config = load_selection_config(self.default_config.with_name("config.performance.json"))
-        except PerformanceV2SelectionError as error:
-            raise PerformanceV2ApiError("INVALID_REQUEST", status=400, message=str(error)) from error
-        equity_filter_enabled, equity_rank_enabled = self._selection_equity_toggles(request)
-        equity_consumer_enabled = equity_filter_enabled or equity_rank_enabled
-        performance_config = self._performance_v2_config()
-        target = performance_v2_database_path(performance_config)
-        if not target.is_file():
-            raise PerformanceV2ApiError("PERFORMANCE_V2_NOT_FOUND", status=404, message="Performance v2 database is unavailable")
-        try:
-            with self._performance_v2_writer_lock, duckdb.connect(str(target), read_only=True) as connection:
-                connection.execute(f"set threads to {performance_config.workers}")
-                schema_version = require_performance_v2_readable(connection)
-                cache_status = selection_cache_status(
-                    connection, request, selection_config, include_equity=equity_consumer_enabled,
-                    include_readiness_breakdown=equity_consumer_enabled,
-                )
-                if not cache_status["ready"]:
-                    equity_only_missing = (
-                        equity_consumer_enabled
-                        and int(cache_status["total"]) > 0
-                        and int(cache_status["window_missing"]) == 0
-                        and int(cache_status["equity_missing"]) > 0
-                    )
-                    code = "EQUITY_CACHE_INCOMPLETE" if equity_only_missing else "SELECTION_CACHE_INCOMPLETE"
-                    raise PerformanceV2ApiError(
-                        code, status=409,
-                        message="Required selection caches are incomplete; prepare or recalculate them before continuing",
-                    )
-                result_token = tuple(connection.execute(
-                    """select s.strategy_id, s.current_result_id from strategies s
-                         join strategy_results r on r.result_id = s.current_result_id and r.strategy_id = s.strategy_id
-                        where s.lifecycle_status = 'ACTIVE' and s.symbol = ? and s.side = ?
-                        order by s.strategy_id""",
-                    [request.symbol, request.side],
-                ).fetchall())
-                if request.ranking_scope == "RETEST_COHORT":
-                    cohort_ids = {strategy_id for strategy_id, _ in request.cohort_members}
-                    result_token = tuple(row for row in result_token if int(row[0]) in cohort_ids)
-                facts_token = connection.execute(
-                    """select count(*), max(wm.calculated_at_utc), bit_xor(hash(
-                                   wm.result_id, wm.requested_start_utc, wm.requested_end_utc,
-                                   wm.metrics_version, wm.availability_status, wm.unavailable_reason,
-                                   wm.growth_factor, wm.return_pct, wm.daily_log_return,
-                                   wm.daily_growth_pct, wm.max_drawdown_pct, wm.return_dd_ratio,
-                                   wm.fees_pct, wm.profit_factor, wm.trade_count, wm.win_rate_pct,
-                                   wm.holding_seconds, wm.time_in_market_pct
-                               ))
-                         from window_metrics wm
-                         join strategy_results r on r.result_id = wm.result_id
-                         join strategies s on s.strategy_id = r.strategy_id and s.current_result_id = r.result_id
-                        where s.lifecycle_status = 'ACTIVE' and s.symbol = ? and s.side = ?"""
-                        + (" and s.strategy_id in (" + ",".join("?" for _ in request.cohort_members) + ")" if request.ranking_scope == "RETEST_COHORT" else ""),
-                    [request.symbol, request.side, *(strategy_id for strategy_id, _ in request.cohort_members)] if request.ranking_scope == "RETEST_COHORT" else [request.symbol, request.side],
-                ).fetchone()
-                equity_facts_token = selection_equity_facts_token(
-                    connection, request, schema_version=schema_version
-                )
-                cache_key = (
-                    request.symbol,
-                    request.side,
-                    request.ranking_scope,
-                    request.bulk_retest_job_id,
-                    request.cohort_members,
-                    tuple(asdict(selection_config).items()),
-                    equity_filter_enabled,
-                    equity_rank_enabled,
-                    result_token,
-                    facts_token,
-                    equity_facts_token,
-                )
-                with self._selection_candidate_cache_lock:
-                    candidates = self._selection_candidate_cache.get(cache_key)
-                    if candidates is not None:
-                        self._selection_candidate_cache.move_to_end(cache_key)
-                if candidates is None:
-                    candidates = load_selection_candidates(connection, request, selection_config, cache_only=True)
-                    with self._selection_candidate_cache_lock:
-                        self._selection_candidate_cache[cache_key] = candidates
-                        self._selection_candidate_cache.move_to_end(cache_key)
-                        while len(self._selection_candidate_cache) > 8:
-                            self._selection_candidate_cache.popitem(last=False)
-                if request.finalists_only:
-                    eligible = finalist_reserved_strategy_ids(
-                        connection, [int(strategy_id) for strategy_id in candidates["strategy_id"]],
-                    )
-                    candidates = candidates.loc[candidates["strategy_id"].isin(eligible)].copy()
-                result = run_selection(apply_prior_rejected(connection, candidates), request, selection_config)
-                result.attrs["source_revisions"] = _current_equity_revisions(
-                    connection, [int(strategy_id) for strategy_id in result["strategy_id"]]
-                )
-            return request, result
-        except EquitySchemaUpgradeRequiredError as error:
-            raise PerformanceV2ApiError(error.code, status=409, message=str(error)) from error
-        except EquityCacheSchemaInvalidError as error:
-            raise PerformanceV2ApiError(error.code, status=500, message=str(error)) from error
-        except PerformanceV2SelectionError as error:
-            if str(error) == "EQUITY_CACHE_INCOMPLETE":
-                raise PerformanceV2ApiError(str(error), status=409, message=str(error)) from error
-            raise
-        except PerformanceV2StoreError as error:
-            raise PerformanceV2ApiError("PERFORMANCE_V2_SCHEMA_INVALID", status=500, message=str(error)) from error
-        except duckdb.Error as error:
-            raise PerformanceV2ApiError("PERFORMANCE_V2_LOCKED", status=409, message="Performance v2 database is locked") from error
-
-    def strategies_performance_v2_selection(self, payload: Mapping[str, object]) -> tuple[str, bytes]:
-        target = performance_v2_database_path(self._performance_v2_config())
-        self._ensure_performance_v2_schema(target)
-        request, result = self._performance_v2_selection_result(payload)
-        selection_config = load_selection_config(self.default_config.with_name("config.performance.json"))
-        try:
-            with tempfile.TemporaryDirectory() as directory:
-                with self._performance_v2_writer_lock, duckdb.connect(str(target), read_only=True) as connection:
-                    metadata = new_run_metadata(connection, request=request)
-                    user_review_rows = latest_user_reviews_by_strategy(
-                        connection, [int(strategy_id) for strategy_id in result["strategy_id"]]
-                    )
-                    pending_by_source = automatic_filter_rejected_ids(
-                        result, request, selection_config,
-                    )
-                    pending_reasons = {
-                        strategy_id: rejection_reason_label(source)
-                        for source, strategy_ids in pending_by_source.items()
-                        for strategy_id in strategy_ids
-                    }
-                    for row in _selection_rows(result):
-                        strategy_id = int(row["strategy_id"])
-                        if row.get("prior_rejected") is True:
-                            user_review_rows.setdefault(strategy_id, {})["user_status"] = "REJECTED"
-                        if strategy_id in pending_reasons:
-                            user_review_rows.setdefault(strategy_id, {})["user_status"] = "REJECTED"
-                    attach_rejection_reasons(connection, user_review_rows, pending_reasons)
-                workbook = write_selection_workbook(
-                    result, Path(directory) / "finalists.xlsx", request, metadata, user_review_rows
-                )
-                data = workbook.read_bytes()
-                with self._performance_v2_writer_guard(target), duckdb.connect(str(target)) as connection:
-                    persist_selection_snapshot(connection, request, selection_config, result, metadata, data)
-        except SelectionReviewError as error:
-            status = 409 if error.code in {
-                "SELECTION_REVIEW_NOT_LATEST_RUN", "SELECTION_REVIEW_STALE_RESULTS", "SELECTION_REVIEW_ALREADY_IMPORTED",
-                "SELECTION_CACHE_INCOMPLETE",
-            } else 400
-            details = f": {error.details}" if error.details else ""
-            raise PerformanceV2ApiError(error.code, status=status, message=f"{error}{details}") from error
-        except duckdb.Error as error:
-            raise PerformanceV2ApiError("PERFORMANCE_V2_LOCKED", status=409, message="Performance v2 database is locked") from error
-        return f"performance-v2-finalists-{request.symbol}-{request.side}.xlsx", data
-
-    def strategies_performance_v2_selection_review_import(self, data: bytes) -> dict[str, object]:
-        target = performance_v2_database_path(self._performance_v2_config())
-        if not target.is_file():
-            raise PerformanceV2ApiError("PERFORMANCE_V2_NOT_FOUND", status=404)
-        self._ensure_performance_v2_schema(target)
-        try:
-            with self._performance_v2_writer_guard(target), duckdb.connect(str(target)) as connection:
-                return import_selection_review(connection, data)
-        except SelectionReviewError as error:
-            status = 409 if error.code in {
-                "SELECTION_REVIEW_NOT_LATEST_RUN", "SELECTION_REVIEW_STALE_RESULTS", "SELECTION_REVIEW_ALREADY_IMPORTED"
-            } else 400
-            details = f": {error.details}" if error.details else ""
-            raise PerformanceV2ApiError(error.code, status=status, message=f"{error}{details}") from error
-        except PerformanceV2StoreError as error:
-            raise PerformanceV2ApiError("PERFORMANCE_V2_SCHEMA_INVALID", status=500, message=str(error)) from error
-        except duckdb.Error as error:
-            raise PerformanceV2ApiError("PERFORMANCE_V2_LOCKED", status=409, message="Performance v2 database is locked") from error
-
-    def strategies_performance_v2_selection_aggregate_import(
-        self, data: bytes, *, aggregate_import_id: str, operation_key: str,
-    ) -> dict[str, object]:
-        target = performance_v2_database_path(self._performance_v2_config())
-        if not target.is_file():
-            raise PerformanceV2ApiError("PERFORMANCE_V2_NOT_FOUND", status=404)
-        self._ensure_performance_v2_schema(target)
-        try:
-            with self._performance_v2_writer_guard(target), duckdb.connect(str(target)) as connection:
-                return import_combined_selection_workbook(
-                    connection, target.parent, data,
-                    aggregate_import_id=aggregate_import_id, operation_key=operation_key,
-                )
-        except SelectionReviewError as error:
-            status = 409 if error.code in {
-                "SELECTION_REVIEW_STALE", "SELECTION_REVIEW_ALREADY_IMPORTED",
-                "STALE_RESULTS", "OPERATION_KEY_CONFLICT",
-            } else 400
-            details = f": {error.details}" if error.details else ""
-            raise PerformanceV2ApiError(error.code, status=status, message=f"{error}{details}") from error
-        except PerformanceV2StoreError as error:
-            raise PerformanceV2ApiError("PERFORMANCE_V2_SCHEMA_INVALID", status=500, message=str(error)) from error
-        except duckdb.Error as error:
-            raise PerformanceV2ApiError("PERFORMANCE_V2_LOCKED", status=409, message="Performance v2 database is locked") from error
-
-    def strategies_performance_v2_selection_user_fields_import(self, data: bytes) -> dict[str, object]:
-        target = performance_v2_database_path(self._performance_v2_config())
-        if not target.is_file():
-            raise PerformanceV2ApiError("PERFORMANCE_V2_NOT_FOUND", status=404)
-        self._ensure_performance_v2_schema(target)
-        try:
-            with self._performance_v2_writer_guard(target), duckdb.connect(str(target)) as connection:
-                return import_selection_user_fields(connection, data)
-        except SelectionReviewError as error:
-            status = 409 if error.code == "SELECTION_REVIEW_ALREADY_IMPORTED" else 400
-            details = f": {error.details}" if error.details else ""
-            raise PerformanceV2ApiError(error.code, status=status, message=f"{error}{details}") from error
-        except PerformanceV2StoreError as error:
-            raise PerformanceV2ApiError("PERFORMANCE_V2_SCHEMA_INVALID", status=500, message=str(error)) from error
-        except duckdb.Error as error:
-            raise PerformanceV2ApiError("PERFORMANCE_V2_LOCKED", status=409, message="Performance v2 database is locked") from error
-
     def strategies_performance_v2_retest_tags_import(self, data: bytes) -> dict[str, object]:
         target = performance_v2_database_path(self._performance_v2_config())
         if not target.is_file():
@@ -5042,80 +4622,6 @@ class PanelController:
             raise PerformanceV2ApiError("PERFORMANCE_V2_SCHEMA_INVALID", status=500, message=str(error)) from error
         except duckdb.Error as error:
             raise PerformanceV2ApiError("PERFORMANCE_V2_LOCKED", status=409, message="Performance v2 database is locked") from error
-
-    def strategies_performance_v2_selection_preview(self, payload: Mapping[str, object]) -> dict[str, object]:
-        _, result = self._performance_v2_selection_result(payload)
-        return {"stages": result.attrs["stage_counts"]}
-
-    def strategies_performance_v2_selection_cache_status(self, payload: Mapping[str, object]) -> dict[str, object]:
-        allowed = {"symbol", "side", "stages", "bulk_retest_job_id", "finalists_only"}
-        if not isinstance(payload, Mapping) or set(payload).difference(allowed):
-            raise PerformanceV2ApiError("INVALID_REQUEST", status=400, message="unsupported selection cache fields")
-        selection_payload = {
-            "symbol": payload.get("symbol"), "side": payload.get("side"),
-            "stages": payload.get("stages", []),
-        }
-        if "finalists_only" in payload:
-            selection_payload["finalists_only"] = payload["finalists_only"]
-        if "bulk_retest_job_id" in payload:
-            selection_payload["bulk_retest_job_id"] = payload.get("bulk_retest_job_id")
-        request = self._selection_request(selection_payload)
-        equity_consumer_enabled = self._selection_requires_equity(request)
-        config = load_selection_config(self.default_config.with_name("config.performance.json"))
-        target = performance_v2_database_path(self._performance_v2_config())
-        if not target.is_file():
-            raise PerformanceV2ApiError("PERFORMANCE_V2_NOT_FOUND", status=404, message="Performance v2 database is unavailable")
-        try:
-            with self._performance_v2_writer_lock, duckdb.connect(str(target), read_only=True) as connection:
-                require_performance_v2_readable(connection)
-                # Equity consumers receive readiness counts; both-off stays legacy-shaped.
-                return selection_cache_status(
-                    connection, request, config,
-                    include_equity=equity_consumer_enabled,
-                    include_readiness_breakdown=equity_consumer_enabled,
-                )
-        except EquitySchemaUpgradeRequiredError as error:
-            raise PerformanceV2ApiError(error.code, status=409, message=str(error)) from error
-        except EquityCacheSchemaInvalidError as error:
-            raise PerformanceV2ApiError(error.code, status=500, message=str(error)) from error
-        except PerformanceV2StoreError as error:
-            raise PerformanceV2ApiError("PERFORMANCE_V2_SCHEMA_INVALID", status=500, message=str(error)) from error
-        except duckdb.Error as error:
-            raise PerformanceV2ApiError("PERFORMANCE_V2_LOCKED", status=409, message="Performance v2 database is locked") from error
-
-    def strategies_performance_v2_recalculate(self, payload: Mapping[str, object]) -> dict[str, object]:
-        try:
-            if not isinstance(payload, Mapping) or set(payload).difference({"symbol", "side", "stages", "bulk_retest_job_id"}):
-                raise PerformanceV2SelectionError("RETEST_COHORT_CLIENT_OVERRIDE")
-            selection_payload = {"symbol": payload.get("symbol"), "side": payload.get("side"), "stages": payload.get("stages", [])}
-            if "bulk_retest_job_id" in payload:
-                selection_payload["bulk_retest_job_id"] = payload.get("bulk_retest_job_id")
-            request = self._selection_request(selection_payload)
-            config = load_selection_config(self.default_config.with_name("config.performance.json"))
-            performance_config = self._performance_v2_config()
-            target = performance_v2_database_path(performance_config)
-            self._ensure_performance_v2_schema(target)
-            with self._performance_v2_writer_lock:
-                with duckdb.connect(str(target), read_only=True) as connection:
-                    missing_strategy_ids = selection_cache_missing_strategy_ids(
-                        connection, request, config, include_equity_regime=True,
-                    )
-                with self._performance_v2_writer_guard(target):
-                    prepare_selection_window_cache(
-                        target, request, config, performance_config.workers, missing_strategy_ids,
-                        include_equity_regime=True,
-                    )
-            with self._selection_candidate_cache_lock:
-                self._selection_candidate_cache.clear()
-            return {"status": "READY"}
-        except EquitySourceChangedError as error:
-            raise PerformanceV2ApiError("EQUITY_SOURCE_CHANGED", status=409, message=str(error)) from error
-        except EquitySchemaUpgradeRequiredError as error:
-            raise PerformanceV2ApiError(error.code, status=409, message=str(error)) from error
-        except EquityCacheSchemaInvalidError as error:
-            raise PerformanceV2ApiError(error.code, status=500, message=str(error)) from error
-        except (PerformanceV2SelectionError, OSError, duckdb.Error) as error:
-            raise PerformanceV2ApiError("PERFORMANCE_V2_RECALCULATE_FAILED", status=400, message=str(error)) from error
 
     def strategies_performance_v2_recalculate_all(self) -> dict[str, object]:
         with self._lock:
@@ -5174,9 +4680,6 @@ class PanelController:
                         )
                     with self._lock:
                         self._performance_v2_recalculate_progress["completed_pairs"] += 1
-            if pending:
-                with self._selection_candidate_cache_lock:
-                    self._selection_candidate_cache.clear()
             with self._lock:
                 self._performance_v2_recalculate_progress.update({"status": "READY", "current_pair": None})
             return {
@@ -5301,144 +4804,16 @@ class _PanelServer(ThreadingHTTPServer):
         return {"restarting": True}
 
 
-    @staticmethod
-    def _selection_process_all_pairs(payload: Mapping[str, object]) -> bool:
-        value = payload.get("process_all_pairs", False)
-        if type(value) is not bool:
-            raise ValueError("process_all_pairs must be a boolean")
-        return value
 
-    def _selection_operation_key(self, payload: Mapping[str, object]) -> str:
-        value = payload.get("operation_key")
-        if not isinstance(value, str) or not value.strip():
-            raise ValueError("operation_key is required")
-        if "\0" in value or value != value.strip():
-            raise ValueError("operation_key is invalid")
-        return value.strip().lower()
 
-    def strategies_performance_v2_selection_aggregate_preview(
-        self, payload: Mapping[str, object],
-    ) -> dict[str, object]:
-        """Validate operation controls without evaluating or writing anything."""
-        if not isinstance(payload, Mapping):
-            raise ValueError("selection payload must be an object")
-        process_all_pairs = self._selection_process_all_pairs(payload)
-        request_payload = dict(payload)
-        request_payload.pop("process_all_pairs", None)
-        request_payload.pop("operation_key", None)
-        request_payload.pop("action", None)
-        request = parse_selection_request(request_payload)
-        return {
-            "process_all_pairs": process_all_pairs,
-            "pair": request.symbol,
-            "side": request.side,
-            "finalists_only": request.finalists_only,
-            "requires_confirmation": True,
-            "action": "EXPORT" if payload.get("action", "EXPORT") == "EXPORT" else "WRITE_REJECTED",
-        }
 
-    def _selection_aggregate_operation(
-        self, payload: Mapping[str, object], *, write_rejected: bool,
-    ) -> tuple[str, bytes | None, object]:
-        """Run one explicit all-pairs action through the Task3/4 coordinator.
 
-        The coordinator remains the only mutation writer.  Workbook bytes are
-        assembled from its frozen partition result and are never written to a
-        path by this controller.
-        """
-        if not isinstance(payload, Mapping):
-            raise ValueError("selection payload must be an object")
-        process_all_pairs = self._selection_process_all_pairs(payload)
-        operation_key = ""
-        if process_all_pairs or "operation_key" in payload:
-            operation_key = self._selection_operation_key(payload)
-        request_payload = dict(payload)
-        request_payload.pop("process_all_pairs", None)
-        request_payload.pop("operation_key", None)
-        request_payload.pop("action", None)
-        request = parse_selection_request(request_payload)
-        if not process_all_pairs:
-            # Keep the established single-pair behavior byte-for-byte and do
-            # not add operation-only fields to its canonical request/hash.
-            filename, data = self.strategies_performance_v2_selection(request_payload)
-            return filename, data, {"process_all_pairs": False, "operation_key": operation_key}
-        config = load_selection_config(self.default_config.with_name("config.performance.json"))
-        performance_config = self._performance_v2_config()
-        target = performance_v2_database_path(performance_config)
-        if not target.is_file():
-            raise PerformanceV2ApiError("PERFORMANCE_V2_NOT_FOUND", status=404)
-        with duckdb.connect(str(target)) as connection:
-            evaluated = coordinate_all_pairs(
-                connection, target.parent, request, config=config,
-                operation_key=operation_key, publish=False,
-            )
-            package = evaluated.package
-            if package is None:
-                raise PerformanceV2ApiError("PERFORMANCE_V2_PUBLICATION_INVALID", status=500)
-            partitions = tuple(
-                AllPairsPartition(item.pair, item.side, item.source_run_id, item.result)
-                for item in evaluated.partitions
-            )
-            strategy_ids = [
-                int(value)
-                for item in partitions
-                for value in item.result.get("strategy_id", pd.Series(dtype=int)).tolist()
-            ]
-            user_review_rows = latest_user_reviews_by_strategy(connection, strategy_ids)
-            attach_rejection_reasons(connection, user_review_rows)
-            data = build_combined_selection_workbook(
-                partitions,
-                database_instance_id=package.database_instance_id,
-                publication_id=package.publication_id,
-                decision_group_id=package.decision_group_id,
-                controls_sha256=package.controls_sha256,
-                render_model_sha256=package.render_model_sha256,
-                user_review_rows=user_review_rows,
-            )
-            validate_combined_selection_workbook(data)
-            publication = publish_publication(
-                connection, target.parent,
-                replace(
-                    package,
-                    export_workbook_sha256=(sha256(data).hexdigest() if not write_rejected else None),
-                ),
-            )
-            return (
-                "performance-v2-selection-all-pairs.xlsx" if data is not None else "",
-                None if write_rejected else data,
-                {
-                    "process_all_pairs": True,
-                    "operation_key": operation_key,
-                    "publication_id": publication.publication_id,
-                    "decision_group_id": package.decision_group_id,
-                    "partitions": len(partitions),
-                },
-            )
 
-    def strategies_performance_v2_selection_export_action(
-        self, payload: Mapping[str, object],
-    ) -> tuple[str, bytes]:
-        filename, data, _metadata = self._selection_aggregate_operation(payload, write_rejected=False)
-        if data is None:
-            raise ValueError("selection export did not produce workbook bytes")
-        return filename, data
 
-    def strategies_performance_v2_selection_write_rejected(
-        self, payload: Mapping[str, object],
-    ) -> dict[str, object]:
-        _filename, _data, metadata = self._selection_aggregate_operation(payload, write_rejected=True)
-        return {"status": "COMMITTED", **dict(metadata)}
-
-    def strategies_performance_v2_selection_aggregate_validate(
-        self, data: bytes,
-    ) -> dict[str, object]:
-        return validate_combined_selection_workbook(data)
 
 
 class _PanelHandler(BaseHTTPRequestHandler):
     server: _PanelServer
-    _PERFORMANCE_V2_EXPORT = "/api/v2/strategies/performance-v2/export"
-    _PERFORMANCE_V2_EXPORT_ALLOW = "GET, HEAD, OPTIONS"
 
     def log_message(self, format: str, *args: object) -> None:
         return
@@ -5468,53 +4843,10 @@ class _PanelHandler(BaseHTTPRequestHandler):
         self._headers(status, "application/json; charset=utf-8", len(payload), headers)
         self.wfile.write(payload)
 
-    def _export_json(self, status: int, value: object, *, body: bool = True) -> None:
+    def _empty_json(self, status: int, value: object) -> None:
+        """HEAD: the JSON headers without a body."""
         payload = json.dumps(value, ensure_ascii=False).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(payload)))
-        self.send_header("Allow", self._PERFORMANCE_V2_EXPORT_ALLOW)
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("X-Frame-Options", "DENY")
-        self.end_headers()
-        if body:
-            self.wfile.write(payload)
-
-    def _export_method_not_allowed(self) -> None:
-        self.send_response(405)
-        self.send_header("Allow", self._PERFORMANCE_V2_EXPORT_ALLOW)
-        self.send_header("Content-Length", "0")
-        self.end_headers()
-
-    def _handle_performance_v2_export(self, query: str, *, body: bool) -> None:
-        try:
-            selection = parse_performance_v2_export_query(query)
-            filename, data = self.server.controller.strategies_performance_v2_export(selection)
-        except PerformanceV2ApiError as error:
-            if error.code in {
-                "unknown_query_parameter", "duplicate_query_parameter", "missing_export_selection",
-                "invalid_query_flag", "all_active_mixed_with_status", "invalid_export_status", "duplicate_export_status",
-            }:
-                self._export_json(error.status, {"error": error.code, "message": str(error)}, body=body)
-            else:
-                self._export_json(error.status, {"error": {"code": error.code, "message": str(error)}}, body=body)
-            return
-        except Exception:
-            _LOGGER.exception("Performance v2 export failed")
-            self._export_json(503, {"error": {"code": "PERFORMANCE_DB_UNAVAILABLE", "message": "PerformanceDB is unavailable."}}, body=body)
-            return
-        self.send_response(200)
-        self.send_header("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        self.send_header("Content-Length", str(len(data)))
-        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
-        self.send_header("Allow", self._PERFORMANCE_V2_EXPORT_ALLOW)
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("X-Frame-Options", "DENY")
-        self.end_headers()
-        if body:
-            self.wfile.write(data)
+        self._headers(status, "application/json; charset=utf-8", len(payload))
 
     def _portfolio_error(self, error: PortfolioPanelError) -> None:
         self._json(error.status, {"error": {"code": error.code, "message": str(error), "field_errors": error.field_errors}})
@@ -5536,9 +4868,6 @@ class _PanelHandler(BaseHTTPRequestHandler):
             self._json(403, {"error": "local Host header required"})
             return
         parsed = urlparse(self.path)
-        if parsed.path == self._PERFORMANCE_V2_EXPORT:
-            self._handle_performance_v2_export(parsed.query, body=True)
-            return
         static_paths = {
             "/": "index.html",
             "/panel-web/app.css": "app.css",
@@ -5638,17 +4967,6 @@ class _PanelHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/v2/jobs":
             self._json(200, {"jobs": self.server.controller.panel_jobs()})
             return
-        if parsed.path == "/api/v2/strategies/performance-v2/catalog":
-            try:
-                self._json(200, self.server.controller.strategies_performance_v2_catalog())
-            except PerformanceV2ApiError as error:
-                self._json(error.status, {"error": {"code": error.code, "message": str(error)}})
-            except ValueError:
-                self._json(400, {"error": "invalid Performance v2 catalog request"})
-            except Exception:
-                _LOGGER.exception("Performance v2 catalog failed")
-                self._json(500, {"error": {"code": "INTERNAL", "message": "Performance v2 catalog failed"}})
-            return
         if parsed.path == "/api/v2/strategies/performance-v2/maintenance/catalog":
             try:
                 self._json(200, self.server.controller.strategies_performance_v2_maintenance_catalog())
@@ -5663,15 +4981,6 @@ class _PanelHandler(BaseHTTPRequestHandler):
                 self._json(200, self.server.controller.strategies_performance_v2_maintenance_status(query["job_id"][0]))
             except PerformanceV2ApiError as error:
                 self._json(error.status, {"error": {"code": error.code, "message": str(error)}})
-            return
-        if parsed.path == "/api/v2/strategies/performance-v2/selection-settings":
-            try:
-                self._json(200, self.server.controller.performance_v2_selection_settings())
-            except PerformanceV2ApiError as error:
-                self._json(error.status, {"error": {"code": error.code, "message": str(error)}})
-            except Exception:
-                _LOGGER.exception("Performance v2 selection settings failed")
-                self._json(500, {"error": {"code": "INTERNAL", "message": "Selection settings unavailable"}})
             return
         if parsed.path == "/api/v2/strategies/fresh/batch":
             try:
@@ -5812,32 +5121,19 @@ class _PanelHandler(BaseHTTPRequestHandler):
 
     def do_HEAD(self) -> None:
         if not self._has_local_host():
-            self._export_json(403, {"error": "local Host header required"}, body=False)
+            self._empty_json(403, {"error": "local Host header required"})
             return
-        parsed = urlparse(self.path)
-        if parsed.path == self._PERFORMANCE_V2_EXPORT:
-            self._handle_performance_v2_export(parsed.query, body=False)
-            return
-        self._export_json(404, {"error": "not found"}, body=False)
+        self._empty_json(404, {"error": "not found"})
 
     def do_OPTIONS(self) -> None:
         if not self._has_local_host():
-            self._export_json(403, {"error": "local Host header required"}, body=False)
+            self._json(403, {"error": "local Host header required"})
             return
-        if urlparse(self.path).path != self._PERFORMANCE_V2_EXPORT:
-            self._export_json(404, {"error": "not found"}, body=False)
-            return
-        self.send_response(204)
-        self.send_header("Allow", self._PERFORMANCE_V2_EXPORT_ALLOW)
-        self.send_header("Content-Length", "0")
-        self.end_headers()
+        self._json(404, {"error": "not found"})
 
     def do_PUT(self) -> None:
         if not self._has_local_host():
             self._json(403, {"error": "local Host header required"})
-            return
-        if urlparse(self.path).path == self._PERFORMANCE_V2_EXPORT:
-            self._export_method_not_allowed()
             return
         if urlparse(self.path).path != "/api/v2/portfolio/settings":
             self._json(404, {"error": "not found"})
@@ -6031,9 +5327,6 @@ class _PanelHandler(BaseHTTPRequestHandler):
             self._json(403, {"error": "local Host header required"})
             return
         endpoint = urlparse(self.path).path
-        if endpoint == self._PERFORMANCE_V2_EXPORT:
-            self._export_method_not_allowed()
-            return
         if endpoint in self._MAIN_POST:
             self._main_post(endpoint)
             return
@@ -6057,9 +5350,6 @@ class _PanelHandler(BaseHTTPRequestHandler):
         bulk_control_import_endpoint = urlparse(self.path).path == "/api/v2/strategies/performance-v2/finalist-retest/control-import"
         if bulk_control_import_endpoint:
             endpoint = "/api/v2/strategies/performance-v2/selection-review-import"
-        performance_v2_windows_endpoint = endpoint == "/api/v2/strategies/performance-v2/windows"
-        performance_v2_selection_endpoint = endpoint == "/api/v2/strategies/performance-v2/selection"
-        performance_v2_selection_aggregate_import_endpoint = endpoint == "/api/v2/strategies/performance-v2/selection/aggregate-import"
         performance_v2_maintenance_apply_endpoint = endpoint == "/api/v2/strategies/performance-v2/maintenance/apply"
         performance_v2_maintenance_endpoint = endpoint in {
             "/api/v2/strategies/performance-v2/maintenance/preview",
@@ -6071,10 +5361,10 @@ class _PanelHandler(BaseHTTPRequestHandler):
         portfolio_submission_route = bool(re.fullmatch(r"/api/v2/portfolio/campaigns/[^/]+/tester-submissions", endpoint))
         if equity_filter_endpoint:
             pass
-        elif bulk_retest_endpoint is None and endpoint != "/api/v2/strategies/performance-v2/selection-settings" and endpoint not in {"/api/v2/panel/restart", "/api/v2/settings/validate", "/api/v2/settings/save", "/api/v2/settings/performance-databases/activate", "/api/v2/settings/performance-databases/create", "/api/v2/jobs", "/api/v2/strategies/tester/verify-inbox", "/api/v2/strategies/tester/report-collection/clear", "/api/v2/strategies/performance-v2/windows", "/api/v2/strategies/performance-v2/selection", "/api/v2/strategies/performance-v2/selection-preview", "/api/v2/strategies/performance-v2/selection-cache-status", "/api/v2/strategies/performance-v2/recalculate", "/api/v2/strategies/performance-v2/recalculate-all", "/api/v2/strategies/performance-v2/selection-review-import", "/api/v2/strategies/performance-v2/selection-user-fields-import", "/api/v2/strategies/performance-v2/retest-tags-import", "/api/v2/strategies/performance-v2/selection/aggregate-import", "/api/v2/strategies/performance-v2/retest/start", "/api/v2/strategies/performance-v2/retest/import"} and not portfolio_route and not performance_v2_maintenance_endpoint:
+        elif bulk_retest_endpoint is None and not bulk_control_import_endpoint and endpoint not in {"/api/v2/panel/restart", "/api/v2/settings/validate", "/api/v2/settings/save", "/api/v2/settings/performance-databases/activate", "/api/v2/settings/performance-databases/create", "/api/v2/jobs", "/api/v2/strategies/tester/verify-inbox", "/api/v2/strategies/tester/report-collection/clear", "/api/v2/strategies/performance-v2/recalculate-all", "/api/v2/strategies/performance-v2/retest-tags-import", "/api/v2/strategies/performance-v2/retest/start", "/api/v2/strategies/performance-v2/retest/import"} and not portfolio_route and not performance_v2_maintenance_endpoint:
             self._json(404, {"error": "not found"})
             return
-        if endpoint in {"/api/v2/strategies/performance-v2/selection-review-import", "/api/v2/strategies/performance-v2/selection-user-fields-import", "/api/v2/strategies/performance-v2/retest-tags-import", "/api/v2/strategies/performance-v2/selection/aggregate-import"}:
+        if endpoint in {"/api/v2/strategies/performance-v2/selection-review-import", "/api/v2/strategies/performance-v2/retest-tags-import"}:
             error_code = "RETEST_TAG_IMPORT_INVALID_FILE" if endpoint.endswith("retest-tags-import") else "SELECTION_REVIEW_INVALID_FILE"
             if self.headers.get("Content-Type", "").partition(";")[0].strip().casefold() != "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet":
                 self._json(415, {"error": {"code": error_code, "message": "XLSX Content-Type required"}})
@@ -6094,19 +5384,8 @@ class _PanelHandler(BaseHTTPRequestHandler):
             try:
                 if bulk_control_import_endpoint:
                     result = self.server.controller.strategies_performance_v2_finalist_retest_control_import(self.rfile.read(length))
-                elif endpoint.endswith("selection-user-fields-import"):
-                    result = self.server.controller.strategies_performance_v2_selection_user_fields_import(self.rfile.read(length))
-                elif endpoint.endswith("retest-tags-import"):
-                    result = self.server.controller.strategies_performance_v2_retest_tags_import(self.rfile.read(length))
-                elif performance_v2_selection_aggregate_import_endpoint:
-                    query = parse_qs(urlparse(self.path).query)
-                    result = self.server.controller.strategies_performance_v2_selection_aggregate_import(
-                        self.rfile.read(length),
-                        aggregate_import_id=query.get("aggregate_import_id", [""])[0],
-                        operation_key=query.get("operation_key", [""])[0],
-                    )
                 else:
-                    result = self.server.controller.strategies_performance_v2_selection_review_import(self.rfile.read(length))
+                    result = self.server.controller.strategies_performance_v2_retest_tags_import(self.rfile.read(length))
             except PerformanceV2ApiError as error:
                 self._json(error.status, {"error": {"code": error.code, "message": str(error)}})
                 return
@@ -6121,26 +5400,20 @@ class _PanelHandler(BaseHTTPRequestHandler):
                 code = "PORTFOLIO_JOB_CANCEL_INVALID" if portfolio_cancel_route else "PORTFOLIO_CAMPAIGN_INVALID"
                 self._portfolio_error(PortfolioPanelError(code, "portfolio request is invalid", status=415))
                 return
-            self._json(400 if performance_v2_windows_endpoint else 415, {"error": {"code": "INVALID_REQUEST", "message": "Content-Type must be application/json"}} if performance_v2_windows_endpoint else (
-                {"error": "invalid settings"} if endpoint.startswith("/api/v2/") else {"error": "Content-Type must be application/json"}
-            ))
+            self._json(415, {"error": "invalid settings"} if endpoint.startswith("/api/v2/") else {"error": "Content-Type must be application/json"})
             return
         max_body_length = 65_536
         try:
             length = int(self.headers.get("Content-Length", "0"))
         except ValueError:
-            self._json(400, {"error": {"code": "INVALID_REQUEST", "message": "invalid Content-Length"}} if performance_v2_windows_endpoint else (
-                {"error": "invalid settings"} if endpoint.startswith("/api/v2/") else {"error": "invalid Content-Length"}
-            ))
+            self._json(400, {"error": "invalid settings"} if endpoint.startswith("/api/v2/") else {"error": "invalid Content-Length"})
             return
         if length <= 0 or length > max_body_length:
             if portfolio_route:
                 code = "PORTFOLIO_JOB_CANCEL_INVALID" if portfolio_cancel_route else "PORTFOLIO_CAMPAIGN_INVALID"
                 self._portfolio_error(PortfolioPanelError(code, "portfolio request is invalid", status=400))
                 return
-            self._json(400, {"error": {"code": "INVALID_REQUEST", "message": "invalid JSON body length"}} if performance_v2_windows_endpoint else (
-                {"error": "invalid settings"} if endpoint.startswith("/api/v2/") else {"error": "JSON body must be between 1 and 65536 bytes"}
-            ))
+            self._json(400, {"error": "invalid settings"} if endpoint.startswith("/api/v2/") else {"error": "JSON body must be between 1 and 65536 bytes"})
             return
         try:
             document = json.loads(self.rfile.read(length).decode("utf-8"))
@@ -6183,28 +5456,10 @@ class _PanelHandler(BaseHTTPRequestHandler):
                 result = self.server.controller.strategies_tester_verify_inbox(self.server.controller._required(document, "job_id"))
             elif endpoint == "/api/v2/strategies/tester/report-collection/clear":
                 result = self.server.controller.strategies_tester_report_collection_clear(document)
-            elif endpoint == "/api/v2/strategies/performance-v2/windows":
-                result = self.server.controller.strategies_performance_v2_windows(document)
             elif endpoint == "/api/v2/strategies/performance-v2/maintenance/preview":
                 result = self.server.controller.strategies_performance_v2_maintenance_preview(document)
             elif endpoint == "/api/v2/strategies/performance-v2/maintenance/apply":
                 result = self.server.controller.strategies_performance_v2_maintenance_apply(document)
-            elif endpoint == "/api/v2/strategies/performance-v2/selection":
-                result = self.server.controller.strategies_performance_v2_selection(document)
-            elif endpoint == "/api/v2/strategies/performance-v2/selection/preview":
-                result = self.server.controller.strategies_performance_v2_selection_aggregate_preview(document)
-            elif endpoint == "/api/v2/strategies/performance-v2/selection/export":
-                result = self.server.controller.strategies_performance_v2_selection_export_action(document)
-            elif endpoint == "/api/v2/strategies/performance-v2/selection/write-rejected":
-                result = self.server.controller.strategies_performance_v2_selection_write_rejected(document)
-            elif endpoint == "/api/v2/strategies/performance-v2/selection-settings":
-                result = self.server.controller.performance_v2_selection_settings(document)
-            elif endpoint == "/api/v2/strategies/performance-v2/selection-preview":
-                result = self.server.controller.strategies_performance_v2_selection_preview(document)
-            elif endpoint == "/api/v2/strategies/performance-v2/selection-cache-status":
-                result = self.server.controller.strategies_performance_v2_selection_cache_status(document)
-            elif endpoint == "/api/v2/strategies/performance-v2/recalculate":
-                result = self.server.controller.strategies_performance_v2_recalculate(document)
             elif endpoint == "/api/v2/strategies/performance-v2/recalculate-all":
                 result = self.server.controller.strategies_performance_v2_recalculate_all()
             elif endpoint == "/api/v2/strategies/performance-v2/retest/start":
@@ -6264,29 +5519,10 @@ class _PanelHandler(BaseHTTPRequestHandler):
             if portfolio_route:
                 code = "PORTFOLIO_JOB_CANCEL_INVALID" if portfolio_cancel_route else "PORTFOLIO_CAMPAIGN_INVALID"
                 self._portfolio_error(PortfolioPanelError(code, "portfolio request is invalid", status=422))
-            elif performance_v2_windows_endpoint:
-                self._json(400, {"error": {"code": "INVALID_REQUEST", "message": str(error)}})
             elif direct_retest_endpoint is not None:
                 self._json(400, {"error": str(error)})
             else:
                 self._json(400, {"error": str(error)} if endpoint == "/api/v2/strategies/tester/verify-inbox" else ({"error": "invalid settings"} if endpoint.startswith("/api/v2/") else {"error": str(error)}))
-            return
-        except Exception:
-            if performance_v2_windows_endpoint:
-                _LOGGER.exception("Performance v2 window calculation failed")
-                self._json(500, {"error": {"code": "INTERNAL", "message": "Performance v2 calculation failed"}})
-                return
-            raise
-        if performance_v2_selection_endpoint or endpoint == "/api/v2/strategies/performance-v2/selection/export":
-            filename, data = result
-            self.send_response(200)
-            self.send_header("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-            self.send_header("Content-Length", str(len(data)))
-            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("X-Content-Type-Options", "nosniff")
-            self.end_headers()
-            self.wfile.write(data)
             return
         accepted = portfolio_preparation_route or portfolio_cancel_route or portfolio_submission_route or performance_v2_maintenance_apply_endpoint or endpoint in {"/api/v2/jobs", "/api/v2/strategies/performance-v2/retest/start", "/api/v2/strategies/performance-v2/retest/import", "/api/v2/strategies/performance-v2/finalist-retest/start", "/api/v2/strategies/performance-v2/finalist-retest/import", "/api/v2/portfolio/campaigns"}
         self._json(202 if accepted else 200, result)
@@ -6295,30 +5531,14 @@ class _PanelHandler(BaseHTTPRequestHandler):
         if not self._has_local_host():
             self._json(403, {"error": "local Host header required"})
             return
-        if urlparse(self.path).path == self._PERFORMANCE_V2_EXPORT:
-            self._export_method_not_allowed()
-            return
         self._json(404, {"error": "not found"})
 
     def do_DELETE(self) -> None:
         if not self._has_local_host():
             self._json(403, {"error": "local Host header required"})
             return
-        if urlparse(self.path).path == self._PERFORMANCE_V2_EXPORT:
-            self._export_method_not_allowed()
-            return
         self._json(404, {"error": "not found"})
 
-# The aggregate action helpers are defined beside the HTTP handler helpers in
-# this module.  Bind them to the controller as well so routes and direct tests
-# use the same implementation without duplicating the operation contract.
-PanelController._selection_process_all_pairs = staticmethod(_PanelServer._selection_process_all_pairs)
-PanelController._selection_operation_key = _PanelServer._selection_operation_key
-PanelController.strategies_performance_v2_selection_aggregate_preview = _PanelServer.strategies_performance_v2_selection_aggregate_preview
-PanelController._selection_aggregate_operation = _PanelServer._selection_aggregate_operation
-PanelController.strategies_performance_v2_selection_export_action = _PanelServer.strategies_performance_v2_selection_export_action
-PanelController.strategies_performance_v2_selection_write_rejected = _PanelServer.strategies_performance_v2_selection_write_rejected
-PanelController.strategies_performance_v2_selection_aggregate_validate = _PanelServer.strategies_performance_v2_selection_aggregate_validate
 
 
 def create_panel_server(

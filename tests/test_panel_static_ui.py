@@ -70,257 +70,6 @@ assert.equal(collectionStatus.textContent, 'Collection: 2 packs');
     assert result.returncode == 0, result.stderr
 
 
-def test_researched_filters_have_fixed_order_and_editable_settings() -> None:
-    html, js, css = _read("index.html"), _read("app.js"), _read("app.css")
-    stages = re.findall(r'data-selection-stage="([^"]+)"', html)
-    assert stages[:10] == [
-        "filter_equity_regime", "filter_lot_variant_redundancy", "filter_hard_cutoffs",
-        "ab_deterioration", "filter_best_trade_dependency", "filter_min_shift",
-        "pair_side_pnl_upper_half", "structural_stage_1", "structural_stage_2", "pair_side_stage_3",
-    ]
-    assert 'id="performance-v2-selection-settings"' in html
-    assert '/api/v2/strategies/performance-v2/selection-settings' in js
-    assert "'pair_side_stage_3'" in js
-    legacy = html.split('id="performance-v2-selection-legacy-filters"', 1)[1].split('</details>', 1)[0]
-    assert "Legacy filters 11" in legacy
-    assert legacy.count('data-selection-stage=') == 17
-    assert '.selection-stage-legacy-details' in css
-    assert 'const stages = orderedSelectionStages();' in js
-    assert 'target.parentElement !== stage.parentElement' in js
-    assert 'target.parentElement.insertBefore(stage' in js
-    defaults = js.split("const defaultEnabledSelectionStages = new Set([", 1)[1].split("]);", 1)[0]
-    enabled = set(re.findall(r"'([^']+)'", defaults))
-    stage_bodies = re.findall(r'<li class="selection-stage[^>]*" data-selection-stage="([^"]+)">(.*?)</li>', html, re.S)
-    assert {stage_id for stage_id, _ in stage_bodies} == set(stages)
-    for stage_id, body in stage_bodies:
-        checkbox = re.search(r'<input type="checkbox"([^>]*)>', body)
-        assert checkbox, stage_id
-        assert ("checked" in checkbox.group(1)) == (stage_id in enabled), stage_id
-    for stage_id in stages[5:9]:
-        body = html.split(f'data-selection-stage="{stage_id}"', 1)[1].split("</li>", 1)[0]
-        assert re.search(r"<small>[^<]+</small>", body), stage_id
-        assert "data-selection-move" not in body, stage_id
-    min_shift = re.search(r'<li class="selection-stage[^>]*" data-selection-stage="filter_min_shift">.*?</li>', html, re.S)
-    assert min_shift and "data-selection-rank" not in min_shift.group(0)
-    rank_tag = re.search(r'<div class="selection-stage selection-stage-fixed" data-selection-rank>', html)
-    assert rank_tag
-    order_markup = html.split('<ol id="performance-v2-selection-order"', 1)[1].split("</ol>", 1)[0]
-    assert order_markup.count('<li class="selection-stage') == len(stages)
-    assert '<div class="selection-stage' not in order_markup
-    assert re.search(
-        r"\.selection-stage-fixed\[data-selection-rank\] \.selection-stage-threshold\s*\{[^}]*grid-column:\s*1",
-        css,
-    )
-    assert not re.search(r"\.selection-stage-fixed\s+\.selection-stage-threshold\s*\{[^}]*grid-column", css)
-    assert not re.search(r"\.selection-stage-fixed\s+\.selection-stage-threshold", css)
-    assert ".selection-stage-fixed[data-selection-rank] .selection-stage-threshold input[data-selection-top-n]" in css
-    assert ".selection-stage-fixed[data-selection-rank] .selection-stage-threshold select" in css
-    assert re.search(r"\.selection-stage-threshold\s*\{[^}]*grid-column:\s*5", css)
-    assert "  .selection-stage-threshold { grid-column: 2; }" in css
-    desktop_grid = re.search(r"\.selection-stage \{[^}]*grid-template-columns:\s*([^;]+);", css)
-    assert desktop_grid
-    desktop_tracks = re.findall(r"minmax\([^)]*\)|\S+", desktop_grid.group(1))
-    assert len(desktop_tracks) >= 8
-    assert "grid-template-columns: 28px 24px minmax(0, 1fr) 112px 78px 175px" in css
-    assert min_shift.group(0).index("selection-stage-kind") < min_shift.group(0).index("selection-stage-threshold") < min_shift.group(0).index("selection-stage-scope")
-    assert ".selection-stage-kind { grid-column: 4;" in css
-    assert ".selection-stage-scope { display: grid; grid-column: 6;" in css
-    assert ".selection-stage-summary { display: grid; grid-column: 7;" in css
-    assert ".selection-stage-controls { grid-column: 8;" in css
-
-
-def test_finalist_reserved_mode_is_above_stage_order_and_submitted_with_selection() -> None:
-    html, js, css = _read("index.html"), _read("app.js"), _read("app.css")
-    card = html.split('id="performance-v2-selection-card"', 1)[1].split("</details>", 1)[0]
-    checkbox = '<input id="performance-v2-selection-finalists-only" type="checkbox">'
-    assert card.index("id=\"performance-v2-selection-pipeline-title\"") < card.index(checkbox)
-    assert card.index(checkbox) < card.index('<ol id="performance-v2-selection-order"')
-    assert "Finalist &amp; Reserved" in card
-    assert '<input id="performance-v2-selection-finalists-only" type="checkbox" checked' not in card
-    assert ".selection-finalists-only input[type=\"checkbox\"]" in css
-    selection_payload = js.split("const selectionPayload = () =>", 1)[1].split(";", 1)[0]
-    assert "finalists_only: Boolean(selectionFinalistsOnly?.checked)" in selection_payload
-    assert "selectionFinalistsOnly?.addEventListener('change'" in js
-    assert js.count("body: JSON.stringify(payload)") >= 2
-    assert "body: JSON.stringify(selectionPayload())" in js
-
-    payload_definition = js[js.index("const selectionPayload = () =>"):].split(";", 1)[0] + ";"
-    listener_definition = js[js.index("selectionFinalistsOnly?.addEventListener('change'"):].split("\n  });", 1)[0] + "\n  });"
-    function_body = payload_definition + "\n" + listener_definition + "\nreturn selectionPayload;"
-    script = r"""
-const assert = require('node:assert/strict');
-let changed;
-let dirtyCount = 0;
-let refreshCount = 0;
-const checkbox = { checked: false, addEventListener: (event, callback) => { assert.equal(event, 'change'); changed = callback; } };
-const create = new Function('performanceV2SelectionPair', 'performanceV2SelectionSide', 'selectionStages', 'selectionFinalistsOnly', 'markSelectionPreviewDirty', 'refreshSelectionCacheStatus', __FUNCTION_BODY__);
-const getPayload = create({value:'BTCUSDT'}, {value:'LONG'}, () => [], checkbox, () => { dirtyCount += 1; }, () => { refreshCount += 1; });
-assert.equal(getPayload().finalists_only, false);
-checkbox.checked = true;
-changed();
-assert.equal(getPayload().finalists_only, true);
-checkbox.checked = false;
-changed();
-assert.equal(getPayload().finalists_only, false);
-assert.equal(dirtyCount, 2);
-assert.equal(refreshCount, 2);
-""".replace("__FUNCTION_BODY__", json.dumps(function_body))
-    completed = subprocess.run(("node", "-e", script), capture_output=True, text=True)
-    assert completed.returncode == 0, completed.stderr or completed.stdout
-
-
-def test_selection_catalog_defaults_to_a_valid_scope_and_refreshes_counts() -> None:
-    js = _read("app.js")
-    sync_body = js.split("const syncPerformanceV2SelectionScope = () => {", 1)[1].split("\n  };", 1)[0]
-    script = """
-class FakeSelect {
-  constructor() { this.value = ''; this.options = []; }
-  replaceChildren(...items) { this.options = items; this.value = items[0]?.value || ''; }
-  append(item) { this.options.push(item); }
-}
-const Option = function (label, value) { this.label = label; this.value = value; };
-const performanceV2Strategies = [
-  {symbol: 'ABC', side: 'LONG'}, {symbol: 'XYZ', side: 'SHORT'}
-];
-const performanceV2SelectionPair = new FakeSelect();
-const performanceV2SelectionSide = new FakeSelect();
-const syncPerformanceV2SelectionScope = () => {SYNC_BODY
-};
-syncPerformanceV2SelectionScope();
-if (performanceV2SelectionPair.value !== 'ABC' || performanceV2SelectionSide.value !== 'LONG') throw new Error('Initial scope missing');
-performanceV2SelectionPair.value = 'XYZ';
-syncPerformanceV2SelectionScope();
-if (performanceV2SelectionSide.value !== 'SHORT') throw new Error('Side not selected after pair change');
-performanceV2Strategies.splice(0);
-syncPerformanceV2SelectionScope();
-if (performanceV2SelectionPair.value || performanceV2SelectionSide.value) throw new Error('Empty catalog scope must be blank');
-performanceV2Strategies.push({symbol: 'ABC', side: ''});
-syncPerformanceV2SelectionScope();
-if (performanceV2SelectionPair.value !== 'ABC' || performanceV2SelectionSide.value) throw new Error('Missing side must stay blank');
-""".replace("SYNC_BODY", sync_body)
-    completed = subprocess.run(("node", "-e", script), capture_output=True, text=True)
-    assert completed.returncode == 0, completed.stderr
-
-    catalog = js.split("const loadPerformanceV2Catalog = async", 1)[1].split("performanceV2WindowRefresh?.addEventListener", 1)[0]
-    reopen = js.split("performanceV2SelectionCard?.addEventListener('toggle'", 1)[1].split("performanceV2WindowAEntire?.addEventListener", 1)[0]
-    all_pairs = js.split("recalculateAllButton?.addEventListener('click'", 1)[1].split("selectionXlsButton?.addEventListener", 1)[0]
-    assert "scheduleSelectionPreview()" in catalog
-    assert "scheduleSelectionPreview()" in reopen
-    assert "scheduleSelectionPreview()" in all_pairs
-
-    preview_body = js.split("const refreshSelectionPreview = async () => {", 1)[1].split("\n  };", 1)[0]
-    preview_script = """
-let side = 'LONG';
-let requests = 0;
-let rendered = null;
-let selectionPreviewRevision = 0;
-const selectionPreviewStatus = {textContent: ''};
-const selectionPayload = () => ({symbol: 'ABC', side, stages: []});
-const renderSelectionCounts = (counts) => { rendered = counts; };
-let fetch = async (url) => {
-  if (url !== '/api/v2/strategies/performance-v2/selection-preview') throw new Error('Preview must stay read-only');
-  requests++;
-  return {ok: true, json: async () => ({stages: {structural_stage_1: {eliminated: 7, remaining: 3}}})};
-};
-const refreshSelectionPreview = async () => {PREVIEW_BODY
-};
-(async () => {
-  await refreshSelectionPreview();
-  if (requests !== 1 || rendered.structural_stage_1.eliminated !== 7) throw new Error('Counts not rendered');
-  side = '';
-  await refreshSelectionPreview();
-  if (requests !== 1 || !selectionPreviewStatus.textContent.includes('Выберите пару и сторону')) throw new Error('Missing scope not explained');
-  side = 'LONG';
-  fetch = async () => ({ok: false, json: async () => ({error: {message: 'failed'}})});
-  await refreshSelectionPreview();
-  if (Object.keys(rendered).length || !selectionPreviewStatus.textContent.includes('Счётчики не обновлены')) throw new Error('Failed preview retained stale counts');
-  const pending = [];
-  fetch = () => new Promise((resolve) => pending.push(resolve));
-  const stale = refreshSelectionPreview();
-  side = 'SHORT';
-  const current = refreshSelectionPreview();
-  pending[1]({ok: true, json: async () => ({stages: {current: {eliminated: 2}}})});
-  await current;
-  pending[0]({ok: true, json: async () => ({stages: {stale: {eliminated: 99}}})});
-  await stale;
-  if (rendered.current?.eliminated !== 2 || rendered.stale) throw new Error('Stale preview overwrote current scope');
-})().catch((error) => { console.error(error); process.exitCode = 1; });
-""".replace("PREVIEW_BODY", preview_body)
-    completed = subprocess.run(("node", "-e", preview_script), capture_output=True, text=True)
-    assert completed.returncode == 0, completed.stderr
-
-    cache_body = js.split("const refreshSelectionCacheStatus = async () => {", 1)[1].split("\n  };", 1)[0]
-    cache_script = """
-let selectionCacheStatusRevision = 0;
-let selectionPreviewRevision = 1;
-const selectionPreviewStatus = {textContent: 'Счётчики обновлены.'};
-const selectionXlsButton = {disabled: true};
-const performanceV2SelectionPair = {value: 'ABC'};
-const performanceV2SelectionSide = {value: 'LONG'};
-const selectionPayload = () => ({symbol: 'ABC', side: 'LONG', stages: []});
-const pending = [];
-const fetch = () => new Promise((resolve) => pending.push(resolve));
-const refreshSelectionCacheStatus = async () => {CACHE_BODY
-};
-(async () => {
-  const ready = refreshSelectionCacheStatus();
-  pending[0]({ok: true, json: async () => ({ready: true, missing: 0, total: 10})});
-  await ready;
-  if (selectionPreviewStatus.textContent !== 'Счётчики обновлены.' || selectionXlsButton.disabled) throw new Error('Ready cache clobbered preview');
-  const old = refreshSelectionCacheStatus();
-  selectionPreviewRevision++;
-  pending[1]({ok: true, json: async () => ({ready: false, missing: 1, total: 10})});
-  await old;
-  if (selectionPreviewStatus.textContent !== 'Счётчики обновлены.') throw new Error('Stale incomplete cache clobbered preview');
-  const current = refreshSelectionCacheStatus();
-  pending[2]({ok: true, json: async () => ({ready: false, missing: 1, total: 10})});
-  await current;
-  if (!selectionPreviewStatus.textContent.includes('Требуется пересчёт')) throw new Error('Current incomplete cache hidden');
-})().catch((error) => { console.error(error); process.exitCode = 1; });
-""".replace("CACHE_BODY", cache_body)
-    completed = subprocess.run(("node", "-e", cache_script), capture_output=True, text=True)
-    assert completed.returncode == 0, completed.stderr
-
-
-def test_selection_browser_payload_keeps_legacy_scope_defaults_and_rank() -> None:
-    from mrs3.performance_v2_selection import parse_selection_request
-
-    html, js = _read("index.html"), _read("app.js")
-    rank = html.split("data-selection-rank>", 1)[1].split("</div>", 1)[0]
-    assert '<input type="checkbox" checked>' in rank
-    stages = "const selectionStages = () =>" + js.split("const selectionStages = () =>", 1)[1].split("const selectionPayload =", 1)[0]
-    scopes = {}
-    stage_bodies = re.findall(r'<li class="selection-stage[^>]*" data-selection-stage="([^"]+)">(.*?)</li>', html, re.S)
-    assert {stage_id for stage_id, _ in stage_bodies} == set(re.findall(r'data-selection-stage="([^"]+)"', html))
-    for stage_id, body in stage_bodies:
-        match = re.search(r'data-selection-scope="([^"]+)"', body)
-        if match:
-            scopes[stage_id] = match.group(1)
-    script = "const scopes = " + json.dumps(scopes) + ";\n" + """
-const orderedSelectionStages = () => ['filter_equity_regime','filter_lot_variant_redundancy',
-'filter_hard_cutoffs','ab_deterioration','filter_best_trade_dependency',
-'filter_min_shift','pair_side_pnl_upper_half','structural_stage_1','structural_stage_2','pair_side_stage_3'].map(id => ({
-  dataset: {selectionStage: id}, querySelector: selector => selector === 'input[type="checkbox"]' ? {checked: true}
-    : selector === '[data-selection-min-shift]' && id === 'filter_min_shift' ? {value: '0.3'}
-    : selector === '[data-selection-scope]' && scopes[id] ? {value: scopes[id]} : null
-}));
-const selectionRankStage = {querySelector: selector => selector === 'input[type="checkbox"]' ? {checked: true} : null};
-""" + stages + "\nconsole.log(JSON.stringify(selectionStages()));"
-    completed = subprocess.run(("node", "-e", script), capture_output=True, text=True)
-    assert completed.returncode == 0, completed.stderr
-    payload = json.loads(completed.stdout)
-    assert [stage["scope"] for stage in payload[:5]] == [
-        "pair_side", "pair_side_timeframe", "pair_side_timeframe", "pair_side", "pair_side_timeframe",
-    ]
-    assert [stage["scope"] for stage in payload[5:10]] == [
-        "pair_side", "pair_side", "pair_side_timeframe", "pair_side_timeframe", "pair_side",
-    ]
-    assert next(stage for stage in payload if stage["id"] == "filter_min_shift") == {
-        "id": "filter_min_shift", "enabled": True, "scope": "pair_side", "min_shift_pct": "0.3",
-    }
-    parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": payload})
-
-
 def test_static_shell_starts_with_all_accordions_collapsed_and_status_in_header() -> None:
     html = _read("index.html")
     js = _read("app.js")
@@ -423,49 +172,45 @@ def test_normal_test_and_import_card_is_unified_and_numbered() -> None:
     assert html.count("performance-inbox-verify") == 1
     assert html.count("performance-import-start") == 1
     assert html.count("3. Test and Import to Performance DB") == 1
-    assert "4. Pareto and filters" in js
-    assert "7. CHECK & RETEST" in js
+    assert "4. Bulk RETEST current FINALIST" in js
+    assert "5. CHECK & RETEST" in js
+    assert "Pareto and filters" not in js and "A/B Performance analysis" not in js     # removed in Panel stage 4c
     card = html.split("3. Test and Import to Performance DB", 1)[1].split("</details>", 1)[0]
     assert card.count('class="progress-block"') == 1
     assert card.count('role="status"') == 3                       # + the store READY status (stage 1b)
     assert 'id="tester-collection-status" class="card-status" role="status" aria-live="polite"' in card
     assert 'id="store-ready-status" class="card-status" role="status" aria-live="polite"' in card
     assert "const v2CardOrder" in js
-    assert "performanceV2WindowTitle) performanceV2WindowTitle.textContent = '5. A/B" in js
 
 
 def test_strategy_dd5_performance_cards_have_the_exact_final_order_and_titles() -> None:
+    # Panel rework stage 4c: the A/B, Pareto/filters and export cards are removed; the two retest cards stay on the
+    # strategies screen, and PerformanceDB maintenance moves to «Настройки»
     html = _read("index.html")
     js = _read("app.js")
 
     strategies = html.split('id="strategies-dd5"', 1)[1].split('id="settings"', 1)[0]
-    for card in ("performance-v2-selection-card", "performance-v2-window-card", "performance-v2-finalist-retest-card", "performance-v2-retest-card", "performance-v2-export-card", "performance-v2-maintenance-card"):
+    settings = html.split('<section id="settings"', 1)[1]
+    for card in ("performance-v2-finalist-retest-card", "performance-v2-retest-card"):
         assert strategies.count(f'id="{card}"') == 1
-    for title in (
-        "4. Pareto and filters",
-        "5. A/B Performance analysis",
-        "6. Bulk RETEST current FINALIST",
-        "7. CHECK & RETEST",
-        "8. EXPORT FROM PERFORMANCEDB",
-        "9. Обслуживание PerformanceDB",
-    ):
+    for card in ("performance-v2-selection-card", "performance-v2-window-card", "performance-v2-export-card",
+                 "performance-v2-selection-settings", "performance-v2-maintenance-card"):
+        assert f'id="{card}"' not in strategies
+    assert settings.count('id="performance-v2-maintenance-card"') == 1
+    assert '<b>Обслуживание PerformanceDB</b>' in settings
+    assert settings.index('id="performance-databases-card"') < settings.index('id="performance-v2-maintenance-card"')
+    for title in ("4. Bulk RETEST current FINALIST", "5. CHECK & RETEST"):
         assert js.count(f"textContent = '{title}'") == 1
-    assert "const v2CardOrder = ['performance-v2-selection-card', 'performance-v2-window-card', 'performance-v2-finalist-retest-card', 'performance-v2-retest-card', 'performance-v2-export-card', 'performance-v2-maintenance-card'];" in js
-    assert ".map((id) => document.getElementById(id))" in js
+    assert "const v2CardOrder = ['performance-v2-finalist-retest-card', 'performance-v2-retest-card'];" in js
     assert "v2Cards.length !== v2CardOrder.length" in js
-    assert "Performance v2 cards are not in the expected Strategies and DD5 layout." in js
-    assert strategies.count("panel-performance-v2") == 6
-    for card, title in (
-        ("performance-v2-selection-card", "4. Pareto and filters"),
-        ("performance-v2-window-card", "5. A/B Performance analysis"),
-        ("performance-v2-finalist-retest-card", "6. Bulk RETEST current FINALIST"),
-        ("performance-v2-retest-card", "7. CHECK &amp; RETEST"),
-        ("performance-v2-export-card", "8. EXPORT FROM PERFORMANCEDB"),
-        ("performance-v2-maintenance-card", "9. Обслуживание PerformanceDB"),
-    ):
-        assert f'<details id="{card}"' in strategies
-        assert f'<b>{title}</b>' in strategies
-    assert "#strategies-dd5 > .panel-performance-v2" not in js
+    for card, title in (("performance-v2-finalist-retest-card", "4. Bulk RETEST current FINALIST"),
+                        ("performance-v2-retest-card", "5. CHECK &amp; RETEST")):
+        assert f'<b>{title}</b>' in strategies.split(f'<details id="{card}"', 1)[1].split("</summary>", 1)[0]
+    for route in ("/api/v2/strategies/performance-v2/windows", "/api/v2/strategies/performance-v2/selection",
+                  "/api/v2/strategies/performance-v2/export", "/api/v2/strategies/performance-v2/catalog",
+                  "/api/v2/strategies/performance-v2/selection-settings",
+                  "/api/v2/strategies/performance-v2/selection-user-fields-import"):
+        assert f"'{route}'" not in js and f"'{route}/" not in js
 
 
 def test_performance_v2_maintenance_card_starts_with_catalog_and_requires_preview_confirmation() -> None:
@@ -531,77 +276,6 @@ def test_performance_v2_maintenance_card_starts_with_catalog_and_requires_previe
     assert "${job.error || 'операция завершилась с ошибкой'}" in failure_status
     assert "Показаны уже подтверждённые изменения." in failure_status
     assert "rollback" not in failure_status.casefold() and "restore" not in failure_status.casefold()
-
-
-def test_performance_v2_export_card_has_status_filters_and_accessible_status() -> None:
-    html = _read("index.html")
-    card = html.split('id="performance-v2-export-card"', 1)[1].split("</details>", 1)[0]
-
-    for control, label in (
-        ("performance-v2-export-finalist", "FINALIST"),
-        ("performance-v2-export-reserve", "RESERVE"),
-        ("performance-v2-export-retest", "RETEST"),
-        ("performance-v2-export-all-active", "ALL ACTIVE"),
-    ):
-        assert f'id="{control}"' in card
-        assert f">{label}</span>" in card
-    assert 'id="performance-v2-export-button"' in card
-    assert ">Скачать XLSX</button>" in card
-    assert 'id="performance-v2-export-status"' in card
-    assert 'role="status"' in card and 'aria-live="polite"' in card
-
-
-def test_performance_v2_export_query_uses_canonical_status_union_and_retest_modifier() -> None:
-    js = _read("app.js")
-    script = js.split("const ORDER_BUCKETS", 1)[0] + """
-const h = globalThis.performanceV2ExportHelpers;
-const checks = {
-  empty: h.query([]) === '',
-  finalist: h.query(['FINALIST']) === '?status=FINALIST',
-  reserve: h.query(['RESERVE']) === '?status=RESERVE',
-  union: h.query(['RESERVE', 'FINALIST']) === '?status=FINALIST&status=RESERVE',
-  retest: h.query(['RETEST']) === '?retest=1',
-  finalistRetest: h.query(['RETEST', 'FINALIST']) === '?status=FINALIST&retest=1',
-  reserveRetest: h.query(['RESERVE', 'RETEST']) === '?status=RESERVE&retest=1',
-  allActive: h.query(['ALL ACTIVE']) === '?all_active=true',
-  allActiveWins: h.query(['ALL ACTIVE', 'FINALIST', 'RETEST']) === '?all_active=true',
-};
-if (!h || Object.values(checks).some((value) => !value)) process.exit(1);
-"""
-    completed = subprocess.run(("node", "-e", script), capture_output=True, text=True)
-    assert completed.returncode == 0, completed.stderr or completed.stdout
-
-
-def test_performance_v2_export_handler_is_get_only_and_server_named_blob_download() -> None:
-    html = _read("index.html")
-    js = _read("app.js")
-    card = html.split('id="performance-v2-export-card"', 1)[1].split("</details>", 1)[0]
-    handler = js.split("performanceV2ExportButton?.addEventListener", 1)[1].split("const maintenanceEndpoint", 1)[0]
-
-    assert "/api/v2/strategies/performance-v2/export" in js
-    assert "method: 'GET'" in handler
-    assert "response.blob()" in handler
-    assert "response.headers.get('Content-Disposition')" in handler
-    assert "URL.revokeObjectURL(url)" in handler
-    assert "download: filename" in handler
-    assert "response.json()" in handler
-    assert "performanceV2ExportStatus.textContent" in handler
-    assert "POST" not in handler
-    assert "import" not in handler.lower()
-    assert "tester" not in handler.lower()
-    assert "strategy_id" not in card and "result_id" not in card
-    assert "strategy_ids" not in handler and "result_ids" not in handler
-    assert "input.name" not in handler and "file.name" not in handler
-
-
-def test_performance_v2_export_controls_enforce_all_active_mutual_exclusion() -> None:
-    js = _read("app.js")
-    handler = js.split("const performanceV2ExportButton", 1)[1].split("const maintenanceEndpoint", 1)[0]
-
-    assert "performanceV2ExportAllActive.checked = false" in handler
-    assert "performanceV2ExportAllActive.checked" in handler
-    assert "control.disabled = performanceV2ExportAllActive?.checked === true" in handler
-    assert "performanceV2ExportButton.disabled = !selected.length" in handler
 
 
 def test_performance_v2_retest_card_uses_server_mapping_and_committed_inbox_gate() -> None:
@@ -785,300 +459,6 @@ def test_retest_check_is_the_only_path_that_activates_a_recovered_job() -> None:
     assert "retestStart.disabled = false" in invalid_dates
     assert "retestTesterJobId = tester.job_id" not in recovery
     assert "retestImportJobId = importJob.job_id" not in recovery
-
-
-def test_performance_v2_selection_preview_exposes_ordered_finalist_stages_without_recalculation() -> None:
-    html = _read("index.html")
-    js = _read("app.js")
-    css = _read("app.css")
-
-    assert 'id="performance-v2-selection-preview"' not in html
-    assert 'id="performance-v2-selection-recalculate-all"' in html
-    assert "scheduleSelectionPreview" in js
-    assert "setTimeout" in js
-    assert "selectionPreviewButton" not in js
-    assert "/api/v2/strategies/performance-v2/recalculate-all" in js
-    assert "recalculate-all', {" in js
-    assert "body: '{}'" in js
-    assert 'id="performance-v2-recalculate-progress"' in html
-    assert "/api/v2/strategies/performance-v2/recalculate-all/progress" in js
-    assert "всего ${result.total_pairs} пар" in js
-    assert "обновлено ${result.planned_pairs}; без пересчёта ${result.ready_pairs}" in js
-    assert "if (!payload.symbol || !payload.side) {" in js
-    assert "Выберите пару и сторону для расчёта счётчиков." in js
-    strategies = html.split('id="strategies-dd5"', 1)[1].split('id="settings"', 1)[0]
-    assert 'id="performance-v2-selection-card"' in strategies
-    assert "4. Pareto and filters" in strategies
-    expected_stage_order = [
-        "filter_equity_regime",
-        "filter_lot_variant_redundancy",
-        "filter_hard_cutoffs",
-        "ab_deterioration",
-        "filter_best_trade_dependency",
-        "filter_min_shift",
-        "pair_side_pnl_upper_half",
-        "structural_stage_1",
-        "structural_stage_2",
-        "pair_side_stage_3",
-        "filter_holding_outlier",
-        "filter_low_trades",
-        "pareto_robust",
-        "pareto_shift_near_tie",
-        "pareto_window_b",
-        "pareto_window_b_dd_shift",
-        "pareto_dd5_balanced",
-        "pareto_plateau_points_per_order",
-        "pareto_plateau_points_total",
-        "pareto_efficiency_shift",
-        "pareto_dd5_holding",
-        "pareto_dd5_close_ma",
-        "pareto_dd5_first_shift",
-        "pareto_conditional_close_ma",
-        "pareto_primary",
-        "pareto_dd5_capital",
-        "pareto_close_ma_near_tie",
-    ]
-    assert re.findall(r'data-selection-stage="([^"]+)"', strategies) == expected_stage_order
-    assert 'data-selection-rank' in strategies
-    assert strategies.count('data-selection-rank') == 1
-    assert 'data-selection-pnl-tolerance' in strategies
-    assert "rank_robust_top_n" in js
-    assert "Final rank stage is unavailable." in js
-    for stage_id in expected_stage_order:
-        assert f'data-selection-stage="{stage_id}"' in strategies
-    checked_stage_ids = {
-        "filter_lot_variant_redundancy", "filter_hard_cutoffs", "ab_deterioration", "filter_best_trade_dependency",
-        "filter_min_shift",
-        "pair_side_pnl_upper_half", "structural_stage_1", "structural_stage_2", "pair_side_stage_3",
-    }
-    for stage_id in checked_stage_ids:
-        stage = re.search(rf'<li class="selection-stage(?: selection-stage-fixed)?" data-selection-stage="{stage_id}">(.*?)</li>', strategies, re.S)
-        assert stage and '<input type="checkbox" checked>' in stage.group(1)
-    for stage_id in set(expected_stage_order) - checked_stage_ids:
-        stage = re.search(rf'<li class="selection-stage(?: selection-stage-fixed)?" data-selection-stage="{stage_id}">(.*?)</li>', strategies, re.S)
-        assert stage and '<input type="checkbox" checked>' not in stage.group(1)
-    assert "defaultSelectionStageOrder" in js
-    assert "stage.querySelector('[data-selection-scope]').value =" not in js
-    default_order = re.search(r"const defaultSelectionStageOrder = \[(.*?)\];", js, re.S)
-    assert default_order
-    assert re.findall(r"'([^']+)'", default_order.group(1)) == [
-        "filter_equity_regime", "filter_lot_variant_redundancy", "filter_hard_cutoffs", "ab_deterioration", "filter_best_trade_dependency",
-        "filter_min_shift", "pair_side_pnl_upper_half", "structural_stage_1", "structural_stage_2", "pair_side_stage_3",
-        "filter_holding_outlier", "filter_low_trades", "pareto_dd5_balanced", "pareto_robust",
-        "pareto_shift_near_tie", "pareto_close_ma_near_tie",
-    ]
-    default_enabled = re.search(r"const defaultEnabledSelectionStages = new Set\(\[(.*?)\]\);", js, re.S)
-    assert default_enabled
-    assert "filter_low_trades" not in default_enabled.group(1)
-    assert "filter_min_shift" in default_enabled.group(1)
-    assert "filter_equity_regime" not in default_enabled.group(1)
-    assert "filter_hard_cutoffs" in default_enabled.group(1)
-    assert "pair_side_pnl_upper_half" in default_enabled.group(1)
-    assert "pareto_dd5_balanced" not in default_enabled.group(1)
-    assert "pareto_plateau_points_per_order" not in default_enabled.group(1)
-    assert "pareto_close_ma_near_tie" not in default_enabled.group(1)
-    assert 'data-selection-top-n type="number" min="1" step="1" value="20"' in strategies
-    assert "near_tie_rank" not in strategies
-    assert "data-selection-group" not in strategies
-    min_shift_stage = re.search(r'<li class="selection-stage selection-stage-fixed" data-selection-stage="filter_min_shift">(.*?)</li>', strategies, re.S)
-    assert min_shift_stage and 'data-selection-min-shift' in min_shift_stage.group(1)
-    assert 'value="0.3"' in min_shift_stage.group(1)
-    assert 'data-selection-move' not in min_shift_stage.group(1)
-    assert strategies.count('data-selection-stage="filter_min_shift"') == 1
-    lot_stage = re.search(r'<li class="selection-stage" data-selection-stage="filter_lot_variant_redundancy">(.*?)</li>', strategies, re.S)
-    assert lot_stage and 'data-selection-scope="pair_side_timeframe"' in lot_stage.group(1)
-    assert re.findall(r'data-selection-stage="(filter_equity_regime|filter_lot_variant_redundancy|filter_hard_cutoffs|ab_deterioration|filter_best_trade_dependency)"', strategies) == [
-        "filter_equity_regime", "filter_lot_variant_redundancy", "filter_hard_cutoffs", "ab_deterioration", "filter_best_trade_dependency",
-    ]
-    for stage_id in ("filter_equity_regime", "filter_lot_variant_redundancy", "filter_hard_cutoffs", "ab_deterioration", "filter_best_trade_dependency"):
-        stage = re.search(rf'<li class="selection-stage(?: selection-stage-fixed)?" data-selection-stage="{stage_id}">(.*?)</li>', strategies, re.S)
-        assert stage and 'data-selection-move' not in stage.group(1)
-        assert re.search(r'<small>[^<]+</small>', stage.group(1))
-    assert 'data-selection-stage="filter_time_consistency"' not in strategies
-    assert "filter_time_consistency" not in js
-    assert "PLANNED" not in strategies
-    assert "selection_config" in js
-    assert "full_dd5_multiplier" in js
-    assert "hard_dd_profit_multiplier" in js
-    assert "ab_completed_cycles" in js
-    assert "top5_share_pct" in js
-    assert "stage.dataset.selectionStage !== 'filter_equity_regime'" not in js
-    assert "fixedSelectionPrefix" in js
-    pair_side_stages = {"filter_holding_outlier", "filter_low_trades", "filter_min_shift", "ab_deterioration", "pareto_dd5_balanced"}
-    for stage_id in pair_side_stages:
-        stage = re.search(rf'<li class="selection-stage(?: selection-stage-fixed)?" data-selection-stage="{stage_id}">(.*?)</li>', strategies, re.S)
-        assert stage and 'data-selection-scope="pair_side"' in stage.group(1)
-    for stage_id in set(expected_stage_order) - pair_side_stages - {"filter_equity_regime", "filter_lot_variant_redundancy", "filter_hard_cutoffs", "filter_best_trade_dependency", "pair_side_pnl_upper_half", "structural_stage_1", "structural_stage_2", "pair_side_stage_3"}:
-        stage = re.search(rf'<li class="selection-stage" data-selection-stage="{stage_id}">(.*?)</li>', strategies, re.S)
-        assert stage and 'data-selection-scope="pair_side_timeframe"' in stage.group(1)
-    assert '<select id="performance-v2-selection-pair">' in strategies
-    assert 'id="performance-v2-selection-side"' in strategies
-    assert 'id="performance-v2-selection-preview"' not in strategies
-    assert 'id="performance-v2-selection-xls"' in strategies
-    assert "Смотреть результаты в xls" in strategies
-    assert "selectionPreviewDirty" in js
-    assert "data-selection-move" in js
-    assert "selectionPreviewStages" in js
-    assert "syncPerformanceV2SelectionScope" in js
-    assert "/api/v2/strategies/performance-v2/selection-preview" in js
-    assert "selection-stage-summary" in js
-    assert "selection-stage-summary-${className}" in js
-    assert "grid-template-columns: 28px 24px minmax(0, 1fr) 112px 78px 175px minmax(80px, 105px) 66px" in css
-    assert "gap: 16px" in css
-    assert re.search(r"\.selection-stage \.check \{[^}]*grid-column: 2 / 4", css)
-    for selector, column in (
-        ("selection-stage-threshold", 5),
-        ("selection-stage-scope", 6),
-        ("selection-stage-summary", 7),
-        ("selection-stage-controls", 8),
-    ):
-        assert re.search(rf"\.{selector} \{{[^}}]*grid-column: {column}", css)
-    assert ".selection-stage-scope > span:first-child { display: none; }" in css
-    assert re.search(r"\.selection-stage-kind \{[^}]*justify-self: start;[^}]*text-align: left", css)
-    assert re.search(r"\.selection-stage-kind \{[^}]*width: max-content", css)
-    assert ".selection-stage:has(> .selection-stage-threshold) .selection-stage-scope > :last-child { margin-top: 14px; }" in css
-    rank_stage = re.search(r'<div class="selection-stage selection-stage-fixed" data-selection-rank>(.*?)</div>\s*<p id="performance-v2-selection-method-help"', strategies, re.S)
-    assert rank_stage and 'class="selection-stage-threshold"' in rank_stage.group(1)
-    assert rank_stage and 'data-selection-top-n' in rank_stage.group(1)
-    assert re.search(r'<div class="selection-rank-main">\s*<label class="check">.*?</label>\s*<div class="selection-stage-threshold">', rank_stage.group(1), re.S)
-    assert ".selection-stage-fixed .selection-stage-scope > span:last-child {" in css
-    assert ".selection-stage-fixed .selection-rank-main { grid-column: 2 / 4;" in css
-    assert ".selection-stage-fixed .selection-stage-scope { grid-column: 6; }" in css
-    assert ".selection-stage-fixed[data-selection-rank] .selection-stage-threshold select { min-width: 0; width: 100%;" in css
-    assert ".selection-stage-summary { display: grid; grid-column: 7;" in css
-    assert "@media (max-width: 1279px)" in css
-    mobile = css.split("@media (max-width: 1279px)", 1)[1]
-    assert ".selection-stage-fixed .selection-rank-main { grid-column: 2; }" in mobile
-    assert ".selection-stage-fixed .selection-stage-scope { grid-column: 2; }" in mobile
-    assert "line('Осталось', count.remaining, 'remaining')" in js
-    assert ".selection-stage-summary-unassessed { color: var(--muted); }" in css
-    assert "selectionPreviewRevision" in js
-    assert "revision !== selectionPreviewRevision" in js
-    assert "performanceV2SelectionCard?.addEventListener('toggle'" in js
-    assert "selection_preview" not in js
-    click_handler = js.split("selectionXlsButton?.addEventListener", 1)[1].split("renderSelectionPreviewOrder();", 1)[0]
-    dirty_handler = js.split("const markSelectionPreviewDirty", 1)[1].split("const selectionStages", 1)[0]
-    assert "fetch('/api/v2/strategies/performance-v2/selection'" in click_handler
-    assert "SELECTION_CACHE_INCOMPLETE" in click_handler
-    assert "Prepare or recalculate the selection cache first." in click_handler
-    assert "selectionPreviewStatus" in click_handler
-    assert "/api/v2/strategies/performance-v2/selection-cache-status" in js
-    assert "selectionXlsButton) selectionXlsButton.disabled = !cache.ready" in js
-    assert "selectionCacheStatusRevision" in js
-    assert "revision !== selectionCacheStatusRevision" in js
-    assert "fetch(" not in dirty_handler
-
-
-def test_fixed_five_stage_prefix_has_equity_off_and_no_scope_or_move_controls() -> None:
-    html = _read("index.html")
-    js = _read("app.js")
-    strategies = html.split('id="strategies-dd5"', 1)[1].split('id="settings"', 1)[0]
-    stage = re.search(r'<li class="selection-stage" data-selection-stage="filter_equity_regime">(.*?)</li>', strategies, re.S)
-
-    assert stage
-    assert re.search(r'data-selection-stage="filter_equity_regime">\s*<span[^>]*>1</span>', stage.group(0))
-    assert '<input type="checkbox"' in stage.group(1)
-    assert not re.search(r'<input type="checkbox" checked', stage.group(1))
-    assert "data-selection-scope" not in stage.group(1)
-    assert "data-selection-move" not in stage.group(1)
-    assert "quiet periods and sparse trades pass" in stage.group(1)
-    assert "main H horizon" in stage.group(1)
-    assert 'id="performance-v2-equity-regime-help"' not in html
-    assert 'aria-describedby="performance-v2-equity-regime-help"' not in stage.group(1)
-    assert "'filter_equity_regime', 'filter_min_shift', 'pair_side_pnl_upper_half', 'pair_side_stage_3'" in js
-    assert re.search(
-        r"const fixedSelectionPrefix = new Set\(\[\s*'filter_equity_regime',\s*'filter_lot_variant_redundancy',\s*'filter_hard_cutoffs',\s*'ab_deterioration',\s*'filter_best_trade_dependency',\s*'filter_min_shift',.*?'pair_side_stage_3',?\s*\]\);",
-        js,
-        re.S,
-    )
-    assert "fixedSelectionPrefix.has(target.dataset.selectionStage)" in js
-    assert "selectionPreviewOrder.querySelectorAll('[data-selection-stage]')" in js
-    assert "const sameParent = (candidate) => candidate?.parentElement === stage.parentElement;" in js
-    assert "target.parentElement !== stage.parentElement" in js
-
-    fixed = re.search(r"const fixedSelectionPrefix = new Set\(\[(.*?)\]\);", js, re.S)
-    default = re.search(r"const defaultSelectionStageOrder = \[(.*?)\];", js, re.S)
-    assert fixed and default
-    panel_fixed_order = re.findall(r"'([^']+)'", fixed.group(1))
-    panel_default_order = re.findall(r"'([^']+)'", default.group(1))
-    from mrs3.performance_v2_selection import _FIXED_PREFIX
-    assert panel_fixed_order == list(_FIXED_PREFIX)
-    assert panel_default_order[:len(_FIXED_PREFIX)] == list(_FIXED_PREFIX)
-
-
-def test_every_selection_stage_keeps_a_nonempty_logic_description() -> None:
-    html = _read("index.html")
-    strategies = html.split('id="strategies-dd5"', 1)[1].split('id="settings"', 1)[0]
-    stages = re.findall(r'<li class="selection-stage" data-selection-stage="([^"]+)">(.*?)</li>', strategies, re.S)
-    assert stages
-    for stage_id, body in stages:
-        assert re.search(r"<small>\s*[^<]+\s*</small>", body), stage_id
-
-
-def test_equity_quality_rank_method_is_native_and_preserves_legacy_default_payload() -> None:
-    html = _read("index.html")
-    js = _read("app.js")
-    strategies = html.split('id="strategies-dd5"', 1)[1].split('id="settings"', 1)[0]
-    rank_stage = re.search(r'<div class="selection-stage selection-stage-fixed" data-selection-rank>(.*?)</div>\s*<p id="performance-v2-selection-method-help"', strategies, re.S)
-    assert rank_stage
-    assert 'class="selection-stage-scope"' in rank_stage.group(1)
-    assert "ПАРА + сторона" in rank_stage.group(1)
-
-    assert '<select id="performance-v2-selection-method" data-selection-method' in rank_stage.group(1)
-    assert '<option value="robust_v1" selected>' in rank_stage.group(1)
-    assert '<option value="equity_quality_v1">' in rank_stage.group(1)
-    assert '<label for="performance-v2-selection-method">Метод</label>' in strategies
-    assert "Метод изменения порядка" not in strategies
-    assert "При robust_v1 короткая коррекция не меняет порядок" in strategies
-    assert "equity_quality_v1 понижает WEAKENING" in strategies
-    selection_stages = js.split("const selectionStages = () =>", 1)[1].split("const selectionPayload =", 1)[0]
-    assert "stage.dataset.selectionStage !== 'filter_equity_regime'" not in selection_stages
-    assert "enabled: !!stage.querySelector('input[type=\"checkbox\"]')?.checked" in selection_stages
-    assert "method: selectionMethod" in selection_stages
-    assert "selectionMethod !== 'robust_v1'" in selection_stages
-    assert "body: JSON.stringify(selectionPayload())" in js
-    assert "selectionRankStage?.querySelector('[data-selection-method]')?.addEventListener('change'" in js
-    assert "[hidden] { display: none !important; }" in _read("app.css")
-
-
-def test_equity_preview_has_no_obsolete_lot_equity_warning_and_keeps_stale_response_guard() -> None:
-    html = _read("index.html")
-    js = _read("app.js")
-
-    assert 'id="performance-v2-selection-equity-warning"' not in html
-    equity_stage = re.search(r'<li class="selection-stage" data-selection-stage="filter_equity_regime">(.*?)</li>', html, re.S)
-    assert equity_stage and not re.search(r'<input type="checkbox" checked', equity_stage.group(1))
-    assert "[hidden] { display: none !important; }" in _read("app.css")
-    assert 'role="status" aria-live="polite"' in html
-    assert "updateSelectionEquityWarning" not in js
-    assert "count.not_evaluated" in js
-    assert "Не оценено" in js
-    assert "revision !== selectionPreviewRevision" in js
-    cache_status = js.split("const refreshSelectionCacheStatus = async", 1)[1].split("const renderSelectionCounts", 1)[0]
-    assert cache_status.index("try {") < cache_status.index("const payload = selectionPayload();")
-    assert "body: JSON.stringify(payload)" in cache_status
-    assert "if (selectionXlsButton) selectionXlsButton.disabled = true;" in cache_status.split("} catch (error) {", 1)[1]
-    assert "failure.error?.code || 'CACHE_STATUS_UNAVAILABLE'" in cache_status
-    assert "selectionPreviewStatus.textContent = `Статус кэша недоступен: ${error.message}`" in cache_status
-    assert "let selectionCacheStatusRevision" in js
-    preview_handler = js.split("const refreshSelectionPreview = async", 1)[1].split("const scheduleSelectionPreview", 1)[0]
-    assert preview_handler.index("try {") < preview_handler.index("const payload = selectionPayload();")
-    assert "selectionRankStage?.querySelector('[data-selection-top-n]')?.addEventListener('input', () => markSelectionPreviewDirty" in js
-    stage_toggle = js.split("selectionPreviewStages.forEach", 1)[1].split("document.querySelectorAll('[data-selection-scope]')", 1)[0]
-    assert "if (stage === selectionEquityStage) refreshSelectionCacheStatus();" in stage_toggle
-    method_change = js.split("selectionRankStage?.querySelector('[data-selection-method]')?.addEventListener('change'", 1)[1].split("});", 1)[0]
-    assert "if (selectionRankStage.querySelector('input[type=\"checkbox\"]')?.checked) refreshSelectionCacheStatus();" in method_change
-    top_n_change = js.split("selectionRankStage?.querySelector('[data-selection-top-n]')", 1)[1].split("selectionRankStage?.querySelector('[data-selection-method]')", 1)[0]
-    assert "refreshSelectionCacheStatus" not in top_n_change
-    render_counts = js.split("const renderSelectionCounts = (counts) =>", 1)[1].split("selectionPreviewOrder?.addEventListener", 1)[0]
-    assert "stage.dataset.selectionStage === 'filter_equity_regime'" in render_counts
-    assert "!stage.querySelector('input[type=\"checkbox\"]')?.checked" in render_counts
-
-
-def test_selection_responsive_breakpoint_does_not_change_portfolio_breakpoint() -> None:
-    css = _read("app.css")
-    assert "@media (max-width: 760px) {\n  .portfolio-result-metrics" in css
-    assert "@media (max-width: 1279px) {\n  .selection-preview-layout" in css
 
 
 def test_surface_timeframe_rows_override_generic_scope_list_label_style() -> None:
@@ -1363,7 +743,7 @@ def test_tester_date_guard_is_iso_validated_before_network_request() -> None:
     assert "const maxDate = testerMaxDate();" in tester
     assert "endDate > maxDate" in tester
     assert "start_date" in tester and "end_date" in tester
-    stop = js.split("if (testerStop) testerStop.addEventListener", 1)[1].split("const renderPerformance", 1)[0]
+    stop = js.split("if (testerStop) testerStop.addEventListener", 1)[1].split("const recoverJobs", 1)[0]
     assert "start_date" not in stop and "end_date" not in stop
 
 
@@ -1696,51 +1076,6 @@ def test_performance_import_renders_the_existing_progress_bar() -> None:
     assert "batch" in render and "retries" in render and "failed" in render
 
 
-def test_performance_v2_window_analysis_uses_native_utc_controls() -> None:
-    html = _read("index.html")
-    js = _read("app.js")
-
-    assert 'id="performance-v2-window-strategy"' in html
-    assert 'id="performance-v2-window-pair"' in js
-    assert 'id="performance-v2-window-strategy-id"' in js
-    assert 'id="performance-v2-window-finalists" type="checkbox" disabled' in js
-    assert "const v2CardOrder" in js
-    assert "4. Pareto and filters" in js
-    assert "5. A/B Performance analysis" in js
-    assert 'id="performance-v2-window-a-start" type="datetime-local" step="1"' in html
-    assert "/api/v2/strategies/performance-v2/windows" in js
-
-
-def test_performance_v2_window_analysis_includes_native_utc_controls() -> None:
-    html = _read("index.html")
-    js = _read("app.js")
-
-    assert 'id="performance-v2-window-strategy"' in html
-    assert 'id="performance-v2-window-pair"' in js
-    assert 'id="performance-v2-window-strategy-id"' in js
-    assert 'id="performance-v2-window-finalists" type="checkbox" disabled' in js
-    assert "const v2CardOrder" in js
-    assert "4. Pareto and filters" in js
-    assert "6. Pareto and filters" not in js
-    assert "5. A/B Performance analysis" in js
-    assert "strategy.symbol === performanceV2WindowPair.value" in js
-    assert "String(strategy.strategy_id).includes(query)" in js
-    assert "strategy.is_latest_finalist" in js
-    assert "performanceV2SelectionPairsWithRuns" in js
-    for field in ("performance-v2-window-a-start", "performance-v2-window-a-end", "performance-v2-window-b-start", "performance-v2-window-b-end"):
-        assert f'id="{field}" type="datetime-local" step="1"' in html
-    assert "UTC" in html.split('id="performance-v2-window-card"', 1)[1].split("</details>", 1)[0]
-    assert "/api/v2/strategies/performance-v2/catalog" in js
-    assert "/api/v2/strategies/performance-v2/windows" in js
-    assert "`${value}Z`" in js
-    assert "performanceV2WindowCard?.addEventListener('toggle'" in js
-    for control in ("performance-v2-window-a-entire", "performance-v2-window-b-2w", "performance-v2-window-b-1w"):
-        assert f'id="{control}"' in html
-    assert "performanceV2SetRecentWindow(14)" in js
-    assert "performanceV2SetRecentWindow(7)" in js
-    assert "Math.max(range[0].getTime(), range[1].getTime() - days * 86_400_000)" in js
-
-
 def test_performance_v2_retest_tag_import_uses_a_folder_picker_and_bounded_endpoint() -> None:
     html = _read("index.html")
     js = _read("app.js")
@@ -1755,40 +1090,10 @@ def test_performance_v2_retest_tag_import_uses_a_folder_picker_and_bounded_endpo
     assert ".filter((file) => file.name.toLowerCase().endsWith('.xlsx'))" in js
 
 
-def test_selection_user_fields_import_is_at_the_top_of_card_six_with_separate_controls() -> None:
-    html = _read("index.html")
-    js = _read("app.js")
-    import_handler = js.split("selectionUserFieldsFile?.addEventListener", 1)[1].split(
-        "selectionReviewImportButton?.addEventListener", 1,
-    )[0]
-    card = html.split('id="performance-v2-finalist-retest-card"', 1)[1].split("</details>", 1)[0]
-    controls = (
-        "performance-v2-selection-user-fields-file",
-        "performance-v2-selection-user-fields-import",
-        "performance-v2-selection-user-fields-results",
-        "performance-v2-selection-user-fields-status",
-    )
-
-    assert card.index('id="performance-v2-selection-user-fields-file"') < card.index(
-        'id="performance-v2-finalist-retest-reserve"'
-    )
-    assert 'accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" multiple webkitdirectory hidden' in card
-    assert "Импортировать статусы и ранги из XLSX" in card
-    assert all(html.count(f'id="{control}"') == 1 for control in controls)
-    assert "/api/v2/strategies/performance-v2/selection-user-fields-import" in js
-    assert "SELECTION_REVIEW_ALREADY_IMPORTED" in js
-    assert "loadPerformanceV2Catalog()" in js
-    assert "loadFinalistRetestPreview()" in js
-    assert "Файл ${index + 1} из ${files.length}" in js
-    assert "result.error?.message" in js
-    assert "result.selection_run_id" not in import_handler
-    assert "if (appliedRows)" in import_handler
-
-
 def test_retest_tag_batch_import_reports_one_clear_status_per_file() -> None:
     html = _read("index.html")
     js = _read("app.js")
-    handler = js.split("selectionReviewFile?.addEventListener", 1)[1].split("renderSelectionPreviewOrder();", 1)[0]
+    handler = js.split("selectionReviewFile?.addEventListener", 1)[1].split("const maintenanceEndpoint", 1)[0]
 
     assert 'id="performance-v2-selection-review-results"' in html
     assert "selectionReviewImportResults" in handler
@@ -1798,7 +1103,7 @@ def test_retest_tag_batch_import_reports_one_clear_status_per_file() -> None:
     assert "RETEST_TAG_IMPORT_INVALID_RETEST" in handler
     assert "SELECTION_REVIEW_INVALID_STATUS" not in handler
     assert "SELECTION_REVIEW_NOT_LATEST_RUN" not in handler
-    assert "const catalogError = await loadPerformanceV2Catalog() || '';" in handler
+    assert "loadPerformanceV2Catalog" not in js                     # the strategy catalog left with the A/B card
     assert "finally {" in handler
     assert "await loadRetestStatus();" in handler
     assert "selectionReviewImportButton.disabled = false;" in handler
@@ -1832,79 +1137,6 @@ def test_finalist_retest_poll_renders_tester_progress_and_error_reason() -> None
     assert "formatErrorReason(job.error)" in poll
     assert "job.error?.cleanup_error" in poll
     assert "Global finalist retest: ${job.phase || job.state || 'RUNNING'} · ${current}/${total}${nativeStatus}${publicationWarning}${error}${cleanupError}" in poll
-
-
-def test_performance_v2_window_analysis_renders_server_normalization_in_one_four_column_table() -> None:
-    js = _read("app.js")
-    render = js.split("const performanceV2MetricDefinitions", 1)[1].split("const loadPerformanceV2Catalog", 1)[0]
-
-    assert render.count("document.createElement('table')") == 1
-    assert "['Наименование', 'Значение в окне A', 'Значение в окне Б', 'Изменение']" in render
-    assert "performanceV2MetricDefinitions" in render
-    assert "performanceV2Change" in render
-    assert "performanceV2Numeric" not in render
-    assert "Math.log" not in render and "Math.exp" not in render
-    assert "classList.add(change.className)" in render
-    for metric in ("observed_days", "return_pct", "growth_factor", "trade_rate"):
-        assert f"['{metric}'," in js
-    for metric in ("return_pct", "daily_growth_pct", "return_dd_ratio", "profit_factor", "win_rate_pct", "trade_count"):
-        assert f"['{metric}'," in js
-    for metric in ("max_drawdown_pct", "fees_pct", "holding_seconds", "time_in_market_pct"):
-        assert f"['{metric}'," in js
-    for label in (
-        "Статус эквивалента 30 дней", "Календарная длительность нормализации (дни)",
-        "Доходность — эквивалент 30 дней", "Фактор роста — эквивалент 30 дней",
-        "Сделок / 30д", "Время удержания (мин)", "raw; не нормализуется по длительности",
-        "Запрошенное начало (UTC)", "Фактический конец (UTC)", "Причина недоступности",
-    ):
-        assert label in js
-    assert "maximumFractionDigits: 2" in render
-    assert "performanceV2StrategyDetails" in js
-    assert "const minutes = Number(value) / 60;" in js
-    assert "batch" not in render.lower()
-    assert "rank" not in render.lower()
-
-
-def test_performance_v2_window_analysis_highlights_effective_coverage_before_metrics() -> None:
-    js = _read("app.js")
-    render = js.split("const performanceV2MetricDefinitions", 1)[1].split("const loadPerformanceV2Catalog", 1)[0]
-
-    assert "performanceV2WindowCoverage" in render
-    assert "requested_start_utc" in render
-    assert "effective_start_utc" in render
-    assert "observed_days" in render
-    assert "performance-v2-coverage-warning" in render
-    assert "performanceV2UtcText(window?.requested_start_utc)" in render
-    assert "performanceV2UtcText(window?.effective_start_utc)" in render
-    assert "effectiveMs / requestedMs" not in render
-    assert "performanceV2WindowCoverage(windowA, windowB), performanceV2WindowTable(windowA, windowB)" in render
-
-
-def test_performance_v2_window_analysis_has_selected_strategy_parameters() -> None:
-    html = _read("index.html")
-    js = _read("app.js")
-    render = js.split("const performanceV2MetricDefinitions", 1)[1].split("const loadPerformanceV2Catalog", 1)[0]
-
-    card = html.split('id="performance-v2-window-card"', 1)[1].split("</details>", 1)[0]
-    assert 'id="performance-v2-window-strategy-details"' in card
-    assert "strategy.close_ma_len ?? '—'" in js
-    assert "window?.normalization_30d" in js
-    assert "status === 'ok'" in js
-    assert "status === 'too_short'" in js
-
-
-def test_performance_v2_window_analysis_keeps_missing_values_as_dash() -> None:
-    js = _read("app.js")
-
-    assert "if (kind === 'raw_minutes')" in js
-    assert "if (value === null || value === undefined || value === '') return '—';" in js
-    assert "String(kind ?? '').startsWith('raw')" in js
-    assert "order.order_id ?? '—'" in js
-    assert "order.open_ma_len ?? '—'" in js
-    assert "order.shift_bp ?? '—'" in js
-    assert "performanceV2StrategyDetails(null);" in js
-    assert "status === 'invalid_duration'" in js
-    assert "Эквивалент 30 дней — математический эквивалент исходного окна при постоянной ставке; это не прогноз, не tick-test и не PnL MRS3." in js
 
 
 def test_settings_does_not_render_or_submit_remote_runner_path() -> None:

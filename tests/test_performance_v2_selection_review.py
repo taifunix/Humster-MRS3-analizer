@@ -394,47 +394,6 @@ def test_outside_top_n_requires_same_run_enabled_stage_and_exact_rank_trace() ->
     })
 
 
-def test_panel_xlsx_does_not_override_equity_reserve_user_status(tmp_path: Path, monkeypatch) -> None:
-    root = tmp_path / "panel"
-    database_root = root / "data"
-    database_root.mkdir(parents=True)
-    connection = _database(database_root, filename="strategy_performance.duckdb")
-    connection.close()
-    local_config = root / "config.local.json"
-    local_config.write_text(json.dumps({"panel_paths": {"performance_db_root": "legacy"}}), encoding="utf-8")
-    (root / "config.performance.json").write_text(
-        json.dumps({"unified_performance_v2": {"database_root": "data", "workers": 1}}), encoding="utf-8"
-    )
-    controller = PanelController(root, local_config)
-    monkeypatch.setattr(
-        "mrs3.panel.latest_user_reviews_by_strategy",
-        lambda *_args, **_kwargs: {1: {"user_status": "FINALIST"}},
-    )
-    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
-        {"id": "filter_lot_variant_redundancy", "enabled": True, "scope": "pair_side_timeframe"},
-        {"id": "filter_hard_cutoffs", "enabled": True, "scope": "pair_side"},
-        {"id": "ab_deterioration", "enabled": True, "scope": "pair_side"},
-    ]})
-    result = _result()
-    result["eliminated_by_filter_equity_regime"] = [True, False]
-    result.loc[0, "auto_status"] = "RESERVE"
-    result.loc[0, "finalist"] = False
-    result.loc[0, "elimination_reason"] = "EQUITY_REGIME_STALLED_RESERVE"
-    monkeypatch.setattr(controller, "_performance_v2_selection_result", lambda _payload: (request, result))
-
-    _, data = controller.strategies_performance_v2_selection({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
-    sheet = load_workbook(BytesIO(data), data_only=True)["All candidates"]
-    headers = {cell.value: cell.column for cell in sheet[1]}
-    exported = next(
-        (sheet.cell(row, headers["User Status"]).value, sheet.cell(row, headers["Auto Status"]).value)
-        for row in range(2, sheet.max_row + 1)
-        if sheet.cell(row, headers["ID"]).value == 1
-    )
-
-    assert exported == ("FINALIST", "RESERVE")
-    assert result.loc[0, "auto_status"] == "RESERVE"
-
-
 def test_hard_cutoff_engine_result_publishes_tag_and_reason(tmp_path: Path) -> None:
     connection = _database(tmp_path)
     request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
@@ -527,74 +486,6 @@ def test_selection_publication_rechecks_loaded_source_revision(tmp_path: Path) -
         )
     for table in ("selection_runs", "selection_results", "strategy_tags"):
         assert connection.execute(f"select count(*) from {table}").fetchone() == (0,)
-
-
-def test_catalog_exposes_selection_thresholds_without_database(tmp_path: Path) -> None:
-    local_config = tmp_path / "config.local.json"
-    local_config.write_text(json.dumps({"panel_paths": {"performance_db_root": "legacy"}}), encoding="utf-8")
-    (tmp_path / "config.performance.json").write_text(json.dumps({
-        "unified_performance_v2": {
-            "database_root": "missing",
-            "finalist_selection": {"hard_dd_pct": 27, "hard_dd_profit_multiplier": 4},
-        },
-    }), encoding="utf-8")
-
-    catalog = PanelController(tmp_path, local_config).strategies_performance_v2_catalog()
-
-    assert catalog["strategies"] == []
-    assert catalog["selection_config"]["hard_dd_pct"] == "27"
-    assert catalog["selection_config"]["hard_dd_profit_multiplier"] == "4"
-
-
-@pytest.mark.parametrize(("stage_id", "scope", "column", "reason", "tag_source"), [
-    ("filter_lot_variant_redundancy", "pair_side_timeframe", "eliminated_by_filter_lot_variant_redundancy", "LOT_VARIANT_FULL_DD5", "SELECTION_LOT_VARIANT"),
-    ("filter_hard_cutoffs", "pair_side", "eliminated_by_filter_hard_cutoffs", 'FILTER_HARD_CUTOFFS:{"triggered":["PNL30_FLOOR"]}', "SELECTION_HARD_CUTOFF"),
-    ("ab_deterioration", "pair_side", "eliminated_by_ab_deterioration", "AB_DETERIORATION;B_PNL30_FLOOR", "SELECTION_AB_DETERIORATION"),
-])
-def test_panel_xlsx_shows_pending_automatic_filter_rejection(
-    tmp_path: Path, monkeypatch, stage_id: str, scope: str, column: str, reason: str, tag_source: str,
-) -> None:
-    root = tmp_path / "panel"
-    database_root = root / "data"
-    database_root.mkdir(parents=True)
-    connection = _database(database_root, filename="strategy_performance.duckdb")
-    connection.close()
-    local_config = root / "config.local.json"
-    local_config.write_text(json.dumps({"panel_paths": {"performance_db_root": "legacy"}}), encoding="utf-8")
-    (root / "config.performance.json").write_text(
-        json.dumps({"unified_performance_v2": {"database_root": "data", "workers": 1}}), encoding="utf-8"
-    )
-    controller = PanelController(root, local_config)
-    monkeypatch.setattr(
-        "mrs3.panel.latest_user_reviews_by_strategy",
-        lambda *_args, **_kwargs: {1: {"user_status": "FINALIST"}},
-    )
-    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": [
-        {"id": stage_id, "enabled": True, "scope": scope},
-    ]})
-    result = _result()
-    result[column] = [True, False]
-    result.loc[0, "auto_status"] = "FILTERED"
-    result.loc[0, "finalist"] = False
-    result.loc[0, "elimination_reason"] = reason
-    monkeypatch.setattr(controller, "_performance_v2_selection_result", lambda _payload: (request, result))
-
-    _, data = controller.strategies_performance_v2_selection({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
-    sheet = load_workbook(BytesIO(data))["All candidates"]
-    headers = {cell.value: cell.column for cell in sheet[1]}
-    values = {
-        sheet.cell(row, headers["ID"]).value: (
-            sheet.cell(row, headers["User Status"]).value,
-            sheet.cell(row, headers["Auto Status"]).value,
-        )
-        for row in range(2, sheet.max_row + 1)
-    }
-    assert values[1] == ("REJECTED", "FILTERED")
-    assert result.loc[0, "auto_status"] == "FILTERED"
-    with duckdb.connect(str(database_root / "strategy_performance.duckdb"), read_only=True) as check:
-        assert check.execute(
-            "select source from strategy_tags where strategy_id = 1 and tag = 'REJECTED'"
-        ).fetchone() == (tag_source,)
 
 
 def _export(connection: duckdb.DuckDBPyConnection, tmp_path: Path) -> tuple[Path, dict[str, str]]:
@@ -1630,54 +1521,6 @@ def test_export_includes_current_retest_tag_and_editable_validation(tmp_path: Pa
     retest_validation = next(validation for validation in sheet.data_validations.dataValidation if validation.formula1 == '"RETEST"')
     assert retest_validation.allow_blank
     assert str(retest_validation.sqref).endswith(f"{sheet.cell(sheet.max_row, headers.index('RETEST') + 1).column_letter}{sheet.max_row}")
-
-
-def test_production_selection_export_preserves_existing_tags_on_round_trip(tmp_path: Path, monkeypatch) -> None:
-    root = tmp_path / "panel"
-    database_root = root / "data"
-    database_root.mkdir(parents=True)
-    connection = _database(database_root, filename="strategy_performance.duckdb")
-    connection.execute(
-        "insert into strategy_tags values (1, 'REJECTED', 'SELECTION_REVIEW', 'old-review', now()), (1, 'RETEST', 'PERIOD_INTEGRITY_AUDIT', 'audit.xlsx', now())"
-    )
-    connection.close()
-    local_config = root / "config.local.json"
-    local_config.write_text(json.dumps({"panel_paths": {"performance_db_root": "legacy"}}), encoding="utf-8")
-    (root / "config.performance.json").write_text(
-        json.dumps({"unified_performance_v2": {"database_root": "data", "workers": 1}}), encoding="utf-8"
-    )
-    controller = PanelController(root, local_config)
-    import mrs3.panel as panel_module
-    monkeypatch.setattr(panel_module, "selection_cache_status", lambda *_args, **_kwargs: {"ready": True})
-    monkeypatch.setattr(panel_module, "load_selection_candidates", lambda *_args, **_kwargs: _result())
-
-    _, data = controller.strategies_performance_v2_selection({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
-    workbook = load_workbook(BytesIO(data))
-    sheet = workbook["All candidates"]
-    headers = {cell.value: cell.column for cell in sheet[1]}
-    exported = {sheet.cell(row, headers["ID"]).value: sheet.cell(row, headers["RETEST"]).value for row in range(2, sheet.max_row + 1)}
-    assert exported == {1: "RETEST", 2: None}
-    statuses = {sheet.cell(row, headers["ID"]).value: sheet.cell(row, headers["User Status"]).value
-                for row in range(2, sheet.max_row + 1)}
-    assert statuses == {1: "REJECTED", 2: None}
-    assert all(
-        sheet.cell(row, headers[name]).value is None
-        for row in range(2, sheet.max_row + 1)
-        for name in ("User Rank", "Analog Of ID", "Comment")
-    )
-    for row in range(2, sheet.max_row + 1):
-        sheet.cell(row, headers["User Status"]).value = "REJECTED" if sheet.cell(row, headers["ID"]).value == 1 else "FILTERED"
-    edited = BytesIO()
-    workbook.save(edited)
-
-    with duckdb.connect(str(database_root / "strategy_performance.duckdb")) as connection:
-        response = import_selection_review(connection, edited.getvalue())
-        assert connection.execute(
-            "select strategy_id, tag, source, source_ref from strategy_tags order by strategy_id, tag"
-        ).fetchall() == [
-            (1, "REJECTED", "SELECTION_REVIEW", response["review_import_id"]),
-            (1, "RETEST", "SELECTION_REVIEW", response["review_import_id"]),
-        ]
 
 
 def test_reviewed_decisions_survive_new_ordinary_run_and_result_replacement(tmp_path: Path) -> None:
