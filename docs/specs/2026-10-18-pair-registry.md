@@ -3,8 +3,8 @@
 **Status:** Approved by the user 2026-10-18 (revision 3 after the user's
 review: sync scope, weekday liquidity with a configurable window, optimizer
 reads computed liquidity only, button instead of a scheduler, automatic new
-listings, per-pair filter settings). Stage 1 implemented (see «Stage 1
-evidence»); stages 2–5 pending.
+listings, per-pair filter settings). Stages 1–2 implemented (see the evidence
+sections); stages 3–5 pending.
 **Replaces (when done):** the hand-maintained `bybit_tradfi_liquidity.xlsx`
 (sheets «Пары», «По дням», «Оборот 30д», «Скрининг», «Скрининг BingX») and the
 `Actual` sheet of the base-lot export as sources of truth.
@@ -541,65 +541,122 @@ clear error:
 Decision: [ADR-0079](../decisions/0079-lot-model-v2-weekday-liquidity.md).
 
 **Module.** `mrs3.pair_registry.liquidity`.
-- `day_facts(rows)`: the facts of one day from the tester's minute day file,
-  read with the `minute_capacity` reader:
-  - turnover;
-  - positive minutes;
-  - active 15-minute bins;
-  - the minute turnovers, for `V25`.
-- `window_row(days, k, step, window_weekdays)`: the `LOT_MODEL_V2` window
-  ending on the last day:
-  - the last N weekdays (Monday–Friday UTC);
-  - `V25` = type-7 Q25 of positive minute turnover over those days;
-  - `A15` = active bins / (N × 96);
+- `day_facts(path, day)`: the facts of one tester minute day file, read with the
+  `minute_capacity` reader: turnover, positive minutes, active 15-minute bins,
+  the minute turnovers (for `V25`) and the file hash.
+- `select_window(files, end_day, n)`: the last `n` weekdays (Monday–Friday UTC)
+  ending on `end_day`. It returns the weekdays with a file and those without
+  one. Weekend days never enter.
+- `window_row(days, k, step)`: the `LOT_MODEL_V2` window of the given days:
+  - `V25` = type-7 Q25 of the positive minute turnover;
+  - `A15` = active bins / (days × 96);
   - `L = V25 × A15`;
-  - base lot = `floor_to_step(K × L, step)`.
+  - base lot = `floor_to_step(K × L, step)`, using V1's `_floor_step`;
+  - the window's input files (day, sha256) and their digest `inputs_sha256`.
 
-  All of it is Decimal and identical to the V1 formulas on the same days.
-- `refresh_liquidity(con, exchange, symbols, data_root, today, settings)`:
-  - For every TRADING pair, builds the day rows of the last
-    `window_weekdays + 10` calendar days that have a file. Weekend days are
-    stored with `weekend = true`.
-  - Writes the window row ending on the latest weekday that has a file, when
-    all N weekdays of that window have files. Otherwise it records
-    `LIQUIDITY_MODEL_WINDOW_UNAVAILABLE` with the missing days.
-  - Re-running on the same files is idempotent: rows are keyed by (exchange,
-    symbol, day), and a file hash is stored per day row.
+  The formulas are identical to V1 on the same days.
+- `refresh_liquidity(con, exchange, today, settings)`, Bybit only until panel
+  stage 5:
+  - The window ends on the **last weekday before `today`**, never on «the
+    last day that has a file». Stale or missing minute data therefore can
+    never produce READY (fail closed, ADR-0079).
+  - For every TRADING pair it reads the files from the window's first day to
+    the day before `today`.
+  - It rewrites the day rows of that span: a day whose file vanished or
+    became unreadable loses its row and is counted in `unreadable_days`.
+  - It writes the window row keyed (exchange, symbol, as-of day = window end).
+  - A window weekday without a readable file gives
+    `LIQUIDITY_MODEL_WINDOW_UNAVAILABLE`, with the missing days and a reason:
+    `missing weekday files` or `no positive minutes`.
+  - Every run writes a journal row (step `liquidity`, OK or FAILED, counts).
+  - One transaction per pair. Re-running on the same files is idempotent.
 
 **Tables.**
 - **`liquidity_days`** (exchange, symbol, day): weekend flag, turnover,
   positive minutes, active bins, file hash.
 - **`liquidity`** (exchange, symbol, as-of day):
-  - model version;
-  - window days (JSON list) and window length;
+  - model version and status;
+  - window length, window days, missing days and reason;
   - positive minutes, active bins, total bins;
   - `V25`, `A15`, `L`, `K`, step and base lot, as decimal text;
-  - status `READY` / `LIQUIDITY_MODEL_WINDOW_UNAVAILABLE` and the missing days.
+  - window input files and `inputs_sha256`.
+
+  Columns added after a draft table was created are added in place by
+  `connect`.
 
 **Settings** (`pair_registry.liquidity`):
-- `window_weekdays` (7, from 3 to 20);
-- `k` (9);
+- `window_weekdays` (7, whole number from 3 to 20);
+- `k` (9, from 1 to 20, the optimizer's accepted range);
 - `round_down_usdt` (10, whole);
 - `data_root` (default `<tester_runner.bot_root>/tester/data/bybit`).
 
-**Reader for consumers.** `pair_registry.read_liquidity(con, exchange,
-symbol)` returns the latest READY row (`L`, `K`, step, base lot, model version,
-as-of day) or None. The optimizer and the base-lot export switch to it in
-registry stage 4 («switch the consumers»). Until then V1 keeps working.
+**Reader for consumers.** `mrs3.pair_registry.read_liquidity(con, exchange,
+symbol)` returns the newest window of a TRADING pair only if that newest window
+is READY, else None. A newer UNAVAILABLE window hides an older READY one.
+`latest_liquidity` returns the newest row of any status, for views.
 
-**CLI.** `python -m mrs3.pair_registry liquidity [--exchange bybit]
-[--symbols …]`.
+The optimizer and the base-lot export switch to the reader in registry stage 4
+(«switch the consumers»). Until then V1 keeps working. Two requirements for
+that switch (review 2026-10-18):
+- The consumer requires `inputs_sha256`: a READY row written by the stage 2
+  draft carries none.
+- V1's `publication_lag_hours` has no equivalent yet. A run early in the UTC
+  day, before yesterday's minute file exists, gives UNAVAILABLE for every
+  pair; a later run on the same day overwrites those rows. This fails safe,
+  and the minute top-up of «Синхронизировать» runs before the liquidity
+  refresh.
+
+**CLI.** `python -m mrs3.pair_registry liquidity [--config …] [--today
+YYYY-MM-DD]`.
 
 **Acceptance.**
 - Unit tests:
-  - weekday selection across a weekend;
-  - Q25/A15/L/lot equal to V1 on the same weekday files;
-  - the window length setting;
-  - a missing weekday gives UNAVAILABLE;
-  - a weekend file never enters the window;
-  - idempotent re-run.
+  - weekday selection across a weekend (weekends never enter);
+  - formulas and floor equal to V1 on the same days;
+  - window length as provenance;
+  - a missing or unreadable weekday gives UNAVAILABLE;
+  - stale files give UNAVAILABLE;
+  - a newer UNAVAILABLE window hides an older READY one;
+  - a pair that left TRADING is not read;
+  - day rows follow the files;
+  - journal rows;
+  - settings validation;
+  - idempotent re-run;
+  - the package export.
 - A live run on the registry's Bybit TRADING pairs, with counts of READY and
   UNAVAILABLE pairs.
+
+## Stage 2 evidence (2026-10-18)
+
+- **Tests:** `tests/test_pair_registry_liquidity.py` (22, after the review fixes). They
+  cover:
+  - day facts;
+  - V25/A15/L/base lot equal to `LOT_MODEL_V1` on the same seven days;
+  - selection of the last weekdays across weekends;
+  - a missing weekday gives UNAVAILABLE with the missing day;
+  - window length as provenance (5 weekdays → 480 bins);
+  - settings validation and defaults (data folder from
+    `tester_runner.bot_root`);
+  - idempotent re-run;
+  - the CLI.
+- **Live** (`python -m mrs3.pair_registry liquidity`, 70 s): 274 TRADING Bybit
+  pairs.
+  - 242 READY, all with the window 2026-10-08…2026-10-16, which skips the
+    weekend 10–11.
+  - 32 UNAVAILABLE: no minute files at all. These are pairs outside the old
+    workbook universe; their minutes come with the minute top-up of
+    «Синхронизировать».
+  - 4,358 day rows in the first run. After the review fixes the span runs
+    from the window's first day to the day before the run: 2,180 day rows,
+    the same 242/32 result, one journal row, `inputs_sha256` on every READY
+    row.
+  - Examples: XOMUSDT `V25` 17.48, `A15` 0.940, base lot 140 USDT; NVDAUSDT
+    base lot 11,060 USDT.
+- **Independent review:** `CODE_REVIEW_PASS` after fixes (fail-closed reader and
+  window end, journal, day rows follow the files, V1 floor, K range, input
+  hashes, reason column, contract matching the code).
+- **BingX liquidity** waits for the BingX minute data layer (panel stage 5).
+  `refresh_liquidity` refuses any exchange other than Bybit.
 
 ## Decisions taken (2026-10-18)
 

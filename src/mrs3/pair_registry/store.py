@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
 import json
 from pathlib import Path
 
@@ -23,6 +24,11 @@ class RegistrySettings:
     bybit_exclude: tuple[str, ...] = ("SPXUSDT", "XAUTUSDT")
     bingx_prefixes: tuple[str, ...] = ("NCSK", "NCSI", "NCCO")
     bingx_exclude: tuple[str, ...] = ()
+    # stage 2, LOT_MODEL_V2 (ADR-0079): window of N weekdays, K and the USDT rounding step of the base lot
+    liquidity_window_weekdays: int = 7
+    liquidity_k: Decimal = Decimal(9)
+    liquidity_round_down: Decimal = Decimal(10)
+    liquidity_data_root: Path | None = None
 
 
 def _strings(value: object, key: str, default: tuple[str, ...]) -> tuple[str, ...]:
@@ -39,6 +45,28 @@ def _object(value: object, key: str) -> dict:
     if not isinstance(value, dict):
         raise RegistryError(f"{key} must be an object")
     return value
+
+
+def _positive_decimal(value: object, key: str, default: Decimal, *, whole: bool = False) -> Decimal:
+    if value is None:
+        return default
+    if isinstance(value, (bool, float)):
+        raise RegistryError(f"pair_registry.liquidity.{key} must be an exact number (int or decimal text)")
+    try:
+        number = Decimal(str(value))
+    except (InvalidOperation, ValueError) as error:
+        raise RegistryError(f"pair_registry.liquidity.{key} must be a number") from error
+    if not number.is_finite() or number <= 0 or (whole and number != number.to_integral_value()):
+        raise RegistryError(f"pair_registry.liquidity.{key} has an invalid value")
+    return number
+
+
+def _coefficient(value: object, default: Decimal) -> Decimal:
+    """K of the lot model: the optimizer accepts 1..20 (position_sizing.calculate_lot_capacity)."""
+    number = _positive_decimal(value, "k", default)
+    if not Decimal(1) <= number <= Decimal(20):
+        raise RegistryError("pair_registry.liquidity.k must be from 1 to 20")
+    return number
 
 
 def load_registry_settings(config_path: Path) -> RegistrySettings:
@@ -63,7 +91,25 @@ def load_registry_settings(config_path: Path) -> RegistrySettings:
     root = Path(raw_root)
     if not root.is_absolute():
         root = config_path.parent / root
+    liquidity = _object(section.get("liquidity"), "pair_registry.liquidity")
+    weekdays = liquidity.get("window_weekdays", defaults.liquidity_window_weekdays)
+    if type(weekdays) is not int or not 3 <= weekdays <= 20:
+        raise RegistryError("pair_registry.liquidity.window_weekdays must be a whole number from 3 to 20")
+    raw_data = liquidity.get("data_root")
+    if raw_data is not None and not isinstance(raw_data, str):
+        raise RegistryError("pair_registry.liquidity.data_root must be a path")
+    if raw_data:
+        data_root: Path | None = Path(raw_data) if Path(raw_data).is_absolute() else config_path.parent / raw_data
+    else:
+        runner = document.get("tester_runner") if isinstance(document.get("tester_runner"), dict) else {}
+        bot_root = runner.get("bot_root")
+        data_root = Path(bot_root) / "tester" / "data" / "bybit" if isinstance(bot_root, str) and bot_root else None
     return RegistrySettings(
+        liquidity_window_weekdays=weekdays,
+        liquidity_k=_coefficient(liquidity.get("k"), defaults.liquidity_k),
+        liquidity_round_down=_positive_decimal(liquidity.get("round_down_usdt"), "round_down_usdt",
+                                               defaults.liquidity_round_down, whole=True),
+        liquidity_data_root=data_root.resolve() if data_root is not None else None,
         root=root.resolve(),
         bybit_symbol_types=_strings(bybit.get("symbol_types"), "universe.bybit.symbol_types", defaults.bybit_symbol_types),
         bybit_exclude=_strings(bybit.get("exclude"), "universe.bybit.exclude", defaults.bybit_exclude),
@@ -100,7 +146,19 @@ SCHEMA = (
     "primary key (exchange, symbol, as_of_day, tier_id))",
     "create table if not exists journal (run_id varchar primary key, step varchar not null, exchange varchar, "
     "status varchar not null, counts varchar, started_at bigint not null, finished_at bigint, error varchar)",
+    # stage 2: weekday liquidity, LOT_MODEL_V2 (ADR-0079)
+    "create table if not exists liquidity_days (exchange varchar not null, symbol varchar not null, day date not null, "
+    "weekend boolean not null, turnover varchar not null, positive_minutes integer not null, active_bins integer not null, "
+    "file_sha256 varchar not null, computed_ms bigint not null, primary key (exchange, symbol, day))",
+    "create table if not exists liquidity (exchange varchar not null, symbol varchar not null, as_of_day date not null, "
+    "model varchar not null, status varchar not null, window_weekdays integer not null, window_days varchar not null, "
+    "missing_days varchar not null, positive_minutes integer, active_bins integer, total_bins integer, v25 varchar, "
+    "a15 varchar, l varchar, k varchar, step varchar, base_lot varchar, computed_ms bigint not null, "
+    "reason varchar, window_files varchar, inputs_sha256 varchar, primary key (exchange, symbol, as_of_day))",
 )
+# columns added after a table was first created (the stage 2 draft): added in place, nulls for old rows
+LATE_COLUMNS = (("liquidity", "reason", "varchar"), ("liquidity", "window_files", "varchar"),
+                ("liquidity", "inputs_sha256", "varchar"))
 
 
 def connect(root: Path) -> duckdb.DuckDBPyConnection:
@@ -110,4 +168,9 @@ def connect(root: Path) -> duckdb.DuckDBPyConnection:
     con = duckdb.connect(str(root / DATABASE))
     for statement in SCHEMA:
         con.execute(statement)
+    for table, column, kind in LATE_COLUMNS:
+        present = {row[0] for row in con.execute(
+            "select column_name from information_schema.columns where table_name = ?", [table]).fetchall()}
+        if column not in present:
+            con.execute(f"alter table {table} add column {column} {kind}")
     return con

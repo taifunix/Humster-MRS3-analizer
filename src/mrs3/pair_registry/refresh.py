@@ -11,7 +11,7 @@ import duckdb
 
 from .store import FIELD_NAMES, RegistryError
 
-__all__ = ["RegistryError", "record_failure", "refresh_exchange"]
+__all__ = ["RegistryError", "record_failure", "refresh_exchange", "write_journal"]
 
 
 def _text(value: object) -> str | None:
@@ -22,11 +22,17 @@ def _text(value: object) -> str | None:
     return str(value)
 
 
+def write_journal(con: duckdb.DuckDBPyConnection, step: str, exchange: str, status: str, counts: Mapping | None,
+                  started: int, error: str | None, run_id: str | None = None) -> None:
+    """One journal row (step, status, counts, start, end, error) for any registry run."""
+    con.execute("insert into journal values (?, ?, ?, ?, ?, ?, ?, ?)",
+                [run_id or uuid4().hex, step, exchange, status, json.dumps(counts, sort_keys=True) if counts else None,
+                 started, int(datetime.now(timezone.utc).timestamp() * 1000), error])
+
+
 def _journal(con: duckdb.DuckDBPyConnection, run_id: str, exchange: str, status: str, counts: Mapping | None,
              started: int, error: str | None) -> None:
-    con.execute("insert into journal values (?, 'refresh', ?, ?, ?, ?, ?, ?)",
-                [run_id, exchange, status, json.dumps(counts, sort_keys=True) if counts else None, started,
-                 int(datetime.now(timezone.utc).timestamp() * 1000), error])
+    write_journal(con, "refresh", exchange, status, counts, started, error, run_id)
 
 
 def record_failure(con: duckdb.DuckDBPyConnection, exchange: str, error: BaseException, started_ms: int) -> None:

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 import json
 from pathlib import Path
 from typing import Sequence
@@ -12,6 +12,7 @@ import duckdb
 
 from .bingx import fetch_bingx, normalize_contracts, unreadable_symbols
 from .bybit import fetch_bybit, normalize_instruments, normalize_risk_limits
+from .liquidity import refresh_liquidity
 from .refresh import record_failure, refresh_exchange
 from .store import RegistryError, connect, load_registry_settings
 
@@ -26,6 +27,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     refresh = commands.add_parser("refresh", help="refresh exchange reference data (pairs, risk tiers)")
     refresh.add_argument("--exchange", choices=("bybit", "bingx", "all"), default="all")
     refresh.add_argument("--config", type=Path, default=Path("config.local.json"))
+    liquidity = commands.add_parser("liquidity", help="weekday liquidity, LOT_MODEL_V2, for the TRADING Bybit pairs")
+    liquidity.add_argument("--config", type=Path, default=Path("config.local.json"))
+    liquidity.add_argument("--today", type=date.fromisoformat, default=None,
+                           help="UTC day of the run (default: today); data up to the day before is used")
     args = parser.parse_args(argv)
 
     try:
@@ -34,6 +39,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (RegistryError, OSError, duckdb.Error) as error:   # e.g. the registry is locked by another process
         print(json.dumps({"error": str(error)}, ensure_ascii=False))
         return 1
+    if args.command == "liquidity":
+        try:
+            today = args.today or datetime.now(timezone.utc).date()
+            result: dict[str, object] = {"bybit": refresh_liquidity(con, "bybit", today, settings)}
+            code = 0
+        except Exception as error:
+            result, code = {"bybit": {"error": f"{type(error).__name__}: {error}"}}, 1
+        finally:
+            con.close()
+        print(json.dumps(result, ensure_ascii=False))
+        return code
     summary: dict[str, object] = {}
     failed = False
     try:

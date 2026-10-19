@@ -8,7 +8,25 @@ Use [PRD.md](PRD.md) for the feature registry and [docs/README.md](docs/README.m
 for the documentation map. Read the linked contract only for the active task;
 do not treat this file as a replacement for a feature specification.
 
-## Panel rework stage 1b, part B and the three-screen shell (2026-10-18, branch `wip/period-csv-generator`)
+## Pair registry stage 2: weekday liquidity, LOT_MODEL_V2 (2026-10-18, branch `wip/period-csv-generator`)
+
+Contract: [pair registry](docs/specs/2026-10-18-pair-registry.md) («Stage 2
+contract», «Stage 2 evidence»), decision
+[ADR-0079](docs/decisions/0079-lot-model-v2-weekday-liquidity.md).
+
+- `mrs3.pair_registry.liquidity` computes the window: V25 / A15 / L / base lot
+  over the last N weekdays (default 7), identical to V1 on the same days. It
+  stores the raw inputs and file hashes.
+- The reader `read_liquidity` fails closed: a newer UNAVAILABLE window hides
+  an older READY one. Runs are journaled.
+- Live: 242 READY, 32 UNAVAILABLE (pairs without minute files).
+- **Verification:** `tests/test_pair_registry_liquidity.py` (22) and
+  `tests/test_pair_registry.py`. Independent review `CODE_REVIEW_PASS` after
+  fixes.
+- **Next:** registry stage 3 (pipeline, tests, finalists, decisions, pair
+  settings). The consumers switch in registry stage 4.
+
+## Panel rework stage 1b, part B and the three-screen shell (2026-10-18, branch `wip/period-csv-generator`, committed `4d087f1`)
 
 Contract: [Panel for the simulation workflow](docs/specs/2026-10-18-panel-simulation-workflow.md)
 («Stage 1b evidence, part B»).
