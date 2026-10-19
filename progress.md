@@ -8,6 +8,37 @@ Use [PRD.md](PRD.md) for the feature registry and [docs/README.md](docs/README.m
 for the documentation map. Read the linked contract only for the active task;
 do not treat this file as a replacement for a feature specification.
 
+## Panel stage 5c: BingX MRS2 tester sampling (2026-10-19, branch `wip/period-csv-generator`)
+
+Contract: [Panel for the simulation workflow](docs/specs/2026-10-18-panel-simulation-workflow.md)
+(«Stage 5c contract» and «Stage 5c evidence»).
+
+- `tester_jobs.py --exchange bingx` (plan, run, import), following the
+  existing BingX tester conventions:
+  - the tester and the strategy get the API symbol;
+  - the exchange block is BingX / `bingx`;
+  - the BingX fees apply, with `UpdateData=false` and without
+    `maintenance_margin_rate`;
+  - the reports are mapped back to the human ticker.
+  - The minute days are verified before each job, so a job with an
+    unaccepted day fails before the tester starts.
+- Panel: «Проверить тестером» works on BingX.
+- **The tick test and retest on BingX moved to 5e.** User decision
+  2026-10-19:
+  - one PerformanceDB for both exchanges, with an exchange identifier;
+  - an exchange selector on the optimizer screen.
+- **Verification:**
+  - `tests/test_bingx_tester_jobs.py`: 6 passed;
+  - independent review `CODE_REVIEW_PASS`; the MINOR findings were fixed
+    with tests; re-review `CODE_REVIEW_PASS` (open NIT: no test for a registry held read-only);
+  - broad suites: 249 passed;
+  - the real tester was not started on BingX.
+- **Next:**
+  - 5d: BingX liquidity;
+  - 5e: one PerformanceDB with an exchange identifier (schema v13, ADR,
+    full audit of the read and write paths), the BingX tick test and
+    retest, and the exchange selector on the optimizer screen.
+
 ## Panel stage 5b: BingX history and READY (2026-10-19, branch `wip/period-csv-generator`)
 
 Contract: [Panel for the simulation workflow](docs/specs/2026-10-18-panel-simulation-workflow.md)

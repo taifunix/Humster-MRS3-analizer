@@ -924,7 +924,13 @@ Stage 5 is split so each part is reviewed and committed on its own:
 - **5c** — BingX MRS2 tester sampling and MRS3 tick tests (data ensured
   first, `UpdateData = false`, BingX templates and fees, report symbols
   mapped back);
-- **5d** — BingX liquidity, and the BingX actions enabled in the Panel.
+- **5d** — BingX liquidity, and the BingX actions enabled in the Panel;
+- **5e** (split off on 2026-10-19) — the BingX MRS3 tick test and retest.
+  **User decision 2026-10-19:**
+  - there is one PerformanceDB for both exchanges, with an exchange
+    identifier, instead of a separate database per exchange;
+  - the optimizer screen («Портфели») gets an exchange selector, and the
+    optimizer takes only that exchange's strategies.
 
 ## Stage 5a contract: the minute data layer (2026-10-19)
 
@@ -1070,6 +1076,102 @@ computes the BingX rows. No PerformanceDB is read for BingX until 5c.
   stay disabled;
 - the Bybit history, READY and Panel suites are unchanged.
 
+## Stage 5c contract: BingX MRS2 tester sampling (2026-10-19)
+
+The plan is split again. 5c is the MRS2 tester sampling («Проверить
+тестером»), which writes only to the trade store. The **MRS3 tick test on
+BingX moves to 5e**: its results go to a PerformanceDB, and BingX needs its
+own BingX database, which does not exist yet (only the default Bybit database
+is configured). Creating it is the user's decision.
+
+**Jobs** (`tester_jobs`, `scripts/tester_jobs.py --exchange bingx`), following
+the conventions of the earlier BingX tester mode (`panel_testing`):
+- **Symbol:** the tester and the strategy get the BingX **API symbol** (from
+  the registry `pairs` row). The job keeps the human ticker for the store and
+  records `tester_symbol`.
+- **Strategy:** the MRS2 LONG template with only `exchange.name` and
+  `exchange.account` taken from `templates/exchanges/BingX/mrs3-strategy.json`
+  (`BingX`, `bingx`), as in `panel_testing`.
+  - The template's execution options (`execute_stop_by_market`) stay, so
+    both exchanges run the same strategy logic.
+- **Tester config:**
+  - the BingX run settings (`exchange_run_settings`: fees, slippage,
+    funding);
+  - `UpdateData = false`;
+  - the Bybit-only `maintenance_margin_rate` removed.
+- **The job records its run settings.** Converting the reports uses them for
+  the maker/taker exit kind and checks the report symbol against
+  `tester_symbol`, so the reports are mapped back to the human ticker.
+- **Job identity:** for Bybit it is unchanged, so existing job ids stay
+  valid. For BingX it includes the exchange, as before.
+- **The queue** runs and lists only the jobs of the requested exchange. AMD
+  on Bybit and AMD on BingX share the human ticker `AMDUSDT`.
+- **Before each BingX job:** the minute days of warm-up and window are
+  ensured and verified (`ensure_bingx_days_shared`). The registry is opened
+  only for that call:
+  - registry free: as `ensure_minute_days`, and the records are written;
+  - registry held read-only: the known records are read and nothing is
+    written;
+  - **registry held by a writer** (DuckDB on Windows refuses even readers
+    then): every day is verified again from disk and the API, using the API
+    symbol in `job.json`;
+  - any day that is not accepted fails the job with `MISSING_DAYS`, and the
+    tester is not started;
+  - a `bingx_data_root` other than the tester's
+    `<bot_root>/tester/data/bingx`, a registry error and a file error also
+    fail the job before the tester. The message names no local path.
+- **Import:** `import_window(..., exchange="bingx")` with the BingX run
+  settings.
+
+**Panel:** «Проверить тестером» on BingX plans and runs the chain with
+`--exchange bingx` (plan, run, import, then the BingX pipeline). The tick
+test and the retest on BingX stay «BingX — этап 5».
+
+**Acceptance (offline, fake tester):**
+- a BingX window is planned with the API symbol in the strategy and the
+  config;
+- the BingX exchange block and fees are applied, without
+  `maintenance_margin_rate`;
+- the job is run with the tester's files restored, converted with the API
+  symbol, and imported as a BingX tester segment;
+- the queue keeps the exchanges apart;
+- a job with an unverified day fails with `MISSING_DAYS` before the tester;
+- the Panel chain carries `--exchange bingx`;
+- the Bybit tester tests are unchanged.
+
+## Stage 5c evidence (2026-10-19)
+
+- **Code:**
+  - `tester_jobs`: `plan_jobs(..., tester_symbol, strategy_exchange)`;
+    `queued_jobs` / `run_queue(exchange)`; `convert_reports` with the job's
+    tester symbol and run settings;
+  - `pair_registry.minute_days.ensure_bingx_days_shared`;
+  - `scripts/tester_jobs.py --exchange`;
+  - Panel: «Проверить тестером» on BingX.
+- **Tests:**
+  - `tests/test_bingx_tester_jobs.py`, 5 tests:
+    - plan, run and import on the API symbol, with the BingX exchange block
+      and fees and no `maintenance_margin_rate`; the reports carry the API
+      symbol; the tester's files are restored;
+    - the queue keeps the exchanges apart, and Bybit jobs keep their shape;
+    - a BingX plan without an API symbol is refused;
+    - a job with an unverified day fails `MISSING_DAYS` before the tester
+      (script `plan` + `run`, bot files unchanged);
+    - with a real second process holding the registry, a plain call is
+      refused and a call with the API symbol verifies from disk and the API
+      without writing.
+  - `test_panel_main.py`: the BingX tester chain carries `--exchange bingx`;
+    tick and retest stay disabled.
+- **Independent review** `CODE_REVIEW_PASS`, with MINOR findings, all
+  fixed:
+  - only name and account are taken from the BingX exchange block;
+  - the data folder must be the tester's;
+  - registry and file errors fail the job, with no local path;
+  - a Bybit plan refuses a foreign symbol or exchange block.
+  - Tests were added for each.
+- **Not run:** the real tester on BingX. The BingX tester mode was used
+  before through `panel_testing`, and this follows its conventions.
+
 ## Stage 5b evidence (2026-10-19)
 
 - **Code:**
@@ -1162,7 +1264,10 @@ computes the BingX rows. No PerformanceDB is read for BingX until 5c.
    «Stage 5 plan»):
    - ✅ 5a, the minute data layer (2026-10-19);
    - ✅ 5b, BingX history and READY (2026-10-19);
-   - 5c and 5d pending.
+   - ✅ 5c, BingX MRS2 tester sampling (2026-10-19);
+   - 5d (liquidity) and 5e pending. 5e is one PerformanceDB with an exchange
+     identifier, the BingX tick test and retest, and the exchange selector of
+     the optimizer.
 
 **Deferred (user, 2026-10-19; not urgent).**
 - Retire the base-lot Excel export (`scripts/calculate_bybit_base_lots.py`,

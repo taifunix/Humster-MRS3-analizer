@@ -36,8 +36,8 @@ from .ready_store import ReadyRule, inputs_sha256, pair_periods
 
 ACTIONS = ("sync", "history", "ready", "tester", "tick", "retest")
 EXCHANGES = ("bybit", "bingx")
-BINGX_PENDING = "BingX — этап 5: тестер и тик-тест BingX ещё не подключены"
-BINGX_READY_ACTIONS = ("sync", "history", "ready")       # Panel stage 5b; tester, tick and retest come in 5c
+BINGX_PENDING = "BingX — этап 5: тик-тест и ретест ждут отдельной базы PerformanceDB для BingX"
+BINGX_READY_ACTIONS = ("sync", "history", "ready", "tester")   # Panel stages 5b, 5c; tick and retest come in 5e
 
 
 class MainScreenError(ValueError):
@@ -809,9 +809,10 @@ class MainScreenService:
             label, stop_file = "Пересобрать READY", None
         else:
             tester = str(scripts / "tester_jobs.py")
-            steps = [(step, [python, tester, step, "--store", store_root, "--config", config, "--pairs", pairs])
-                     for step in ("plan", "run", "import")]
-            steps.append(("Конвейер", [python, "-m", "mrs3.pair_registry", "pipeline", "--config", config]))
+            steps = [(step, [python, tester, step, "--store", store_root, "--config", config, "--pairs", pairs,
+                             "--exchange", exchange]) for step in ("plan", "run", "import")]
+            steps.append(("Конвейер", [python, "-m", "mrs3.pair_registry", "pipeline", "--config", config,
+                                       "--exchange", exchange]))
             label, stop_file = "Проверить тестером", Path(store_root) / "jobs" / ".stop"
         return self._start_chain(action, label, steps, stop_file)
 

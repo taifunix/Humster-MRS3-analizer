@@ -6,6 +6,7 @@ Contract: docs/specs/2026-10-17-mrs2-history-store-and-tester-sampling.md («Sta
 
 from __future__ import annotations
 
+from dataclasses import asdict
 from datetime import date, datetime, timezone
 import hashlib
 import json
@@ -64,14 +65,28 @@ def jobs_root(store: TradeStore) -> Path:
 
 def plan_jobs(store: TradeStore, symbol: str, *, strategy_template: Mapping, config_template: Mapping,
               settings: RunSettings = RunSettings(), parallel_runs: int = 4, fraction: float = 0.10,
-              exchange: str = "bybit") -> dict:
-    """Select the window's points, cover them by blocks and queue one job per block (idempotent)."""
+              exchange: str = "bybit", tester_symbol: str | None = None,
+              strategy_exchange: Mapping | None = None) -> dict:
+    """Select the window's points, cover them by blocks and queue one job per block (idempotent).
+
+    BingX (Panel stage 5c): the tester and the strategy get `tester_symbol` (the BingX API symbol) and the
+    exchange block `strategy_exchange`; the Bybit-only `maintenance_margin_rate` is dropped; the job records its
+    tester symbol and run settings, so the reports are converted with them."""
+    if exchange != "bybit" and (not tester_symbol or strategy_exchange is None):
+        raise JobQueueError(f"{exchange}: the tester symbol and the strategy exchange block are required")
+    if exchange == "bybit" and (tester_symbol not in (None, symbol) or strategy_exchange is not None):
+        raise JobQueueError("bybit: jobs run on the pair symbol with the template's exchange block")
+    run_symbol = tester_symbol or symbol
     window = window_segment(store, symbol, exchange)
     start, end = _date(window["start_ms"]), _date(window["end_ms"])
     selection = select_points(store.read_metrics(window), (window["end_ms"] - window["start_ms"]) / DAY_MS,
                               window["metrics_sha256"], fraction=fraction)
     blocks = cover_blocks(selection.point_ids)
-    strategy = strategy_document(strategy_template, symbol, settings)
+    strategy = strategy_document(strategy_template, run_symbol, settings)
+    if strategy_exchange is not None:
+        # only the exchange and the account, as the BingX tester mode of `panel_testing`: the MRS2 template's
+        # execution options (e.g. execute_stop_by_market) stay, so both exchanges run the same strategy logic
+        strategy["exchange"].update(name=strategy_exchange["name"], account=strategy_exchange["account"])
     created = 0
     with store.connect(read_only=True) as con:
         known = {row[0] for row in con.execute("select job_id from jobs where symbol = ?", [symbol]).fetchall()}
@@ -86,9 +101,12 @@ def plan_jobs(store: TradeStore, symbol: str, *, strategy_template: Mapping, con
         name = f"job_{job_id}"
         folder = jobs_root(store) / job_id
         folder.mkdir(parents=True, exist_ok=True)
-        config = block_config(config_template, symbol, start, end, block, name, settings, parallel_runs)
+        config = block_config(config_template, run_symbol, start, end, block, name, settings, parallel_runs)
         job = {**identity, "job_id": job_id, "name": name, "window_segment": window["segment_id"],
                "strategy_file": f"{strategy['name']}.json", "points": block.point_ids()}
+        if exchange != "bybit":                    # Bybit jobs keep their exact pre-BingX shape
+            config.pop("maintenance_margin_rate", None)
+            job.update(tester_symbol=run_symbol, run_settings=asdict(settings))
         (folder / "job.json").write_text(json.dumps(job, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         (folder / "config_tester.json").write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n",
                                                    encoding="utf-8")
@@ -123,17 +141,19 @@ def set_state(store: TradeStore, job_id: str, state: str, *, executor: str | Non
                     "where job_id = ?", [state, executor, error, utc_now(), job_id])
 
 
-def queued_jobs(store: TradeStore, symbols: Sequence[str] | None = None) -> list[str]:
-    """Queued jobs of the current plan only: the latest planned window of each pair and its latest selection."""
+def queued_jobs(store: TradeStore, symbols: Sequence[str] | None = None, exchange: str | None = None) -> list[str]:
+    """Queued jobs of the current plan only: the latest planned window of each pair and its latest selection
+    (of one exchange when given: a human ticker can exist on both exchanges)."""
     with store.connect(read_only=True) as con:
         rows = con.execute("""
             with latest as (select exchange, symbol, max(start_ms) as start_ms from plans group by exchange, symbol)
-            select j.job_id, j.symbol from jobs j
+            select j.job_id, j.symbol, j.exchange from jobs j
             join plans p on p.exchange = j.exchange and p.symbol = j.symbol and p.start_ms = j.start_ms
                         and p.end_ms = j.end_ms and p.selection_sha256 = j.selection_sha256
             join latest l on l.exchange = j.exchange and l.symbol = j.symbol and l.start_ms = j.start_ms
             where j.state = 'queued' order by j.created_utc, j.job_id""").fetchall()
-    return [job_id for job_id, symbol in rows if not symbols or symbol in symbols]
+    return [job_id for job_id, symbol, job_exchange in rows
+            if (not symbols or symbol in symbols) and (exchange is None or job_exchange == exchange)]
 
 
 def retry_failed(store: TradeStore, job_ids: Sequence[str] | None = None) -> int:
@@ -436,7 +456,7 @@ def _quiet_state(store: TradeStore, job_id: str, error: str) -> None:
 
 
 def run_queue(store: TradeStore, bot_root: Path, *, symbols: Sequence[str] | None = None, limit: int = 0,
-              timeout_s: float = 6 * 3600, keep_html: bool = False,
+              timeout_s: float = 6 * 3600, keep_html: bool = False, exchange: str | None = None,
               prepare: Callable[[Mapping], str | None] | None = None,
               run: Callable[..., dict] = run_job, report: Callable[[dict], None] = lambda item: None) -> dict:
     """Run queued jobs one by one. Stops cleanly between jobs when `jobs/.stop` appears (the Panel's Stop) and
@@ -444,7 +464,7 @@ def run_queue(store: TradeStore, bot_root: Path, *, symbols: Sequence[str] | Non
     stop = jobs_root(store) / STOP_NAME          # cleared by the starter (Panel) and at the end, not here: a Stop
     report({"recover": recover(store, bot_root)})   # pressed while the process starts must still count
     done = failed = 0
-    for job_id in queued_jobs(store, symbols):
+    for job_id in queued_jobs(store, symbols, exchange):
         if stop.exists():
             stop.unlink(missing_ok=True)
             report({"stopped": True, "done": done, "failed": failed})
@@ -474,9 +494,12 @@ def convert_reports(store: TradeStore, job: Mapping, bot_root: Path, *, keep_htm
     reports = Path(bot_root) / "tester" / "report" / job["name"]
     paths = sorted(reports.glob("*_run_*.html")) if reports.is_dir() else []
     start, end = date.fromisoformat(job["start"]), date.fromisoformat(job["end"])
+    # a BingX job ran on the API symbol with the BingX fees (Panel stage 5c); Bybit jobs keep the defaults
+    settings = RunSettings(**job["run_settings"]) if "run_settings" in job else RunSettings()
     found: dict[int, tuple] = {}
     for path in paths:
-        pid, trades, hourly, metrics = report_tables(parse(path.read_bytes()), symbol=job["symbol"], start=start, end=end)
+        pid, trades, hourly, metrics = report_tables(parse(path.read_bytes()), symbol=job.get("tester_symbol",
+                                                     job["symbol"]), start=start, end=end, settings=settings)
         if pid in found:
             raise JobQueueError(f"two reports for point {pid}")
         found[pid] = (trades, hourly, metrics)

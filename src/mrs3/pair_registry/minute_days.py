@@ -239,6 +239,49 @@ def write_records(con: duckdb.DuckDBPyConnection, records: Sequence[Mapping]) ->
                     [[record[name] for name in RECORD_COLUMNS] for record in records])
 
 
+def ensure_bingx_days_shared(settings: RegistrySettings, symbol: str, first: date, last: date, *, client=None,
+                             now: datetime | None = None, api_symbol: str | None = None) -> MinuteDays:
+    """`ensure_minute_days` for a BingX pair from a process that does not own the registry (the tester executor).
+
+    The registry is opened only for this call. While another process holds it: with the records read read-only
+    when that is possible, else (a writer holds it: DuckDB refuses even readers) from `api_symbol` alone with no
+    known records, so every day is verified again from disk and the API. New records are written only in the first
+    case (the next call verifies again)."""
+    from .store import DATABASE, connect
+
+    try:
+        con = connect(settings.root)
+    except duckdb.Error:
+        con = None
+    if con is not None:
+        try:
+            return ensure_minute_days(con, settings, "bingx", symbol, first, last, client=client, now=now)
+        finally:
+            con.close()
+    if settings.bingx_data_root is None:
+        raise RegistryError("the BingX minute data folder is unknown: set tester_runner.bot_root")
+    try:
+        reader = duckdb.connect(str(settings.root / DATABASE), read_only=True)
+    except duckdb.Error:
+        if not api_symbol:
+            raise RegistryError("the pair registry is held by another process and cannot be read") from None
+        # the listing minute is unknown here: with 0 a listing day inside the warm-up expects 1,440 minutes and its
+        # pre-listing hours are accepted as VERIFIED_GAPS by the hourly check (no candle there); days after it are
+        # unaffected
+        return verify_bingx_days(settings.bingx_data_root, symbol, api_symbol, 0, first, last, known={},
+                                 client=client, now=now, mode=settings.bingx_download_mode)
+    try:
+        pair = reader.execute("select api_symbol, listing_ms from pairs where exchange = 'bingx' and symbol = ?",
+                              [symbol]).fetchone()
+        if pair is None or not pair[0]:
+            raise RegistryError(f"bingx: {symbol} is not in the registry")
+        known = known_records(reader, "bingx", symbol, first, last)
+    finally:
+        reader.close()
+    return verify_bingx_days(settings.bingx_data_root, symbol, pair[0], int(pair[1] or 0), first, last, known=known,
+                             client=client, now=now, mode=settings.bingx_download_mode)
+
+
 def ensure_minute_days(con: duckdb.DuckDBPyConnection, settings: RegistrySettings, exchange: str, symbol: str,
                        first: date, last: date, *, client=None, now: datetime | None = None,
                        fetch_day=None) -> MinuteDays:
