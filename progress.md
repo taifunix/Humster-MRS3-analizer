@@ -8,6 +8,36 @@ Use [PRD.md](PRD.md) for the feature registry and [docs/README.md](docs/README.m
 for the documentation map. Read the linked contract only for the active task;
 do not treat this file as a replacement for a feature specification.
 
+## Panel stage 5d: BingX liquidity (2026-10-19, branch `wip/period-csv-generator`)
+
+Contract: [Panel for the simulation workflow](docs/specs/2026-10-18-panel-simulation-workflow.md)
+(«Stage 5d contract» and «Stage 5d evidence»).
+
+- LOT_MODEL_V2 on BingX:
+  - a BingX day reader (`close × volume`; BingX volume is in the base asset,
+    checked live against the 24 h ticker);
+  - only verified days count;
+  - a verified quiet weekday has zero turnover.
+- `liquidity --exchange bingx` and the `sync` steps `liquidity_bingx` /
+  `pipeline_bingx`. BingX has no market collector, so the BingX window days
+  are downloaded and verified in that step. The first run takes about ten
+  days per pair, later runs one day.
+- **Verification:**
+  - `tests/test_bingx_liquidity.py`: 5 passed;
+  - live on a registry copy: 3 pairs READY (AMD 7,830, KOPN 7,760, TSLA
+    14,390);
+  - broad suites, `.venv\Scripts\python.exe -m pytest --basetemp=C:/Temp/...`
+    over the BingX, minute-days, registry, Panel main-screen, base-lot,
+    optimizer and portfolio-liquidity suites: 302 passed before the review
+    fixes;
+  - after the fixes: `test_bingx_liquidity`, `test_pair_registry_liquidity`
+    and `test_pair_registry_records`: 53 passed;
+  - independent review `CODE_REVIEW_PASS`. The MINOR findings were fixed:
+    the BingX lag, the failed pairs listed, non-finite rows, and an early
+    stop without a data folder. Re-review `CODE_REVIEW_PASS` (NITs left: the lag summary shows `pairs: 0`).
+- **Next:** 5e, one PerformanceDB with an exchange identifier, the BingX
+  tick test and retest, and the exchange selector of the optimizer.
+
 ## Panel stage 5c: BingX MRS2 tester sampling (2026-10-19, branch `wip/period-csv-generator`)
 
 Contract: [Panel for the simulation workflow](docs/specs/2026-10-18-panel-simulation-workflow.md)

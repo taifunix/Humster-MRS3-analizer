@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
-from decimal import ROUND_DOWN, ROUND_HALF_EVEN, Decimal, localcontext
+from decimal import ROUND_DOWN, ROUND_HALF_EVEN, Decimal, InvalidOperation, localcontext
 import hashlib
 import json
 from pathlib import Path
@@ -53,6 +53,79 @@ def day_facts(path: Path, day: date) -> DayFacts:
         total = sum(positive, Decimal(0))
     return DayFacts(day, day.weekday() >= 5, total, len(positive), len(bins), tuple(positive),
                     hashlib.sha256(data).hexdigest())
+
+
+def bingx_day_facts(path: Path, day: date) -> DayFacts:
+    """Facts of one BingX minute day file (Panel stage 5d). BingX files carry no trade count and no buy/sell split,
+    so the V1 reader would refuse them; the turnover is `close × volume` (volume in the base asset, checked live)."""
+    from ..bingx_downloader import _text
+    from ..tester_candles import CandleDayError, read_day
+
+    data = Path(path).read_bytes()
+    try:
+        columns = read_day(data).to_pydict()
+    except CandleDayError as error:
+        raise MinuteCapacityError(f"unreadable BingX day: {error}") from None
+    start, previous, positive, bins = _day_start_ms(day), -1, [], set()
+    for index, stamp in enumerate(columns["timestamp"]):
+        stamp = int(stamp)
+        if stamp % 60_000 or not start <= stamp < start + 86_400_000 or stamp <= previous:
+            raise MinuteCapacityError("BingX minute timestamps are not unique, ordered, aligned and in-day")
+        previous = stamp
+        try:
+            opened, high, low, close, volume = (Decimal(_text(columns[name][index]))
+                                                for name in ("open", "high", "low", "close", "volume"))
+        except (InvalidOperation, ValueError, TypeError):
+            raise MinuteCapacityError(f"unreadable BingX minute row {index + 1}") from None
+        if not all(value.is_finite() for value in (opened, high, low, close, volume)) or \
+                min(opened, high, low, close) <= 0 or volume < 0 or high < max(opened, low, close) \
+                or low > min(opened, close):
+            raise MinuteCapacityError(f"inconsistent BingX minute row {index + 1}")
+        with localcontext() as context:
+            context.prec = 28
+            context.rounding = ROUND_HALF_EVEN
+            turnover = close * volume
+        if turnover > 0:
+            positive.append(turnover)
+            bins.add((stamp - start) // 60_000 // 15)
+    with localcontext() as context:
+        context.prec = 28
+        total = sum(positive, Decimal(0))
+    return DayFacts(day, day.weekday() >= 5, total, len(positive), len(bins), tuple(positive),
+                    hashlib.sha256(data).hexdigest())
+
+
+def window_span(today: date, weekdays: int) -> tuple[date, date, date]:
+    """(first day, last weekday = window end, last day) of the window that ends on the last weekday before today."""
+    last_day = today - timedelta(days=1)
+    end = _last_weekday(last_day)
+    _none, window = select_window({}, end, weekdays)
+    return min(window), end, last_day
+
+
+def ensure_bingx_window(con: duckdb.DuckDBPyConnection, settings: RegistrySettings, first_today: date,
+                        today: date, *, client=None, now: datetime | None = None) -> dict[str, int]:
+    """Download and verify the window days of every TRADING BingX pair (BingX has no market collector): from the
+    window of `first_today` to the day before `today`. One pair failing never stops the others."""
+    from .minute_days import ensure_minute_days
+
+    if settings.bingx_data_root is None:
+        raise RegistryError("the BingX minute data folder is unknown: set tester_runner.bot_root")
+    first, _end, _last = window_span(first_today, settings.liquidity_window_weekdays)
+    last_day = today - timedelta(days=1)
+    symbols = [row[0] for row in con.execute("select symbol from pairs where exchange = 'bingx' and status = 'TRADING' "
+                                             "and api_symbol is not null order by symbol").fetchall()]
+    counts: dict = {"pairs": len(symbols), "accepted": 0, "refused": 0, "failed_pairs": 0, "failed": {}}
+    for symbol in symbols:
+        try:
+            days = ensure_minute_days(con, settings, "bingx", symbol, first, last_day, client=client, now=now)
+        except (RegistryError, OSError, duckdb.Error) as error:
+            counts["failed_pairs"] += 1
+            counts["failed"][symbol] = type(error).__name__
+            continue
+        counts["accepted"] += len(days.accepted)
+        counts["refused"] += len(days.refused)
+    return counts
 
 
 def select_window(available: Mapping[date, object], end_day: date, weekdays: int) -> tuple[list[date], list[date]]:
@@ -105,13 +178,13 @@ def _last_weekday(day: date) -> date:
 
 
 def refresh_liquidity(con: duckdb.DuckDBPyConnection, exchange: str, today: date,
-                      settings: RegistrySettings) -> dict[str, int]:
+                      settings: RegistrySettings, *, now: datetime | None = None) -> dict[str, int]:
     """One LOT_MODEL_V2 window per TRADING pair, ending on the last weekday before `today`, plus the day rows from
     the window's first day to the day before `today`. A window weekday without a readable file makes the window
     unavailable (fail closed: stale or missing minute data never yields READY). Journaled as step `liquidity`."""
     started = _now_ms()
     try:
-        counts = _refresh_liquidity(con, exchange, today, settings, started)
+        counts = _refresh_liquidity(con, exchange, today, settings, started, now)
     except Exception as error:
         try:
             write_journal(con, "liquidity", exchange, "FAILED", None, started, f"{type(error).__name__}: {error}")
@@ -123,24 +196,33 @@ def refresh_liquidity(con: duckdb.DuckDBPyConnection, exchange: str, today: date
 
 
 def _refresh_liquidity(con: duckdb.DuckDBPyConnection, exchange: str, today: date, settings: RegistrySettings,
-                       computed: int) -> dict[str, int]:
-    if exchange != "bybit":
-        raise RegistryError("liquidity: only Bybit minute data until the BingX data layer (panel stage 5)")
-    root = settings.liquidity_data_root
+                       computed: int, now: datetime | None = None) -> dict[str, int]:
+    if exchange not in ("bybit", "bingx"):
+        raise RegistryError(f"liquidity: unknown exchange {exchange}")
+    root = settings.liquidity_data_root if exchange == "bybit" else settings.bingx_data_root
     if root is None:
         raise RegistryError("liquidity data folder is not configured (tester_runner.bot_root)")
     weekdays = settings.liquidity_window_weekdays
-    last_day = today - timedelta(days=1)
-    end = _last_weekday(last_day)
-    _none, window = select_window({}, end, weekdays)              # no files given: lists every window weekday
-    first = min(window)
+    first, end, last_day = window_span(today, weekdays)
+    if exchange == "bingx":
+        from ..bingx_downloader import last_available_day
+
+        available = last_available_day(now or datetime.now(timezone.utc))
+        if end > available:
+            # BingX days appear about 9 h after midnight UTC: an early run keeps the last computed rows instead of
+            # writing every window as UNAVAILABLE (Bybit's collector writes yesterday's file at once)
+            return {"pairs": 0, "ready": 0, "unavailable": 0, "day_rows": 0, "unreadable_days": 0,
+                    "not_yet_available": end.isoformat()}
     span = [first + timedelta(days=offset) for offset in range((last_day - first).days + 1)]
-    symbols = [row[0] for row in con.execute(
-        "select symbol from pairs where exchange = ? and status = 'TRADING' order by symbol", [exchange]).fetchall()]
+    pairs = con.execute("select symbol, api_symbol from pairs where exchange = ? and status = 'TRADING' "
+                        "order by symbol", [exchange]).fetchall()
+    symbols = [symbol for symbol, _api in pairs]
     counts = {"pairs": len(symbols), "ready": 0, "unavailable": 0, "day_rows": 0, "unreadable_days": 0}
-    for symbol in symbols:
+    for symbol, api_symbol in pairs:
         facts: dict[date, DayFacts] = {}
-        for day in span:
+        if exchange == "bingx":
+            counts["unreadable_days"] += _bingx_facts(con, Path(root), symbol, api_symbol, span, facts)
+        for day in span if exchange == "bybit" else ():
             path = _day_path(Path(root), symbol, day)
             if not path.is_file():
                 continue
@@ -190,6 +272,34 @@ def _refresh_liquidity(con: duckdb.DuckDBPyConnection, exchange: str, today: dat
             raise
         counts["day_rows"] += len(facts)
     return counts
+
+
+def _bingx_facts(con: duckdb.DuckDBPyConnection, root: Path, symbol: str, api_symbol: str | None,
+                 span: Sequence[date], facts: dict[date, DayFacts]) -> int:
+    """The verified BingX days of the span (Panel stage 5d): a day counts only while its file is the verified one; a
+    verified day without a file had no trades (zero turnover). Returns the number of unreadable files."""
+    from .minute_days import ACCEPTED, day_path, known_records
+
+    if not api_symbol or not span:
+        return 0
+    unreadable = 0
+    known = known_records(con, "bingx", symbol, span[0], span[-1])
+    for day in span:
+        record = known.get(day)
+        if record is None or record["status"] not in ACCEPTED:
+            continue
+        path = day_path(root, symbol, api_symbol, day)
+        data = path.read_bytes() if path.is_file() else None
+        if (hashlib.sha256(data).hexdigest() if data is not None else None) != record["file_sha256"]:
+            continue                                   # changed since the verification: missing until verified
+        if data is None:
+            facts[day] = DayFacts(day, day.weekday() >= 5, Decimal(0), 0, 0, (), "none")
+            continue
+        try:
+            facts[day] = bingx_day_facts(path, day)
+        except (OSError, MinuteCapacityError):
+            unreadable += 1
+    return unreadable
 
 
 _COLUMNS = ("as_of_day", "model", "status", "window_weekdays", "window_days", "missing_days", "reason",

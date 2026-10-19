@@ -1139,6 +1139,93 @@ test and the retest on BingX stay «BingX — этап 5».
 - the Panel chain carries `--exchange bingx`;
 - the Bybit tester tests are unchanged.
 
+## Stage 5d contract: BingX liquidity (2026-10-19)
+
+**Model:** LOT_MODEL_V2 ([ADR-0079](../decisions/0079-lot-model-v2-weekday-liquidity.md))
+unchanged: the same window of weekdays, `V25 × A15 = L`, K and the rounding.
+- **Volume units, checked live on 2026-10-19:** BingX kline `volume` is in
+  the base asset. The sum of 1,440 minutes equals the 24 h ticker `volume`
+  within 0.2 %, and `Σ volume × close` equals its `quoteVolume` (AMD, KOPN,
+  TSLA).
+  - So the minute turnover is `close × volume`, as on Bybit.
+
+**BingX day reader** (`liquidity.bingx_day_facts`):
+- The Bybit (V1) reader cannot be used: it requires `trades > 0` and
+  `volume = buy + sell`, while BingX files carry `trades = 0` and no
+  buy/sell split.
+- The BingX reader checks each row:
+  - aligned, ordered, in-day minutes;
+  - positive prices with consistent high and low;
+  - non-negative volume.
+- Zero-volume minutes are kept in the file and are not positive minutes.
+
+**Which days count:**
+- Only days that the minute verification accepted (`minute_days` `OK` /
+  `VERIFIED_GAPS`) and whose file is still the verified one (same sha256,
+  or still absent).
+- A verified weekday with no file had no trades. It is a day of zero
+  turnover, not a missing day.
+- Any other weekday of the window is missing, and the window is
+  `LIQUIDITY_MODEL_WINDOW_UNAVAILABLE` (fail closed, as on Bybit).
+
+**Data:**
+- BingX has no market collector, so the BingX liquidity step first ensures
+  and verifies the window days of every `TRADING` BingX pair
+  (`ensure_bingx_window`, `ensure_minute_days`).
+- The first run downloads about ten days per pair (about 30 minutes for
+  about 370 pairs). Later runs add one day (a few minutes).
+- `failed` lists the pairs whose days could not be ensured, with the error
+  type.
+- **BingX lag:** BingX days appear about 9 h after midnight UTC.
+  - A run whose window end is not available yet writes no new rows and
+    returns `not_yet_available`.
+  - The last computed rows stay in force. They are never replaced by
+    UNAVAILABLE just because the run was early.
+
+**CLI and «Синхронизировать»:**
+- `liquidity --exchange bingx` (`--days N` as on Bybit).
+- `sync` gains the steps `liquidity_bingx` and `pipeline_bingx`. The Bybit
+  steps and their summaries are unchanged.
+
+**Acceptance:**
+- the BingX reader on a downloader-format file; a broken or non-finite row
+  is an unreadable day;
+- a window from verified days gives READY;
+- a verified quiet weekday gives zero turnover, not a missing day;
+- an unverified or changed day is missing, so the window is UNAVAILABLE;
+- the Bybit liquidity suite is unchanged;
+- `sync` lists the new steps.
+
+## Stage 5d evidence (2026-10-19)
+
+- **Code:**
+  - `pair_registry/liquidity.py`: `bingx_day_facts`, `window_span`,
+    `ensure_bingx_window`, and the BingX branch of `refresh_liquidity`
+    (`_bingx_facts`);
+  - CLI `liquidity --exchange`;
+  - the `sync` steps `liquidity_bingx` and `pipeline_bingx`.
+- **Tests:**
+  - `tests/test_bingx_liquidity.py`, 9 tests:
+    - the reader;
+    - a verified window gives READY;
+    - a quiet weekday gives zero turnover (`file_sha256 = none`);
+    - unverified and changed days are missing, so UNAVAILABLE;
+    - the CLI.
+    - Added after the independent review (`CODE_REVIEW_PASS`, MINOR
+      findings):
+      - a run before the BingX lag keeps the last rows;
+      - a file where none was verified counts as missing;
+      - broken and NaN rows are unreadable;
+      - one failing pair never stops the others.
+  - `test_pair_registry_records.py`: the sync steps.
+- **Live** (a copy of the registry, three TRADING BingX pairs, temporary
+  folders, removed):
+  - `liquidity --exchange bingx`: 33 days accepted, and all 3 pairs READY on
+    2026-10-16;
+  - base lots: AMD 7,830, KOPN 7,760 and TSLA 14,390 USDT. Bybit TSLA on the
+    same day is 2,610: BingX TSLA turns over about $6 M a day by its 24 h
+    ticker.
+
 ## Stage 5c evidence (2026-10-19)
 
 - **Code:**
@@ -1265,7 +1352,8 @@ test and the retest on BingX stay «BingX — этап 5».
    - ✅ 5a, the minute data layer (2026-10-19);
    - ✅ 5b, BingX history and READY (2026-10-19);
    - ✅ 5c, BingX MRS2 tester sampling (2026-10-19);
-   - 5d (liquidity) and 5e pending. 5e is one PerformanceDB with an exchange
+   - ✅ 5d, BingX liquidity (2026-10-19);
+   - 5e pending. 5e is one PerformanceDB with an exchange
      identifier, the BingX tick test and retest, and the exchange selector of
      the optimizer.
 

@@ -1,7 +1,7 @@
 """Pair registry CLI: `python -m mrs3.pair_registry <command> [--config config.local.json]`.
 
-Commands: refresh, liquidity, pipeline, sync (pull + refresh + liquidity + pipeline + listing workbook + push, the
-Panel's «Синхронизировать»), sync-init, workbook, decide, setting. Contract: docs/specs/2026-10-18-pair-registry.md.
+Commands: refresh, liquidity, pipeline, sync (pull + refresh + liquidity of both exchanges + pipeline of both
+exchanges + listing workbook + push, the Panel's «Синхронизировать»), sync-init, workbook, decide, setting. Contract: docs/specs/2026-10-18-pair-registry.md.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ import duckdb
 
 from .bingx import fetch_bingx, normalize_contracts, unreadable_symbols
 from .bybit import fetch_bybit, normalize_instruments, normalize_risk_limits
-from .liquidity import refresh_liquidity
+from .liquidity import ensure_bingx_window, refresh_liquidity
 from .records import record_decision, record_setting
 from .refresh import record_failure, refresh_exchange
 from .store import RegistryError, RegistrySettings, connect, load_registry_settings
@@ -114,7 +114,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     commands = parser.add_subparsers(dest="command", required=True)
     refresh = commands.add_parser("refresh", help="refresh exchange reference data (pairs, risk tiers)")
     refresh.add_argument("--exchange", choices=("bybit", "bingx", "all"), default="all")
-    liquidity = commands.add_parser("liquidity", help="weekday liquidity, LOT_MODEL_V2, for the TRADING Bybit pairs")
+    liquidity = commands.add_parser("liquidity", help="weekday liquidity, LOT_MODEL_V2, for the TRADING pairs")
+    liquidity.add_argument("--exchange", choices=("bybit", "bingx"), default="bybit",
+                           help="bingx: the window days are downloaded and verified first (no market collector)")
     liquidity.add_argument("--days", type=int, default=1,
                            help="also the windows of the N-1 run days before, oldest first (1-31; e.g. 14 to backfill "
                                 "the base-lot history)")
@@ -204,15 +206,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             try:
                 from datetime import timedelta
 
-                runs = [refresh_liquidity(con, "bybit", today - timedelta(days=offset), settings)
+                ensured = (ensure_bingx_window(con, settings, today - timedelta(days=args.days - 1), today)
+                           if args.exchange == "bingx" else None)
+                runs = [refresh_liquidity(con, args.exchange, today - timedelta(days=offset), settings)
                         for offset in range(args.days - 1, -1, -1)]          # oldest first: today's window is newest
-                result, code = {"bybit": runs[-1] if args.days == 1 else {"days": args.days, "runs": runs}}, 0
+                result = runs[-1] if args.days == 1 else {"days": args.days, "runs": runs}
+                result, code = {args.exchange: result if ensured is None else {**result, "minute_days": ensured}}, 0
             except Exception as error:
-                result, code = {"bybit": {"error": f"{type(error).__name__}: {error}"}}, 1
+                result, code = {args.exchange: {"error": f"{type(error).__name__}: {error}"}}, 1
             _emit(result)
             return code
         if args.command == "sync":
-            steps = ("pull", "refresh", "liquidity", "pipeline", "workbook", "push")
+            steps = ("pull", "refresh", "liquidity", "liquidity_bingx", "pipeline", "pipeline_bingx", "workbook",
+                     "push")
             summary: dict[str, object] = {}
             failed = False
             for done, step in enumerate(steps):
@@ -230,6 +236,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                         failed = failed or step_failed
                     elif step == "liquidity":
                         summary[step] = refresh_liquidity(con, "bybit", today, settings)
+                    elif step == "liquidity_bingx":           # Panel stage 5d: BingX days first, no collector
+                        ensured = ensure_bingx_window(con, settings, today, today)
+                        summary[step] = {**refresh_liquidity(con, "bingx", today, settings), "minute_days": ensured}
+                    elif step == "pipeline_bingx":
+                        summary[step] = _pipeline(con, args.config, today, args.machine or settings.machine,
+                                                  args.skip_track, "bingx")
                     elif step == "workbook":
                         try:
                             summary[step] = write_listing_workbook(con, settings.root / WORKBOOK_NAME)

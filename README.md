@@ -75,6 +75,8 @@ Copy-Item config.local.json.example config.local.json
 # --source minute-files keeps the old seven-calendar-day model). A sheet never mixes the two models:
 # switching a sheet needs past registry windows and one full rebuild
 .\.venv\Scripts\python.exe -m mrs3.pair_registry liquidity --days 14
+# BingX: the window days are downloaded and verified first (no market collector for BingX)
+.\.venv\Scripts\python.exe -m mrs3.pair_registry liquidity --exchange bingx
 .\scripts\calculate_bybit_base_lots.cmd --rebuild-history
 .\scripts\calculate_bybit_base_lots.cmd
 # One-time rebuild of all ten dated columns after interrupted/partial initialization
