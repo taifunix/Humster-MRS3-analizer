@@ -8,6 +8,36 @@ Use [PRD.md](PRD.md) for the feature registry and [docs/README.md](docs/README.m
 for the documentation map. Read the linked contract only for the active task;
 do not treat this file as a replacement for a feature specification.
 
+## Panel stage 5a: the minute data layer (2026-10-19, branch `wip/period-csv-generator`)
+
+Contract: [Panel for the simulation workflow](docs/specs/2026-10-18-panel-simulation-workflow.md)
+(«Stage 5 plan», «Stage 5a contract» and «Stage 5a evidence»).
+
+- `ensure_minute_days(con, settings, exchange, symbol, first, last)`:
+  - Bybit uses the trade archive;
+  - BingX uses klines, verified per day: `OK`, `VERIFIED_GAPS` by the hourly
+    klines, or `SUSPECT` after three refetches.
+  - Results are recorded in the local registry table `minute_days` and
+    reused while the file hash is unchanged.
+- **Verification:**
+  - `tests/test_minute_days.py`: 19 passed;
+  - registry, BingX downloader and Panel main-screen suites: 170 passed;
+  - independent review `CODE_REVIEW_FAIL`: a MAJOR, an empty BingX answer
+    removed a valid day file. Fixed: the file changes only when the day is
+    accepted, and never for a worse or empty answer. The MINOR findings were
+    fixed too (relative tolerance, malformed answer, workers from
+    `duckdb_import.workers`).
+  - Re-review `CODE_REVIEW_PASS`. Open:
+    - MINOR: a `SUSPECT` record describes the last refetched candidate, not
+      the kept file whose hash it stores;
+    - NIT: a transient read error on a valid file plus an empty answer could
+      remove the file.
+  - live on BingX (temporary folders, removed): AMD four days `OK`, KOPN
+    10-15 `VERIFIED_GAPS` `22:52-23:02`, as recorded in the spec.
+- **Next:**
+  - 5b: BingX history in the trade store and READY;
+  - then 5c (tester sampling, tick tests) and 5d (liquidity, Panel actions).
+
 ## Pair registry stage 5: git sync between machines (2026-10-19, branch `wip/period-csv-generator`)
 
 Contract: [pair registry](docs/specs/2026-10-18-pair-registry.md) («Stage 5

@@ -237,10 +237,10 @@ class BingXClient:
             raise BingXDownloadError("unexpected contracts response")
         return data
 
-    def klines(self, symbol: str, start_ms: int, end_ms: int) -> list[dict[str, object]]:
+    def klines(self, symbol: str, start_ms: int, end_ms: int, interval: str = "1m") -> list[dict[str, object]]:
         data = self._get(
             KLINES_PATH,
-            {"symbol": symbol, "interval": "1m", "startTime": start_ms, "endTime": end_ms, "limit": 1440},
+            {"symbol": symbol, "interval": interval, "startTime": start_ms, "endTime": end_ms, "limit": 1440},
         )
         if not isinstance(data, list):
             raise BingXDownloadError("unexpected klines response")

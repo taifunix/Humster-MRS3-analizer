@@ -13,6 +13,7 @@ import socket
 
 import duckdb
 
+from ..config import DuckDBImportSettings
 DEFAULT_ROOT = Path("data") / "pair_registry"
 DATABASE = "registry.duckdb"
 
@@ -36,6 +37,11 @@ class RegistrySettings:
     # stage 5, git sync (ADR-0081): this machine's name and the local sync repository
     machine: str = ""
     sync_path: Path | None = None
+    # Panel stage 5a, the minute data layer: the BingX tester data folder and the download mode
+    bingx_data_root: Path | None = None
+    bingx_download_mode: str = "incremental"
+    # the shared limit for resource-heavy work (`duckdb_import.workers`, CLAUDE.md)
+    workers: int = DuckDBImportSettings().workers
 
 
 def _strings(value: object, key: str, default: tuple[str, ...]) -> tuple[str, ...]:
@@ -123,12 +129,27 @@ def load_registry_settings(config_path: Path) -> RegistrySettings:
     raw_data = liquidity.get("data_root")
     if raw_data is not None and not isinstance(raw_data, str):
         raise RegistryError("pair_registry.liquidity.data_root must be a path")
+    runner = document.get("tester_runner") if isinstance(document.get("tester_runner"), dict) else {}
+    bot_root = runner.get("bot_root") if isinstance(runner.get("bot_root"), str) and runner.get("bot_root") else None
     if raw_data:
         data_root: Path | None = Path(raw_data) if Path(raw_data).is_absolute() else config_path.parent / raw_data
     else:
-        runner = document.get("tester_runner") if isinstance(document.get("tester_runner"), dict) else {}
-        bot_root = runner.get("bot_root")
-        data_root = Path(bot_root) / "tester" / "data" / "bybit" if isinstance(bot_root, str) and bot_root else None
+        data_root = Path(bot_root) / "tester" / "data" / "bybit" if bot_root else None
+    minute = _object(section.get("minute_data"), "pair_registry.minute_data")
+    raw_bingx = minute.get("bingx_data_root")
+    if raw_bingx is not None and not isinstance(raw_bingx, str):
+        raise RegistryError("pair_registry.minute_data.bingx_data_root must be a path")
+    if raw_bingx:
+        bingx_root: Path | None = Path(raw_bingx) if Path(raw_bingx).is_absolute() else config_path.parent / raw_bingx
+    else:
+        bingx_root = Path(bot_root) / "tester" / "data" / "bingx" if bot_root else None
+    bingx_mode = minute.get("bingx_download_mode", defaults.bingx_download_mode)
+    if bingx_mode not in ("incremental", "overwrite"):
+        raise RegistryError("pair_registry.minute_data.bingx_download_mode must be incremental or overwrite")
+    importer = document.get("duckdb_import") if isinstance(document.get("duckdb_import"), dict) else {}
+    workers = importer.get("workers", defaults.workers)
+    if isinstance(workers, bool) or not isinstance(workers, int) or workers < 1:
+        raise RegistryError("duckdb_import.workers must be a positive integer")
     machine = _machine_name(section.get("machine"))
     sync = _object(section.get("sync"), "pair_registry.sync")
     raw_sync = sync.get("path")
@@ -144,6 +165,9 @@ def load_registry_settings(config_path: Path) -> RegistrySettings:
         liquidity_round_down=_positive_decimal(liquidity.get("round_down_usdt"), "round_down_usdt",
                                                defaults.liquidity_round_down, whole=True),
         liquidity_data_root=data_root.resolve() if data_root is not None else None,
+        bingx_data_root=bingx_root.resolve() if bingx_root is not None else None,
+        bingx_download_mode=bingx_mode,
+        workers=workers,
         root=root.resolve(),
         bybit_symbol_types=_strings(bybit.get("symbol_types"), "universe.bybit.symbol_types", defaults.bybit_symbol_types),
         bybit_exclude=_strings(bybit.get("exclude"), "universe.bybit.exclude", defaults.bybit_exclude),
@@ -189,6 +213,11 @@ SCHEMA = (
     "missing_days varchar not null, positive_minutes integer, active_bins integer, total_bins integer, v25 varchar, "
     "a15 varchar, l varchar, k varchar, step varchar, base_lot varchar, computed_ms bigint not null, "
     "reason varchar, window_files varchar, inputs_sha256 varchar, primary key (exchange, symbol, as_of_day))",
+    # Panel stage 5a: the verified minute days (local, never synced)
+    "create table if not exists minute_days (exchange varchar not null, symbol varchar not null, day date not null, "
+    "candles integer not null, expected_minutes integer not null, zero_volume_minutes integer not null, "
+    "missing_minutes integer not null, gap_ranges varchar not null, differing_hours varchar not null, "
+    "status varchar not null, verified_ms bigint not null, file_sha256 varchar, primary key (exchange, symbol, day))",
 )
 # columns added after a table was first created (the stage 2 draft): added in place, nulls for old rows
 LATE_COLUMNS = (("liquidity", "reason", "varchar"), ("liquidity", "window_files", "varchar"),

@@ -914,6 +914,126 @@ is not caused by stage 1b.
   and staging the two new specs in the same commit). The re-review returned
   `CODE_REVIEW_PASS`.
 
+## Stage 5 plan: BingX (2026-10-19)
+
+Stage 5 is split so each part is reviewed and committed on its own:
+- **5a** — the minute data layer: `ensure_minute_days` for both exchanges,
+  the BingX minute verification and the registry table `minute_days`
+  (contract below);
+- **5b** — BingX history in the trade store («Посчитать историю») and READY;
+- **5c** — BingX MRS2 tester sampling and MRS3 tick tests (data ensured
+  first, `UpdateData = false`, BingX templates and fees, report symbols
+  mapped back);
+- **5d** — BingX liquidity, and the BingX actions enabled in the Panel.
+
+## Stage 5a contract: the minute data layer (2026-10-19)
+
+The rules are in the pair registry spec: «Minute data layer (both exchanges)»
+and «BingX minute verification». This contract fixes the code shape.
+
+**Module** `mrs3.pair_registry.minute_days`.
+- `ensure_minute_days(con, settings, exchange, symbol, first, last)` returns
+  the accepted days, the refused days with a reason, and the records:
+  - Bybit: `minute_data.ensure_days` on the Bybit data folder. A day is
+    accepted when its file exists or was created; nothing is recorded.
+  - BingX: the pair must be in `pairs` (exchange `bingx`). Its `api_symbol`
+    and `listing_ms` locate the files:
+    `<bingx data root>/<api symbol>/<human ticker><day>_1m.parquet`, the
+    downloader's format.
+  - Days before the listing day or after the last available day (lag 9 h)
+    are out of the plan, neither accepted nor refused.
+- `verify_bingx_days(...)` does the same for BingX without the registry. It
+  takes the known records and returns the new ones, so a process-pool worker
+  can verify and the main process writes the records.
+
+**BingX, per day:**
+1. **Reuse.** In `incremental` mode, a recorded `OK` / `VERIFIED_GAPS` day
+   whose file hash is unchanged is accepted with no request. A day with no
+   file counts as unchanged while the file is still absent.
+2. **Download.**
+   - A valid file on disk is verified as it is (`incremental`).
+   - A missing or invalid file is downloaded (1m klines). In `overwrite`
+     mode every day is downloaded again and re-verified.
+   - The fetched minutes are only a candidate. The file changes only when the
+     candidate is accepted, and is then written by the downloader's
+     `write_day_file`, so a valid file is never replaced by a worse answer.
+   - An empty answer never removes a valid file: the day is refused with
+     «the file is kept». Only a damaged file is removed.
+3. **Check.**
+   - Expected minutes run from the listing minute (on the listing day) or
+     00:00 to 23:59 UTC.
+   - Every expected minute present → `OK`.
+   - Otherwise one hourly klines request for the day:
+     - every hour equals the aggregate of its minutes (open of the first,
+       close of the last, max high, min low, sum of volume, at a relative
+       tolerance of 1e-9 with no absolute floor) → `VERIFIED_GAPS`;
+     - an hour with no minutes must have no candle or zero volume.
+   - When an hour differs, the minutes are downloaded again (up to 3 times).
+     If it still differs the day is `SUSPECT`.
+4. **Recorded** in `minute_days` (local, never synced), one row per
+   (exchange, symbol, day), replaced on each verification:
+   - candles, expected / zero-volume / missing minutes;
+   - gap ranges and differing hours, as JSON;
+   - status, verification time, file sha256.
+5. **Accepted:** `OK` and `VERIFIED_GAPS`.
+   - These are refused with the reason, and the caller refuses the segment,
+     test or job with `MISSING_DAYS`:
+     - `SUSPECT`;
+     - a failed request;
+     - a malformed klines answer.
+   - A failed request or a malformed answer refuses only its own day.
+   - A `SUSPECT` day is verified again on the next call.
+
+**Settings** (`pair_registry.minute_data`):
+- `bingx_data_root`: default `<tester_runner.bot_root>/tester/data/bingx`.
+  An empty value means not set.
+- `bingx_download_mode`: `incremental` (default) or `overwrite`.
+- Bybit downloads use the shared `duckdb_import.workers` limit (CLAUDE.md).
+
+**Acceptance (offline, fake BingX client):**
+- a complete day is `OK`;
+- a day with gaps whose hours equal the minutes is `VERIFIED_GAPS`, with the
+  gap ranges;
+- a day without candles whose hours are empty is `VERIFIED_GAPS` with 0
+  candles and no file;
+- a differing hour is refetched, then `SUSPECT` and refused;
+- reuse makes no request while the hash is unchanged; a changed file and
+  `overwrite` re-verify;
+- days outside the plan are skipped;
+- a day already on disk is verified once;
+- Bybit delegates to `ensure_days`;
+- an unknown BingX pair is refused.
+
+## Stage 5a evidence (2026-10-19)
+
+- **Code:**
+  - `pair_registry/minute_days.py`;
+  - the `minute_days` table and the settings `bingx_data_root` /
+    `bingx_download_mode` in `pair_registry/store.py`;
+  - `BingXClient.klines(..., interval)`.
+- **Tests:** `tests/test_minute_days.py`, 19 tests:
+  - one per acceptance item;
+  - a failed request is refused and not recorded;
+  - `verify_bingx_days` works without the registry;
+  - added after the independent review (`CODE_REVIEW_FAIL`: a MAJOR, an
+    empty BingX answer removed a valid file):
+    - an empty answer in `overwrite` keeps the file;
+    - a worse refetch never replaces the file;
+    - a refetch that heals the day is written;
+    - the listing day;
+    - an hour without minutes;
+    - the relative tolerance;
+    - a malformed answer refuses only its own day;
+    - the settings.
+- **Live, BingX API, 2026-10-19,** in a temporary registry and data folder
+  (removed afterwards); AMD and KOPN, 2026-10-14…17:
+  - AMD: all four days `OK` with 1,440 candles;
+  - KOPN: 10-14 and 10-17 `OK`;
+  - KOPN 10-15: `VERIFIED_GAPS`, 11 missing minutes `22:52-23:02`, the
+    exchange pause the registry spec recorded;
+  - KOPN 10-16: `VERIFIED_GAPS`, `00:08-00:21`.
+  - Every real hourly candle equalled the aggregate of its minutes.
+
 ## Order of work
 
 1. Remove the obsolete screens and their backend (1a, 1b above); three-screen
@@ -925,7 +1045,9 @@ is not caused by stage 1b.
 4. ✅ «Стратегии» view: tick-test metrics, column chooser, filter toggles, ranks,
    finalist marks, Excel round trip, finalist retest (4a, 4b); A/B and the
    Pareto screen removed (4c) — 2026-10-19.
-5. ⏳ BingX in the trade store, READY, tester sampling and tick tests.
+5. ⏳ BingX in the trade store, READY, tester sampling and tick tests (see
+   «Stage 5 plan»): ✅ 5a, the minute data layer (2026-10-19); 5b–5d
+   pending.
 
 **Deferred (user, 2026-10-19; not urgent).**
 - Retire the base-lot Excel export (`scripts/calculate_bybit_base_lots.py`,
