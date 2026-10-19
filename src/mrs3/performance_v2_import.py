@@ -45,6 +45,9 @@ from .performance_v2_store import (
     initialize_performance_v2,
     performance_v2_database_path,
     require_database_identity,
+    KNOWN_EXCHANGES,
+    exchange_name_tag,
+    known_exchange,
     require_performance_v2,
     PerformanceV2WriterLock,
 )
@@ -739,6 +742,29 @@ def report_evaluation_protocol(
     return "v2", tuple(unmet)
 
 
+TESTER_EXCHANGE_NAME = "tester"                 # what the real tester writes into exchange.name of its HTML
+
+
+def _reported_exchange(settings: Mapping[str, object]) -> str:
+    exchange = settings.get("exchange")
+    name = exchange.get("name") if isinstance(exchange, Mapping) else None
+    return name.strip() if isinstance(name, str) else ""
+
+
+def effective_exchange(entry: PreparedV2Entry, settings: Mapping[str, object]) -> tuple[str | None, str | None]:
+    """(the known exchange of a report, conflict text). ADR-0083: the real tester writes `exchange.name = "tester"`
+    into its HTML, so a report naming no exchange or the tester takes the one of its hash-verified strategy JSON /
+    manifest (`entry.exchange_name`); any other unknown name stays unknown; two known exchanges that differ are a
+    conflict."""
+    reported = _reported_exchange(settings)
+    from_report, from_strategy = known_exchange(reported), known_exchange(entry.exchange_name)
+    if from_report is not None and from_strategy is not None and from_report != from_strategy:
+        return None, f"report exchange is {from_report}, strategy exchange is {from_strategy}"
+    if from_report is None and reported and reported.casefold() != TESTER_EXCHANGE_NAME:
+        return None, None                       # an unknown exchange name: EXCHANGE_UNKNOWN in a marked database
+    return from_report or from_strategy, None
+
+
 def _identity_rejection(
     entry: PreparedV2Entry, settings: Mapping[str, object], database_protocol: str, database_exchange: str | None,
 ) -> tuple[str, str] | None:
@@ -753,12 +779,27 @@ def _identity_rejection(
         return _PROTOCOL_V2_INCOMPLETE, "protocol v2 report does not meet: " + ", ".join(unmet)
     if protocol != database_protocol:
         return "EVALUATION_PROTOCOL_MISMATCH", f"report is {protocol}, database is {database_protocol}"
-    if database_exchange is not None:
-        exchange = settings.get("exchange")
-        name = exchange.get("name") if isinstance(exchange, Mapping) else None
-        reported = name.strip() if isinstance(name, str) else ""
-        if reported.casefold() != database_exchange.strip().casefold():
-            return "EXCHANGE_MISMATCH", f"report exchange is {reported or 'not set'}, database is {database_exchange}"
+    # ADR-0083: one database holds every known exchange. A bound database needs a known exchange for each report;
+    # in any database the name and the exchange agree both ways (a non-Bybit name carries its tag, a tagged name is
+    # of that exchange), so the exchanges never share a name and a replacement never changes a result's exchange.
+    canonical, conflict = effective_exchange(entry, settings)
+    if conflict is not None:
+        return "EXCHANGE_CONFLICT", conflict
+    if database_exchange is not None and canonical is None:
+        reported = _reported_exchange(settings)
+        if not reported and not str(entry.exchange_name or "").strip():
+            return "EXCHANGE_MISSING", "report does not name its exchange"
+        known = ", ".join(KNOWN_EXCHANGES)
+        return "EXCHANGE_UNKNOWN", f"report exchange {reported or entry.exchange_name} is not one of {known}"
+    name = str(entry.strategy_name)
+    if canonical is not None:
+        tag = exchange_name_tag(canonical)
+        if tag and not name.startswith(tag):
+            return "EXCHANGE_NAME_TAG", f"a {canonical} strategy name must start with {tag}"
+    for other in KNOWN_EXCHANGES:
+        tag = exchange_name_tag(other)
+        if tag and other != canonical and name.startswith(tag):
+            return "EXCHANGE_NAME_TAG", f"a name starting with {tag} is a {other} strategy"
     return None
 
 
@@ -2181,6 +2222,9 @@ def _result_values(entry: PreparedV2Entry, report: ParsedPerformanceV2Report, co
     exchange_name = entry.exchange_name
     if isinstance(exchange, Mapping) and isinstance(exchange.get("name"), str) and exchange["name"].strip():
         exchange_name = exchange["name"].strip()
+    known, _conflict = effective_exchange(entry, report.settings)
+    if known is not None:                       # ADR-0083: the canonical exchange, never the tester's "tester"
+        exchange_name = known
     reported_start = (report.reported_start_utc or start).astimezone(timezone.utc)
     reported_end = (report.reported_end_utc or end).astimezone(timezone.utc)
     effective_start = (report.effective_start_utc or reported_start).astimezone(timezone.utc)

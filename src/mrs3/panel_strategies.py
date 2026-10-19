@@ -19,7 +19,7 @@ from typing import Mapping, Sequence
 
 import duckdb
 
-from .pair_registry.records import FINALIST_STATUSES, current_finalists, database_exchange
+from .pair_registry.records import FINALIST_STATUSES, current_finalists, database_exchange, result_exchange_sql
 from .performance_v2_html import REPORT_ANALYTICS_LABELS
 from .performance_v2_selection import (
     SelectionConfig, SelectionRequest, hard_cutoff_evidence, load_selection_candidates, retest_cohort_request,
@@ -142,13 +142,12 @@ def _read_tested_rows(performance_db: Path, exchange: str, config: SelectionConf
     metrics (read only). Returns rows by strategy name and notes about pairs whose metrics could not be read."""
     notes: list[str] = []
     with duckdb.connect(str(performance_db), read_only=True) as connection:
-        if database_exchange(connection) != exchange:
-            return {}, []
-        rows = connection.execute(
+        rows = connection.execute(               # ADR-0083: the strategies whose current result is of this exchange
             "select s.strategy_id, s.strategy_name, s.symbol, s.side, s.timeframe, r.result_id, r.report_start_utc, "
             "r.report_end_utc, r.total_pnl_pct, r.max_drawdown_pct, r.total_trades from strategies s "
             "join strategy_results r on r.result_id = s.current_result_id and r.strategy_id = s.strategy_id "
-            "where s.lifecycle_status = 'ACTIVE' order by s.strategy_name").fetchall()
+            f"where s.lifecycle_status = 'ACTIVE' and {result_exchange_sql('r')} = ? order by s.strategy_name",
+            [database_exchange(connection), exchange.lower()]).fetchall()
         tested: dict[str, dict] = {}
         cohorts: dict[tuple[str, str], list[tuple[int, int]]] = {}
         for strategy_id, name, symbol, side, timeframe, result_id, start, end, pnl, dd, trades in rows:

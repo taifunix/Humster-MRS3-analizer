@@ -3553,18 +3553,17 @@ def test_same_batch_incomparable_typed_intervals_roll_back(tmp_path: Path) -> No
         assert connection.execute("select count(*) from strategies").fetchone() == (0,)
 
 
-def test_import_refuses_a_database_bound_to_another_exchange_before_writing(tmp_path: Path) -> None:
+def test_a_database_marked_with_another_exchange_takes_the_reports_of_known_exchanges(tmp_path: Path) -> None:
+    # ADR-0083: the database marker no longer binds its exchange; each report names its own
     request, _ = _request(tmp_path, initialize_db=False)
     target = performance_v2_database_path(request.config)
     target.parent.mkdir(parents=True)
     with duckdb.connect(str(target)) as connection:
-        initialize_performance_v2(connection, exchange="OKX")
-    before = target.read_bytes()
+        initialize_performance_v2(connection, exchange="BingX")
 
-    with pytest.raises(PerformanceV2ImportError, match="EXCHANGE_MISMATCH"):
-        import_performance_v2(request)
-
-    assert target.read_bytes() == before
+    assert import_performance_v2(request).imported_count == 1
+    with duckdb.connect(str(target), read_only=True) as connection:
+        assert connection.execute("select exchange from strategy_results").fetchall() == [("Bybit",)]
 
 
 def _report_with_ma(open_source: str | None, *, close_source: str = "ohlc4", fixed_lot: bool = True) -> bytes:
@@ -3917,15 +3916,36 @@ def test_v2_database_accepts_v2_and_rejects_others_one_by_one(tmp_path: Path) ->
 
     result = import_performance_v2(request)
 
-    assert (result.imported_count, result.rejected_count) == (1, 4)
+    # epsilon names no exchange: it takes its strategy's (Bybit), as the real tester's reports do (ADR-0083)
+    assert (result.imported_count, result.rejected_count) == (2, 3)
     target = performance_v2_database_path(request.config)
     assert _import_statuses(target) >= {
-        "REJECTED:PROTOCOL_V2_INCOMPLETE", "REJECTED:EVALUATION_PROTOCOL_MISMATCH", "REJECTED:EXCHANGE_MISMATCH",
+        "REJECTED:PROTOCOL_V2_INCOMPLETE", "REJECTED:EVALUATION_PROTOCOL_MISMATCH", "REJECTED:EXCHANGE_UNKNOWN",
     }
     with duckdb.connect(str(target), read_only=True) as connection:
-        assert connection.execute("select s.strategy_name, r.sizing_use_upnl, r.sizing_use_fix from strategies s join strategy_results r on r.result_id = s.current_result_id").fetchall() == [("alpha", False, True)]
+        assert connection.execute("select s.strategy_name, r.sizing_use_upnl, r.sizing_use_fix from strategies s join strategy_results r on r.result_id = s.current_result_id order by 1").fetchall() == [("alpha", False, True), ("epsilon", False, True)]
         rows = connection.execute("select status from import_files").fetchall()
-    assert sum(1 for (status,) in rows if status == "REJECTED:EXCHANGE_MISMATCH") == 2
+    assert sum(1 for (status,) in rows if status.startswith("REJECTED:EXCHANGE_")) == 1
+
+
+def test_one_database_holds_both_exchanges_with_tagged_bingx_names(tmp_path: Path) -> None:
+    # ADR-0083: a BingX report sits next to a Bybit one; its name carries BINGX_, so names never collide
+    request = _v2_request(tmp_path, ("alpha", "BINGX_alpha", "gamma"))
+    for name in ("BINGX_alpha", "gamma"):
+        _strategy_exchange(request, name, "BingX")
+    _write_named_report(request, "alpha", _report_2026_10(protocol_v2=True))
+    _write_named_report(request, "BINGX_alpha", _report_2026_10(protocol_v2=True, exchange="BingX"))
+    _write_named_report(request, "gamma", _report_2026_10(protocol_v2=True, exchange="bingx"))
+
+    result = import_performance_v2(request)
+
+    assert (result.imported_count, result.rejected_count) == (2, 1)
+    target = performance_v2_database_path(request.config)
+    assert "REJECTED:EXCHANGE_NAME_TAG" in _import_statuses(target)
+    with duckdb.connect(str(target), read_only=True) as connection:
+        assert connection.execute(
+            "select s.strategy_name, r.exchange from strategies s join strategy_results r "
+            "on r.result_id = s.current_result_id order by 1").fetchall() == [("BINGX_alpha", "BingX"), ("alpha", "Bybit")]
 
 
 def test_report_evaluation_protocol_names_unmet_v2_fields() -> None:
@@ -4028,3 +4048,56 @@ def test_failed_replace_keeps_old_core_and_analytics(tmp_path: Path, monkeypatch
         ))
 
     assert snapshot() == before
+
+
+def test_an_unbound_database_still_requires_the_tag_of_another_exchange(tmp_path: Path) -> None:
+    # ADR-0083: the live PerformanceDB is v1 and unmarked; a BingX report there still needs its BINGX_ name
+    request, _ = _request(tmp_path, names=("alpha", "BINGX_beta"))
+    for name in ("alpha", "BINGX_beta"):
+        _strategy_exchange(request, name, "BingX")
+    _write_named_report(request, "alpha", _report_2026_10(exchange="BingX") + b"<!-- alpha -->")   # distinct files
+    _write_named_report(request, "BINGX_beta", _report_2026_10(exchange="BingX"))
+
+    result = import_performance_v2(request)
+
+    assert (result.imported_count, result.rejected_count) == (1, 1)
+    assert "REJECTED:EXCHANGE_NAME_TAG" in _import_statuses(performance_v2_database_path(request.config))
+
+
+def _strategy_exchange(request: PerformanceV2ImportRequest, name: str, exchange: str) -> None:
+    manifest_path = request.inbox / "inbox_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    for entry in manifest["entries"]:
+        if entry["strategy_name"] == name:
+            entry["exchange_name"] = exchange
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+
+def test_a_tester_report_takes_the_exchange_of_its_strategy(tmp_path: Path) -> None:
+    # review of 5e-1: the real tester writes exchange.name = "tester"; the strategy (manifest) names the exchange
+    request, _ = _request(tmp_path, names=("alpha", "BINGX_beta", "gamma"))
+    _write_named_report(request, "alpha", _report_2026_10(exchange="tester") + b"<!-- a -->")
+    _write_named_report(request, "BINGX_beta", _report_2026_10(exchange="tester") + b"<!-- b -->")
+    _write_named_report(request, "gamma", _report_2026_10(exchange="BingX") + b"<!-- g -->")
+    for name in ("alpha", "BINGX_beta"):
+        _strategy_exchange(request, name, "BingX")                       # alpha: a BingX strategy without its tag
+
+    result = import_performance_v2(request)
+
+    assert (result.imported_count, result.rejected_count) == (1, 2)
+    target = performance_v2_database_path(request.config)
+    assert _import_statuses(target) >= {"REJECTED:EXCHANGE_NAME_TAG", "REJECTED:EXCHANGE_CONFLICT"}
+    with duckdb.connect(str(target), read_only=True) as connection:
+        assert connection.execute("select s.strategy_name, r.exchange from strategies s join strategy_results r "
+                                  "using (strategy_id)").fetchall() == [("BINGX_beta", "BingX")]   # canonical
+
+
+def test_a_tagged_name_with_a_bybit_report_is_refused(tmp_path: Path) -> None:
+    # review of 5e-1: the tag works both ways, so a replacement can never move a BingX strategy to Bybit
+    request = _v2_request(tmp_path, ("BINGX_alpha",))
+    _write_named_report(request, "BINGX_alpha", _report_2026_10(protocol_v2=True, exchange="Bybit"))
+
+    result = import_performance_v2(request)
+
+    assert (result.imported_count, result.rejected_count) == (0, 1)
+    assert "REJECTED:EXCHANGE_NAME_TAG" in _import_statuses(performance_v2_database_path(request.config))

@@ -235,6 +235,13 @@ def _performance(database: Path) -> duckdb.DuckDBPyConnection:
     return duckdb.connect(str(database), read_only=True)
 
 
+def result_exchange_sql(alias: str) -> str:
+    """SQL of a result's exchange (ADR-0083): a stored known exchange, else the database's home exchange (one `?`
+    parameter: `database_exchange`). Legacy results hold e.g. `tester` (the v1 PerformanceDB, live 2026-10-18)."""
+    return (f"case when lower(trim({alias}.exchange)) in ('bybit', 'bingx') then lower(trim({alias}.exchange)) "
+            "else ? end")
+
+
 def database_exchange(source: duckdb.DuckDBPyConnection) -> str:
     """Exchange of a PerformanceDB: `schema_info.exchange` (protocol v2); a protocol v1 database has none and holds
     Bybit results only (its `strategy_results.exchange` column says `tester`)."""
@@ -253,14 +260,15 @@ def import_finalists(con: duckdb.DuckDBPyConnection, performance_db: Path, excha
         tables = {row[0] for row in source.execute("select table_name from information_schema.tables").fetchall()}
         if not {"selection_review_rows", "selection_review_imports", "strategies"} <= tables:
             return 0
-        if database_exchange(source) != exchange.lower():
-            return 0
+        # ADR-0083: one PerformanceDB holds both exchanges; a strategy's exchange is that of its current result
         rows = source.execute(
             "select s.symbol, s.side, s.strategy_name, r.user_status, r.user_rank from ("
             "select r.*, row_number() over (partition by r.strategy_id order by i.imported_at_utc desc, "
             "r.review_import_id desc) as latest "
             "from selection_review_rows r join selection_review_imports i using (review_import_id)) r "
-            "join strategies s using (strategy_id) where r.latest = 1 order by s.strategy_name").fetchall()
+            "join strategies s using (strategy_id) join strategy_results x on x.strategy_id = s.strategy_id "
+            f"where r.latest = 1 and {result_exchange_sql('x')} = ? order by s.strategy_name",
+            [database_exchange(source), exchange.lower()]).fetchall()
     in_force = {row["strategy"]: row["status"] for row in current_finalists(con, exchange)}
     changes = 0
     for symbol, side, name, status, rank in rows:
@@ -310,12 +318,13 @@ def import_tick_tests(con: duckdb.DuckDBPyConnection, performance_db: Path, exch
     now_ms = now_ms or _now_ms()
     with _performance(performance_db) as source:
         tables = {row[0] for row in source.execute("select table_name from information_schema.tables").fetchall()}
-        if not {"strategies", "strategy_results"} <= tables or database_exchange(source) != exchange.lower():
+        if not {"strategies", "strategy_results"} <= tables:
             return 0
-        rows = source.execute(
+        rows = source.execute(                   # ADR-0083: the results of this exchange only
             "select r.result_id, s.symbol, s.side, s.strategy_name, r.report_start_utc, r.report_end_utc, "
             "r.total_pnl_pct, r.max_drawdown_pct, r.total_trades from strategy_results r join strategies s "
-            "using (strategy_id) order by r.result_id").fetchall()
+            f"using (strategy_id) where {result_exchange_sql('r')} = ? order by r.result_id",
+            [database_exchange(source), exchange.lower()]).fetchall()
     added = 0
     for result_id, symbol, side, name, start, end, pnl, maxdd, trades in rows:
         added += _add_test(con, {"source": f"perfdb:{result_id}", "exchange": exchange, "symbol": symbol,

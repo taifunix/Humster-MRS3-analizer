@@ -2110,11 +2110,9 @@ def test_identity_markers_are_written_at_creation_and_validated() -> None:
         with pytest.raises(PerformanceV2IdentityError) as protocol_error:
             require_database_identity(v2, PerformanceV2Config(root))
         assert protocol_error.value.code == "EVALUATION_PROTOCOL_MISMATCH"
-        with pytest.raises(PerformanceV2IdentityError) as exchange_error:
-            require_database_identity(v2, PerformanceV2Config(root, evaluation_protocol="v2", exchange="OKX"))
-        assert exchange_error.value.code == "EXCHANGE_MISMATCH"
-        with pytest.raises(PerformanceV2IdentityError, match="EXCHANGE_MISMATCH"):
-            require_database_identity(v1_bound, PerformanceV2Config(root))
+        # ADR-0083: the exchange is no longer part of the identity; only the protocol is
+        require_database_identity(v2, PerformanceV2Config(root, evaluation_protocol="v2", exchange="BingX"))
+        require_database_identity(v1_bound, PerformanceV2Config(root))
 
         v2.execute("delete from schema_info where key = 'exchange'")
         with pytest.raises(PerformanceV2StoreError, match="requires an exchange marker"):

@@ -99,8 +99,7 @@ def _pipeline(con: duckdb.DuckDBPyConnection, config: Path, today: date, machine
     store_root = (document.get("trade_store") or {}).get("root")
     if not store_root:
         raise RegistryError("trade_store.root is not configured")
-    # the PerformanceDB holds Bybit tick tests; BingX reads none until Panel stage 5c
-    performance_db, why = _performance_db(Path(config)) if exchange == "bybit" else (None, "BingX: Panel stage 5c")
+    performance_db, why = _performance_db(Path(config))      # ADR-0083: one PerformanceDB for both exchanges
     machine = machine or os.environ.get("COMPUTERNAME") or socket.gethostname()
     outcome = compute_pipeline(con, TradeStore(Path(store_root)), exchange, today, machine,
                                performance_db=performance_db, track=not skip_track)

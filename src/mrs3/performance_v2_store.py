@@ -1227,6 +1227,27 @@ def require_performance_v2(connection: duckdb.DuckDBPyConnection) -> None:
     _require_v12_catalog(connection)
 
 
+# ADR-0083: one PerformanceDB for both exchanges. A strategy's exchange is the `exchange` of its current result;
+# the database marker `exchange` stays only as the home exchange (the default of the optimizer until its selector).
+KNOWN_EXCHANGES = ("Bybit", "BingX")
+
+
+def known_exchange(name: object) -> str | None:
+    """The canonical spelling of a known exchange name (case and spaces ignored), else None."""
+    if not isinstance(name, str):
+        return None
+    wanted = name.strip().casefold()
+    return next((exchange for exchange in KNOWN_EXCHANGES if exchange.casefold() == wanted), None)
+
+
+def exchange_name_tag(exchange: str) -> str:
+    """The strategy-name prefix of an exchange: none for Bybit (its names stay as they are), `BINGX_` for BingX."""
+    canonical = known_exchange(exchange)
+    if canonical is None:
+        raise ValueError(f"unknown exchange: {exchange!r}")
+    return "" if canonical == "Bybit" else f"{canonical.upper()}_"
+
+
 def database_identity(connection: duckdb.DuckDBPyConnection) -> tuple[str, str | None]:
     """Return the immutable (evaluation protocol, exchange) markers; no marker means v1 / unbound."""
     markers = _schema_markers(connection)
@@ -1234,16 +1255,13 @@ def database_identity(connection: duckdb.DuckDBPyConnection) -> tuple[str, str |
 
 
 def require_database_identity(connection: duckdb.DuckDBPyConnection, config: PerformanceV2Config) -> None:
-    """Refuse a database whose protocol or exchange marker differs from the active configuration."""
-    protocol, exchange = database_identity(connection)
+    """Refuse a database whose evaluation protocol differs from the active configuration. The exchange is no longer
+    part of the identity (ADR-0083): one database holds both exchanges, each result names its own."""
+    protocol, _exchange = database_identity(connection)
     if protocol != config.evaluation_protocol:
         raise PerformanceV2IdentityError(
             "EVALUATION_PROTOCOL_MISMATCH",
             f"database is {protocol}, configuration is {config.evaluation_protocol}",
-        )
-    if exchange is not None and (config.exchange or "").casefold() != exchange.casefold():
-        raise PerformanceV2IdentityError(
-            "EXCHANGE_MISMATCH", f"database is {exchange}, configuration is {config.exchange or 'not set'}",
         )
 
 

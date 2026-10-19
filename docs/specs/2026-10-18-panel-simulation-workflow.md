@@ -1139,6 +1139,79 @@ test and the retest on BingX stay «BingX — этап 5».
 - the Panel chain carries `--exchange bingx`;
 - the Bybit tester tests are unchanged.
 
+## Stage 5e contract: one PerformanceDB for both exchanges (2026-10-19)
+
+Decision: [ADR-0083](../decisions/0083-one-performancedb-for-both-exchanges.md).
+It follows the user's decision of 2026-10-19 and rests on its audit:
+- no schema change;
+- the exchange of a strategy is the `exchange` of its current result.
+
+5e is committed in three parts.
+
+**5e-1 — the database accepts both exchanges:**
+- `require_database_identity` checks the evaluation protocol only. A
+  configuration of another exchange is no longer `EXCHANGE_MISMATCH`.
+- **Import, per report:**
+  - **the effective exchange:**
+    - the report's `exchange.name` if it is known;
+    - if the report names no exchange or the tester's `tester`, the
+      exchange of its strategy JSON / manifest;
+    - two different known exchanges are `EXCHANGE_CONFLICT`;
+    - the canonical name is stored;
+  - in a marked database:
+    - the report must name its exchange; otherwise `EXCHANGE_MISSING`;
+    - the exchange must be a known one (`Bybit`, `BingX`, case-insensitive,
+      `KNOWN_EXCHANGES`); otherwise `EXCHANGE_UNKNOWN`;
+  - in every database, the unmarked live v1 one included, the name and the
+    exchange agree both ways, otherwise `EXCHANGE_NAME_TAG`:
+    - a BingX strategy is named `BINGX_…`;
+    - a `BINGX_…` name is a BingX strategy;
+  - each is rejected alone, as before.
+- **The rows of one exchange,** by the result's exchange
+  (`result_exchange_sql`), in:
+  - a stored `Bybit` / `BingX` counts as that exchange;
+  - any other value counts as the home exchange (the marker, or Bybit).
+    The live database is v1, schema 6, unmarked, and its 1,805 results hold
+    `tester`.
+
+  The filter is applied in:
+  - the registry imports `import_tick_tests` and `import_finalists`;
+  - the «Стратегии» view.
+  The marker of the database no longer decides.
+- `pipeline --exchange bingx` reads the same PerformanceDB.
+- **Creating a database on «Настройки»** (`performance_databases_create`,
+  unchanged code): an empty protocol-v2 database whose marker is now its
+  *home* exchange. It takes the strategies of both exchanges.
+  - The card says so: «Одна база для обеих бирж»; the field is «Основная
+    биржа».
+  - The user does not need the live v1 database (2026-10-19). A new
+    database is created there.
+- The optimizer, portfolios and the finalist retest stay on the database's
+  home exchange (its marker, Bybit) until 5e-2.
+
+**5e-2 — the optimizer by exchange:** an exchange selector on «Портфели».
+The optimizer, its finalists and its strategy selection take only that
+exchange's strategies.
+
+**5e-3 — BingX tick test and retest** (only after 5e-2: until then some
+readers have no exchange filter, see ADR-0083 «Stage order»):
+- the BingX profile for the evaluation target;
+- strategy names `BINGX_…`;
+- the API symbol in the tester strategy;
+- the reports mapped back to the human ticker.
+
+**Acceptance, 5e-1:**
+- a database created on «Настройки» (home exchange Bybit) takes a Bybit and
+  a BingX report, and the registry splits them by exchange;
+- a BingX report is imported into a Bybit-marked database next to Bybit
+  reports;
+- an unnamed or unknown exchange, or a BingX name without the tag, is
+  rejected alone;
+- the configuration of another exchange is accepted;
+- the registry imports and «Стратегии» list only the rows of their
+  exchange;
+- the rejected-identity suites are updated to the new codes.
+
 ## Stage 5d contract: BingX liquidity (2026-10-19)
 
 **Model:** LOT_MODEL_V2 ([ADR-0079](../decisions/0079-lot-model-v2-weekday-liquidity.md))

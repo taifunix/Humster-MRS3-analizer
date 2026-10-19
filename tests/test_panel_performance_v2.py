@@ -3794,9 +3794,9 @@ def test_panel_creates_bound_database_and_refuses_a_different_exchange(tmp_path:
     (tmp_path / "config.performance.json").write_text(json.dumps({"unified_performance_v2": {
         "database_root": "data", "evaluation_protocol": "v2", "exchange": "OKX"}}), encoding="utf-8")
     restarted = PanelController(tmp_path, tmp_path / "config.local.json")
-    with pytest.raises(PerformanceV2ApiError) as raised:
-        restarted._ensure_performance_v2_schema(database)
-    assert (raised.value.code, raised.value.status) == ("EXCHANGE_MISMATCH", 409)
+    restarted._ensure_performance_v2_schema(database)          # ADR-0083: the exchange no longer binds the database
+    with duckdb.connect(str(database), read_only=True) as connection:
+        assert connection.execute("select value from schema_info where key = 'exchange'").fetchone() == ("Bybit",)
 
 
 def test_panel_rechecks_identity_when_only_the_configuration_changes(tmp_path: Path) -> None:

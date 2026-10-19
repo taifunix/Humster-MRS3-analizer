@@ -8,6 +8,40 @@ Use [PRD.md](PRD.md) for the feature registry and [docs/README.md](docs/README.m
 for the documentation map. Read the linked contract only for the active task;
 do not treat this file as a replacement for a feature specification.
 
+## Panel stage 5e-1: one PerformanceDB for both exchanges (2026-10-19, branch `wip/period-csv-generator`)
+
+Contract: [Panel for the simulation workflow](docs/specs/2026-10-18-panel-simulation-workflow.md)
+(«Stage 5e contract»), [ADR-0083](docs/decisions/0083-one-performancedb-for-both-exchanges.md).
+User decision 2026-10-19: one PerformanceDB with an exchange identifier
+instead of a database per exchange.
+
+- **No schema change.** The audit found that a strategy's exchange is
+  already stored (`strategy_results.exchange`, one result per strategy).
+  The binding to one exchange was only the marker and two checks, and
+  those are relaxed. Schema v13 would have touched about 30 modules for
+  nothing.
+- **The live database** (checked read-only): v1, schema 6, unmarked; all
+  1,805 results hold `exchange = 'tester'`. An unknown stored value
+  therefore counts as the home exchange (Bybit), and every existing result
+  stays Bybit.
+- **Import:**
+  - reports of `Bybit` / `BingX` are accepted;
+  - a report's exchange is its own, or, when the real tester writes
+    `tester`, its strategy's;
+  - the canonical name is stored;
+  - names and exchanges agree both ways (`BINGX_`) in every database.
+- **Readers:** the registry imports and «Стратегии» take the rows of their
+  exchange. `pipeline --exchange bingx` reads the same database.
+- **A new database from «Настройки»** (the user does not need the old v1
+  one): it takes both exchanges, and the selected exchange is only its home
+  exchange. This is tested end to end: create, import a Bybit and a BingX
+  report, then split them in the registry. The card text was updated.
+- **Verification:** the identity tests were updated to the new rule; new
+  tests cover BingX next to Bybit, the name tag (marked and unmarked), and
+  the per-exchange split. After the review fixes the broad run (performance_v2_*, performance_import, Panel, databases, registry, finalists, portfolio): 2,129 passed, 24 failed (same set). First broad run: 2,070 passed, 24 failed (the known pre-existing set: equity_regime_selection 3, v5_read_compat 6, flaky panel_portfolio stage 2 1, portfolio_input 14). Independent review `CODE_REVIEW_FAIL` (MAJOR: the tester writes `tester`, so a BingX report escaped the tag check) fixed; re-review `CODE_REVIEW_PASS` (open NIT: an unknown report exchange with a known strategy exchange is not a conflict).
+- **Next:** 5e-2, the exchange selector of the optimizer; then 5e-3, the
+  BingX tick test and retest.
+
 ## Panel stage 5d: BingX liquidity (2026-10-19, branch `wip/period-csv-generator`)
 
 Contract: [Panel for the simulation workflow](docs/specs/2026-10-18-panel-simulation-workflow.md)

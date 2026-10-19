@@ -257,3 +257,38 @@ def test_create_stores_the_exchange_as_its_template_folder_names_it(tmp_path: Pa
     controller.performance_databases_create({"name": "x", "database_root": "data/x", "exchange": "bingx"})
 
     assert json.loads(local.read_text(encoding="utf-8"))["performance_databases"]["items"]["x"]["exchange"] == "BingX"
+
+
+def test_a_database_created_in_the_settings_takes_both_exchanges(tmp_path: Path) -> None:
+    # ADR-0083 (user, 2026-10-19): a new database from «Настройки» holds Bybit and BingX strategies together
+    from dataclasses import replace
+
+    from mrs3.pair_registry.records import import_tick_tests
+    from mrs3.performance_v2_import import PerformanceV2ImportRequest, import_performance_v2
+    from tests.test_pair_registry_records import NOW, _registry
+    from tests.test_performance_v2_import import _report_2026_10, _request, _strategy_exchange, _write_named_report
+
+    controller, _local = _setup(tmp_path)
+    controller.performance_databases_create(
+        {"name": "both", "database_root": "data/performance-both", "exchange": "Bybit"})
+    root = tmp_path / "data" / "performance-both"
+    request, _ = _request(tmp_path / "import", names=("alpha", "BINGX_alpha"), initialize_db=False)
+    config = replace(request.config, database_root=root, evaluation_protocol="v2", exchange="Bybit")
+    request = PerformanceV2ImportRequest(request.inbox, request.report_root, config,
+                                         listing_dates_path=request.listing_dates_path)
+    _strategy_exchange(request, "BINGX_alpha", "BingX")                     # the BingX strategy JSON names BingX
+    _write_named_report(request, "alpha", _report_2026_10(protocol_v2=True))
+    _write_named_report(request, "BINGX_alpha", _report_2026_10(protocol_v2=True, exchange="BingX"))
+
+    result = import_performance_v2(request)
+
+    assert (result.imported_count, result.rejected_count) == (2, 0)
+    database = root / "strategy_performance.duckdb"
+    with duckdb.connect(str(database), read_only=True) as connection:
+        assert database_identity(connection) == ("v2", "Bybit")                 # the home exchange only
+        assert connection.execute("select r.exchange from strategies s join strategy_results r "
+                                  "on r.result_id = s.current_result_id order by 1").fetchall() == [
+            ("BingX",), ("Bybit",)]
+    registry = _registry(tmp_path / "registry")
+    assert import_tick_tests(registry, database, "bybit", now_ms=NOW) == 1
+    assert import_tick_tests(registry, database, "bingx", now_ms=NOW) == 1

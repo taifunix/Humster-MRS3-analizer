@@ -106,9 +106,8 @@ def test_target_reads_the_base_and_checks_the_database_marker(tmp_path: Path) ->
     database.parent.mkdir(parents=True, exist_ok=True)
     with duckdb.connect(str(database)) as connection:
         initialize_performance_v2(connection, evaluation_protocol="v2", exchange="BingX")
-    with pytest.raises(EvaluationProtocolError) as error:
-        evaluation_target(config, template)
-    assert error.value.code == "EXCHANGE_MISMATCH"
+    # ADR-0083: one database holds both exchanges, so a database marked BingX serves a Bybit target too
+    assert evaluation_target(config, template) == TARGET
 
 
 

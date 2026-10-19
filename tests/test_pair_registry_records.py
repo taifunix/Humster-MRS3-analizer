@@ -287,3 +287,43 @@ def test_cli_sync_runs_refresh_liquidity_and_pipeline_with_progress(tmp_path: Pa
     summary = events[-1]["sync"]
     assert summary["refresh"]["bybit"]["pairs"] == 3 and summary["pipeline"]["pairs"] == 3
     assert summary["workbook"]["bybit"] == 3 and (tmp_path / "registry" / "pairs.xlsx").is_file()   # registry stage 4
+
+
+def test_one_performance_db_splits_tick_tests_and_strategies_by_exchange(tmp_path: Path) -> None:
+    # ADR-0083: a BingX strategy sits in the same database; each reader takes the rows of its exchange
+    from mrs3.panel_strategies import _read_tested_rows
+
+    con = _registry(tmp_path)
+    database = _performance_db(tmp_path / "perf.duckdb")
+    with duckdb.connect(str(database)) as source:
+        source.execute("update strategies set current_result_id = strategy_id + 10")
+        source.execute("insert into strategies (strategy_id, strategy_name, symbol, side, timeframe, close_ma_len, "
+                       "order_count, analysis_run_id, candidate_identity, lifecycle_status, current_result_id, "
+                       "created_at_utc, updated_at_utc) values (3, 'BINGX_GOODUSDT_1h_LONG_C', 'GOODUSDT', 'LONG', "
+                       "'1h', 2, 2, 'run', 'c', 'ACTIVE', 13, now(), now())")
+        source.execute("insert into strategy_results (result_id, strategy_id, report_start_utc, report_end_utc, "
+                       "exchange, initial_balance, final_balance, total_pnl_pct, max_drawdown_pct, total_trades, "
+                       "imported_at_utc) values (13, 3, '2026-09-01 00:00:00+00', '2026-10-01 00:00:00+00', 'BingX', "
+                       "10000, 10100, 1, 1, 10, now())")
+        source.execute("update strategy_results set exchange = 'tester' where result_id = 12")   # a legacy row
+    assert import_tick_tests(con, database, "bingx", now_ms=NOW) == 1
+    assert import_tick_tests(con, database, "bybit", now_ms=NOW) == 2                  # the legacy row is Bybit
+    assert con.execute("select exchange, structure from pair_tests where source = 'perfdb:13'").fetchone() == (
+        "bingx", "BINGX_GOODUSDT_1h_LONG_C")
+    bybit, _notes = _read_tested_rows(database, "bybit", None, metrics=False)
+    bingx, _notes = _read_tested_rows(database, "bingx", None, metrics=False)
+    assert sorted(bybit) == ["GOODUSDT_15m_LONG_A", "GOODUSDT_1h_LONG_B"] and list(bingx) == ["BINGX_GOODUSDT_1h_LONG_C"]
+
+
+def test_finalists_are_imported_per_exchange(tmp_path: Path) -> None:
+    # review of 5e-1: a BingX finalist goes to the BingX registry rows only; a legacy 'tester' result is Bybit
+    con = _registry(tmp_path)
+    database = _performance_db(tmp_path / "perf.duckdb")
+    with duckdb.connect(str(database)) as source:
+        source.execute("update strategy_results set exchange = 'BingX' where strategy_id = 2")
+        source.execute("update strategy_results set exchange = 'tester' where strategy_id = 1")
+    _review(database, "1", "2026-10-02 00:00:00+00", [(1, "FINALIST", 1), (2, "FINALIST", 2)])
+    assert import_finalists(con, database, "bingx", now_ms=NOW) == 1
+    assert import_finalists(con, database, "bybit", now_ms=NOW) == 1
+    assert [row["strategy"] for row in current_finalists(con, "bingx")] == ["GOODUSDT_1h_LONG_B"]
+    assert [row["strategy"] for row in current_finalists(con, "bybit")] == ["GOODUSDT_15m_LONG_A"]
