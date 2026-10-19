@@ -1601,6 +1601,8 @@ def _weighted_executable_identity(
                     if field in evidence and evidence[field] != row[field]:
                         raise CampaignContractError(WEIGHTED_EXECUTABLE_IDENTITY_INVALID)
                     evidence[field] = row[field]
+                if row.get("liquidity_lot_model") == "LOT_MODEL_V2":     # ADR-0079; V1 payloads stay byte-identical
+                    evidence["liquidity_lot_model"] = "LOT_MODEL_V2"
 
         ordered_members = []
         expected_identity_by_name: dict[str, tuple[str, str, int, int]] = {}
@@ -1667,7 +1669,7 @@ def _weighted_executable_identity(
                     field: _identity_evidence_decimal_text(evidence[field])
                     if field in {"liquidity_v25_usdt", "liquidity_a15"} and isinstance(evidence[field], Decimal)
                     else evidence[field]
-                    for field in evidence_fields if field in evidence
+                    for field in (*evidence_fields, "liquidity_lot_model") if field in evidence   # model: V2 rows only
                 },
                 "payload": payload,
             })
@@ -2561,8 +2563,12 @@ def run_portfolio_adapter(
     archive_fetcher: Any = None,
     workers: int = 1,
     progress_callback: Callable[[Mapping[str, Any]], Any] | None = None,
+    liquidity_reader: Callable[[str, datetime, Any], MinuteCapacityResult] | None = None,
 ) -> AdapterResult:
-    """Load official public/local facts for one frozen weighted Campaign."""
+    """Load official public/local facts for one frozen weighted Campaign.
+
+    `liquidity_reader(symbol, anchor, round_down_usdt)` supplies LOT_MODEL_V2 capacities from the pair registry
+    (pair registry stage 4, ADR-0079); without it the LOT_MODEL_V1 minute files are read (and topped up)."""
     try:
         validate_campaign_contract(campaign)
     except CampaignContractError as error:
@@ -2613,7 +2619,12 @@ def run_portfolio_adapter(
         archive_fetch_day = archive_fetcher if callable(archive_fetcher) else minute_capacity.fetch_bybit_trade_archive
 
         capacities: dict[str, MinuteCapacityResult] = {}
+        if liquidity_reader is not None and not callable(liquidity_reader):
+            raise MinuteCapacityError(MINUTE_CAPACITY_UNAVAILABLE)
         for symbol in symbols:
+            if liquidity_reader is not None:
+                capacities[symbol] = liquidity_reader(symbol, anchor, liquidity["round_down_usdt"])
+                continue
             backfill = backfill_missing_days(
                 minute_root,
                 symbol,
@@ -2673,7 +2684,7 @@ def run_portfolio_adapter(
 
     except MinuteCapacityError as error:
         code = str(error)
-        if code not in {"LIQUIDITY_MODEL_ANCHOR_UNAVAILABLE", "LIQUIDITY_MODEL_WINDOW_UNAVAILABLE"}:
+        if code not in {"LIQUIDITY_MODEL_ANCHOR_UNAVAILABLE", "LIQUIDITY_MODEL_WINDOW_UNAVAILABLE", "PAIR_REGISTRY_BUSY"}:
             code = MINUTE_CAPACITY_UNAVAILABLE
         return AdapterResult("FAIL", blockers=(code,))
     except MarketSnapshotError:

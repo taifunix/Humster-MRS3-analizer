@@ -849,7 +849,7 @@ def test_cli_reports_partial_failure_after_saving_workbook(tmp_path: Path, capsy
     assert main([
         "--input", str(workbook_path),
         "--data-root", str(data_root),
-        "--anchor-created-at", anchor.isoformat(),
+        "--anchor-created-at", anchor.isoformat(), "--source", "minute-files",
     ]) == 1
     output = capsys.readouterr().out
     assert "ERROR: ETHUSDT " in output
@@ -869,7 +869,7 @@ def test_cli_success_path_has_no_report_option_or_output(tmp_path: Path, capsys:
     assert main([
         "--input", str(workbook_path),
         "--data-root", str(data_root),
-        "--anchor-created-at", anchor.isoformat(),
+        "--anchor-created-at", anchor.isoformat(), "--source", "minute-files",
     ]) == 0
     output = capsys.readouterr().out
     assert "OK: wrote 20 dated base lots" in output

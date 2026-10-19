@@ -155,3 +155,13 @@ validation errors fail without replacing it.
 Openpyxl rewrites legacy comment package parts and can drop calculation-chain
 or printer-settings packaging metadata; the source workbook is replaced only
 after all calculations and validation have completed.
+
+## Pair registry stage 4 note (2026-10-19)
+
+- The export reads the base lots from the pair registry (LOT_MODEL_V2,
+  ADR-0079) by default. `--source minute-files` keeps the minute-file
+  calculation described above.
+- The workbook records the model of its values (defined name
+  `MRS3_BASE_LOT_MODEL`). A run of the other model refuses to add to an
+  existing history; only `--rebuild-history` replaces all ten dates.
+- Contract: [pair registry](2026-10-18-pair-registry.md), «Stage 4 contract».

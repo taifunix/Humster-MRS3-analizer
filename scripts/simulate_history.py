@@ -20,36 +20,11 @@ if __package__ in {None, ""}:
 
 from mrs3.minute_data import instrument, last_archived_day  # noqa: E402
 from mrs3.period_csv import TIMEFRAMES, grid  # noqa: E402
+from mrs3.pair_registry.history import history_pairs, listing_days  # noqa: E402
 from mrs3.trade_history import pair_order, run_history  # noqa: E402
 from mrs3.trade_store import TradeStore  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[1]
-
-
-def registry_listing(config: Path) -> dict:
-    """Listing days of the Bybit pairs in the pair registry (read-only); empty when there is no registry or a
-    writer holds it."""
-    from datetime import datetime, timezone
-
-    import duckdb
-
-    from mrs3.pair_registry.store import DATABASE, RegistryError, load_registry_settings
-
-    try:
-        settings = load_registry_settings(config)
-    except RegistryError:
-        return {}
-    if not (settings.root / DATABASE).is_file():
-        return {}
-    try:
-        con = duckdb.connect(str(settings.root / DATABASE), read_only=True)
-    except duckdb.Error as error:          # the registry is held by a writer: fall back to the workbook dates
-        print(json.dumps({"warning": f"pair registry unavailable: {type(error).__name__}"}), flush=True)
-        return {}
-    with con:
-        rows = con.execute("select symbol, listing_ms from pairs where exchange = 'bybit' and listing_ms is not null"
-                           ).fetchall()
-    return {symbol: datetime.fromtimestamp(ms / 1000, timezone.utc).date() for symbol, ms in rows}
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -70,10 +45,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--store or trade_store.root in the config is required")
     data_root = Path(config["tester_runner"]["bot_root"]) / "tester" / "data" / "bybit"
     workers = args.workers or int(config.get("duckdb_import", {}).get("workers", 4))
-    order = pair_order(Path(config["panel_workflow"]["listing_dates_path"]))
+    warn = lambda text: print(json.dumps({"warning": text}), flush=True)          # noqa: E731
+    order = history_pairs(args.config, on_busy=warn)    # the pair registry; the workbook only without one
+    if order is None:
+        order = pair_order(Path(config["panel_workflow"]["listing_dates_path"]))
     if args.pairs:
         wanted = [item.strip().upper() for item in args.pairs.split(",") if item.strip()]
-        known = {**dict(order), **registry_listing(args.config)}    # the registry wins, as in the Panel plan
+        known = {**dict(order), **listing_days(args.config, on_busy=warn)}    # the registry wins, as in the plan
         missing = [symbol for symbol in wanted if symbol not in known]
         if missing:
             parser.error(f"pairs without a listing day in the registry: {', '.join(missing)}")

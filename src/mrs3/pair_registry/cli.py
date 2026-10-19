@@ -1,7 +1,7 @@
 """Pair registry CLI: `python -m mrs3.pair_registry <command> [--config config.local.json]`.
 
-Commands: refresh, liquidity, pipeline, sync (refresh + liquidity + pipeline, the Panel's «Синхронизировать»),
-decide, setting. Contract: docs/specs/2026-10-18-pair-registry.md.
+Commands: refresh, liquidity, pipeline, sync (refresh + liquidity + pipeline + listing workbook, the Panel's
+«Синхронизировать»), workbook, decide, setting. Contract: docs/specs/2026-10-18-pair-registry.md.
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ from .liquidity import refresh_liquidity
 from .records import record_decision, record_setting
 from .refresh import record_failure, refresh_exchange
 from .store import RegistryError, RegistrySettings, connect, load_registry_settings
+from .workbook import WORKBOOK_NAME, write_listing_workbook
 
 
 def _now_ms() -> int:
@@ -103,8 +104,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     refresh = commands.add_parser("refresh", help="refresh exchange reference data (pairs, risk tiers)")
     refresh.add_argument("--exchange", choices=("bybit", "bingx", "all"), default="all")
     liquidity = commands.add_parser("liquidity", help="weekday liquidity, LOT_MODEL_V2, for the TRADING Bybit pairs")
+    liquidity.add_argument("--days", type=int, default=1,
+                           help="also the windows of the N-1 run days before, oldest first (1-31; e.g. 14 to backfill "
+                                "the base-lot history)")
     pipeline = commands.add_parser("pipeline", help="import tests and finalists, recompute the pipeline state")
-    sync = commands.add_parser("sync", help="refresh both exchanges, then liquidity, then the pipeline")
+    sync = commands.add_parser("sync", help="refresh both exchanges, then liquidity, the pipeline, the workbook")
+    workbook = commands.add_parser("workbook", help="write the listing workbook (sheets «Пары», «Пары_BingX»)")
+    workbook.add_argument("--out", type=Path, default=None, help=f"default: <registry root>/{WORKBOOK_NAME}")
     for sub in (liquidity, pipeline, sync):
         sub.add_argument("--today", type=date.fromisoformat, default=None,
                          help="UTC day of the run (default: today); data up to the day before is used")
@@ -123,12 +129,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     setting.add_argument("--filter", default="ready_v4")
     setting.add_argument("--parameter", required=True)
     setting.add_argument("--value", default=None, help="empty or omitted: reset to the common default")
-    for sub in (refresh, liquidity, pipeline, sync, decide, setting):
+    for sub in (refresh, liquidity, pipeline, sync, workbook, decide, setting):
         sub.add_argument("--config", type=Path, default=Path("config.local.json"))
     args = parser.parse_args(argv)
 
     try:
         settings = load_registry_settings(args.config)
+        if args.command == "workbook" and not (settings.root / "registry.duckdb").is_file():
+            raise RegistryError("the pair registry does not exist yet: run sync first")
         con = connect(settings.root)
     except (RegistryError, OSError, duckdb.Error) as error:   # e.g. the registry is locked by another process
         _emit({"error": str(error)})
@@ -155,15 +163,29 @@ def main(argv: Sequence[str] | None = None) -> int:
                 result, code = {"bybit": {"error": f"{type(error).__name__}: {error}"}}, 1
             _emit(result)
             return code
-        if args.command == "liquidity":
+        if args.command == "workbook":
             try:
-                result, code = {"bybit": refresh_liquidity(con, "bybit", today, settings)}, 0
+                result, code = {"workbook": write_listing_workbook(con, args.out or settings.root / WORKBOOK_NAME)}, 0
+            except (OSError, duckdb.Error) as error:
+                result, code = {"error": f"{type(error).__name__}: listing workbook not written"}, 1
+            _emit(result)
+            return code
+        if args.command == "liquidity":
+            if not 1 <= args.days <= 31:
+                _emit({"error": "--days: a whole number from 1 to 31"})
+                return 1
+            try:
+                from datetime import timedelta
+
+                runs = [refresh_liquidity(con, "bybit", today - timedelta(days=offset), settings)
+                        for offset in range(args.days - 1, -1, -1)]          # oldest first: today's window is newest
+                result, code = {"bybit": runs[-1] if args.days == 1 else {"days": args.days, "runs": runs}}, 0
             except Exception as error:
                 result, code = {"bybit": {"error": f"{type(error).__name__}: {error}"}}, 1
             _emit(result)
             return code
         if args.command == "sync":
-            steps = ("refresh", "liquidity", "pipeline")
+            steps = ("refresh", "liquidity", "pipeline", "workbook")
             summary: dict[str, object] = {}
             failed = False
             for done, step in enumerate(steps):
@@ -177,6 +199,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                         failed = failed or step_failed
                     elif step == "liquidity":
                         summary[step] = refresh_liquidity(con, "bybit", today, settings)
+                    elif step == "workbook":
+                        try:
+                            summary[step] = write_listing_workbook(con, settings.root / WORKBOOK_NAME)
+                        except OSError as error:          # e.g. the workbook is open in Excel; no local path
+                            raise RegistryError(f"{type(error).__name__}: listing workbook not written") from None
                     else:
                         summary[step] = _pipeline(con, args.config, today, args.machine, args.skip_track)
                 except Exception as error:          # one step failing never stops the next one

@@ -395,6 +395,7 @@ def test_lot_enrichment_uses_formula_bound_not_legacy_capacity_and_binds_evidenc
     assert enriched["liquidity_publication_lag_hours"] == 6
     assert enriched["liquidity_anchor_created_at_utc"] == "2026-09-08T06:00:00+00:00"
     assert len(enriched["liquidity_file_hashes"]) == 7
+    assert enriched["liquidity_lot_model"] == "LOT_MODEL_V1"           # pair registry stage 4: the model is recorded
 
 
 @pytest.mark.parametrize("shift_bp", [1, 29, 551, 600, True])

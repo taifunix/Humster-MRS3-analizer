@@ -414,7 +414,8 @@ compatible «Пары» sheet (same columns as today) so nothing breaks mid-way.
    `pipeline`, stage rule, track record, `pair_tests`, `finalists`,
    `decisions`, `pair_settings` and READY reading the effective per-pair rule.
 4. **Panel screen + Excel export + both buttons**, then switch the consumers
-   listed above.
+   listed above. ✅ 2026-10-19 (see «Stage 4 contract» and «Stage 4
+   evidence»).
 5. **Git sync**: the private repository, automatic upload on change,
    `registry sync` pull/import.
 
@@ -812,6 +813,189 @@ machine, now_ms)`):
   Note: catalog rows written before stage 3 keep a payload without
   `rule` / `overridden` when the same inputs are rebuilt, so readers must
   allow for those fields being absent.
+
+## Stage 4 contract: switch of the consumers (2026-10-19)
+
+**Panel screen, Excel and buttons** are delivered by Panel rework stage 3.
+- The main screen has the views Пары, Справочник, Ликвидность and Изменения,
+  each with an Excel export of exactly the rows shown.
+- Decisions and per-pair thresholds are entered in the pair card.
+- «Синхронизировать», «Пересчитать историю» and «Пересобрать READY» are
+  actions with plan dialogs.
+- See [Panel for the simulation workflow](2026-10-18-panel-simulation-workflow.md),
+  «Stage 3 contract».
+
+**1. Optimizer: LOT_MODEL_V2 from the registry** (ADR-0079).
+- `portfolio.adapter.run_portfolio_adapter` takes a keyword
+  `liquidity_reader(symbol, anchor, round_down_usdt) -> MinuteCapacityResult`
+  (the Campaign's own floor). With a reader, no minute file is read or
+  downloaded.
+- The Panel passes `pair_registry.liquidity.registry_capacity` whenever the
+  registry of the local config exists (`pair_registry.root`, default
+  `data/pair_registry`). Without a registry the adapter keeps LOT_MODEL_V1
+  (fixtures, a machine without a registry).
+- A registry held by a writer gives the blocker `PAIR_REGISTRY_BUSY`.
+- `registry_capacity(con, exchange, symbol, anchor_created_at=…,
+  round_down_usdt=…)`:
+  - takes the window of a TRADING pair that ends on the last weekday before
+    the anchor's UTC day (`liquidity_on`), so a frozen Campaign retried after
+    a later sync still finds its window;
+  - requires it READY, LOT_MODEL_V2 and with `inputs_sha256`, otherwise
+    `LIQUIDITY_MODEL_WINDOW_UNAVAILABLE` (the registry needs
+    «Синхронизировать»);
+  - applies no publication lag. Between UTC midnight and a sync run after the
+    previous weekday's minute file exists, Campaigns get
+    `LIQUIDITY_MODEL_WINDOW_UNAVAILABLE`. A sync run too early writes that day
+    as UNAVAILABLE until the next sync. The Campaign keys
+    `archive_publication_lag_hours`, `backfill_write_enabled` and
+    `bybit_minute_data_root` are unused under V2;
+  - returns `selected_basis = "LOT_MODEL_V2"`, the window weekdays, the
+    `(day, sha256)` file hashes and a content digest over the row inputs.
+- Position sizing validates a V2 window:
+  - weekdays only, sorted and unique;
+  - as many file hashes as days;
+  - start and end equal to the capacity window;
+  - the end is the last weekday before the anchor day;
+  - active bins at most N × 96.
+- Enriched rows carry `liquidity_lot_model` (`LOT_MODEL_V1` or
+  `LOT_MODEL_V2`). The V2 model digest uses the schema
+  `liquidity_lot_model_v2`, and the executable identity evidence records
+  `LOT_MODEL_V2`; V1 identities keep their bytes. So V1 and V2 results cannot
+  be mixed unnoticed.
+
+**2. Base-lot export.**
+- `scripts/calculate_bybit_base_lots.py --source registry` is the default.
+  Each (pair, date) cell takes the registry window ending on the last weekday
+  before that date (`liquidity_on`). The window must be READY and carry
+  `inputs_sha256`, and its K and step must equal the export's.
+- The registry's K and step settings are compared once, before any cell is
+  computed.
+- A missing or unavailable row, or a busy registry, is an error cell, as
+  before.
+- The workbook records the model of its values: the defined name
+  `MRS3_BASE_LOT_MODEL`; without it the values are LOT_MODEL_V1.
+  - A run of the other model refuses to add to an existing history, and the
+    workbook is left unchanged.
+  - Only `--rebuild-history` replaces all ten dates. V1 and V2 values are
+    never mixed in one sheet.
+  - Registry windows of past days come from
+    `python -m mrs3.pair_registry liquidity --days 14`: oldest first, so the
+    newest window stays today's.
+- `--source minute-files` keeps LOT_MODEL_V1. `run_export(lot_source=…)` is
+  the library form.
+
+**3. Pairs and listing days of the history.**
+- `pair_registry.history.history_pairs(config)` returns the TRADING Bybit
+  pairs of the registry with their listing day, ordered by the latest
+  liquidity `L` descending, then by symbol. The screening verdicts left with
+  the screener.
+- `simulate_history` and `generate_period_csv` use it. They fall back to the
+  workbook (`trade_history.pair_order`) when there is no registry, or with a
+  warning line while a writer holds it.
+- Explicit `--pairs` resolve listing days of any status
+  (`pair_registry.history.listing_days`).
+
+**4. Listing dates of the PerformanceDB import, pipeline, finalist retest and
+plateau research.**
+- These keep reading a workbook through `loader.load_listing_dates`. The path
+  and the source of the listing date are recorded in PerformanceDB, so their
+  contract does not change.
+- The registry writes that workbook atomically:
+  - on demand: `python -m mrs3.pair_registry workbook [--out PATH]`; this
+    needs an existing registry;
+  - on every `sync`: `<registry root>/pairs.xlsx`. A locked file fails only
+    that step, with no local path in the message.
+- Sheets:
+  - «Пары»: Пара, Дата листинга на Bybit (UTC);
+  - «Пары_BingX»: Пара, Листинг.
+- Pointing `panel_workflow.listing_dates_path` at it moves these consumers to
+  the registry. That switch of the local config is the user's.
+
+**Non-goals.**
+- No PerformanceDB schema change.
+- The V1 code stays for fixtures and comparison.
+- BingX liquidity comes in Panel stage 5.
+
+**Acceptance.**
+- Unit tests:
+  - `registry_capacity`: freshness, `inputs_sha256`, a pair that is not
+    TRADING, no row;
+  - sizing validation of a V2 window and the row's model field;
+  - the adapter with a reader, with no minute files present;
+  - the Panel wiring;
+  - the base-lot export in registry mode;
+  - `history_pairs`: ordering and fallback;
+  - the workbook read back by `load_listing_dates` on both sheets.
+- Live checks:
+  - the listing dates in the generated workbook equal the current workbook's
+    for the shared pairs;
+  - the number of TRADING pairs with a usable V2 capacity.
+
+## Stage 4 evidence (2026-10-19)
+
+**Code**
+- `pair_registry.liquidity`: `registry_capacity`, `liquidity_on`,
+  `last_weekday_before`.
+- `pair_registry.history.history_pairs`; `pair_registry.workbook`.
+- CLI: `workbook`; `sync` gains a `workbook` step.
+- `portfolio.adapter`: `liquidity_reader`.
+- `portfolio.position_sizing`: V2 window checks, `liquidity_lot_model`, and
+  the model digest schema `liquidity_lot_model_v2`.
+- `panel_portfolio`: `_registry_liquidity_reader`.
+- `scripts/calculate_bybit_base_lots.py`: `--source`, `registry_lot_source`.
+- `simulate_history` and `generate_period_csv` use `history_pairs`.
+
+**Review fixes.** The first independent review returned `CODE_REVIEW_FAIL`,
+with one MAJOR finding: the default registry source would have mixed V1 and
+V2 values in an existing base-lot sheet. The fixes:
+- the model marker, the refusal and the full rebuild;
+- `liquidity --days`;
+- the Campaign's frozen window via `liquidity_on`;
+- the busy-registry paths;
+- the K/step check done once;
+- explicit `--pairs` resolving listing days of any status;
+- V2 recorded in the identity evidence;
+- the workbook command requiring an existing registry;
+- redacted workbook step errors.
+
+The re-review returned `CODE_REVIEW_PASS`.
+
+**Tests** (`.venv`, basetemp on drive C)
+- `tests/test_pair_registry_consumers.py` (16).
+- In `test_portfolio_adapter`: the reader test and the identity evidence of
+  V2.
+- `liquidity_lot_model` asserted on V1 sizing rows.
+- The CLI sync test now includes the workbook step.
+- The base-lot CLI tests now pass `--source minute-files` explicitly.
+- After the fixes, the registry, consumer, sizing, adapter, base-lot,
+  portfolio Panel and main-screen suites: 877 passed, 1 skipped.
+- Before the fixes, the portfolio, base-lot, registry, Panel main-screen,
+  store and READY suites: 2,289 passed and 17 failed.
+  - 15 of the failures also fail on HEAD; one example is
+    `test_portfolio_input` (the `selection_review_imports` schema).
+  - The other two are the `test_panel_portfolio` stage 2 tests, which are
+    flaky: the same run on HEAD also fails one of them.
+
+**Live checks** (real registry, read-only; output to a temporary folder)
+- The generated workbook has 274 Bybit and 610 BingX pairs.
+  - All 242 pairs shared with the current workbook have equal listing dates
+    through `load_listing_dates`.
+  - The registry has 32 pairs the workbook lacks.
+- `registry_capacity` with an anchor of now (Monday 2026-10-19): 242 of 274
+  TRADING pairs are LOT_MODEL_V2; 32 are `LIQUIDITY_MODEL_WINDOW_UNAVAILABLE`
+  (no minute files, the same 32 as in stage 2).
+- `history_pairs`: 274 pairs, most liquid first.
+- Not run live:
+  - a real optimizer Campaign (it needs the market API and a v2
+    PerformanceDB);
+  - the base-lot export on the user's workbook.
+
+  Both are covered by unit tests.
+
+**Note for the user.** To move the PerformanceDB import and the other
+loader-based consumers to the registry, point
+`panel_workflow.listing_dates_path` in `config.local.json` at
+`<registry root>/pairs.xlsx`. «Синхронизировать» writes it.
 
 ## Decisions taken (2026-10-18)
 

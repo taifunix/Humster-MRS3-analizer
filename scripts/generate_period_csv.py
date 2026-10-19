@@ -20,6 +20,7 @@ if __package__ in {None, ""}:
 
 from mrs3.minute_data import ensure_days, instrument, last_archived_day  # noqa: E402
 from mrs3.mrs2_simulator import RunSettings  # noqa: E402
+from mrs3.pair_registry.history import history_pairs, listing_days  # noqa: E402
 from mrs3.trade_history import pair_order  # noqa: E402
 from mrs3.period_csv import (  # noqa: E402
     GENERATOR_VERSION, TIMEFRAMES, csv_bytes, first_period_day, grid, has_warmup_data, header, journal_append,
@@ -105,12 +106,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     config = json.loads(args.config.read_text(encoding="utf-8"))
     bot_root = Path(config["tester_runner"]["bot_root"])
     data_root = bot_root / "tester" / "data" / "bybit"
-    registry = Path(config["panel_workflow"]["listing_dates_path"])
     workers = args.workers or int(config.get("duckdb_import", {}).get("workers", 4))
-    order = pair_order(registry)
+    warn = lambda text: print(json.dumps({"warning": text}), flush=True)          # noqa: E731
+    order = history_pairs(args.config, on_busy=warn)    # the pair registry; the workbook only without one
+    if order is None:
+        order = pair_order(Path(config["panel_workflow"]["listing_dates_path"]))
     if args.pairs:
         wanted = [item.strip().upper() for item in args.pairs.split(",") if item.strip()]
-        known = dict(order)
+        known = {**dict(order), **listing_days(args.config, on_busy=warn)}      # any status, as simulate_history
         order = [(symbol, known[symbol]) for symbol in wanted if symbol in known]
     if args.limit:
         order = order[: args.limit]

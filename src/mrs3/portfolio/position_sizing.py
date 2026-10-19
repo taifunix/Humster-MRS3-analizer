@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, is_dataclass, replace
-from datetime import datetime
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_EVEN, localcontext
 import hashlib
 import json
@@ -28,8 +28,9 @@ _RUNTIME_FIELDS = frozenset({
     "raw_capacity_usdt", "binding_order_id", "liquidity_v25_usdt", "liquidity_a15",
     "liquidity_factor", "lot_model_digest", "liquidity_window_dates",
     "liquidity_publication_lag_hours", "liquidity_anchor_created_at_utc",
-    "liquidity_file_hashes", "liquidity_feature_digest",
+    "liquidity_file_hashes", "liquidity_feature_digest", "liquidity_lot_model",
 })
+LOT_MODEL_V2 = "LOT_MODEL_V2"          # registry weekday windows (ADR-0079, pair registry stage 4)
 
 
 def _decimal(value: Any, field: str, *, positive: bool = False, nonnegative: bool = False) -> Decimal:
@@ -89,6 +90,35 @@ def _floor_step(value: Decimal, step: Decimal) -> Decimal:
     with localcontext() as context:
         context.prec = max(64, len(value.as_tuple().digits) + len(step.as_tuple().digits) + 16)
         return (value / step).to_integral_value(rounding=ROUND_DOWN) * step
+
+
+def _check_v2_window(capacity: MinuteCapacityResult, features: MinuteLiquidityFeatures, a15: Decimal) -> None:
+    """A registry LOT_MODEL_V2 window: weekdays only, sorted and unique, one file hash per day, equal to the capacity
+    window, ending on the last weekday before the Campaign anchor day, at most N x 96 active bins."""
+    days = tuple(features.window_dates)
+    anchor = datetime.fromisoformat(_text(features.anchor_created_at_utc, "anchor_created_at_utc"))
+    if anchor.tzinfo is None:
+        raise ValueError("LIQUIDITY_MODEL_WINDOW_UNAVAILABLE")
+    expected = anchor.astimezone(timezone.utc).date() - timedelta(days=1)
+    while expected.weekday() >= 5:
+        expected -= timedelta(days=1)
+    if (
+        not days
+        or any(not isinstance(day, date) or isinstance(day, datetime) or day.weekday() >= 5 for day in days)
+        or list(days) != sorted(set(days))
+        or days[0] != capacity.window_start
+        or days[-1] != capacity.window_end
+        or days[-1] != expected
+        or len(features.file_hashes) != len(days)
+        or [name for name, _digest in features.file_hashes] != [day.isoformat() for day in days]
+        or any(not isinstance(digest, str) or len(digest) != 64 for _name, digest in features.file_hashes)
+        or a15 > 1
+        or type(features.active_15m_bins) is not int
+        or not 1 <= features.active_15m_bins <= len(days) * 96
+        or not isinstance(features.content_digest, str)
+        or not features.content_digest
+    ):
+        raise ValueError("LIQUIDITY_MODEL_WINDOW_UNAVAILABLE")
 
 
 @dataclass(frozen=True, slots=True)
@@ -323,10 +353,14 @@ def enrich_finalist_rows(
                     v25 = _decimal(features.v25, "v25", positive=True)
                     a15 = _decimal(features.a15, "a15", positive=True)
                     anchor = features.anchor_created_at_utc
-                    frozen_dates = resolve_liquidity_window(
-                        datetime.fromisoformat(anchor), features.publication_lag_hours,
-                    ) if isinstance(anchor, str) and type(features.publication_lag_hours) is int else ()
-                    if (
+                    if capacity.selected_basis == LOT_MODEL_V2:
+                        _check_v2_window(capacity, features, a15)
+                        frozen_dates = tuple(features.window_dates)
+                    else:
+                        frozen_dates = resolve_liquidity_window(
+                            datetime.fromisoformat(anchor), features.publication_lag_hours,
+                        ) if isinstance(anchor, str) and type(features.publication_lag_hours) is int else ()
+                    if capacity.selected_basis != LOT_MODEL_V2 and (
                         a15 > 1
                         or type(features.active_15m_bins) is not int
                         or not 1 <= features.active_15m_bins <= 672
@@ -385,7 +419,7 @@ def enrich_finalist_rows(
                     for item in geometry
                 )
             model_digest = _digest({
-                "schema": "liquidity_lot_model_v1",
+                "schema": "liquidity_lot_model_v2" if capacity.selected_basis == LOT_MODEL_V2 else "liquidity_lot_model_v1",
                 "features": features,
                 "settings": {"base_coefficient": model_settings[0], "max_shift_bonus": model_settings[1]} if model_settings is not None else None,
                 "formula": formula,
@@ -442,6 +476,7 @@ def enrich_finalist_rows(
                     "liquidity_anchor_created_at_utc": features.anchor_created_at_utc,
                     "liquidity_file_hashes": features.file_hashes,
                     "liquidity_feature_digest": features.content_digest,
+                    "liquidity_lot_model": LOT_MODEL_V2 if capacity.selected_basis == LOT_MODEL_V2 else "LOT_MODEL_V1",
                 })
             enriched.append(_freeze(enriched_row))
         except LiquidityError:

@@ -1,4 +1,10 @@
-"""Export the optimizer base lot from official Bybit minute liquidity data."""
+"""Export the optimizer base lot: from the pair registry (LOT_MODEL_V2, default) or from Bybit minute files (V1).
+
+Registry mode (pair registry stage 4, docs/specs/2026-10-18-pair-registry.md): each (pair, date) cell takes the
+registry window ending on the last weekday before that date; its K and step must equal the export's. The workbook
+records the model of its values (defined name MRS3_BASE_LOT_MODEL; none means LOT_MODEL_V1): a run of the other model
+refuses to add to an existing history, only `--rebuild-history` replaces all ten dates (ADR-0079: V1 and V2 values
+are never mixed). Registry windows of past days come from `python -m mrs3.pair_registry liquidity --days 14`."""
 
 from __future__ import annotations
 
@@ -18,6 +24,7 @@ import zipfile
 
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill
+from openpyxl.workbook.defined_name import DefinedName
 
 if __package__ in {None, ""}:  # Allow ``python scripts/calculate_bybit_base_lots.py``.
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -49,6 +56,15 @@ FRACTIONAL_NUMBER_FORMAT = "#,##0.##########"
 ERROR_FILL = PatternFill(fill_type="solid", fgColor="FFC7CE")
 _CLEAR_FILL = PatternFill(fill_type=None)
 _SYMBOL = re.compile(r"[A-Z0-9]+\Z", re.ASCII)
+MODEL_NAME = "MRS3_BASE_LOT_MODEL"
+MINUTE_FILES_MODEL = "LOT_MODEL_V1"
+REGISTRY_MODEL = "LOT_MODEL_V2"
+
+
+def recorded_model(workbook) -> str:
+    """The model of the workbook's base-lot values; a workbook without the marker holds LOT_MODEL_V1 values."""
+    marker = workbook.defined_names.get(MODEL_NAME)
+    return str(marker.attr_text).strip('"') if marker is not None and marker.attr_text else MINUTE_FILES_MODEL
 
 
 class BaseLotExportError(ValueError):
@@ -536,8 +552,13 @@ def run_export(
     workers: int = DEFAULT_WORKERS,
     rebuild_history: bool = False,
     fetch_day: Callable[[str, object], bytes] | None = None,
+    lot_source: Callable[[str, date], ExportRow] | None = None,
+    model: str | None = None,
 ) -> ExportResult:
-    """Calculate and publish a rolling ten-date base-lot history."""
+    """Calculate and publish a rolling ten-date base-lot history. `lot_source(symbol, date)` supplies each cell
+    (the pair registry, `registry_lot_source`); without it LOT_MODEL_V1 reads the minute files. `model` is the model
+    of the values (default: LOT_MODEL_V2 with a `lot_source`, else LOT_MODEL_V1)."""
+    model = model or (REGISTRY_MODEL if lot_source is not None else MINUTE_FILES_MODEL)
     workbook_path = Path(workbook_path)
     data_root = Path(data_root)
     if not isinstance(sheet_name, str) or not sheet_name:
@@ -576,6 +597,11 @@ def run_export(
         sheet = workbook[sheet_name]
         migrated = _migrate_previous_layout(sheet)
         history_dates = _history_columns(sheet)
+        if history_dates is not None and recorded_model(workbook) != model and not rebuild_history:
+            raise BaseLotExportError(
+                f"the sheet holds {recorded_model(workbook)} base lots and this run computes {model}: replace all ten "
+                "dates with --rebuild-history (registry windows of past days: python -m mrs3.pair_registry liquidity "
+                "--days 14), or use the matching --source; workbook unchanged")
         if history_dates is not None:
             _check_average_column(sheet)
         current_date_present = history_dates is not None and actualization_date in history_dates
@@ -653,6 +679,9 @@ def run_export(
         days = resolve_liquidity_window(calculation_anchor, publication_lag_hours)
         for symbol in write_symbols:
             try:
+                if lot_source is not None:
+                    rows.append(lot_source(symbol, target_date))
+                    continue
                 _ensure_data(data_root, symbol, days, workers=workers, fetch_day=fetch)
                 capacity = calculate_minute_capacity(
                     data_root,
@@ -736,6 +765,7 @@ def run_export(
                 header.number_format = "yyyy-mm-dd"
         _write_averages(sheet, symbol_rows, step)
         _clear_output_filters(sheet, 1, 0)  # empty range: keep every criterion, extend the filter over A:M and beyond
+        workbook.defined_names[MODEL_NAME] = DefinedName(MODEL_NAME, attr_text=f'"{model}"')
         _atomic_save_workbook(workbook, workbook_path)
     finally:
         workbook.close()
@@ -754,8 +784,50 @@ def _anchor(value: str) -> datetime:
     return parsed
 
 
+def registry_lot_source(config_path: str | Path, *, k: object = DEFAULT_K,
+                        round_down_usdt: object = DEFAULT_ROUND_DOWN_USDT) -> Callable[[str, date], ExportRow]:
+    """Cells from the pair registry: the READY window ending on the last weekday before the cell's date."""
+    import duckdb
+
+    from mrs3.pair_registry.liquidity import last_weekday_before, liquidity_on
+    from mrs3.pair_registry.store import DATABASE, RegistryError, load_registry_settings
+
+    try:
+        settings = load_registry_settings(Path(config_path))
+    except RegistryError as error:
+        raise BaseLotExportError("pair registry settings are unavailable") from error
+    database = settings.root / DATABASE
+    if not database.is_file():
+        raise BaseLotExportError("pair registry not found: run the registry sync first")
+    coefficient = _decimal(k, "k", positive=True)
+    step = _decimal(round_down_usdt, "round_down_usdt", positive=True)
+    if settings.liquidity_k != coefficient or settings.liquidity_round_down != step:
+        raise BaseLotExportError("the registry's liquidity K or step differ from the export's; workbook unchanged")
+
+    def source(symbol: str, target_date: date) -> ExportRow:
+        window_end = last_weekday_before(target_date)
+        try:
+            with duckdb.connect(str(database), read_only=True) as con:
+                row = liquidity_on(con, "bybit", symbol, window_end)
+        except duckdb.Error as error:              # a sync or a Panel write holds the registry: an error cell
+            raise BaseLotExportError("pair registry is busy: run the export again") from error
+        if row is None:
+            raise BaseLotExportError(f"no READY registry window ending {window_end.isoformat()}")
+        if Decimal(str(row["k"])) != coefficient or Decimal(str(row["step"])) != step:
+            raise BaseLotExportError("registry K or step differ from the export's")
+        return ExportRow(symbol, target_date, Decimal(str(row["v25"])), Decimal(str(row["a15"])),
+                         Decimal(str(row["base_lot"])), str(row["inputs_sha256"]),
+                         tuple((str(day), str(digest)) for day, digest in row["window_files"]))
+
+    return source
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--source", choices=("registry", "minute-files"), default="registry",
+                        help="registry: LOT_MODEL_V2 windows of the pair registry; minute-files: LOT_MODEL_V1")
+    parser.add_argument("--config", type=Path, default=Path(__file__).resolve().parents[1] / "config.local.json",
+                        help="local config with pair_registry (registry source)")
     parser.add_argument("--input", dest="workbook_path", type=Path, default=DEFAULT_WORKBOOK)
     parser.add_argument("--data-root", type=Path, default=DEFAULT_DATA_ROOT)
     parser.add_argument("--sheet", dest="sheet_name", default=DEFAULT_SHEET)
@@ -774,7 +846,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     try:
-        result = run_export(**vars(build_parser().parse_args(argv)))
+        options = vars(build_parser().parse_args(argv))
+        source, config = options.pop("source"), options.pop("config")
+        if source == "registry":
+            options["lot_source"] = registry_lot_source(config, k=options["k"], round_down_usdt=options["round_down_usdt"])
+        result = run_export(**options)
     except Exception as error:  # CLI boundary: every failure is explicit and nonzero.
         print(f"ERROR: {type(error).__name__}: {error}")
         return 1

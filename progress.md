@@ -8,7 +8,43 @@ Use [PRD.md](PRD.md) for the feature registry and [docs/README.md](docs/README.m
 for the documentation map. Read the linked contract only for the active task;
 do not treat this file as a replacement for a feature specification.
 
-## Panel rework stage 3: the «Пары и стратегии» main screen (2026-10-19, branch `wip/period-csv-generator`)
+## Pair registry stage 4: the consumers read the registry (2026-10-19, branch `wip/period-csv-generator`)
+
+Contract: [pair registry](docs/specs/2026-10-18-pair-registry.md) («Stage 4
+contract», «Stage 4 evidence»), decision
+[ADR-0079](docs/decisions/0079-lot-model-v2-weekday-liquidity.md).
+
+- **Optimizer:** sizes positions with LOT_MODEL_V2 from the registry whenever
+  the registry exists. `registry_capacity` checks that the window ends on the
+  last weekday before the Campaign anchor; no minute files are read. Rows
+  carry `liquidity_lot_model`.
+- **Base-lot export:** reads the registry by default
+  (`--source minute-files` keeps V1).
+- **History scripts:** take the pair list and listing days from the registry.
+- **Loader-based consumers** (the PerformanceDB import and others): the
+  registry writes a compatible listing workbook, `<registry root>/pairs.xlsx`,
+  on every «Синхронизировать».
+- **Verification:**
+  - `tests/test_pair_registry_consumers.py` (16) plus the adapter, sizing,
+    base-lot and registry suites (877 passed after the review fixes).
+  - Independent review: the first pass returned `CODE_REVIEW_FAIL` (V1/V2
+    mixing in the base-lot sheet); fixed, then re-reviewed: `CODE_REVIEW_PASS`.
+  - Broad run: 2,289 passed. The 17 failures also fail or are flaky on HEAD.
+  - Live: the generated workbook equals the current one for all 242 shared
+    pairs; V2 capacity is available for 242 of 274 TRADING pairs.
+- **Next:**
+  - Panel stage 4: the «Стратегии» view; removal of A/B and the Pareto screen.
+  - Registry stage 5: git sync.
+  - Panel stage 5: BingX.
+- **User actions:**
+  - point `panel_workflow.listing_dates_path` at the generated `pairs.xlsx`
+    to move the import to the registry;
+  - before the next base-lot export (it now refuses the existing V1 sheet),
+    run `python -m mrs3.pair_registry liquidity --days 14`, then
+    `calculate_bybit_base_lots.cmd --rebuild-history`, or keep
+    `--source minute-files`.
+
+## Panel rework stage 3: the «Пары и стратегии» main screen (2026-10-19, branch `wip/period-csv-generator`, committed `61ee0df`)
 
 Contract: [Panel for the simulation workflow](docs/specs/2026-10-18-panel-simulation-workflow.md)
 («Stage 3 contract», «Stage 3 evidence»).

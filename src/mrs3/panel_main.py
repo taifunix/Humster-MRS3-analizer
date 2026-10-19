@@ -448,7 +448,7 @@ class MainScreenService:
             con.close()
 
     def _plan_sync(self, exchange: str) -> dict:
-        return {"items": [], "note": "Обновить справочник обеих бирж, ликвидность и конвейер."}
+        return {"items": [], "note": "Обновить справочник обеих бирж, ликвидность, конвейер и книгу листингов."}
 
     def _history_end_day(self) -> date:
         from .minute_data import last_archived_day

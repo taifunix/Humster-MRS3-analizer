@@ -68,10 +68,18 @@ Copy-Item config.local.json.example config.local.json
 .\.venv\Scripts\python.exe -m mrs3.cli tester-plan --help
 .\.venv\Scripts\python.exe -m mrs3.cli tester-run --help
 
-# Bybit base-lot values in the Actual sheet of the liquidity workbook
+# Bybit base-lot values in the Actual sheet of the liquidity workbook (from the pair registry;
+# --source minute-files keeps the old seven-calendar-day model). A sheet never mixes the two models:
+# switching a sheet needs past registry windows and one full rebuild
+.\.venv\Scripts\python.exe -m mrs3.pair_registry liquidity --days 14
+.\scripts\calculate_bybit_base_lots.cmd --rebuild-history
 .\scripts\calculate_bybit_base_lots.cmd
 # One-time rebuild of all ten dated columns after interrupted/partial initialization
 .\scripts\calculate_bybit_base_lots.cmd --rebuild-history
+
+# Pair registry: refresh, liquidity, pipeline and the listing workbook (sheets «Пары», «Пары_BingX»)
+.\.venv\Scripts\python.exe -m mrs3.pair_registry sync
+.\.venv\Scripts\python.exe -m mrs3.pair_registry workbook --out <path.xlsx>
 
 # MRS2 history in the trade store (trade_store.root in config.local.json)
 .\.venv\Scripts\python.exe scripts\simulate_history.py --pairs XOMUSDT,SNOWUSDT

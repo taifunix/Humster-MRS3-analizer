@@ -189,3 +189,11 @@ minute features, frozen window, cycle arbitration/attribution and downstream
 consistency, independent caps, payload readback, migration and historical
 reads; relevant broader tests and independent Opus CODE_REVIEW_PASS. No live
 database mutation, real tester or exchange action is included.
+
+## Pair registry stage 4 note (2026-10-19)
+
+- When the pair registry exists, the Panel optimizer takes V25 and A15 from
+  the registry's LOT_MODEL_V2 weekday window (ADR-0079) instead of reading
+  the seven calendar days of minute files. The formula above is unchanged.
+- Rows record `liquidity_lot_model`.
+- Contract: [pair registry](2026-10-18-pair-registry.md), «Stage 4 contract».

@@ -988,6 +988,34 @@ def _duckdb_import_workers(root: Path) -> int:
     return load_duckdb_import_settings(root / "config.local.json").workers
 
 
+def _registry_liquidity_reader(root: Path) -> Callable[..., Any] | None:
+    """LOT_MODEL_V2 capacities from the pair registry (pair registry stage 4, ADR-0079) when the local config's
+    registry exists; None keeps the LOT_MODEL_V1 minute files (fixtures, a machine without a registry)."""
+    from .pair_registry.store import DATABASE, RegistryError, load_registry_settings
+
+    try:
+        database = load_registry_settings(Path(root) / "config.local.json").root / DATABASE
+    except RegistryError:
+        return None
+    if not database.is_file():
+        return None
+
+    def reader(symbol: str, anchor: Any, round_down_usdt: Any) -> Any:
+        import duckdb
+
+        from .pair_registry.liquidity import registry_capacity
+        from .portfolio.minute_capacity import MinuteCapacityError
+
+        try:
+            con = duckdb.connect(str(database), read_only=True)
+        except duckdb.Error as error:          # a sync or a Panel write holds the registry
+            raise MinuteCapacityError("PAIR_REGISTRY_BUSY") from error
+        with con:
+            return registry_capacity(con, "bybit", symbol, anchor_created_at=anchor, round_down_usdt=round_down_usdt)
+
+    return reader
+
+
 class PortfolioPanelService:
     """Server-owned portfolio service with injected package and tester boundaries."""
 
@@ -1801,6 +1829,9 @@ class PortfolioPanelService:
             adapter_kwargs = {"workspace_root": self.root, "workers": _duckdb_import_workers(self.root)}
             if progress_callback is not None:
                 adapter_kwargs["progress_callback"] = progress_callback
+            liquidity_reader = _registry_liquidity_reader(Path(self.root))
+            if liquidity_reader is not None:
+                adapter_kwargs["liquidity_reader"] = liquidity_reader
             result = run_portfolio_adapter(selected, campaign, **adapter_kwargs)
         except Exception as error:
             raise PortfolioPanelError("PORTFOLIO_JOB_FAILED", "portfolio adapter failed", status=500) from error

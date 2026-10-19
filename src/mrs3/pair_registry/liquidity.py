@@ -17,7 +17,10 @@ from typing import Mapping, Sequence
 
 import duckdb
 
-from ..portfolio.minute_capacity import MinuteCapacityError, _day_path, _day_start_ms, _read_day_bytes, _type7_q25
+from ..portfolio.minute_capacity import (
+    MinuteCapacityError, MinuteCapacityResult, MinuteLiquidityFeatures, _day_path, _day_start_ms, _read_day_bytes,
+    _type7_q25,
+)
 from ..portfolio.position_sizing import _floor_step
 from .refresh import write_journal
 from .store import RegistryError, RegistrySettings
@@ -201,6 +204,69 @@ def latest_liquidity(con: duckdb.DuckDBPyConnection, exchange: str, symbol: str)
     if row is None:
         return None
     result = dict(zip(_COLUMNS, row))
+    result["as_of_day"] = result["as_of_day"].isoformat()
+    for key in ("window_days", "missing_days", "window_files"):
+        result[key] = json.loads(result[key]) if result[key] else []
+    return result
+
+
+def last_weekday_before(day: date) -> date:
+    """The last Monday-Friday day before `day`: where a LOT_MODEL_V2 window computed on `day` ends."""
+    return _last_weekday(day - timedelta(days=1))
+
+
+def registry_capacity(con: duckdb.DuckDBPyConnection, exchange: str, symbol: str, *, anchor_created_at: datetime,
+                      round_down_usdt: Decimal | int | str | None = None) -> MinuteCapacityResult:
+    """LOT_MODEL_V2 capacity of a pair for an optimizer Campaign frozen at `anchor_created_at` (registry stage 4).
+
+    The window of a TRADING pair ending on the last weekday before the anchor's UTC day is used when it is READY and
+    carries `inputs_sha256` (`liquidity_on`), so a Campaign retried after a later sync still finds its window; anything
+    else is `LIQUIDITY_MODEL_WINDOW_UNAVAILABLE` (fail closed: the registry needs «Синхронизировать» once the previous
+    weekday's minute file exists). No minute file is read and no publication lag applies. `round_down_usdt` is the
+    Campaign's own floor (default: the registry step)."""
+    if (not isinstance(anchor_created_at, datetime) or anchor_created_at.tzinfo is None
+            or anchor_created_at.utcoffset() is None):
+        raise MinuteCapacityError("LIQUIDITY_MODEL_ANCHOR_UNAVAILABLE")
+    anchor = anchor_created_at.astimezone(timezone.utc)
+    symbol = str(symbol).strip().upper()
+    expected = last_weekday_before(anchor.date())
+    status = con.execute("select status from pairs where exchange = ? and symbol = ?", [exchange, symbol]).fetchone()
+    row = liquidity_on(con, exchange, symbol, expected)
+    if status is None or status[0] != "TRADING" or row is None:
+        raise MinuteCapacityError(UNAVAILABLE)
+    try:
+        days = tuple(date.fromisoformat(str(day)) for day in row["window_days"])
+        files = tuple((str(day), str(digest)) for day, digest in row["window_files"])
+        v25, a15 = Decimal(str(row["v25"])), Decimal(str(row["a15"]))
+        step = Decimal(str(row["step"] if round_down_usdt is None else round_down_usdt))
+    except (TypeError, ValueError, ArithmeticError) as error:
+        raise MinuteCapacityError(UNAVAILABLE) from error
+    if (not days or days[-1] != expected or len(files) != len(days)
+            or [day for day, _digest in files] != [day.isoformat() for day in days]
+            or type(row["active_bins"]) is not int):
+        raise MinuteCapacityError(UNAVAILABLE)
+    payload = {"model": MODEL, "exchange": exchange, "symbol": symbol, "window": [day.isoformat() for day in days],
+               "file_hashes": files, "positive_minute_count": row["positive_minutes"], "v25": row["v25"],
+               "active_15m_bins": row["active_bins"], "a15": row["a15"], "inputs_sha256": row["inputs_sha256"]}
+    feature_digest = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    features = MinuteLiquidityFeatures(v25, row["active_bins"], a15, files, feature_digest, days, None,
+                                       anchor.isoformat())
+    digest = hashlib.sha256(json.dumps({**payload, "round_down_usdt": format(step, "f")}, sort_keys=True,
+                                       separators=(",", ":")).encode()).hexdigest()
+    return MinuteCapacityResult("READY", symbol, days[0], days[-1], None, step, None, None, Decimal(0), MODEL, (),
+                                tuple(day for day, _digest in files), digest, features)
+
+
+def liquidity_on(con: duckdb.DuckDBPyConnection, exchange: str, symbol: str, as_of_day: date) -> dict[str, object] | None:
+    """The READY window of a pair ending on `as_of_day` with its `inputs_sha256`, else None (the base-lot export's
+    dated history cells, registry stage 4)."""
+    row = con.execute(f"select {', '.join(_COLUMNS)} from liquidity where exchange = ? and symbol = ? and as_of_day = ?",
+                      [exchange, str(symbol).strip().upper(), as_of_day]).fetchone()
+    if row is None:
+        return None
+    result = dict(zip(_COLUMNS, row))
+    if result["status"] != "READY" or not result["inputs_sha256"] or result["model"] != MODEL:
+        return None
     result["as_of_day"] = result["as_of_day"].isoformat()
     for key in ("window_days", "missing_days", "window_files"):
         result[key] = json.loads(result[key]) if result[key] else []

@@ -5355,3 +5355,50 @@ def _real_weighted_template_payload(side):
 def test_legacy_stage2_payload_from_real_template_is_byte_identical(side, digest):
     # Golden digests of the pre-P2c payload: rows without MA facts keep the legacy prototype.
     assert _real_weighted_template_payload(side) == digest
+
+
+def test_runtime_adapter_reads_lot_model_v2_from_a_liquidity_reader(monkeypatch, tmp_path):
+    # pair registry stage 4: with a liquidity reader the adapter neither downloads nor reads minute files
+    selected = ({"symbol": "BTCUSDT", "side": "LONG", "strategy_id": 11, "result_id": 101},)
+    campaign = _runtime_weighted_campaign()
+    campaign["config_document"]["liquidity"]["spread_history_bypass_pretest"] = True
+    calls = {}
+
+    monkeypatch.setattr(adapter_module, "backfill_missing_days", lambda *_a, **_k: pytest.fail("minute files downloaded"))
+    monkeypatch.setattr(adapter_module, "calculate_minute_capacity", lambda *_a, **_k: pytest.fail("minute files read"))
+    monkeypatch.setattr(adapter_module, "load_market_snapshot", lambda *_a, **_k: SimpleNamespace(reference="reference", mark_prices={"BTCUSDT": "100"}))
+    monkeypatch.setattr(
+        adapter_module, "build_portfolio_candidates",
+        lambda rows, _campaign, **kwargs: calls.update(build=kwargs) or adapter_module.AdapterResult("PASS", variants=({"candidate_id": "c"},)),
+    )
+
+    def reader(symbol, anchor, round_down_usdt):
+        calls.setdefault("reader", []).append((symbol, anchor.tzinfo is not None, round_down_usdt))
+        return "v2-capacity"
+
+    result = run_portfolio_adapter(selected, campaign, workspace_root=tmp_path, liquidity_reader=reader)
+    assert result.status == "PASS"
+    assert calls["reader"] == [("BTCUSDT", True, campaign["config_document"]["liquidity"]["round_down_usdt"])]
+    assert calls["build"]["capacities"] == {"BTCUSDT": "v2-capacity"}
+
+    def unavailable(symbol, anchor, round_down_usdt):
+        raise adapter_module.MinuteCapacityError("LIQUIDITY_MODEL_WINDOW_UNAVAILABLE")
+
+    result = run_portfolio_adapter(selected, campaign, workspace_root=tmp_path, liquidity_reader=unavailable)
+    assert result.status == "FAIL" and result.blockers == ("LIQUIDITY_MODEL_WINDOW_UNAVAILABLE",)
+
+
+def test_weighted_executable_identity_records_lot_model_v2_only():
+    # pair registry stage 4 (ADR-0079): a V2 row changes the identity; a V1 row keeps the earlier identity bytes
+    campaign = weighted_campaign()
+    member = {"symbol": "BTCUSDT", "side": "LONG", "strategy_id": 11, "result_id": 101, "x_usdt": "100"}
+    payload = {"strategy": {"name": "PORTFOLIO_BTCUSDT_11_101", "basic": {"symbol": "BTCUSDT"}}, "account": {}, "facts": {}}
+    enriched = dict(_weighted_required_evidence(member), liquidity_v25_usdt=Decimal("123.4"), liquidity_a15=Decimal("0.5"))
+
+    def identity(row):
+        return adapter_module._weighted_executable_identity(
+            campaign, "AGGRESSIVE", "AGGRESSIVE", Decimal("1000"), (member,), (row,), (payload,))
+
+    plain = identity(enriched)
+    assert identity(dict(enriched, liquidity_lot_model="LOT_MODEL_V1")) == plain
+    assert identity(dict(enriched, liquidity_lot_model="LOT_MODEL_V2")) != plain
