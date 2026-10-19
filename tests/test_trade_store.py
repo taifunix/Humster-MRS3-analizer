@@ -266,3 +266,44 @@ def test_history_run_resimulates_a_superseded_segment_with_damaged_files(tmp_pat
     assert {row["segment_id"]: row["trades_sha256"] for row in store.segments("TESTUSDT")} == original
     assert store.read_trades(store.segments("TESTUSDT")[0]).num_rows > 0
     assert "REACTIVATE_FAILED" in (store.root / "journal.jsonl").read_text(encoding="utf-8")
+
+
+def test_catalog_connections_wait_for_a_lock_held_elsewhere(tmp_path: Path, monkeypatch):
+    # moved from tests/test_panel_store.py when the MRS2 STORE card was removed (Panel rework stage 3)
+    import duckdb
+    import mrs3.trade_store as trade_store
+    store = TradeStore(tmp_path / "store")
+    real = duckdb.connect
+    attempts = []
+
+    def busy(*args, **kwargs):
+        attempts.append(1)
+        if len(attempts) < 3:
+            raise duckdb.IOException("Could not set lock on file")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(trade_store.duckdb, "connect", busy)
+    with store.connect() as con:
+        assert con.execute("select 1").fetchone() == (1,)
+    assert len(attempts) == 3
+    attempts.clear()
+    with pytest.raises(duckdb.IOException):
+        store.connect(wait_s=0)
+
+
+def test_a_reader_never_creates_or_writes_the_catalog(tmp_path: Path):
+    # Panel rework stage 3 review: the Panel reads the catalog in-process while other threads hold read-only
+    # connections; a writable connection (the TradeStore constructor's DDL) would be refused by DuckDB.
+    import duckdb
+    from mrs3.trade_store import TradeStoreError
+
+    with pytest.raises(TradeStoreError):
+        TradeStore.reader(tmp_path / "missing")
+    assert not (tmp_path / "missing").exists()
+    TradeStore(tmp_path / "store")
+    held = duckdb.connect(str(tmp_path / "store" / "catalog.duckdb"), read_only=True)
+    try:
+        reader = TradeStore.reader(tmp_path / "store")
+        assert reader.segments("TESTUSDT") == []
+    finally:
+        held.close()

@@ -12,7 +12,7 @@ import hashlib
 import itertools
 import json
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Callable, Mapping, Sequence
 import warnings
 
 import numpy as np
@@ -187,26 +187,35 @@ def best_structures(periods: Sequence[PeriodFeatures], rule: ReadyRule = ReadyRu
     return out
 
 
-LATEST_SOURCES = ("simulator", "tester")
+LATEST_SOURCES = ("simulator", "tester", "auto")
+
+
+def pair_periods(store: TradeStore, symbol: str, rule: ReadyRule = ReadyRule(), exchange: str = "bybit",
+                 latest_source: str = "simulator") -> tuple[list[dict], str | None]:
+    """The active segments a READY entry is built from and the source of its newest period. The last
+    `rule.periods` simulator segments; with `latest_source="tester"` the newest one is replaced by the tester segment
+    of the same span (None as the source while it is missing); with "auto" it is replaced when that segment exists
+    (Panel rework stage 3: tester results are used automatically)."""
+    if latest_source not in LATEST_SOURCES:
+        raise TradeStoreError(f"unknown latest source: {latest_source}")
+    segments = store.segments(symbol, exchange, source="simulator")[-rule.periods:]
+    if latest_source == "simulator" or not segments:
+        return segments, "simulator"
+    newest = segments[-1]
+    tester = [s for s in store.segments(symbol, exchange, source="tester")
+              if (s["start_ms"], s["end_ms"]) == (newest["start_ms"], newest["end_ms"])]
+    if tester:
+        return [*segments[:-1], tester[-1]], "tester"
+    return segments, (None if latest_source == "tester" else "simulator")
 
 
 def pair_entry(store: TradeStore, symbol: str, rule: ReadyRule = ReadyRule(), exchange: str = "bybit",
                latest_source: str = "simulator") -> dict:
-    """READY entry of one pair from its last active simulator segments; with `latest_source="tester"` the newest
-    period is the tester segment of the same span (only its sampled points take part)."""
-    if latest_source not in LATEST_SOURCES:
-        raise TradeStoreError(f"unknown latest source: {latest_source}")
-    segments = store.segments(symbol, exchange, source="simulator")[-rule.periods:]
-    pending = False
-    if latest_source == "tester" and segments:
-        newest = segments[-1]
-        tester = [s for s in store.segments(symbol, exchange, source="tester")
-                  if (s["start_ms"], s["end_ms"]) == (newest["start_ms"], newest["end_ms"])]
-        if tester:
-            segments = [*segments[:-1], tester[-1]]
-        else:
-            pending = True
-    entry = {"pair": symbol, "latest_source": latest_source,
+    """READY entry of one pair from its last active segments (`pair_periods`): only the sampled points of a tester
+    segment take part."""
+    segments, newest_source = pair_periods(store, symbol, rule, exchange, latest_source)
+    pending = newest_source is None
+    entry = {"pair": symbol, "latest_source": latest_source, "newest_source": newest_source,
              "periods": [{"segment_id": s["segment_id"], "metrics_sha256": s["metrics_sha256"],
                           "start_ms": s["start_ms"], "end_ms": s["end_ms"]} for s in segments]}
     if len(segments) < rule.min_periods:
@@ -245,14 +254,16 @@ def structure_document(symbol: str, item: Mapping) -> dict:
 
 def build_ready(store: TradeStore, symbols: Sequence[str], out_dir: Path, template: Mapping,
                 rule: ReadyRule = ReadyRule(), exchange: str = "bybit", latest_source: str = "simulator",
-                rules: Mapping[str, ReadyRule] | None = None) -> dict:
+                rules: Mapping[str, ReadyRule] | None = None,
+                progress: Callable[[dict], None] | None = None) -> dict:
     """READY folder (strategies + manifest) for the pairs and one catalog `ready` row per pair. `rules` gives a
     pair its own rule (registry per-pair settings, stage 3); the entry records the effective parameters and the
     overridden ones, and the inputs hash covers them."""
     entries = []
     pair_rules: dict[str, ReadyRule] = {}
     base = asdict(rule)
-    for symbol in dict.fromkeys(symbols):
+    ordered = list(dict.fromkeys(symbols))
+    for done, symbol in enumerate(ordered, 1):
         pair_rule = (rules or {}).get(symbol, rule)
         pair_rules[symbol] = pair_rule
         try:
@@ -264,6 +275,10 @@ def build_ready(store: TradeStore, symbols: Sequence[str], out_dir: Path, templa
         entry["rule"] = effective
         entry["overridden"] = sorted(key for key, value in effective.items() if base.get(key) != value)
         entries.append(entry)
+        if progress is not None:
+            if entry["status"] == "ERROR":
+                progress({"error": entry["error"], "pair": symbol, "step": "ready"})
+            progress({"progress": {"done": done, "total": len(ordered), "step": "ready", "pair": symbol}})
     best: dict[str, tuple[float, str, str]] = {}
     for entry in entries:
         for item in entry["structures"]:

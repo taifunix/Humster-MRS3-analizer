@@ -136,7 +136,11 @@ from .panel_testing import (
     PanelTestingError,
     mrs3_tester_config_template,
 )
-from .panel_store import StoreTaskError, StoreTaskService
+from .error_sanitization import redact_local_paths as _redact_local_paths
+from .pair_registry.store import RegistryError
+from .panel_main import MainScreenError, MainScreenService
+from .trade_store import TradeStoreError
+from .panel_tasks import TaskRunner
 from .store_ready_tick import StoreReadyError, list_ready_folders, prepare_tick_batch, resolve_ready_folder
 from .evaluation_protocol import (
     EvaluationProtocolError,
@@ -822,6 +826,8 @@ class PanelController:
     def has_active_panel_jobs(self) -> bool:
         if any(job["state"] not in {"COMMITTED", "CANCELLED", "FAILED"} for job in self.panel_jobs()):
             return True
+        if self._main_task_running():
+            return True
         return (
             self._strategy_batch_service is not None and self._strategy_batch_service.has_active_job()
         ) or (
@@ -1118,36 +1124,51 @@ class PanelController:
     # «Подготовить файлы» first tops up BingX data in a background thread, then
     # fills the tester with the API symbols resolved by that completed top-up.
 
-    # -- MRS2 trade store (docs/specs/2026-10-17-mrs2-history-store-and-tester-sampling.md, stage 4): history
-    # simulation, tester jobs and READY run as store CLI child processes, one at a time.
+    # -- «Пары и стратегии» main screen (docs/specs/2026-10-18-panel-simulation-workflow.md, «Stage 3 contract»):
+    # actions run as one task of a TaskRunner at a time; views and the pair card read the pair registry.
 
-    _store_task_lock = threading.Lock()
+    _main_screen_lock = threading.Lock()
 
-    def store_tasks(self) -> StoreTaskService:
-        with self._store_task_lock:            # one service per controller: one store task at a time
-            service = getattr(self, "_store_task_service", None)
+    def main_screen(self) -> MainScreenService:
+        with self._main_screen_lock:           # one service per controller: one main-screen task at a time
+            service = getattr(self, "_main_screen_service", None)
             if service is None:
-                service = StoreTaskService(Path(__file__).resolve().parents[2], self.default_config)
-                self._store_task_service = service
+                repo = Path(__file__).resolve().parents[2]
+                service = MainScreenService(repo, self.default_config, TaskRunner(repo), controller=self)
+                self._main_screen_service = service
         return service
+
+    def _main_task_running(self) -> bool:
+        service = getattr(self, "_main_screen_service", None)
+        return service is not None and service.task()["task"].get("state") == "running"
+
+    def _trade_store_root(self) -> Path:
+        try:
+            document = json.loads(self.default_config.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            raise StoreReadyError("конфиг не читается") from None
+        root = (document.get("trade_store") or {}).get("root") if isinstance(document, dict) else None
+        if not isinstance(root, str) or not root.strip():
+            raise StoreReadyError("в config не задан trade_store.root")
+        return Path(root)
 
     # -- MRS3 tick test from a store READY folder (docs/specs/2026-10-18-panel-simulation-workflow.md, «Stage 1b
     # contract»): the folder is re-rendered for the active PerformanceDB and published as a generation manifest
     # under Output/store-ready/, which the unchanged SINGLE_MODE tick test runs.
 
     def store_ready_catalog(self) -> dict[str, object]:
-        return {"folders": list_ready_folders(self.store_tasks().store_root())}
+        return {"folders": list_ready_folders(self._trade_store_root())}
 
     _store_ready_lock = threading.Lock()
 
-    def store_ready_prepare(self, payload: Mapping[str, object]) -> dict[str, object]:
+    def store_ready_prepare(self, payload: Mapping[str, object], *, strategies: Sequence[str] | None = None) -> dict[str, object]:
         if set(payload) != {"ready"}:
             raise StoreReadyError("запрос: только поле ready")
-        folder = resolve_ready_folder(self.store_tasks().store_root(), payload["ready"])
+        folder = resolve_ready_folder(self._trade_store_root(), payload["ready"])
         target = self._evaluation_target()
         with self._store_ready_lock:                 # one preparation at a time: no race on the batch folder
             result = prepare_tick_batch(folder, self.root / "Output" / "store-ready",
-                                        self._ready_strategy_template(target, "LONG"), target)
+                                        self._ready_strategy_template(target, "LONG"), target, strategies)
         self._fresh_strategy_manifests[str(result["analysis_run_id"])] = Path(str(result["manifest_path"])).resolve()
         return {"ready": folder.name, **{key: result[key] for key in
                                          ("analysis_run_id", "strategy_count", "pairs", "ready_pairs", "reused")}}
@@ -5487,16 +5508,13 @@ class _PanelHandler(BaseHTTPRequestHandler):
             self._headers(200, f"{content_type}; charset=utf-8", len(payload))
             self.wfile.write(payload)
             return
-        if parsed.path == "/api/v2/store/status":
-            try:
-                self._json(200, self.server.controller.store_tasks().status())
-            except StoreTaskError as error:
-                self._json(400, {"error": str(error)})
+        if parsed.path.startswith("/api/v2/main/"):
+            self._main_get(parsed)
             return
         if parsed.path == "/api/v2/strategies/store-ready/catalog":
             try:
                 self._json(200, self.server.controller.store_ready_catalog())
-            except (StoreTaskError, StoreReadyError) as error:
+            except StoreReadyError as error:
                 self._json(400, {"error": str(error)})
             return
         if parsed.path == "/api/v2/bootstrap":
@@ -5806,24 +5824,105 @@ class _PanelHandler(BaseHTTPRequestHandler):
             return False
         return True
 
-    def _store_post(self, endpoint: str) -> None:
+    # -- «Пары и стратегии» main screen routes (docs/specs/2026-10-18-panel-simulation-workflow.md, «Stage 3»)
+
+    _MAIN_POST = ("/api/v2/main/view-settings", "/api/v2/main/decision", "/api/v2/main/setting",
+                  "/api/v2/main/plan", "/api/v2/main/run", "/api/v2/main/stop")
+
+    def _main_error(self, error: Exception) -> None:
+        if isinstance(error, EvaluationProtocolError):
+            self._json(409, {"error": {"code": error.code, "message": str(error)}})
+        elif isinstance(error, PanelJobError):
+            self._json(409 if error.code in {"RESOURCE_BUSY", "JOB_CAPACITY_EXHAUSTED", "IDEMPOTENCY_CONFLICT",
+                                             "RESTART_BLOCKED"} else 400, {"error": error.code})
+        elif isinstance(error, FinalistRetestError):
+            self._json(400 if error.code in {"INVALID_REQUEST", "INVALID_TEST_RANGE"} else 409,
+                       {"error": {"code": error.code, "message": str(error)}})
+        elif isinstance(error, StrategyBatchValidationError):
+            self._json(500, {"error": f"пакет не прошёл самопроверку: {error}"})
+        elif isinstance(error, PanelTestingError):
+            self._json(400, {"error": "настройки тик-теста не приняты"})
+        elif isinstance(error, duckdb.Error):     # the registry or the store catalog is held by a task
+            self._json(409, {"error": "реестр или хранилище заняты задачей: повторите"})
+        elif isinstance(error, (MainScreenError, StoreReadyError, RegistryError, TradeStoreError)):
+            self._json(400, {"error": _redact_local_paths(str(error))})
+        elif isinstance(error, RuntimeError):     # a tester service: busy or unavailable
+            self._json(409, {"error": "тестер занят или недоступен"})
+        else:
+            _LOGGER.exception("Main screen request failed")
+            self._json(500, {"error": "внутренняя ошибка панели: подробности в журнале"})
+
+    def _main_get(self, parsed) -> None:
+        query = {key: values[-1] for key, values in parse_qs(parsed.query).items()}
+        service = self.server.controller.main_screen()
+        workbook = None
+        try:
+            if parsed.path == "/api/v2/main/view":
+                result = service.view(query.get("name", ""), query.get("exchange", ""))
+            elif parsed.path == "/api/v2/main/view.xlsx":
+                columns = [key for key in query.get("columns", "").split(",") if key] or None
+                workbook = service.view_xlsx(query.get("name", ""), query.get("exchange", ""), columns,
+                                             query.get("text", ""), query.get("sort") or None,
+                                             query.get("desc") in ("1", "true"))
+            elif parsed.path == "/api/v2/main/view-settings":
+                result = service.view_settings()
+            elif parsed.path == "/api/v2/main/pair":
+                result = service.pair(query.get("exchange", ""), query.get("symbol", ""))
+            elif parsed.path == "/api/v2/main/task":
+                result = service.task()
+            else:
+                self._json(404, {"error": "not found"})
+                return
+        except Exception as error:                 # every failure answers JSON: the connection is never dropped
+            self._main_error(error)
+            return
+        if workbook is not None:
+            filename, data = workbook
+            self.send_response(200)
+            self.send_header("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(data)
+            return
+        self._json(200, result)
+
+    def _main_post(self, endpoint: str) -> None:
         if not self._json_request():
             return
         try:
             length = int(self.headers.get("Content-Length", "0"))
             document = json.loads(self.rfile.read(length).decode("utf-8")) if 0 < length <= 65_536 else {}
             if not isinstance(document, dict):
-                raise StoreTaskError("тело запроса: JSON-объект")
-            service = self.server.controller.store_tasks()
-            if endpoint == "/api/v2/store/stop":
-                result = service.stop()
-            else:
-                result = service.start(str(document.get("action", "")), document)
-        except StoreTaskError as error:
-            self._json(400, {"error": str(error)})
-            return
+                raise ValueError
         except (ValueError, UnicodeDecodeError):
             self._json(400, {"error": "тело запроса: JSON-объект"})
+            return
+        service = self.server.controller.main_screen()
+        try:
+            if endpoint == "/api/v2/main/view-settings":
+                result = service.save_view_settings(document)
+            elif endpoint == "/api/v2/main/decision":
+                result = service.decision(document)
+            elif endpoint == "/api/v2/main/setting":
+                result = service.setting(document)
+            elif endpoint == "/api/v2/main/plan":
+                result = service.plan(str(document.get("action", "")), str(document.get("exchange", "")))
+            elif endpoint == "/api/v2/main/run":
+                options = {} if document.get("options") is None else document["options"]
+                if not isinstance(options, dict):
+                    raise MainScreenError("options: JSON-объект")
+                result = service.run(str(document.get("action", "")), str(document.get("exchange", "")),
+                                     document.get("items", []), options)
+            else:
+                result = service.stop()
+        except OSError:
+            self._json(409, {"error": "файлы заняты: повторите"})
+            return
+        except Exception as error:                 # every failure answers JSON: the connection is never dropped
+            self._main_error(error)
             return
         self._json(200, result)
 
@@ -5839,7 +5938,7 @@ class _PanelHandler(BaseHTTPRequestHandler):
         except EvaluationProtocolError as error:
             self._json(409, {"error": {"code": error.code, "message": str(error)}})
             return
-        except (StoreTaskError, StoreReadyError) as error:
+        except StoreReadyError as error:
             self._json(400, {"error": str(error)})
             return
         except StrategyBatchValidationError as error:
@@ -5861,8 +5960,8 @@ class _PanelHandler(BaseHTTPRequestHandler):
         if endpoint == self._PERFORMANCE_V2_EXPORT:
             self._export_method_not_allowed()
             return
-        if endpoint in ("/api/v2/store/start", "/api/v2/store/stop"):
-            self._store_post(endpoint)
+        if endpoint in self._MAIN_POST:
+            self._main_post(endpoint)
             return
         if endpoint == "/api/v2/strategies/store-ready/prepare":
             self._store_ready_post()

@@ -8,7 +8,7 @@ from __future__ import annotations
 from concurrent.futures import FIRST_COMPLETED, Executor, ProcessPoolExecutor, ThreadPoolExecutor, wait
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Callable, Mapping, Sequence
 import uuid
 
 import duckdb
@@ -147,7 +147,8 @@ def _reactivate(store: TradeStore, segment: SegmentKey, journal: Path, base: Map
 def run_history(store: TradeStore, *, data_root: Path, pairs: Sequence[tuple[str, date]], end_day: date,
                 instruments: Mapping[str, tuple[float, float]], points: Sequence[Point], workers: int,
                 download: bool = True, settings: RunSettings = RunSettings(), exchange: str = "bybit",
-                engine: str = ENGINE, run_args: Mapping | None = None) -> dict:
+                engine: str = ENGINE, run_args: Mapping | None = None,
+                progress: Callable[[dict], None] | None = None) -> dict:
     """Bring every pair's planned segments into the store, pairs in the given priority order.
 
     Workers simulate and write segment files; only this process writes the catalog and the journal. Pairs are
@@ -161,6 +162,15 @@ def run_history(store: TradeStore, *, data_root: Path, pairs: Sequence[tuple[str
     store.start_run(run_id, engine=engine, settings=settings, end_day=end_day, args=dict(run_args or {}))
     journal = store.root / "journal.jsonl"
     counts = {"written": 0, "reactivated": 0, "skipped": 0, "failed": 0}
+    units = {"done": 0, "total": len(queue)}           # one unit per pair plan, plus one per segment to simulate
+
+    def report(symbol: str, step: str, error: str | None = None) -> None:
+        if progress is None:
+            return
+        if error is not None:
+            progress({"error": error, "pair": symbol, "step": step})
+        progress({"progress": {"done": units["done"], "total": units["total"], "step": step, "pair": symbol}})
+
     download_threads = max(1, workers // PREPARE_IN_FLIGHT)
     pool: Executor = ThreadPoolExecutor(max_workers=1) if workers == 1 else ProcessPoolExecutor(max_workers=workers)
     pending: dict = {}
@@ -189,6 +199,8 @@ def run_history(store: TradeStore, *, data_root: Path, pairs: Sequence[tuple[str
                         journal_append(journal, {**base, "stage": kind, "status": "ERROR",
                                                  "segment_id": key.segment_id if key else None,
                                                  "error": f"{type(error).__name__}: {error}"})
+                        units["done"] += 1
+                        report(symbol, kind, f"{type(error).__name__}: {error}")
                         continue
                     if kind == "prepare":
                         plan, record = result
@@ -207,6 +219,9 @@ def run_history(store: TradeStore, *, data_root: Path, pairs: Sequence[tuple[str
                                 pending[pool.submit(simulate_and_write, str(store.root), segment, str(data_root),
                                                     tick, qty_step, points, settings, True)] = ("segment", symbol,
                                                                                                 segment)
+                                units["total"] += 1
+                        units["done"] += 1
+                        report(symbol, "plan")
                         fill()
                         continue
                     if result["status"] == "OK":
@@ -224,6 +239,9 @@ def run_history(store: TradeStore, *, data_root: Path, pairs: Sequence[tuple[str
                         counts["skipped"] += 1
                         journal_append(journal, {**base, "segment_id": key.segment_id,
                                                  **{name: value for name, value in result.items()}})
+                    units["done"] += 1
+                    report(symbol, "segment", None if result.get("status") == "OK" else
+                           f"{key.segment_id}: {result.get('status')} {result.get('missing_days', '')}".strip())
                 fill()
     finally:
         store.finish_run(run_id, written=counts["written"] + counts["reactivated"], skipped=counts["skipped"],

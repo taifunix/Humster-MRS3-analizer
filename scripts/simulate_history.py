@@ -26,6 +26,32 @@ from mrs3.trade_store import TradeStore  # noqa: E402
 REPO = Path(__file__).resolve().parents[1]
 
 
+def registry_listing(config: Path) -> dict:
+    """Listing days of the Bybit pairs in the pair registry (read-only); empty when there is no registry or a
+    writer holds it."""
+    from datetime import datetime, timezone
+
+    import duckdb
+
+    from mrs3.pair_registry.store import DATABASE, RegistryError, load_registry_settings
+
+    try:
+        settings = load_registry_settings(config)
+    except RegistryError:
+        return {}
+    if not (settings.root / DATABASE).is_file():
+        return {}
+    try:
+        con = duckdb.connect(str(settings.root / DATABASE), read_only=True)
+    except duckdb.Error as error:          # the registry is held by a writer: fall back to the workbook dates
+        print(json.dumps({"warning": f"pair registry unavailable: {type(error).__name__}"}), flush=True)
+        return {}
+    with con:
+        rows = con.execute("select symbol, listing_ms from pairs where exchange = 'bybit' and listing_ms is not null"
+                           ).fetchall()
+    return {symbol: datetime.fromtimestamp(ms / 1000, timezone.utc).date() for symbol, ms in rows}
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--store", type=Path, default=None, help="store root; default: trade_store.root in the config")
@@ -47,7 +73,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     order = pair_order(Path(config["panel_workflow"]["listing_dates_path"]))
     if args.pairs:
         wanted = [item.strip().upper() for item in args.pairs.split(",") if item.strip()]
-        known = dict(order)
+        known = {**dict(order), **registry_listing(args.config)}    # the registry wins, as in the Panel plan
         missing = [symbol for symbol in wanted if symbol not in known]
         if missing:
             parser.error(f"pairs without a listing day in the registry: {', '.join(missing)}")
@@ -66,7 +92,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     summary = run_history(store, data_root=data_root, pairs=order, end_day=end_day, instruments=instruments,
                           points=grid(timeframes), workers=workers, download=not args.no_download,
                           run_args={"pairs": [symbol for symbol, _ in order], "timeframes": timeframes,
-                                    "workers": workers, "download": not args.no_download})
+                                    "workers": workers, "download": not args.no_download},
+                          progress=lambda event: print(json.dumps(event, ensure_ascii=False), flush=True))
     print(json.dumps({**summary, "pairs": len(order), "end_day": end_day.isoformat(),
                       "seconds": round(time.monotonic() - started, 1)}), flush=True)
     return 1 if summary["failed"] else 0

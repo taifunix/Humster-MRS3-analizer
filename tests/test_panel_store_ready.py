@@ -111,7 +111,8 @@ def test_catalog_needs_a_configured_trade_store(tmp_path: Path, served) -> None:
 def test_prepare_requires_a_json_request(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, served) -> None:
     # review of stage 1b part A: a cross-site text/plain POST must not reach the early routes
     server = served(_controller(tmp_path, monkeypatch))
-    for path in ("/api/v2/strategies/store-ready/prepare", "/api/v2/store/start", "/api/v2/store/stop"):
+    for path in ("/api/v2/strategies/store-ready/prepare", "/api/v2/main/run", "/api/v2/main/stop",
+                 "/api/v2/main/plan", "/api/v2/main/decision", "/api/v2/main/setting", "/api/v2/main/view-settings"):
         connection = HTTPConnection("127.0.0.1", server.server_port, timeout=10)
         try:
             data = json.dumps({"ready": NAME}).encode("utf-8")

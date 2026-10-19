@@ -209,10 +209,71 @@ const portfolioResultHelpers = (() => {
 })();
 if (typeof globalThis !== 'undefined') globalThis.portfolioResultHelpers = portfolioResultHelpers;
 
+// «Пары и стратегии» main screen (docs/specs/2026-10-18-panel-simulation-workflow.md, «Stage 3 contract»): the table
+// filter and sort follow the same rules as the server's Excel export (panel_main.filter_rows / sort_rows).
+const mainScreenHelpers = (() => {
+  const empty = (value) => value === null || value === undefined || value === '';
+  const DECIMAL = /^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$/;
+  const number = (value) => {           // numbers and decimal strings only (panel_main._number)
+    if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+    if (typeof value === 'string' && DECIMAL.test(value.trim())) return Number(value);
+    return null;
+  };
+  const filterRows = (rows, columns, text) => {
+    const needle = String(text || '').trim().toLowerCase();
+    if (!needle) return rows.slice();
+    return rows.filter((row) => columns.some((key) => String(empty(row[key]) ? '' : row[key]).toLowerCase().includes(needle)));
+  };
+  const sortRows = (rows, key, descending = false) => {
+    if (!key) return rows.slice();
+    const filled = rows.filter((row) => !empty(row[key]));
+    const blank = rows.filter((row) => empty(row[key]));
+    const numeric = filled.every((row) => number(row[key]) !== null);
+    const value = (row) => (numeric ? number(row[key]) : String(row[key]).toLowerCase());
+    const sign = descending ? -1 : 1;
+    const ordered = filled.slice().sort((a, b) => {
+      const left = value(a);
+      const right = value(b);
+      return left < right ? -sign : left > right ? sign : 0;
+    });
+    return ordered.concat(blank);
+  };
+  const duration = (value) => {
+    const seconds = Math.max(0, Math.round(Number(value) || 0));
+    const hours = Math.floor(seconds / 3600);
+    const minutes = Math.floor((seconds % 3600) / 60);
+    return hours ? `${hours}ч ${minutes}м` : `${minutes}м ${seconds % 60}с`;
+  };
+  const taskSummary = (task) => {
+    const state = String(task?.state || 'idle');
+    const progress = task?.progress || {};
+    const done = Number.isInteger(progress.done) ? progress.done : null;
+    const total = Number.isInteger(progress.total) && progress.total > 0 ? progress.total : null;
+    const percent = done !== null && total ? Math.min(100, Math.round((done / total) * 100)) : (state === 'done' ? 100 : 0);
+    const parts = [];
+    if (progress.step) parts.push([progress.step, progress.pair].filter(Boolean).join(' · '));
+    if (done !== null && total) parts.push(`${done} из ${total}`);
+    if (state !== 'idle') parts.push(`прошло ${duration(task.elapsed_s)}`);
+    if (state === 'running' && task.eta_s !== null && task.eta_s !== undefined) parts.push(`осталось ≈ ${duration(task.eta_s)}`);
+    if (state === 'running' && task.stopping) parts.push('остановка…');
+    const words = { idle: 'Нет активной задачи.', running: 'Выполняется', done: 'Готово', failed: 'Ошибка', stopped: 'Остановлено' };
+    const head = words[state] || state;
+    return {
+      state,
+      badge: state.toUpperCase(),
+      badgeClass: state === 'failed' ? 'state-error' : state === 'running' ? 'state-running' : state === 'stopped' ? 'state-pending' : 'state-ready',
+      percent,
+      text: state === 'idle' ? head : [head, ...parts].join(' · '),
+    };
+  };
+  return { filterRows, sortRows, taskSummary, duration };
+})();
+if (typeof globalThis !== 'undefined') globalThis.mainScreenHelpers = mainScreenHelpers;
+
 const panelRequestErrorHelpers = (() => {
   const safeStringPrefixes = [
     '/api/v2/strategies/fresh/',
-    '/api/v2/store/',
+    '/api/v2/main/',
     '/api/v2/strategies/store-ready/',
   ];
   const safeStringEndpoints = new Set([]);
@@ -551,7 +612,7 @@ if (typeof globalThis !== 'undefined') globalThis.portfolioSelectionHelpers = po
   } else {
     v2Cards.forEach((card) => strategyStack.append(card));
   }
-  // The tester card by id: the MRS2 STORE card (an <article>) shares this screen since Panel rework stage 1b.
+  // The tester card by id: the main-screen section and dialogs share this screen since Panel rework stage 3.
   const strategyCards = [document.querySelector('#tester-card')].filter(Boolean);
   ['3. Test and Import to Performance DB'].forEach((label, index) => {
     const heading = strategyCards[index]?.querySelector('summary b');
@@ -3730,77 +3791,375 @@ if (typeof globalThis !== 'undefined') globalThis.portfolioSelectionHelpers = po
     if (force || !loadPortfolioSettings.state.document) loadPortfolioSettings.state.load();
   }
 
-  // MRS2 trade store (docs/specs/2026-10-17-mrs2-history-store-and-tester-sampling.md, stage 4): one store CLI task at
-  // a time; the mode decides whether the newest period comes from the simulator or from the imported tester segment.
-  const storeCard = document.querySelector('#store-local');
-  if (storeCard) {
-    const storeEl = (id) => document.querySelector(`#store-${id}`);
-    let storeTimer = null;
-    const syncStoreMode = () => {
-      const tester = storeEl('mode')?.value === 'tester';
-      storeCard.querySelectorAll('[data-tester-only]').forEach((button) => { button.disabled = !tester; });
+  // «Пары и стратегии» main screen (docs/specs/2026-10-18-panel-simulation-workflow.md, «Stage 3 contract»): actions
+  // with plan dialogs run as one task (progress, ETA, errors, «Стоп»); views and the pair card read the pair registry.
+  const mainScreen = document.querySelector('#main-screen');
+  if (mainScreen) {
+    const mainEl = (id) => document.querySelector(`#main-${id}`);
+    const mainState = { exchange: 'bybit', view: 'pairs', document: null, settings: {}, sort: null, desc: false, plan: null, timer: null, lastState: null, pair: null };
+    const BINGX_READY_ACTIONS = new Set(['sync']);
+    const node = (tag, text, className) => {
+      const element = document.createElement(tag);
+      if (text !== undefined && text !== null) element.textContent = String(text);
+      if (className) element.className = className;
+      return element;
     };
-    const storeCell = (value) => { const cell = document.createElement('td'); cell.textContent = value ?? '—'; return cell; };
-    const renderStore = (status) => {
+    const cellText = (value) => (value === null || value === undefined || value === '' ? '—'
+      : typeof value === 'boolean' ? (value ? 'да' : 'нет') : String(value));
+    const errorText = (error, fallback) => error?.message || fallback;
+    const viewStatus = (text) => { const line = mainEl('view-status'); if (line) line.textContent = text; };
+    const author = mainEl('author');
+
+    // -- task area ------------------------------------------------------------------------------------------
+    const renderTask = (status) => {
       const task = status?.task || {};
-      const badge = storeEl('badge');
-      if (badge) {
-        badge.textContent = String(task.state || 'idle').toUpperCase();
-        badge.className = `state-badge ${task.state === 'failed' ? 'state-error' : task.state === 'running' ? 'state-pending' : 'state-ready'}`;
+      const summary = mainScreenHelpers.taskSummary(task);
+      const label = mainEl('task-label');
+      if (label) label.textContent = task.label || 'Задача не запускалась';
+      const badge = mainEl('task-badge');
+      if (badge) { badge.textContent = summary.badge; badge.className = `state-badge ${summary.badgeClass}`; }
+      const bar = mainEl('task-bar');
+      if (bar) bar.style.width = `${summary.percent}%`;
+      const text = mainEl('task-text');
+      if (text) text.textContent = summary.text;
+      const stop = mainEl('task-stop');
+      if (stop) stop.disabled = summary.state !== 'running' || Boolean(task.stopping);
+      const errors = mainEl('task-errors');
+      if (errors) {
+        const items = (task.errors || []).slice(-50).map((item) => node('li', [item.pair, item.step, item.message].filter(Boolean).join(' · ')));
+        errors.replaceChildren(...items);
+        errors.hidden = !items.length;
       }
-      const last = (task.results || []).slice(-1)[0];
-      const text = task.state === 'running' && task.stopping ? 'Остановка после текущего задания тестера…'
-        : task.state === 'running' ? `Выполняется: ${task.action}…`
-        : task.state === 'done' ? `Готово: ${task.action}.`
-          : task.state === 'failed' ? `Ошибка: ${task.action} (код ${task.returncode}).` : 'Задача не запускалась.';
-      const statusLine = storeEl('status');
-      if (statusLine) statusLine.textContent = last ? `${text} ${JSON.stringify(last)}` : text;
-      const log = storeEl('log');
-      if (log) { log.hidden = !(task.log || []).length; log.textContent = (task.log || []).slice(-40).join('\n'); }
-      const body = storeEl('pairs-body');
-      if (body && status?.store) {
-        body.replaceChildren(...(status.store.pairs || []).map((pair) => {
-          const row = document.createElement('tr');
-          const jobs = Object.entries(pair.jobs || {}).map(([state, count]) => `${state} ${count}`).join(', ');
-          row.append(storeCell(pair.pair), storeCell(pair.periods), storeCell(pair.first), storeCell(pair.end),
-            storeCell(pair.latest_tested ? 'есть' : (pair.tester_segments ? 'старый' : 'нет')), storeCell(jobs || '—'));
-          return row;
-        }));
+      const log = mainEl('task-log');
+      const logBox = mainEl('task-log-box');
+      if (log && logBox) { log.textContent = (task.log || []).slice(-60).join('\n'); logBox.hidden = !(task.log || []).length; }
+      document.querySelectorAll('[data-main-action]').forEach((button) => {
+        button.dataset.busy = summary.state === 'running' ? 'true' : 'false';
+      });
+      syncActions();
+      const finished = mainState.lastState === 'running' && summary.state !== 'running';
+      mainState.lastState = summary.state;
+      if (finished) loadView();
+      return summary.state === 'running';
+    };
+    const pollTask = async () => {
+      clearTimeout(mainState.timer);
+      try {
+        if (renderTask(await requestJson('/api/v2/main/task'))) mainState.timer = setTimeout(pollTask, 1500);
+      } catch (_) { mainState.timer = setTimeout(pollTask, 5000); }
+    };
+    mainEl('task-stop')?.addEventListener('click', async () => {
+      try { renderTask(await remoteRequest('/api/v2/main/stop', {})); pollTask(); }
+      catch (error) { viewStatus(errorText(error, 'Остановка не удалась.')); }
+    });
+
+    // -- exchange switch and actions ------------------------------------------------------------------------
+    function syncActions() {
+      document.querySelectorAll('[data-main-action]').forEach((button) => {
+        const pending = mainState.exchange === 'bingx' && !BINGX_READY_ACTIONS.has(button.dataset.mainAction);
+        button.disabled = pending || button.dataset.busy === 'true';
+        button.title = pending ? 'BingX — этап 5: минутные данные BingX ещё не подключены' : '';
+      });
+    }
+    document.querySelectorAll('[data-exchange]').forEach((button) => {
+      button.addEventListener('click', () => {
+        mainState.exchange = button.dataset.exchange;
+        document.querySelectorAll('[data-exchange]').forEach((item) => item.setAttribute('aria-pressed', String(item === button)));
+        syncActions();
+        loadView();
+      });
+    });
+    const startRun = async (action, items, options) => {
+      const result = await remoteRequest('/api/v2/main/run', { action, exchange: mainState.exchange, items, options });
+      if (result.task) { renderTask(result); pollTask(); }
+      if (result.tick) viewStatus(`Тик-тест запущен: ${result.tick.strategy_count} стратегий из ${result.tick.ready}; ход — в карточке «3. Test and Import».`);
+      if (result.retest) viewStatus('Ретест финалистов запущен; ход — в карточке ретеста.');
+      return result;
+    };
+    const planDialog = mainEl('plan');
+    const planItems = () => Array.from(mainEl('plan-items')?.querySelectorAll('input[type="checkbox"]') || []);
+    const planCount = () => {
+      const count = mainEl('plan-count');
+      const boxes = planItems();
+      if (count) count.textContent = `отмечено ${boxes.filter((box) => box.checked).length} из ${boxes.length}`;
+    };
+    const isoDay = (day) => day.toISOString().slice(0, 10);
+    const openPlan = (plan, title) => {
+      mainState.plan = plan;
+      mainEl('plan-title').textContent = title;
+      mainEl('plan-note').textContent = plan.note || '';
+      const list = mainEl('plan-items');
+      list.replaceChildren(...(plan.items || []).map((item) => {
+        const row = node('label', null, 'check main-plan-item');
+        const box = document.createElement('input');
+        box.type = 'checkbox';
+        box.value = item.key;
+        box.checked = Boolean(item.checked);
+        box.addEventListener('change', planCount);
+        const text = node('span');
+        text.append(node('strong', item.label), node('small', item.detail));
+        row.append(box, text);
+        return row;
+      }));
+      const withItems = plan.action !== 'retest';
+      mainEl('plan-select').hidden = !withItems;
+      list.hidden = !withItems;
+      mainEl('plan-window').hidden = plan.action !== 'tick';
+      mainEl('plan-reserve-box').hidden = plan.action !== 'retest';
+      if (plan.action === 'tick') {
+        const end = new Date(Date.now() - 86400000);
+        mainEl('plan-end').value = isoDay(end);
+        mainEl('plan-start').value = isoDay(new Date(end.getTime() - 30 * 86400000));
       }
-      return task.state === 'running';
+      mainEl('plan-reserve').checked = Boolean(plan.options?.include_reserve);
+      const status = mainEl('plan-status');
+      status.hidden = true;
+      status.textContent = '';
+      planCount();
+      planDialog.showModal();
     };
-    const storeMessage = (error, fallback) => { const line = storeEl('status'); if (line) line.textContent = error?.message || fallback; };
-    const pollStore = async () => {
+    mainEl('plan-all')?.addEventListener('click', () => { planItems().forEach((box) => { box.checked = true; }); planCount(); });
+    mainEl('plan-none')?.addEventListener('click', () => { planItems().forEach((box) => { box.checked = false; }); planCount(); });
+    mainEl('plan-cancel')?.addEventListener('click', () => planDialog.close());
+    mainEl('plan-run')?.addEventListener('click', async () => {
+      const plan = mainState.plan;
+      if (!plan) return;
+      const items = planItems().filter((box) => box.checked).map((box) => box.value);
+      const options = plan.action === 'tick' ? { start_date: mainEl('plan-start').value, end_date: mainEl('plan-end').value }
+        : plan.action === 'retest' ? { include_reserve: mainEl('plan-reserve').checked } : {};
+      const run = mainEl('plan-run');
+      run.disabled = true;
       try {
-        const running = renderStore(await requestJson('/api/v2/store/status'));
-        clearTimeout(storeTimer);
-        if (running) storeTimer = setTimeout(pollStore, 2000);
-      } catch (error) { storeMessage(error, 'Статус недоступен.'); }
+        await startRun(plan.action, items, options);
+        planDialog.close();
+      } catch (error) {
+        const status = mainEl('plan-status');
+        status.hidden = false;
+        status.textContent = errorText(error, 'Запуск не удался.');
+      } finally { run.disabled = false; }
+    });
+    document.querySelectorAll('[data-main-action]').forEach((button) => {
+      button.addEventListener('click', async () => {
+        const action = button.dataset.mainAction;
+        try {
+          if (action === 'sync') { await startRun('sync', [], {}); return; }    // «Синхронизировать» has no plan dialog
+          viewStatus(`Составляю план: ${button.textContent}…`);
+          const plan = await remoteRequest('/api/v2/main/plan', { action, exchange: mainState.exchange });
+          if (plan.disabled) { viewStatus(plan.disabled); return; }
+          viewStatus('');
+          openPlan(plan, button.textContent);
+        } catch (error) { viewStatus(errorText(error, 'Действие не выполнено.')); }
+      });
+    });
+
+    // -- views ----------------------------------------------------------------------------------------------
+    const shownColumns = () => {
+      const columns = (mainState.document?.columns || []).map((column) => column.key);
+      const saved = mainState.settings[mainState.view]?.columns || [];
+      const chosen = saved.filter((key) => columns.includes(key));
+      return chosen.length ? chosen : columns;
     };
-    const startStore = async (action) => {
-      const payload = {
-        action,
-        mode: storeEl('mode')?.value || 'simulation',
-        pairs: storeEl('pairs')?.value || '',
-        end_day: storeEl('end-date')?.value || '',
-        download: storeEl('download')?.checked !== false,
-        limit: Number(storeEl('run-limit')?.value || 0),
-      };
+    const visibleRows = () => {
+      const shown = shownColumns();
+      const filtered = mainScreenHelpers.filterRows(mainState.document?.rows || [], shown, mainEl('filter')?.value || '');
+      return mainScreenHelpers.sortRows(filtered, shown.includes(mainState.sort) ? mainState.sort : null, mainState.desc);
+    };
+    const renderColumnsPanel = () => {
+      const panel = mainEl('columns-panel');
+      if (!panel || !mainState.document) return;
+      const shown = shownColumns();
+      const legend = node('legend', 'Показывать столбцы');
+      panel.replaceChildren(legend, ...mainState.document.columns.map((column) => {
+        const row = node('label', null, 'check');
+        const box = document.createElement('input');
+        box.type = 'checkbox';
+        box.value = column.key;
+        box.checked = shown.includes(column.key);
+        box.addEventListener('change', async () => {
+          const columns = Array.from(panel.querySelectorAll('input:checked')).map((input) => input.value);
+          if (!columns.length) { box.checked = true; viewStatus('Нужен хотя бы один столбец.'); return; }
+          try {
+            mainState.settings = await remoteRequest('/api/v2/main/view-settings', { view: mainState.view, columns });
+            renderTable();
+          } catch (error) { box.checked = !box.checked; viewStatus(errorText(error, 'Выбор столбцов не сохранён.')); }
+        });
+        row.append(box, node('span', column.label));
+        return row;
+      }));
+    };
+    function renderTable() {
+      const table = mainEl('table');
+      if (!table || !mainState.document) return;
+      const labels = Object.fromEntries(mainState.document.columns.map((column) => [column.key, column.label]));
+      const shown = shownColumns();
+      const head = document.createElement('tr');
+      shown.forEach((key) => {
+        const th = document.createElement('th');
+        th.scope = 'col';
+        th.setAttribute('aria-sort', mainState.sort === key ? (mainState.desc ? 'descending' : 'ascending') : 'none');
+        const button = node('button', `${labels[key]}${mainState.sort === key ? (mainState.desc ? ' ↓' : ' ↑') : ''}`, 'main-sort');
+        button.type = 'button';
+        button.addEventListener('click', () => {
+          if (mainState.sort === key) mainState.desc = !mainState.desc;
+          else { mainState.sort = key; mainState.desc = false; }
+          renderTable();
+        });
+        th.append(button);
+        head.append(th);
+      });
+      table.tHead.replaceChildren(head);
+      const rows = visibleRows();
+      const withCard = mainState.view !== 'changes';
+      table.tBodies[0].replaceChildren(...rows.map((row) => {
+        const tr = document.createElement('tr');
+        shown.forEach((key) => {
+          const td = document.createElement('td');
+          if (key === 'symbol' && withCard && row.symbol) {
+            const link = node('button', row.symbol, 'main-pair-link');
+            link.type = 'button';
+            link.addEventListener('click', () => openPair(row.symbol));
+            td.append(link);
+          } else td.textContent = cellText(row[key]);
+          tr.append(td);
+        });
+        return tr;
+      }));
+      viewStatus(`Строк: ${rows.length} из ${(mainState.document.rows || []).length} · ${mainState.exchange === 'bingx' ? 'BingX' : 'Bybit'}`);
+    }
+    async function loadView() {
+      const exchange = mainState.exchange;
+      const view = mainState.view;
       try {
-        renderStore(await requestJson('/api/v2/store/start', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) }));
-        pollStore();
-      } catch (error) { storeMessage(error, 'Запуск не удался.'); }
+        const document_ = await requestJson(`/api/v2/main/view?name=${encodeURIComponent(view)}&exchange=${encodeURIComponent(exchange)}`);
+        if (exchange !== mainState.exchange || view !== mainState.view) return;      // a newer choice won
+        mainState.document = document_;
+        renderColumnsPanel();
+        renderTable();
+      } catch (error) {
+        mainState.document = null;
+        mainEl('table')?.tHead.replaceChildren();
+        mainEl('table')?.tBodies[0].replaceChildren();
+        viewStatus(errorText(error, 'Вид недоступен.'));
+      }
+    }
+    document.querySelectorAll('[data-main-view]').forEach((button) => {
+      button.addEventListener('click', () => {
+        mainState.view = button.dataset.mainView;
+        mainState.sort = null;
+        mainState.desc = false;
+        document.querySelectorAll('[data-main-view]').forEach((item) => item.setAttribute('aria-pressed', String(item === button)));
+        loadView();
+      });
+    });
+    mainEl('filter')?.addEventListener('input', renderTable);
+    mainEl('columns')?.addEventListener('click', () => {
+      const panel = mainEl('columns-panel');
+      panel.hidden = !panel.hidden;
+      mainEl('columns').setAttribute('aria-expanded', String(!panel.hidden));
+    });
+    mainEl('excel')?.addEventListener('click', () => {
+      const params = new URLSearchParams({ name: mainState.view, exchange: mainState.exchange, columns: shownColumns().join(','),
+        text: mainEl('filter')?.value || '' });
+      if (mainState.sort) { params.set('sort', mainState.sort); params.set('desc', mainState.desc ? '1' : '0'); }
+      const link = document.createElement('a');
+      link.href = `/api/v2/main/view.xlsx?${params.toString()}`;
+      link.download = '';
+      document.body.append(link);
+      link.click();
+      link.remove();
+    });
+
+    // -- pair card ------------------------------------------------------------------------------------------
+    const pairTable = (headers, rows) => {
+      const wrap = node('div', null, 'table-wrap');
+      const table = document.createElement('table');
+      const head = document.createElement('tr');
+      headers.forEach(([, label]) => { const th = node('th', label); th.scope = 'col'; head.append(th); });
+      table.createTHead().append(head);
+      const body = table.createTBody();
+      rows.forEach((row) => {
+        const tr = document.createElement('tr');
+        headers.forEach(([key]) => tr.append(node('td', cellText(row[key]))));
+        body.append(tr);
+      });
+      wrap.append(table);
+      return wrap;
     };
-    ['history', 'plan', 'run', 'import', 'ready'].forEach((action) => {
-      storeEl(action)?.addEventListener('click', () => startStore(action));
+    const pairSection = (title, content) => {
+      const section = node('section', null, 'main-pair-section');
+      section.append(node('h3', title));
+      if (typeof content === 'string') section.append(node('p', content, 'helper'));
+      else section.append(content);
+      return section;
+    };
+    const renderPair = (card) => {
+      mainState.pair = card;
+      mainEl('pair-title').textContent = `${card.symbol} · ${card.exchange === 'bingx' ? 'BingX' : 'Bybit'}`;
+      const ref = card.reference || {};
+      const facts = [['Статус', ref.status], ['Стадия', card.pipeline?.stage], ['История', card.history?.status],
+        ['Тик', ref.tick_size], ['Шаг лота', ref.qty_step], ['Мин. ордер USDT', ref.min_notional],
+        ['Макс. плечо', ref.max_leverage], ['Базовый лот', card.liquidity?.base_lot], ['Ликвидность на', card.liquidity?.as_of_day]];
+      const list = node('dl', null, 'main-facts');
+      facts.forEach(([label, value]) => { list.append(node('dt', label), node('dd', cellText(value))); });
+      const body = mainEl('pair-body');
+      body.replaceChildren(
+        list,
+        pairSection('Периоды в хранилище', card.periods.length ? pairTable([['start', 'С'], ['end', 'По'], ['source', 'Источник']], card.periods) : 'Периодов нет.'),
+        pairSection('READY по ТФ', card.ready ? pairTable([['timeframe', 'ТФ'], ['score', 'Score'], ['dd', 'DD'], ['admitted', 'Допущена']], card.ready.timeframes) : 'READY не собирался.'),
+        pairSection('Тесты', card.tests.length ? pairTable([['kind', 'Вид'], ['structure', 'Структура'], ['window_start', 'С'], ['window_end', 'По'], ['pnl_pct', 'PnL %'], ['maxdd_pct', 'DD %'], ['trades', 'Сделок']], card.tests.slice(0, 100)) : 'Тестов нет.'),
+        pairSection('Решения', card.decisions.length ? pairTable([['when', 'Когда'], ['side', 'Сторона'], ['decision', 'Решение'], ['reason', 'Причина'], ['author', 'Автор']], card.decisions) : 'Решений нет.'),
+        pairSection('Пороги фильтра READY', pairTable([['parameter', 'Параметр'], ['default', 'Общий'], ['value', 'Для пары'], ['overridden_text', 'Свой']],
+          card.thresholds.map((item) => ({ ...item, overridden_text: item.overridden ? 'да' : '' })))),
+        pairSection('История порогов', card.settings_history.length ? pairTable([['when', 'Когда'], ['side', 'Сторона'], ['parameter', 'Параметр'], ['value', 'Значение'], ['reason', 'Причина'], ['author', 'Автор']], card.settings_history) : 'Личных порогов не было.'),
+      );
+      const parameter = mainEl('setting-parameter');
+      const previous = parameter.value;
+      parameter.replaceChildren(...card.thresholds.map((item) => {
+        const option = node('option', `${item.parameter} (общий ${item.default})`);
+        option.value = item.parameter;
+        return option;
+      }));
+      if (previous) parameter.value = previous;
+    };
+    async function openPair(symbol) {
+      const status = mainEl('pair-status');
+      status.textContent = '';
+      try {
+        renderPair(await requestJson(`/api/v2/main/pair?exchange=${encodeURIComponent(mainState.exchange)}&symbol=${encodeURIComponent(symbol)}`));
+        const dialog = mainEl('pair');
+        if (!dialog.open) dialog.showModal();
+      } catch (error) { viewStatus(errorText(error, 'Карточка пары недоступна.')); }
+    }
+    mainEl('pair-close')?.addEventListener('click', () => mainEl('pair').close());
+    const pairWrite = async (endpoint, payload, done) => {
+      const status = mainEl('pair-status');
+      const who = (author?.value || '').trim();
+      if (!who) { status.textContent = 'Укажите автора записи.'; author?.focus(); return; }
+      try {
+        await remoteRequest(endpoint, { exchange: mainState.pair.exchange, symbol: mainState.pair.symbol, author: who, ...payload });
+        status.textContent = done;
+        await openPair(mainState.pair.symbol);
+        mainEl('pair-status').textContent = done;
+        loadView();
+      } catch (error) { status.textContent = errorText(error, 'Запись не сохранена.'); }
+    };
+    mainEl('pair-decision')?.addEventListener('submit', (event) => {
+      event.preventDefault();
+      pairWrite('/api/v2/main/decision', { side: mainEl('decision-side').value, decision: mainEl('decision-value').value,
+        reason: mainEl('decision-reason').value.trim() }, 'Решение записано.');
     });
-    storeEl('stop')?.addEventListener('click', async () => {
-      try { renderStore(await requestJson('/api/v2/store/stop', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })); }
-      catch (error) { storeMessage(error, 'Остановка не удалась.'); }
+    mainEl('pair-setting')?.addEventListener('submit', (event) => {
+      event.preventDefault();
+      const raw = mainEl('setting-value').value.trim();
+      pairWrite('/api/v2/main/setting', { side: 'ALL', filter: 'ready_v4', parameter: mainEl('setting-parameter').value,
+        value: raw === '' ? null : raw, reason: mainEl('setting-reason').value.trim() },
+      raw === '' ? 'Порог сброшен к общему.' : 'Порог записан.');
     });
-    storeEl('mode')?.addEventListener('change', syncStoreMode);
-    syncStoreMode();
-    pollStore();
+
+    requestJson('/api/v2/main/view-settings').then((settings) => { mainState.settings = settings; renderTable(); }).catch(() => {});
+    syncActions();
+    loadView();
+    pollTask();
   }
 
   loadSafeDefaults();

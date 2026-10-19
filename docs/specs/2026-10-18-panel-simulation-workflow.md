@@ -308,6 +308,177 @@ themselves must meet protocol v2 for the active PerformanceDB.
 - A run on the real store and the real tester for a few strategies, then the
   import into PerformanceDB.
 
+## Stage 3 contract: the «Пары и стратегии» main screen (2026-10-19)
+
+**Task area: `panel_tasks.TaskRunner`.** One task at a time, built from
+real facts reported by the child process.
+- JSON lines: `progress` (done, total, step, pair), `error` (pair, step,
+  message); other objects are results; other lines are the log.
+- Status: state, progress, elapsed time, ETA from the rate so far, errors as
+  they happen, results, log. Local paths are redacted.
+- «Стоп»: a tester run stops cooperatively through its stop file, after the
+  current job and with the tester's files restored. Any other task kills the
+  whole process tree, held in a Windows job object.
+- The defect: the task finishes when the main process exits, even if
+  orphaned workers still hold the output pipe. They are ended through the
+  job object, and the pipe is never closed under the reader.
+- The MRS2 STORE card, its routes `/api/v2/store/*` and `panel_store` are
+  removed: its functions are the actions below. The history and READY
+  scripts emit `progress` lines; a chain script (`scripts/panel_chain.py`)
+  runs the steps of one action and honours the stop file.
+- A running task blocks the panel restart (`has_active_panel_jobs`).
+
+**Actions** (bar at the top, for the selected exchange):
+- «Синхронизировать»: registry refresh, then liquidity, then pipeline. No plan
+  dialog. The git sync is added in registry stage 5.
+- «Пересчитать историю»: the plan lists one row per pair:
+  - «новая пара: N периодов»: a pair with no store segments and enough days;
+  - «продлить последнее окно / N новых периодов»: planned P2 segments (from
+    the listing day, `trade_history.pair_segments`) that the store lacks;
+  - «без изменений».
+  Rows with work are pre-checked. The run takes the checked pairs.
+- «Пересобрать READY»: the plan row says «READY ещё не собирался», or
+  «появились новые периоды» when the pair's active segments differ from its
+  latest READY catalog inputs, else «без изменений». The run is
+  `ready_from_store --latest-source auto` with the checked pairs, then the
+  pipeline.
+- `latest_source="auto"` (`ready_store.pair_periods`): the newest period is
+  the imported tester segment of the same span when it exists, otherwise the
+  simulator segment. The entry records `newest_source`, the plan uses the
+  same periods for its inputs hash, and the «Пары» view shows it as
+  «Последний период».
+- «Проверить тестером»: plan / run / import of `tester_jobs` for the checked
+  pairs (sampling rule `select-v1` unchanged).
+- «Тик-тест MRS3»: the plan lists the strategies of the newest READY folder.
+  The run prepares a batch of the checked strategies (`prepare_tick_batch`
+  with a strategy filter) and starts the existing SINGLE_MODE tick test.
+- «Ретест финалистов»: the existing finalist retest, with an option
+  «включая резерв».
+
+**Plan dialog.** One row per pair or strategy, with what would be done, a
+checkbox per row, «Выделить все» / «Снять выделение», and «Запустить».
+
+**Views** (switch buttons). Each is a table with:
+- sorting by column;
+- a text filter;
+- a column chooser, saved on the server in `pair_registry/view_settings.json`;
+- «Excel» export of exactly the rows and columns shown, generated on the
+  server with openpyxl, without changing any data.
+
+The views:
+- **Пары**: latest pipeline rows — stage, periods, READY, tester, tick tests,
+  finalists, decision, history sufficiency, track record, base lot from
+  `read_liquidity`;
+- **Справочник**: reference, current risk tiers and maximum leverage;
+- **Ликвидность**: the latest liquidity row of each pair;
+- **Изменения**: `pair_changes`, newest first.
+
+The «Стратегии» view comes in stage 4.
+
+**Pair card** (click on a pair): reference, periods, READY per TF, tests,
+decisions with history, personal thresholds next to the common defaults. A
+new decision and a threshold (or a reset) are entered here, through
+`records.record_decision` and `record_setting`.
+
+**Exchange switch** (Bybit / BingX, top of the screen): views and plans take
+the exchange. Actions that need the BingX data layer show «BingX — этап 5»
+and stay disabled until stage 5.
+
+**Routes.**
+- `GET /api/v2/main/view?name=…&exchange=…`
+- `GET /api/v2/main/view.xlsx?…`
+- `GET/POST /api/v2/main/view-settings`
+- `GET /api/v2/main/pair?exchange=…&symbol=…`
+- `POST /api/v2/main/decision`
+- `POST /api/v2/main/setting`
+- `POST /api/v2/main/plan {action, exchange}`
+- `POST /api/v2/main/run {action, exchange, items, options}`
+- `POST /api/v2/main/stop`
+- `GET /api/v2/main/task`
+
+POST routes require JSON.
+
+**Acceptance.**
+- Task runner tests with real processes: progress / ETA / errors, tree kill,
+  the orphan-pipe defect, cooperative stop, a failing child.
+- Plan builders on synthetic stores.
+- Routes for views, Excel, settings, pair card, decision and setting entry,
+  plan, run and stop.
+- Static UI tests for the action bar, plan dialog, task area, views and pair
+  card.
+- A live check on the real registry and store: «Синхронизировать» and the
+  READY plan.
+
+## Stage 3 evidence: the «Пары и стратегии» main screen (2026-10-19)
+
+**Code**
+- `panel_tasks.TaskRunner`, `panel_main.MainScreenService`,
+  `scripts/panel_chain.py`.
+- `pair_registry` CLI `sync`, progress lines in `trade_history.run_history`
+  and `ready_store.build_ready`.
+- Strategy filter in `prepare_tick_batch`; `latest_source="auto"`.
+- `/api/v2/main/*` routes in `panel.py`.
+- UI: section `#main-screen` and dialogs `#main-plan` and `#main-pair` in
+  `index.html`, the main-screen block and `mainScreenHelpers` in `app.js`.
+- Removed: `panel_store.py`, `tests/test_panel_store.py`, the store card and
+  `/api/v2/store/*`. The store-lock test moved to `tests/test_trade_store.py`.
+
+**Review fixes** (independent review, first pass `CODE_REVIEW_FAIL`)
+- The Panel reads the store catalog through `TradeStore.reader` and never
+  opens it writable. Before this fix, a writable open was refused while
+  another thread held a read-only connection.
+- Every `/api/v2/main/*` failure answers JSON:
+  - a busy DuckDB file → 409;
+  - validation errors → 400, local paths redacted;
+  - anything else → 500, logged.
+- The chain ends after a step reports a cooperative stop
+  (`tester_jobs run` deletes the stop file itself). Children run with UTF-8
+  output. `--cleanup` deletes the steps file.
+- The table and the Excel export share one rule for value text
+  (JavaScript `String`) and for numbers (decimal strings only). A sort on a
+  hidden column is ignored in both.
+- Excel cells starting with «=» are written as text.
+- The history plan says «пересчитать последние окна» when the P2 grid
+  realigns stored windows.
+- `simulate_history --pairs` takes the listing day from the registry first,
+  the same source as the plan.
+- READY folders from the Panel are named `<day>_ready_<time>`. The tick
+  plan takes the newest testable folder by its manifest time, not by its
+  name.
+- `simulate_history` falls back to the workbook listing days, with a
+  warning line, while a writer holds the registry.
+- Second pass: `CODE_REVIEW_PASS`. Its two follow-ups (the newest folder by
+  manifest time, the busy registry) are fixed.
+
+**Tests** (`.venv`, basetemp on drive C)
+- `test_panel_tasks` (7), `test_panel_chain` (5), `test_panel_main` (18,
+  with the routes), `test_panel_static_ui` (5 new main-screen tests),
+  `test_ready_store` (auto source), `test_trade_store` (reader),
+  `test_pair_registry_records` (CLI sync).
+- Related set: 300 passed, 1 failed. The failure is
+  `test_panel.py::test_static_panel_shell_contains_only_navigation_contract`,
+  which already fails on HEAD (the `previewtoken` identifiers predate this
+  stage).
+
+**Live check** (real registry and store, real `TaskRunner`)
+- Views: Bybit 274 rows in each view; BingX reference 605 and changes 605.
+- Plans:
+  - history 274 rows, 254 checked;
+  - READY 274 rows: 228 «READY ещё не собирался», 44 «мало периодов»,
+    2 «без изменений»;
+  - tester 242 rows;
+  - tick 7 strategies of the newest testable READY folder;
+  - BingX READY: «BingX — этап 5».
+- «Синхронизировать»: done, exit code 0, no errors, progress and ETA by step,
+  69 s.
+  - Refresh: Bybit 274 pairs, BingX 610.
+  - Liquidity: 242 READY / 32 UNAVAILABLE.
+  - Pipeline: TICK 9 / READY 1 / HISTORY 220 / NEW 44.
+- HTTP smoke on the real controller:
+  - index with `#main-screen`, view, Excel, tick plan, pair card and task all
+    return 200;
+  - `/api/v2/store/status` returns 404.
+
 ## Stage 1b evidence, part B: retired screens removed and three-screen shell (2026-10-18)
 
 **Removed and disconnected**
@@ -456,14 +627,14 @@ is not caused by stage 1b.
 
 1. Remove the obsolete screens and their backend (1a, 1b above); three-screen
    shell. ✅ 1a, 1b part A, 1b part B and the shell done (2026-10-18, reviewed).
-2. ⏳ Registry stages 1–3 ([pair registry](2026-10-18-pair-registry.md)).
-3. ⏳ «Пары и стратегии»: exchange switch, actions with plan dialogs, task area
-   with progress/ETA/errors, views, pair card.
+2. ✅ Registry stages 1–3 ([pair registry](2026-10-18-pair-registry.md)).
+3. ✅ «Пары и стратегии»: exchange switch, actions with plan dialogs, task area
+   with progress/ETA/errors, views, pair card (2026-10-19, see «Stage 3
+   evidence»).
 4. ⏳ «Стратегии» view: tick-test metrics, column chooser, filter toggles, ranks,
    finalist marks, Excel round trip, finalist retest.
 5. ⏳ BingX in the trade store, READY, tester sampling and tick tests.
 
 Each stage: spec details first, TDD, `.venv` tests on drive C, independent
-review. Changes stay uncommitted until the whole rework is done, then one
-commit (the user's standing rule for multi-stage features), unless the user
-asks for a commit earlier.
+review, then one commit per stage (the user asked for per-stage commits on
+2026-10-18; no push until asked).

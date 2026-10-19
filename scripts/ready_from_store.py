@@ -52,8 +52,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--config", type=Path, default=REPO / "config.local.json")
     parser.add_argument("--out", type=Path, required=True, help="new READY folder (must not exist)")
     parser.add_argument("--pairs", default="", help="comma-separated symbols; default: every pair in the store")
-    parser.add_argument("--latest-source", choices=("simulator", "tester"), default="simulator",
-                        help="newest period from the simulator or from the imported tester segment")
+    parser.add_argument("--latest-source", choices=("simulator", "tester", "auto"), default="simulator",
+                        help="newest period from the simulator, from the imported tester segment, or (auto) from the "
+                             "tester segment when it exists")
     args = parser.parse_args(argv)
     store_root = args.store
     if store_root is None:
@@ -72,7 +73,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "select distinct symbol from segments where status = 'active' order by symbol").fetchall()]
     template = json.loads(TEMPLATE.read_text(encoding="utf-8"))
     summary = build_ready(store, symbols, args.out, template, latest_source=args.latest_source,
-                          rules=registry_rules(args.config))
+                          rules=registry_rules(args.config),
+                          progress=lambda event: print(json.dumps(event, ensure_ascii=False), flush=True))
     print(json.dumps({**summary, "out": str(args.out)}), flush=True)
     return 0
 

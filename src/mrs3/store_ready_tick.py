@@ -14,7 +14,7 @@ from pathlib import Path
 import re
 import shutil
 import tempfile
-from typing import Mapping
+from typing import Mapping, Sequence
 
 from .config import AlgorithmConfig
 from .evaluation_protocol import EvaluationTarget, apply_protocol_v2
@@ -124,12 +124,20 @@ def _digest(data: bytes) -> str:
     return sha256(data).hexdigest()
 
 
-def prepare_tick_batch(ready_dir: Path, out_root: Path, template_path: Path, target: EvaluationTarget) -> dict[str, object]:
+def prepare_tick_batch(ready_dir: Path, out_root: Path, template_path: Path, target: EvaluationTarget,
+                       strategies: Sequence[str] | None = None) -> dict[str, object]:
     """Publish `<out_root>/<analysis_run_id>/` (strategies + generation manifest) for one READY folder and target;
-    the same folder, template and target reuse the existing batch."""
+    the same folder, template, target (and strategy choice) reuse the existing batch. `strategies` limits the batch
+    to those strategy names of the folder (Panel stage 3 plan dialog)."""
     ready_dir = Path(ready_dir).resolve()
     data, document = _read(ready_dir)
     items = _items(document)
+    if strategies is not None:
+        wanted = set(strategies)
+        unknown = wanted - {str(item.get("strategy")) for _pair, item in items}
+        if unknown:
+            raise StoreReadyError(f"стратегий нет в папке READY: {', '.join(sorted(unknown))}")
+        items = [(pair, item) for pair, item in items if item.get("strategy") in wanted]
     problem = _zone_problem(items)
     if problem:
         raise StoreReadyError(problem)
@@ -145,6 +153,7 @@ def prepare_tick_batch(ready_dir: Path, out_root: Path, template_path: Path, tar
         "adapter": ADAPTER_VERSION, "ready_manifest_sha256": _digest(data), "template_sha256": _digest(template_bytes),
         "base": str(target.base), "exchange": target.exchange,
         "strategy_exchange": [list(pair) for pair in target.strategy_exchange],
+        **({"strategies": sorted(set(strategies))} if strategies is not None else {}),
     }
     run_id = _digest(_canonical(identity))
     out_root = Path(out_root)

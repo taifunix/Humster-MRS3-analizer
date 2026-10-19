@@ -292,6 +292,18 @@ class TradeStore:
         with self.connect() as con:
             con.execute(CATALOG_DDL)
 
+    @classmethod
+    def reader(cls, root: Path) -> "TradeStore":
+        """The store opened for reading only: no folder or catalog is created and no DDL runs, so no writable
+        connection is opened (the Panel reads the catalog while its threads hold read-only connections and a CLI
+        child process writes it). Only the read methods may be used."""
+        store = cls.__new__(cls)
+        store.root = Path(root)
+        store.catalog_path = store.root / "catalog.duckdb"
+        if not store.catalog_path.is_file():
+            raise TradeStoreError("в хранилище ещё нет каталога")
+        return store
+
     def connect(self, read_only: bool = False, *, wait_s: float = CONNECT_WAIT_S) -> duckdb.DuckDBPyConnection:
         """Catalog connection; a file lock held by another process (a reader such as the Panel status, or the
         writing CLI) is waited for instead of failing."""

@@ -10,7 +10,9 @@ import pytest
 
 from mrs3.mrs2_simulator import RunSettings
 from mrs3.period_csv import MA_LENGTHS, SHIFTS_BP, grid
-from mrs3.ready_store import RULE_VERSION, PeriodFeatures, ReadyRule, best_structures, build_ready, zone_scores
+from mrs3.ready_store import (
+    RULE_VERSION, PeriodFeatures, ReadyRule, best_structures, build_ready, pair_periods, zone_scores,
+)
 from mrs3.trade_store import (
     HOURLY_SCHEMA, METRICS_SCHEMA, TRADE_SCHEMA, SegmentKey, SegmentTables, TradeStore, point_id,
 )
@@ -169,6 +171,28 @@ def test_tester_mode_takes_the_newest_period_from_the_tester_segment(tmp_path: P
     assert summary["ready_pairs"] == 1 and manifest["latest_source"] == "tester"
     assert manifest["pairs"][0]["periods"][-1]["segment_id"] == record["segment_id"]
     assert manifest["pairs"][0]["structures"][0]["score"] == pytest.approx(0.5 * 40 + 0.3 * 30 + 0.2 * 30)
+
+
+def test_auto_mode_takes_the_tester_segment_when_it_exists_else_the_simulator(tmp_path: Path):
+    # Panel rework stage 3, «Tester in the workflow»: READY uses the tester results of the newest period
+    # automatically when they exist; the entry says which source the newest period came from.
+    store = _store_with_periods(tmp_path / "store", "GOODUSDT", 3, 35.0)
+    template = json.loads((REPO / "templates/exchanges/Bybit/mrs3-strategy.json").read_text(encoding="utf-8"))
+    simulated = build_ready(store, ["GOODUSDT"], tmp_path / "sim", template, latest_source="auto")
+    entry = json.loads((tmp_path / "sim" / "ready_manifest.json").read_text(encoding="utf-8"))["pairs"][0]
+    assert simulated["ready_pairs"] == 1 and simulated["tester_pending"] == 0 and entry["newest_source"] == "simulator"
+    periods, newest_source = pair_periods(store, "GOODUSDT", ReadyRule(), "bybit", "auto")
+    assert newest_source == "simulator" and [p["segment_id"] for p in periods] == [p["segment_id"] for p in entry["periods"]]
+    tables = SegmentTables(TRADE_SCHEMA.empty_table(), HOURLY_SCHEMA.empty_table(),
+                           _metrics({shift: 40.0 for shift in SHIFTS_BP}, 20))
+    record = store.write_files(SegmentKey("bybit", "GOODUSDT", "tester", date(2026, 8, 10), date(2026, 8, 30),
+                                          "hb-tester"), tables, settings=RunSettings(), tick_size=0.01, qty_step=0.01)
+    store.register(record)
+    build_ready(store, ["GOODUSDT"], tmp_path / "auto", template, latest_source="auto")
+    entry = json.loads((tmp_path / "auto" / "ready_manifest.json").read_text(encoding="utf-8"))["pairs"][0]
+    assert entry["newest_source"] == "tester" and entry["periods"][-1]["segment_id"] == record["segment_id"]
+    assert pair_periods(store, "GOODUSDT", ReadyRule(), "bybit", "auto")[1] == "tester"
+    assert pair_periods(store, "GOODUSDT", ReadyRule(), "bybit", "simulator")[1] == "simulator"
 
 
 def test_admit_score_threshold_is_calibrated_at_30():

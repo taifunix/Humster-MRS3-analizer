@@ -1,6 +1,6 @@
 # MRS3 Current Status
 
-Last updated: 2026-10-18
+Last updated: 2026-10-19
 
 This file is a current-status snapshot, not a session log. Earlier progress notes remain in Git history; feature contracts and detailed evidence belong in the linked specs, reports, and plans.
 
@@ -8,7 +8,45 @@ Use [PRD.md](PRD.md) for the feature registry and [docs/README.md](docs/README.m
 for the documentation map. Read the linked contract only for the active task;
 do not treat this file as a replacement for a feature specification.
 
-## Pair registry stage 3: pipeline, tests, finalists, decisions, pair settings (2026-10-19, branch `wip/period-csv-generator`)
+## Panel rework stage 3: the «Пары и стратегии» main screen (2026-10-19, branch `wip/period-csv-generator`)
+
+Contract: [Panel for the simulation workflow](docs/specs/2026-10-18-panel-simulation-workflow.md)
+(«Stage 3 contract», «Stage 3 evidence»).
+
+- The top of the «Пары и стратегии» screen now has:
+  - the exchange switch;
+  - the actions «Синхронизировать», «Пересчитать историю», «Пересобрать
+    READY», «Проверить тестером», «Тик-тест MRS3» and «Ретест финалистов»,
+    with plan dialogs (row checkboxes, «Выделить все» / «Снять выделение»);
+  - a task area with progress, elapsed time, ETA, errors, log and «Стоп»;
+  - four views (Пары, Справочник, Ликвидность, Изменения), each with sort,
+    filter, a column chooser saved on the server, and Excel;
+  - a pair card where decisions and personal thresholds are entered.
+- Tasks run in `panel_tasks.TaskRunner`, inside a Windows job object (fixes
+  the orphan-pipe defect).
+- READY takes the tester segment of the newest period automatically
+  (`--latest-source auto`).
+- The MRS2 STORE card, `/api/v2/store/*` and `panel_store` are removed.
+- **Verification:**
+  - `test_panel_tasks` (7), `test_panel_chain` (5), `test_panel_main` (18),
+    `test_panel_static_ui` (136) and `test_ready_store` (9).
+  - Related set: 300 passed. The one failure,
+    `test_panel.py::test_static_panel_shell_contains_only_navigation_contract`,
+    already fails on HEAD.
+  - Live run on the real registry and store, with the plans and
+    «Синхронизировать»: done in 69 s with no errors.
+  - Independent review: the first pass returned `CODE_REVIEW_FAIL`. The
+    findings were fixed (read-only catalog access, JSON for every route
+    failure, chain stop and UTF-8, table/Excel parity), then re-reviewed: `CODE_REVIEW_PASS`.
+- **Next:** registry stage 4 (switch the consumers to `read_liquidity` and the
+  registry). Then panel stage 4 («Стратегии» view, A/B and the Pareto screen
+  removed), registry stage 5 (git sync) and panel stage 5 (BingX).
+- **Blockers / notes:** the active PerformanceDB is protocol v1, so the Panel
+  refuses MRS3 tick tests (`DATABASE_PROTOCOL_V1`) until a v2 database is
+  created and activated. BingX actions other than «Синхронизировать» stay
+  disabled until stage 5.
+
+## Pair registry stage 3: pipeline, tests, finalists, decisions, pair settings (2026-10-19, branch `wip/period-csv-generator`, committed `3c7c84e`)
 
 Contract: [pair registry](docs/specs/2026-10-18-pair-registry.md) («Stage 3
 contract», «Stage 3 evidence»).

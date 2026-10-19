@@ -40,31 +40,103 @@
         <div class="screen-heading">
           <div>
             <h1 id="strategies-title">Пары и стратегии</h1>
-            <p class="screen-intro">История и READY из хранилища сделок, тик-тест MRS3 с импортом в PerformanceDB и отбор финалистов.</p>
+            <p class="screen-intro">Реестр пар обеих бирж, история и READY из хранилища сделок, тестер, тик-тест MRS3 и отбор финалистов.</p>
           </div>
         </div>
-        <div class="runner-grid">
-          <article id="store-local" class="panel-card runner-card">
-            <div class="card-heading">
-              <div><span class="card-index">MRS2 STORE</span><h2>История MRS2: симулятор, тестер, READY</h2></div>
-              <span id="store-badge" class="state-badge state-ready">IDLE</span>
-            </div>
-            <div class="card-body">
-              <p class="helper">Хранилище сделок MRS2: история пар по 20-дневным периодам считается симулятором, последний период можно проверить настоящим тестером на отобранных точках. Одна задача за раз; работа идёт отдельным процессом.</p>
-              <div class="field-grid">
-                <div class="field-group"><label for="store-mode">Режим последнего периода</label><select id="store-mode"><option value="simulation">Симуляция</option><option value="tester">Тестер</option></select></div>
-                <div class="field-group"><label for="store-end-date">Конец (пусто — последний архивный день)</label><input id="store-end-date" type="date"></div>
-                <div class="field-group"><label for="store-run-limit">Заданий тестера за запуск (0 — все)</label><input id="store-run-limit" type="number" min="0" step="1" value="0"></div>
+        <section id="main-screen" class="panel-card main-screen" aria-label="Пары, действия и задачи">
+          <div class="card-body">
+            <div class="main-toolbar">
+              <div class="segmented" role="group" aria-label="Биржа">
+                <button type="button" class="segmented-button" data-exchange="bybit" aria-pressed="true">Bybit</button>
+                <button type="button" class="segmented-button" data-exchange="bingx" aria-pressed="false">BingX</button>
               </div>
-              <div class="field-group"><label for="store-pairs">Пары (пусто — все пары реестра или хранилища)</label><textarea id="store-pairs" rows="2" placeholder="XOMUSDT, SNOWUSDT"></textarea></div>
-              <div class="field-group"><label class="check" for="store-download"><input id="store-download" type="checkbox" checked><span>Докачивать недостающие дни свечей</span></label></div>
-              <div class="button-row"><button type="button" id="store-history" class="button button-primary">Посчитать историю</button><button type="button" id="store-plan" class="button button-secondary" data-tester-only>План тестера</button><button type="button" id="store-run" class="button button-secondary" data-tester-only>Запустить тестер</button><button type="button" id="store-import" class="button button-secondary" data-tester-only>Импорт тестера</button><button type="button" id="store-ready" class="button button-primary">Собрать READY</button><button type="button" id="store-stop" class="button button-secondary">Стоп</button></div>
-              <p id="store-status" class="card-status" role="status" aria-live="polite">Задача не запускалась.</p>
-              <pre id="store-log" class="helper" hidden></pre>
-              <div class="table-wrap"><table class="store-table"><thead><tr><th scope="col">Пара</th><th scope="col">Периодов</th><th scope="col">С</th><th scope="col">По</th><th scope="col">Тестер</th><th scope="col">Задания</th></tr></thead><tbody id="store-pairs-body"></tbody></table></div>
+              <div id="main-actions" class="button-row" role="group" aria-label="Действия">
+                <button type="button" class="button button-primary" data-main-action="sync">Синхронизировать</button>
+                <button type="button" class="button button-secondary" data-main-action="history">Пересчитать историю</button>
+                <button type="button" class="button button-secondary" data-main-action="ready">Пересобрать READY</button>
+                <button type="button" class="button button-secondary" data-main-action="tester">Проверить тестером</button>
+                <button type="button" class="button button-secondary" data-main-action="tick">Тик-тест MRS3</button>
+                <button type="button" class="button button-secondary" data-main-action="retest">Ретест финалистов</button>
+              </div>
             </div>
-          </article>
-        </div>
+            <div id="main-task" class="main-task">
+              <div class="main-task-head">
+                <strong id="main-task-label">Задача не запускалась</strong>
+                <span id="main-task-badge" class="state-badge state-ready">IDLE</span>
+                <button type="button" id="main-task-stop" class="button button-secondary" disabled>Стоп</button>
+              </div>
+              <div class="progress-track"><span id="main-task-bar" style="width:0%"></span></div>
+              <p id="main-task-text" class="helper" role="status" aria-live="polite">Нет активной задачи.</p>
+              <ul id="main-task-errors" class="main-task-errors" hidden></ul>
+              <details id="main-task-log-box" class="main-task-log" hidden><summary>Журнал задачи</summary><pre id="main-task-log"></pre></details>
+            </div>
+            <div class="main-view-bar">
+              <div class="segmented" role="group" aria-label="Вид">
+                <button type="button" class="segmented-button" data-main-view="pairs" aria-pressed="true">Пары</button>
+                <button type="button" class="segmented-button" data-main-view="reference" aria-pressed="false">Справочник</button>
+                <button type="button" class="segmented-button" data-main-view="liquidity" aria-pressed="false">Ликвидность</button>
+                <button type="button" class="segmented-button" data-main-view="changes" aria-pressed="false">Изменения</button>
+              </div>
+              <div class="main-view-tools">
+                <label class="sr-only" for="main-filter">Фильтр</label>
+                <input id="main-filter" type="search" placeholder="Фильтр по показанным столбцам" autocomplete="off">
+                <button type="button" id="main-columns" class="button button-secondary" aria-expanded="false" aria-controls="main-columns-panel">Столбцы</button>
+                <button type="button" id="main-excel" class="button button-secondary">Excel</button>
+              </div>
+            </div>
+            <fieldset id="main-columns-panel" class="main-columns" hidden><legend>Показывать столбцы</legend></fieldset>
+            <p id="main-view-status" class="card-status" role="status" aria-live="polite">Загрузка вида…</p>
+            <div class="table-wrap main-table-wrap"><table id="main-table" class="main-table"><thead></thead><tbody></tbody></table></div>
+          </div>
+        </section>
+        <dialog id="main-plan" class="gap-dialog main-dialog" aria-labelledby="main-plan-title">
+          <div class="gap-dialog-body">
+            <h2 id="main-plan-title">План</h2>
+            <p id="main-plan-note"></p>
+            <div class="field-grid" id="main-plan-window" hidden>
+              <div class="field-group"><label for="main-plan-start">Начало окна тик-теста</label><input id="main-plan-start" type="date"></div>
+              <div class="field-group"><label for="main-plan-end">Конец окна (не позже вчера)</label><input id="main-plan-end" type="date"></div>
+            </div>
+            <label class="check" id="main-plan-reserve-box" hidden><input id="main-plan-reserve" type="checkbox"><span>включая резерв</span></label>
+            <div class="button-row" id="main-plan-select">
+              <button type="button" id="main-plan-all" class="button button-secondary">Выделить все</button>
+              <button type="button" id="main-plan-none" class="button button-secondary">Снять выделение</button>
+              <span id="main-plan-count" class="helper"></span>
+            </div>
+            <div id="main-plan-items" class="main-plan-items"></div>
+            <p id="main-plan-status" class="card-status" role="status" aria-live="polite" hidden></p>
+            <div class="button-row">
+              <button type="button" id="main-plan-run" class="button button-primary">Запустить</button>
+              <button type="button" id="main-plan-cancel" class="button button-secondary">Отмена</button>
+            </div>
+          </div>
+        </dialog>
+        <dialog id="main-pair" class="gap-dialog main-dialog main-pair-dialog" aria-labelledby="main-pair-title">
+          <div class="gap-dialog-body">
+            <div class="main-task-head"><h2 id="main-pair-title">Пара</h2><button type="button" id="main-pair-close" class="button button-secondary">Закрыть</button></div>
+            <div id="main-pair-body" class="main-pair-body"></div>
+            <form id="main-pair-decision" class="main-pair-form">
+              <h3>Новое решение</h3>
+              <div class="field-grid">
+                <div class="field-group"><label for="main-decision-value">Решение</label><select id="main-decision-value"><option value="INCLUDE">INCLUDE — включить</option><option value="EXCLUDE">EXCLUDE — исключить</option><option value="WATCH">WATCH — наблюдать</option></select></div>
+                <div class="field-group"><label for="main-decision-side">Сторона</label><select id="main-decision-side"><option value="ALL">ALL</option><option value="LONG">LONG</option><option value="SHORT">SHORT</option></select></div>
+              </div>
+              <div class="field-group"><label for="main-decision-reason">Причина</label><input id="main-decision-reason" type="text" required></div>
+              <div class="button-row"><button type="submit" class="button button-primary">Записать решение</button></div>
+            </form>
+            <form id="main-pair-setting" class="main-pair-form">
+              <h3>Личный порог фильтра READY</h3>
+              <div class="field-grid">
+                <div class="field-group"><label for="main-setting-parameter">Параметр</label><select id="main-setting-parameter"></select></div>
+                <div class="field-group"><label for="main-setting-value">Значение (пусто — общий порог)</label><input id="main-setting-value" type="number" step="any"></div>
+              </div>
+              <div class="field-group"><label for="main-setting-reason">Причина</label><input id="main-setting-reason" type="text" required></div>
+              <div class="button-row"><button type="submit" class="button button-primary">Записать порог</button></div>
+            </form>
+            <div class="field-group"><label for="main-author">Автор записей</label><input id="main-author" type="text" autocomplete="off" required></div>
+            <p id="main-pair-status" class="card-status" role="status" aria-live="polite"></p>
+          </div>
+        </dialog>
         <details id="performance-v2-retest-card" class="panel-card accordion retest-card panel-performance-v2"><summary><span><b>7. CHECK &amp; RETEST</b><small>отметьте стратегии, затем повторно проверьте их</small></span><span id="performance-v2-retest-badge" class="state-badge state-pending">WAITING</span></summary><div class="card-body details-content"><p class="helper">RETEST: <strong id="performance-v2-retest-count">0</strong> active strategies. Сервер строит mapping из committed inbox; браузер не передаёт Strategy ID.</p><section class="retest-tag-import"><p class="helper"><strong>Шаг 1. Загрузите отмеченные XLSX.</strong> Импорт читает только ID, скрытый ID базы и метки RETEST. User Status, ранги, результаты и старый запуск отбора игнорируются; пустые RETEST не меняют метки.</p><div class="button-row"><input id="performance-v2-selection-review-file" type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" multiple webkitdirectory hidden><button type="button" id="performance-v2-selection-review-import" class="button button-secondary">Импортировать RETEST из XLS</button></div><p id="performance-v2-retest-tag-import-status" class="card-status" role="status" aria-live="polite">Выберите папку с XLSX, где нужные строки отмечены RETEST.</p><div id="performance-v2-selection-review-results" aria-live="polite"></div></section><p class="helper"><strong>Шаг 2.</strong> Убедитесь, что число RETEST соответствует отметкам, выберите период и нажмите CHECK &amp; RETEST. <strong>Шаг 3.</strong> После готового inbox отдельно подтвердите IMPORT &amp; REPLACE.</p><div class="field-grid"><div class="field-group"><label for="performance-v2-retest-start">Test start</label><input id="performance-v2-retest-start" type="date"></div><div class="field-group"><label for="performance-v2-retest-end">Test end</label><input id="performance-v2-retest-end" type="date"></div></div><div class="button-row"><button type="button" id="performance-v2-retest-check" class="button button-primary">CHECK &amp; RETEST</button><button type="button" id="performance-v2-retest-import" class="button button-primary" disabled>IMPORT &amp; REPLACE</button></div><div class="progress-block"><progress id="performance-v2-retest-progress" max="100" value="0">0%</progress><p id="performance-v2-retest-progress-text">Ожидание RETEST.</p></div><p id="performance-v2-retest-status" class="card-status" role="status" aria-live="polite">CHECK &amp; RETEST не запускался.</p><p id="performance-v2-retest-inbox" class="helper"></p><a id="performance-v2-retest-failure-report" hidden>failure report</a></div></details>
         <details id="performance-v2-window-card" class="panel-card accordion panel-performance-v2"><summary><span><b>5. A/B Performance analysis</b><small>одна стратегия · UPNL-relative metrics</small></span><span class="state-badge state-pending">READY</span></summary><div class="card-body details-content"><div class="field-group"><label for="performance-v2-window-strategy">Стратегия</label><select id="performance-v2-window-strategy"><option value="">Каталог загружается при открытии</option></select></div><div id="performance-v2-window-strategy-details" class="performance-v2-strategy-details" aria-live="polite">Выберите стратегию, чтобы увидеть параметры.</div><div class="field-grid performance-v2-window-row"><div class="field-group"><label for="performance-v2-window-a-start">Window A start (UTC)</label><input id="performance-v2-window-a-start" type="datetime-local" step="1"></div><div class="field-group"><label for="performance-v2-window-a-end">Window A end (UTC)</label><input id="performance-v2-window-a-end" type="datetime-local" step="1"></div><div class="button-row"><button type="button" id="performance-v2-window-a-entire" class="button button-secondary">Весь период</button></div><div class="field-group"><label for="performance-v2-window-b-start">Window B start (UTC)</label><input id="performance-v2-window-b-start" type="datetime-local" step="1"></div><div class="field-group"><label for="performance-v2-window-b-end">Window B end (UTC)</label><input id="performance-v2-window-b-end" type="datetime-local" step="1"></div><div class="button-row"><button type="button" id="performance-v2-window-b-2w" class="button button-secondary">Последние 2 недели</button><button type="button" id="performance-v2-window-b-1w" class="button button-secondary">Последняя неделя</button></div></div><div class="button-row"><button type="button" id="performance-v2-window-refresh" class="button button-secondary">Обновить стратегии</button><button type="button" id="performance-v2-window-calculate" class="button button-primary">Рассчитать A/B</button></div><p id="performance-v2-window-status" class="card-status" role="status" aria-live="polite">Откройте карточку: каталог загрузится автоматически.</p><div id="performance-v2-window-result" class="table-wrap" aria-live="polite"></div></div></details>
         <details id="performance-v2-selection-card" class="panel-card accordion panel-performance-v2">

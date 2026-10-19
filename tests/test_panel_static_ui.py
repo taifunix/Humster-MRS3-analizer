@@ -3049,14 +3049,137 @@ process.exitCode = 1;
 
 
 def test_tester_card_lookups_resolve_to_the_test_and_import_card() -> None:
-    # review of stage 1b part B: the MRS2 STORE card on the same screen must not be taken for the tester card
+    # review of stage 1b part B: another card on the same screen (since stage 3 the main-screen section) must not be
+    # taken for the tester card
     html = _read("index.html")
     js = _read("app.js")
     screen = html.split('<section id="strategies-dd5"', 1)[1].split('<section id="portfolio"', 1)[0]
     card = screen.split('<details id="tester-card"', 1)[1].split("</details>", 1)[0]
     assert "3. Test and Import to Performance DB" in card and 'class="state-badge' in card
     assert 'class="progress-block"' in card and "progress-track" in card
-    assert screen.index('id="store-local"') < screen.index('id="tester-card"')
+    assert screen.index('id="main-screen"') < screen.index('id="tester-card"')
     assert "const strategyCards = [document.querySelector('#tester-card')].filter(Boolean);" in js
     assert "const testerCard = strategyCards[0];" in js
     assert screen.count('id="strategies-title"') == 1
+
+
+# -- «Пары и стратегии» main screen (docs/specs/2026-10-18-panel-simulation-workflow.md, «Stage 3 contract») ------
+
+def _main_screen_html() -> str:
+    html = _read("index.html")
+    return html.split('<section id="main-screen"', 1)[1].split('<details id="performance-v2-retest-card"', 1)[0]
+
+
+def test_main_screen_has_the_exchange_switch_actions_and_task_area() -> None:
+    html = _read("index.html")
+    screen = html.split('<section id="strategies-dd5"', 1)[1].split('<section id="portfolio"', 1)[0]
+    assert 'id="store-local"' not in html and "MRS2 STORE" not in html          # the store card is gone
+    assert screen.index('id="main-screen"') < screen.index('id="tester-card"')
+    main = _main_screen_html()
+    assert 'data-exchange="bybit" aria-pressed="true"' in main and 'data-exchange="bingx" aria-pressed="false"' in main
+    actions = re.findall(r'data-main-action="([a-z]+)">([^<]+)<', main)
+    assert actions == [("sync", "Синхронизировать"), ("history", "Пересчитать историю"), ("ready", "Пересобрать READY"),
+                       ("tester", "Проверить тестером"), ("tick", "Тик-тест MRS3"), ("retest", "Ретест финалистов")]
+    for element in ('id="main-task-label"', 'id="main-task-badge"', 'id="main-task-bar"', 'id="main-task-text"',
+                    'id="main-task-errors"', 'id="main-task-log"', 'id="main-task-stop"'):
+        assert element in main, element
+    assert 'id="main-task-text" class="helper" role="status" aria-live="polite"' in main
+
+
+def test_main_screen_plan_dialog_has_row_checkboxes_select_all_and_run() -> None:
+    main = _main_screen_html()
+    dialog = main.split('<dialog id="main-plan"', 1)[1].split("</dialog>", 1)[0]
+    assert ">Выделить все<" in dialog and ">Снять выделение<" in dialog and ">Запустить<" in dialog
+    assert 'id="main-plan-items"' in dialog and 'id="main-plan-start" type="date"' in dialog
+    assert 'id="main-plan-end" type="date"' in dialog and "включая резерв" in dialog
+    js = _read("app.js")
+    block = js.split("const mainScreen = document.querySelector('#main-screen');", 1)[1]
+    assert "remoteRequest('/api/v2/main/plan', { action, exchange: mainState.exchange })" in block
+    assert "remoteRequest('/api/v2/main/run', { action, exchange: mainState.exchange, items, options })" in block
+    assert "if (action === 'sync') { await startRun('sync', [], {}); return; }" in block
+    assert "{ include_reserve: mainEl('plan-reserve').checked }" in block
+    assert "{ start_date: mainEl('plan-start').value, end_date: mainEl('plan-end').value }" in block
+    assert "if (plan.disabled) { viewStatus(plan.disabled); return; }" in block
+    assert "remoteRequest('/api/v2/main/stop', {})" in block and "requestJson('/api/v2/main/task')" in block
+    assert "BingX — этап 5" in block
+    assert "innerHTML" not in block                                     # registry text is rendered as text only
+
+
+def test_main_screen_views_pair_card_and_safe_errors() -> None:
+    main = _main_screen_html()
+    views = re.findall(r'data-main-view="([a-z]+)"', main)
+    assert views == ["pairs", "reference", "liquidity", "changes"]
+    for element in ('id="main-filter" type="search"', 'id="main-columns"', 'id="main-excel"', 'id="main-columns-panel"',
+                    'id="main-table"', '<dialog id="main-pair"', 'id="main-pair-decision"', 'id="main-pair-setting"',
+                    'id="main-author"', 'id="main-decision-reason"', 'id="main-setting-value"'):
+        assert element in main, element
+    js = _read("app.js")
+    block = js.split("const mainScreen = document.querySelector('#main-screen');", 1)[1]
+    assert "remoteRequest('/api/v2/main/view-settings', { view: mainState.view, columns })" in block
+    assert "`/api/v2/main/view.xlsx?${params.toString()}`" in block
+    assert "pairWrite('/api/v2/main/decision'" in block and "pairWrite('/api/v2/main/setting'" in block
+    assert "value: raw === '' ? null : raw" in block                     # an empty threshold resets to the default
+    assert "'/api/v2/main/'," in js.split("const safeStringPrefixes", 1)[1].split("];", 1)[0]
+    assert "'/api/v2/store/'" not in js and "#store-local" not in js
+
+
+def test_main_screen_table_rules_match_the_server_export() -> None:
+    # the same rows as panel_main.filter_rows / sort_rows (tests/test_panel_main.py) and the task summary text
+    js = _read("app.js")
+    start = js.index("const mainScreenHelpers = (() => {")
+    end = js.index("if (typeof globalThis !== 'undefined') globalThis.mainScreenHelpers = mainScreenHelpers;")
+    script = r"""
+const assert = require('node:assert/strict');
+const vm = require('node:vm');
+const context = {};
+vm.createContext(context);
+vm.runInContext(__SOURCE__ + ';globalThis.helpers = mainScreenHelpers;', context);
+const h = context.helpers;
+const rows = [{ a: 'XOM', n: 10 }, { a: 'aapl', n: 2 }, { a: 'Nvda', n: null }];
+assert.deepEqual(h.filterRows(rows, ['a'], 'a').map((r) => r.a), ['aapl', 'Nvda']);
+assert.deepEqual(h.sortRows(rows, 'n').map((r) => r.a), ['aapl', 'XOM', 'Nvda']);
+assert.deepEqual(h.sortRows(rows, 'n', true).map((r) => r.a), ['XOM', 'aapl', 'Nvda']);
+assert.deepEqual(h.sortRows(rows, 'a').map((r) => r.a), ['aapl', 'Nvda', 'XOM']);
+const running = h.taskSummary({ state: 'running', label: 'READY', elapsed_s: 65, eta_s: 130,
+  progress: { done: 1, total: 4, step: 'ready', pair: 'XOMUSDT' } });
+assert.equal(running.percent, 25);
+assert.equal(running.badgeClass, 'state-running');
+assert.equal(running.text, 'Выполняется · ready · XOMUSDT · 1 из 4 · прошло 1м 5с · осталось ≈ 2м 10с');
+assert.equal(h.taskSummary({ state: 'idle' }).text, 'Нет активной задачи.');
+assert.equal(h.taskSummary({ state: 'failed', elapsed_s: 3 }).badgeClass, 'state-error');
+assert.equal(h.taskSummary({ state: 'done', elapsed_s: 3, progress: {} }).percent, 100);
+"""
+    script = script.replace("__SOURCE__", json.dumps(js[start:end]))
+    completed = subprocess.run(["node", "-e", script], capture_output=True, text=True, encoding="utf-8")
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_main_screen_filter_and_sort_equal_the_python_export_rules() -> None:
+    # review of stage 3: the Excel export (panel_main.filter_rows / sort_rows) must hold exactly the table's rows
+    from mrs3.panel_main import filter_rows, sort_rows
+
+    rows = [{"k": 1, "v": 25.0, "t": "XOM"}, {"k": 2, "v": 1e-05, "t": "0x10"}, {"k": 3, "v": None, "t": "1_000"},
+            {"k": 4, "v": 3, "t": "inf"}, {"k": 5, "v": "2.5", "t": True}, {"k": 6, "v": "", "t": "aapl"}]
+    cases = [("filter", ["v"], "25"), ("filter", ["v"], "25.0"), ("filter", ["v"], "0.00001"), ("filter", ["t"], "tr"),
+             ("sort", "v", False), ("sort", "v", True), ("sort", "t", False), ("sort", "t", True)]
+    expected = [[row["k"] for row in (filter_rows(rows, case[1], case[2]) if case[0] == "filter"
+                                      else sort_rows(rows, case[1], case[2]))] for case in cases]
+    js = _read("app.js")
+    start = js.index("const mainScreenHelpers = (() => {")
+    end = js.index("if (typeof globalThis !== 'undefined') globalThis.mainScreenHelpers = mainScreenHelpers;")
+    script = r"""
+const assert = require('node:assert/strict');
+const vm = require('node:vm');
+const context = {};
+vm.createContext(context);
+vm.runInContext(__SOURCE__ + ';globalThis.helpers = mainScreenHelpers;', context);
+const h = context.helpers;
+const rows = __ROWS__;
+const cases = __CASES__;
+const got = cases.map(([kind, a, b]) => (kind === 'filter' ? h.filterRows(rows, a, b) : h.sortRows(rows, a, b)).map((r) => r.k));
+assert.deepEqual(got, __EXPECTED__);
+"""
+    for name, value in (("__SOURCE__", js[start:end]), ("__ROWS__", rows), ("__CASES__", cases), ("__EXPECTED__", expected)):
+        script = script.replace(name, json.dumps(value))
+    completed = subprocess.run(["node", "-e", script], capture_output=True, text=True, encoding="utf-8")
+    assert completed.returncode == 0, completed.stderr

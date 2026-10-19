@@ -264,3 +264,24 @@ def test_short_settings_keep_the_dd_ordering_and_short_finalists_do_not_mark_the
     record_finalist(con, "bybit", "GOODUSDT", "SHORT", "S_SHORT", "FINALIST", "panel", now_ms=NOW)
     compute_pipeline(con, store, "bybit", date(2026, 10, 18), "pc1", now_ms=NOW, track=False)
     assert con.execute("select stage, finalist_strategies from pipeline where symbol = 'GOODUSDT'").fetchone() == ("NEW", 0)
+
+
+def test_cli_sync_runs_refresh_liquidity_and_pipeline_with_progress(tmp_path: Path, monkeypatch, capsys) -> None:
+    # Panel stage 3: «Синхронизировать» runs `sync`; every step reports progress, a failing step does not stop others
+    from mrs3.pair_registry import cli
+    from tests.test_pair_registry import BINGX, BYBIT, RISK
+
+    store = _store_with_periods(tmp_path / "store", "XOMUSDT", 2, 35.0)
+    config = tmp_path / "config.local.json"
+    config.write_text(json.dumps({"pair_registry": {"root": str(tmp_path / "registry")},
+                                  "trade_store": {"root": str(store.root)}}), encoding="utf-8")
+    monkeypatch.setattr(cli, "fetch_bybit", lambda: (BYBIT, RISK))
+    monkeypatch.setattr(cli, "fetch_bingx", lambda: BINGX)
+    code = cli.main(["sync", "--config", str(config), "--today", "2026-10-19", "--machine", "pc1", "--skip-track"])
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    steps = [event["progress"]["step"] for event in events if "progress" in event]
+    assert steps == ["refresh", "liquidity", "pipeline", "done"]
+    errors = [event for event in events if "error" in event]
+    assert code == 1 and [error["step"] for error in errors] == ["liquidity"]          # no data folder configured
+    summary = events[-1]["sync"]
+    assert summary["refresh"]["bybit"]["pairs"] == 3 and summary["pipeline"]["pairs"] == 3
