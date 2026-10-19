@@ -4,8 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
+import hashlib
 import json
+import os
 from pathlib import Path
+import re
+import socket
 
 import duckdb
 
@@ -29,6 +33,9 @@ class RegistrySettings:
     liquidity_k: Decimal = Decimal(9)
     liquidity_round_down: Decimal = Decimal(10)
     liquidity_data_root: Path | None = None
+    # stage 5, git sync (ADR-0081): this machine's name and the local sync repository
+    machine: str = ""
+    sync_path: Path | None = None
 
 
 def _strings(value: object, key: str, default: tuple[str, ...]) -> tuple[str, ...]:
@@ -69,6 +76,24 @@ def _coefficient(value: object, default: Decimal) -> Decimal:
     return number
 
 
+MACHINE_NAME = re.compile(r"[A-Za-z0-9._-]{1,64}")
+
+
+def _machine_name(configured: object) -> str:
+    """This machine's name in the sync files (ADR-0081). A configured name must already be safe; a name taken from
+    the system is made safe (other characters become '_', plus a short hash of the original so two such names never
+    collide), so a non-ASCII computer name never stops the registry."""
+    if configured not in (None, ""):
+        if not isinstance(configured, str) or not MACHINE_NAME.fullmatch(configured.strip()):
+            raise RegistryError("pair_registry.machine must be a name of letters, digits, '.', '_' or '-'")
+        return configured.strip()
+    raw = (os.environ.get("COMPUTERNAME") or socket.gethostname() or "").strip()
+    if MACHINE_NAME.fullmatch(raw):
+        return raw
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", raw)[:48] or "machine"
+    return f"{safe}-{hashlib.sha256(raw.encode('utf-8')).hexdigest()[:8]}"
+
+
 def load_registry_settings(config_path: Path) -> RegistrySettings:
     """`pair_registry` of the local config; every key has a default, `root` is relative to the config folder."""
     config_path = Path(config_path)
@@ -104,7 +129,16 @@ def load_registry_settings(config_path: Path) -> RegistrySettings:
         runner = document.get("tester_runner") if isinstance(document.get("tester_runner"), dict) else {}
         bot_root = runner.get("bot_root")
         data_root = Path(bot_root) / "tester" / "data" / "bybit" if isinstance(bot_root, str) and bot_root else None
+    machine = _machine_name(section.get("machine"))
+    sync = _object(section.get("sync"), "pair_registry.sync")
+    raw_sync = sync.get("path")
+    if raw_sync is not None and (not isinstance(raw_sync, str) or not raw_sync.strip()):
+        raise RegistryError("pair_registry.sync.path must be a path")
+    sync_path = (Path(raw_sync) if Path(raw_sync).is_absolute() else config_path.parent / raw_sync) if raw_sync \
+        else root / "sync"
     return RegistrySettings(
+        machine=machine,
+        sync_path=sync_path.resolve(),
         liquidity_window_weekdays=weekdays,
         liquidity_k=_coefficient(liquidity.get("k"), defaults.liquidity_k),
         liquidity_round_down=_positive_decimal(liquidity.get("round_down_usdt"), "round_down_usdt",

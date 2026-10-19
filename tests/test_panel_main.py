@@ -10,6 +10,7 @@ from http.client import HTTPConnection
 from io import BytesIO
 import json
 from pathlib import Path
+import subprocess
 
 from openpyxl import load_workbook
 import pytest
@@ -129,6 +130,30 @@ def test_pair_card_and_entries(tmp_path: Path) -> None:
                          "reason": "r", "author": "u"})
     with pytest.raises(MainScreenError):
         service.pair("bybit", "MISSINGUSDT")
+
+
+def test_a_panel_write_exports_the_registry_to_the_sync_repository(tmp_path: Path) -> None:
+    from mrs3.pair_registry.sync import init_repo
+
+    service, _runner, _store = _world(tmp_path)
+    entry = {"exchange": "bybit", "symbol": "GOODUSDT", "side": "ALL", "decision": "WATCH", "reason": "r",
+             "author": "user"}
+    assert service.decision(entry)["sync"] == {"enabled": False}            # no sync repository: sync is off
+    config = json.loads(service.config_path.read_text(encoding="utf-8"))
+    config["pair_registry"]["machine"] = "pc1"
+    service.config_path.write_text(json.dumps(config), encoding="utf-8")
+    repo = tmp_path / "registry" / "sync"
+    init_repo(repo, "pc1")
+    result = service.setting({"exchange": "bybit", "symbol": "GOODUSDT", "side": "ALL", "parameter": "admit_score",
+                              "value": "25", "reason": "r", "author": "user"})
+    assert result["sync"] == {"enabled": True, "queued": True}
+    service._push_thread.join(timeout=60)                                  # files and commit run in the background
+    decisions = (repo / "decisions" / "pc1.jsonl").read_text(encoding="utf-8").strip().splitlines()
+    assert len(decisions) == 2                                             # the earlier decision is exported too
+    rows = (repo / "pair_settings" / "pc1.jsonl").read_text(encoding="utf-8").strip().splitlines()
+    assert len(rows) == 2 and json.loads(rows[1])[1] == "pc1"
+    log = subprocess.run(["git", "-C", str(repo), "log", "--format=%s"], capture_output=True, text=True, check=True)
+    assert log.stdout.startswith("panel setting (pc1)")
 
 
 def test_plans_for_history_ready_tester_and_tick(tmp_path: Path, monkeypatch) -> None:

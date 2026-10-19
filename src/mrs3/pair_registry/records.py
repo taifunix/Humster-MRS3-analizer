@@ -57,9 +57,19 @@ SCHEMA = (
 )
 
 
+# stage 5, git sync (ADR-0081): where a row was created and its global identity; nulls are stamped on export
+SYNC_COLUMNS = (("decisions", "origin"), ("decisions", "row_id"), ("pair_settings", "origin"),
+                ("pair_settings", "row_id"), ("finalists", "origin"), ("finalists", "row_id"), ("pair_tests", "origin"))
+
+
 def ensure_schema(con: duckdb.DuckDBPyConnection) -> None:
     for statement in SCHEMA:
         con.execute(statement)
+    for table, column in SYNC_COLUMNS:
+        present = {row[0] for row in con.execute(
+            "select column_name from information_schema.columns where table_name = ?", [table]).fetchall()}
+        if column not in present:
+            con.execute(f"alter table {table} add column {column} varchar")
 
 
 def _now_ms() -> int:
@@ -97,7 +107,7 @@ def record_decision(con: duckdb.DuckDBPyConnection, exchange: str, symbol: str, 
 
 def current_decision(con: duckdb.DuckDBPyConnection, exchange: str, symbol: str, side: str = "LONG") -> str | None:
     row = con.execute("select decision from decisions where exchange = ? and symbol = ? and side in (?, 'ALL') "
-                      "order by seq desc limit 1", [exchange, symbol, side]).fetchone()
+                      "order by created_ms desc, seq desc limit 1", [exchange, symbol, side]).fetchone()
     return row[0] if row else None
 
 
@@ -124,7 +134,7 @@ def _value(filter_name: str, parameter: str, value: object) -> str | None:
 def _overrides(con: duckdb.DuckDBPyConnection, exchange: str, symbol: str, filter_name: str,
                side: str = "LONG") -> dict[str, str | None]:
     rows = con.execute("select parameter, value from pair_settings where exchange = ? and symbol = ? and filter = ? "
-                       "and side in (?, 'ALL') order by seq", [exchange, symbol, filter_name, side]).fetchall()
+                       "and side in (?, 'ALL') order by created_ms, seq", [exchange, symbol, filter_name, side]).fetchall()
     latest: dict[str, str | None] = {}
     for parameter, value in rows:
         latest[parameter] = value
@@ -186,7 +196,7 @@ def record_finalist(con: duckdb.DuckDBPyConnection, exchange: str, symbol: str, 
         raise RegistryError(f"status must be one of {', '.join(FINALIST_STATUSES)}")
     strategy = _text(strategy, "strategy")
     current = con.execute("select status, user_rank from finalists where exchange = ? and strategy = ? "
-                          "order by seq desc limit 1", [exchange, strategy]).fetchone()
+                          "order by created_ms desc, seq desc limit 1", [exchange, strategy]).fetchone()
     if current is not None and (current[0], current[1]) == (status, user_rank):
         return False
     con.execute("insert into finalists (exchange, symbol, side, strategy, status, user_rank, source, created_ms) "
@@ -198,7 +208,7 @@ def record_finalist(con: duckdb.DuckDBPyConnection, exchange: str, symbol: str, 
 
 def current_finalists(con: duckdb.DuckDBPyConnection, exchange: str, symbol: str | None = None) -> list[dict]:
     query = ("select symbol, side, strategy, status, user_rank from (select *, row_number() over "
-             "(partition by strategy order by seq desc) as latest from finalists where exchange = ?"
+             "(partition by strategy order by created_ms desc, seq desc) as latest from finalists where exchange = ?"
              + (" and symbol = ?" if symbol else "") + ") where latest = 1 order by symbol, strategy")
     rows = con.execute(query, [exchange, *([symbol] if symbol else [])]).fetchall()
     return [dict(zip(("symbol", "side", "strategy", "status", "user_rank"), row)) for row in rows]
@@ -214,7 +224,7 @@ def finalist_marks(con: duckdb.DuckDBPyConnection, exchange: str) -> dict[str, d
     """The marks in force by strategy name (status other than NONE) with their row: seq, source and time are the
     provenance the finalist retest and the optimizer bind to (ADR-0080)."""
     rows = con.execute("select seq, symbol, side, strategy, status, user_rank, source, created_ms from (select *, "
-                       "row_number() over (partition by strategy order by seq desc) as latest from finalists "
+                       "row_number() over (partition by strategy order by created_ms desc, seq desc) as latest from finalists "
                        "where exchange = ?) where latest = 1 and status <> 'NONE' order by strategy",
                        [exchange]).fetchall()
     return {row[3]: dict(zip(("seq", "symbol", "side", "strategy", "status", "user_rank", "source", "created_ms"), row))
@@ -270,7 +280,8 @@ def import_finalists(con: duckdb.DuckDBPyConnection, performance_db: Path, excha
 def _add_test(con: duckdb.DuckDBPyConnection, row: Mapping[str, object], now_ms: int) -> bool:
     if con.execute("select 1 from pair_tests where source = ?", [row["source"]]).fetchone() is not None:
         return False
-    con.execute("insert into pair_tests values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    con.execute("insert into pair_tests (source, exchange, symbol, side, kind, window_start, window_end, structure, "
+                "pnl_pct, maxdd_pct, trades, created_ms) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 [row["source"], row["exchange"], row["symbol"], row["side"], row["kind"], row.get("window_start"),
                  row.get("window_end"), row.get("structure"), row.get("pnl_pct"), row.get("maxdd_pct"),
                  row.get("trades"), now_ms])

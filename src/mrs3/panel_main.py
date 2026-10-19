@@ -17,6 +17,7 @@ from pathlib import Path
 import re
 import sys
 import tempfile
+import threading
 from typing import Callable, Mapping, Sequence
 
 import duckdb
@@ -196,6 +197,39 @@ class MainScreenService:
             raise MainScreenError("биржа: bybit или bingx")
         return str(value)
 
+    # -- registry sync (registry stage 5, ADR-0081) ------------------------------------------------------------
+
+    def _export_after_write(self, con: duckdb.DuckDBPyConnection, message: str) -> dict:
+        """After a Panel write: stamp the rows and read this machine's hand-made rows on the write connection (fast,
+        in memory); the files, the git commit and the push run in a background thread under the sync repository lock
+        (shared with the CLI), so a Panel write never waits for git or the network. The files keep every row already
+        in them, so an older snapshot never drops a row. A sync failure never fails the write: the next write or
+        «Синхронизировать» exports again."""
+        from .pair_registry.sync import (
+            APPEND_ONLY, SyncError, collect_tables, commit_and_push, commit_message, is_enabled, repo_lock,
+            stamp_local_rows, write_tables,
+        )
+
+        try:
+            settings = self._settings()
+            if not is_enabled(settings.sync_path):
+                return {"enabled": False}
+            stamp_local_rows(con, settings.machine)
+            snapshot = collect_tables(con, settings.machine, APPEND_ONLY)
+        except (MainScreenError, RegistryError, OSError, duckdb.Error) as error:
+            return {"error": redact_local_paths(f"{type(error).__name__}: {error}")}
+
+        def background() -> None:
+            try:
+                with repo_lock(settings.sync_path):
+                    changed = write_tables(settings.sync_path, settings.machine, snapshot)
+                    commit_and_push(settings.sync_path, commit_message(f"panel {message}", settings.machine, changed))
+            except (SyncError, OSError):
+                pass
+        self._push_thread = threading.Thread(target=background, name="registry-sync-push", daemon=True)
+        self._push_thread.start()
+        return {"enabled": True, "queued": True}
+
     # -- views ----------------------------------------------------------------------------------------------
 
     def view(self, name: str, exchange: str, options: Mapping | None = None) -> dict:
@@ -333,6 +367,8 @@ class MainScreenService:
             else:
                 changed = record_finalist(con, exchange, str(row["symbol"]), str(row["side"] or "LONG"), strategy,
                                           status, "panel", user_rank=rank)
+            if changed:
+                self._export_after_write(con, "finalist")
         except RegistryError as error:
             raise MainScreenError(str(error)) from None
         finally:
@@ -397,6 +433,8 @@ class MainScreenService:
                                 status, "excel", user_rank=rank)
                 changed.append({"strategy": row["strategy"], "from": before[0], "to": status, "user_rank": rank})
             con.commit()
+            if changed:
+                self._export_after_write(con, "finalist marks")
         except BaseException:
             try:
                 con.rollback()
@@ -514,9 +552,9 @@ class MainScreenService:
                                 "from pair_tests where exchange = ? and symbol = ? order by window_end desc nulls last, "
                                 "source limit 500", [exchange, symbol]).fetchall()
             decisions = con.execute("select side, decision, reason, author, created_ms from decisions where exchange = ? "
-                                    "and symbol = ? order by seq desc", [exchange, symbol]).fetchall()
+                                    "and symbol = ? order by created_ms desc, seq desc", [exchange, symbol]).fetchall()
             settings_rows = con.execute("select side, filter, parameter, value, reason, author, created_ms from "
-                                        "pair_settings where exchange = ? and symbol = ? order by seq desc",
+                                        "pair_settings where exchange = ? and symbol = ? order by created_ms desc, seq desc",
                                         [exchange, symbol]).fetchall()
             rule, overridden = effective_ready_rule(con, exchange, symbol)
             liquidity = read_liquidity(con, exchange, symbol)
@@ -572,9 +610,10 @@ class MainScreenService:
             raise MainScreenError("поля решения: строки")
         con = self._write()
         try:
-            return record_decision(con, self._exchange(payload.get("exchange")), payload.get("symbol"),
-                                   payload.get("side", "ALL"), payload.get("decision"), payload.get("reason"),
-                                   payload.get("author"))
+            result = record_decision(con, self._exchange(payload.get("exchange")), payload.get("symbol"),
+                                     payload.get("side", "ALL"), payload.get("decision"), payload.get("reason"),
+                                     payload.get("author"))
+            return {**result, "sync": self._export_after_write(con, "decision")}
         except RegistryError as error:
             raise MainScreenError(str(error)) from None
         finally:
@@ -586,9 +625,11 @@ class MainScreenService:
             raise MainScreenError("поля порога: строки или числа")
         con = self._write()
         try:
-            return record_setting(con, self._exchange(payload.get("exchange")), payload.get("symbol"),
-                                  payload.get("side", "ALL"), payload.get("filter", "ready_v4"), payload.get("parameter"),
-                                  payload.get("value"), payload.get("reason"), payload.get("author"))
+            result = record_setting(con, self._exchange(payload.get("exchange")), payload.get("symbol"),
+                                    payload.get("side", "ALL"), payload.get("filter", "ready_v4"),
+                                    payload.get("parameter"), payload.get("value"), payload.get("reason"),
+                                    payload.get("author"))
+            return {**result, "sync": self._export_after_write(con, "setting")}
         except RegistryError as error:
             raise MainScreenError(str(error)) from None
         finally:

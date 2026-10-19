@@ -82,6 +82,9 @@ Copy-Item config.local.json.example config.local.json
 
 # Pair registry: refresh, liquidity, pipeline and the listing workbook (sheets «Пары», «Пары_BingX»)
 .\.venv\Scripts\python.exe -m mrs3.pair_registry sync
+# Git sync between machines: once per machine; --remote is a private repository you create yourself
+# (with GitHub CLI installed and logged in, the sync repository uses its credentials)
+.\.venv\Scripts\python.exe -m mrs3.pair_registry sync-init --remote <URL>
 .\.venv\Scripts\python.exe -m mrs3.pair_registry workbook --out <path.xlsx>
 
 # MRS2 history in the trade store (trade_store.root in config.local.json)

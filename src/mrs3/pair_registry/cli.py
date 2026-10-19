@@ -1,7 +1,7 @@
 """Pair registry CLI: `python -m mrs3.pair_registry <command> [--config config.local.json]`.
 
-Commands: refresh, liquidity, pipeline, sync (refresh + liquidity + pipeline + listing workbook, the Panel's
-«Синхронизировать»), workbook, decide, setting. Contract: docs/specs/2026-10-18-pair-registry.md.
+Commands: refresh, liquidity, pipeline, sync (pull + refresh + liquidity + pipeline + listing workbook + push, the
+Panel's «Синхронизировать»), sync-init, workbook, decide, setting. Contract: docs/specs/2026-10-18-pair-registry.md.
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ from .liquidity import refresh_liquidity
 from .records import record_decision, record_setting
 from .refresh import record_failure, refresh_exchange
 from .store import RegistryError, RegistrySettings, connect, load_registry_settings
+from .sync import SyncError, init_repo, sync_pull, sync_push
 from .workbook import WORKBOOK_NAME, write_listing_workbook
 
 
@@ -78,6 +79,14 @@ def _refresh(con: duckdb.DuckDBPyConnection, settings: RegistrySettings, exchang
     return summary, failed
 
 
+def _push(con: duckdb.DuckDBPyConnection, settings: RegistrySettings, message: str) -> dict:
+    """Export the synced tables after a write (ADR-0081); a sync failure never fails the write itself."""
+    try:
+        return sync_push(con, settings.sync_path, settings.machine, message)
+    except (SyncError, OSError, duckdb.Error) as error:
+        return {"error": f"{type(error).__name__}: {error}"}
+
+
 def _pipeline(con: duckdb.DuckDBPyConnection, config: Path, today: date, machine: str | None, skip_track: bool) -> dict:
     import os
     import socket
@@ -108,7 +117,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                            help="also the windows of the N-1 run days before, oldest first (1-31; e.g. 14 to backfill "
                                 "the base-lot history)")
     pipeline = commands.add_parser("pipeline", help="import tests and finalists, recompute the pipeline state")
-    sync = commands.add_parser("sync", help="refresh both exchanges, then liquidity, the pipeline, the workbook")
+    sync = commands.add_parser("sync", help="pull the sync repository, refresh both exchanges, liquidity, the "
+                                            "pipeline, the workbook, then push")
+    sync_init = commands.add_parser("sync-init", help="create the local sync repository (git); with --remote, pull "
+                                                      "and push go to that repository")
+    sync_init.add_argument("--remote", default=None, help="URL of the private sync repository (created by the user)")
     workbook = commands.add_parser("workbook", help="write the listing workbook (sheets «Пары», «Пары_BingX»)")
     workbook.add_argument("--out", type=Path, default=None, help=f"default: <registry root>/{WORKBOOK_NAME}")
     for sub in (liquidity, pipeline, sync):
@@ -129,15 +142,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     setting.add_argument("--filter", default="ready_v4")
     setting.add_argument("--parameter", required=True)
     setting.add_argument("--value", default=None, help="empty or omitted: reset to the common default")
-    for sub in (refresh, liquidity, pipeline, sync, workbook, decide, setting):
+    for sub in (refresh, liquidity, pipeline, sync, sync_init, workbook, decide, setting):
         sub.add_argument("--config", type=Path, default=Path("config.local.json"))
     args = parser.parse_args(argv)
 
     try:
         settings = load_registry_settings(args.config)
+        if args.command == "sync-init":
+            _emit({"sync": init_repo(settings.sync_path, settings.machine, args.remote), "machine": settings.machine})
+            return 0
         if args.command == "workbook" and not (settings.root / "registry.duckdb").is_file():
             raise RegistryError("the pair registry does not exist yet: run sync first")
         con = connect(settings.root)
+    except SyncError as error:
+        _emit({"error": str(error)})
+        return 1
     except (RegistryError, OSError, duckdb.Error) as error:   # e.g. the registry is locked by another process
         _emit({"error": str(error)})
         return 1
@@ -154,13 +173,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                 code = 0
             except (RegistryError, duckdb.Error) as error:
                 result, code = {"error": str(error)}, 1
+            if code == 0:
+                result = {**result, "sync": _push(con, settings, args.command)}
             _emit(result)
             return code
         if args.command == "pipeline":
             try:
-                result, code = {"bybit": _pipeline(con, args.config, today, args.machine, args.skip_track)}, 0
+                result, code = {"bybit": _pipeline(con, args.config, today, args.machine or settings.machine, args.skip_track)}, 0
             except Exception as error:
                 result, code = {"bybit": {"error": f"{type(error).__name__}: {error}"}}, 1
+            if code == 0:
+                result["sync"] = _push(con, settings, "pipeline")
             _emit(result)
             return code
         if args.command == "workbook":
@@ -185,13 +208,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             _emit(result)
             return code
         if args.command == "sync":
-            steps = ("refresh", "liquidity", "pipeline", "workbook")
+            steps = ("pull", "refresh", "liquidity", "pipeline", "workbook", "push")
             summary: dict[str, object] = {}
             failed = False
             for done, step in enumerate(steps):
                 _emit({"progress": {"done": done, "total": len(steps), "step": step, "pair": None}})
                 try:
-                    if step == "refresh":
+                    if step == "pull":
+                        summary[step] = sync_pull(con, settings.sync_path, settings.machine)
+                    elif step == "push":
+                        summary[step] = sync_push(con, settings.sync_path, settings.machine, "sync")
+                    elif step == "refresh":
                         summary[step], step_failed = _refresh(con, settings, ("bybit", "bingx"))
                         for exchange, value in summary[step].items():
                             if isinstance(value, dict) and "error" in value:
@@ -205,7 +232,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         except OSError as error:          # e.g. the workbook is open in Excel; no local path
                             raise RegistryError(f"{type(error).__name__}: listing workbook not written") from None
                     else:
-                        summary[step] = _pipeline(con, args.config, today, args.machine, args.skip_track)
+                        summary[step] = _pipeline(con, args.config, today, args.machine or settings.machine, args.skip_track)
                 except Exception as error:          # one step failing never stops the next one
                     summary[step] = {"error": f"{type(error).__name__}: {error}"}
                     _emit({"error": summary[step]["error"], "step": step, "pair": None})

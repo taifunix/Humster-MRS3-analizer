@@ -8,6 +8,46 @@ Use [PRD.md](PRD.md) for the feature registry and [docs/README.md](docs/README.m
 for the documentation map. Read the linked contract only for the active task;
 do not treat this file as a replacement for a feature specification.
 
+## Pair registry stage 5: git sync between machines (2026-10-19, branch `wip/period-csv-generator`)
+
+Contract: [pair registry](docs/specs/2026-10-18-pair-registry.md) («Stage 5
+contract» and «Stage 5 evidence»), [ADR-0081](docs/decisions/0081-pair-registry-git-sync-format.md).
+
+- **Synced tables:** decisions, per-pair settings, finalist marks, pair tests
+  and pipeline. They go through a private git repository, with one file per
+  table and machine.
+- **When sync runs:**
+  - export after every CLI or Panel write; the Panel commits and pushes in
+    the background;
+  - «Синхронизировать» pulls first and pushes last.
+- **Sync repository:** the user asked for it, and it was created as a private
+  GitHub repository. `sync-init --remote` was run on the first machine, and
+  the first export was pushed.
+- The sync repository uses the `gh` login as its credential helper. The
+  system credential manager holds a different GitHub account and got
+  «Repository not found».
+- **Verification** (`.venv`, basetemp on drive C):
+  - independent review `CODE_REVIEW_FAIL`, with 1 BLOCKER and 1 MAJOR, both
+    fixed:
+    - BLOCKER: a non-ASCII computer name stopped every registry command;
+    - MAJOR: there was no lock between the Panel and the CLI, and file
+      writes were not atomic;
+    - the MINOR findings were fixed too.
+  - Re-review `CODE_REVIEW_PASS`. Open NITs:
+    - a sync file in another encoding (UnicodeDecodeError) is not turned
+      into `SyncError`;
+    - an `export-*.tmp` is left in `.git` when the rename fails.
+  - Registry, Panel main-screen, «Стратегии», base-lot, optimizer and READY
+    suites: 286 passed;
+  - `panel_portfolio`, `v5_read_compat` and `portfolio_input`: 20 failed,
+    the same known failures as HEAD (21 on HEAD, with the flaky stage 2
+    test).
+- **Next:**
+  - on the second machine: `gh auth login`, then
+    `python -m mrs3.pair_registry sync-init --remote <URL>` and
+    «Синхронизировать»;
+  - Panel stage 5 (BingX).
+
 ## Panel rework stage 4c: the A/B and Pareto screens removed (2026-10-19, branch `wip/period-csv-generator`)
 
 Contract: [Panel for the simulation workflow](docs/specs/2026-10-18-panel-simulation-workflow.md)

@@ -421,7 +421,8 @@ compatible «Пары» sheet (same columns as today) so nothing breaks mid-way.
    listed above. ✅ 2026-10-19 (see «Stage 4 contract» and «Stage 4
    evidence»).
 5. **Git sync**: the private repository, automatic upload on change,
-   `registry sync` pull/import.
+   `registry sync` pull/import. ✅ 2026-10-19 (see «Stage 5 contract» and
+   «Stage 5 evidence»).
 
 Each stage: spec details first, TDD, `.venv` tests on drive C, independent
 review, then a commit.
@@ -1000,6 +1001,148 @@ The re-review returned `CODE_REVIEW_PASS`.
 loader-based consumers to the registry, point
 `panel_workflow.listing_dates_path` in `config.local.json` at
 `<registry root>/pairs.xlsx`. «Синхронизировать» writes it.
+
+## Stage 5 contract: git sync (2026-10-19)
+
+Decision: [ADR-0081](../decisions/0081-pair-registry-git-sync-format.md).
+
+**Repository.**
+- A local git repository, `pair_registry.sync.path` (default `<root>/sync`),
+  is created with `python -m mrs3.pair_registry sync-init [--remote URL]`.
+  Sync is on when it exists.
+- Pull and push run only when the repository has a remote `origin`. The user
+  creates the private GitHub repository (`gh repo create <name> --private`)
+  and passes its URL; the code never creates anything on GitHub.
+- Commits use the repository-local identity `mrs3-registry <machine>`.
+- When the GitHub CLI is installed, `sync-init` makes it the only credential
+  helper of the sync repository, including for the first clone. The private
+  repository belongs to the account `gh` is logged in to, which may differ
+  from the one in the system credential manager. Global git settings are
+  never changed.
+
+**Machine.**
+- `pair_registry.machine` if it is set: it must match `[A-Za-z0-9._-]{1,64}`,
+  otherwise the settings are refused.
+- Otherwise the computer name. Other characters become `_`, and a short hash
+  of the original name is appended. A non-ASCII computer name never stops
+  the registry.
+
+**One sync at a time.**
+- Pull + import and export + commit + push run under an OS lock on
+  `.git/mrs3-sync.lock`, shared by the Panel and the CLI (it waits up to
+  300 s).
+- Files are written atomically: a temporary file in `.git`, then a rename.
+- Writing an append-only file keeps the rows already in it (union by
+  `row_id`).
+- A broken sync file stops the import with a `SyncError` naming
+  `<table>/<file>`, and the registry is unchanged.
+- A failed git merge is aborted, and the error names
+  `pair_registry.machine`.
+
+**Files.**
+- One file per synced table and machine: `<table>/<machine>.jsonl`.
+- The first line is a header (a JSON array of the column names). Every other
+  line is a JSON array of the values in that order. UTF-8, LF, rows sorted by
+  key.
+- A machine writes only its own files.
+- Contents:
+  - `decisions`, `pair_settings`, `finalists`: the rows created on this
+    machine, keyed by `row_id`;
+  - `pair_tests`: the tests of this machine, keyed by `source`;
+  - `pipeline`: the newest row per (exchange, symbol, side) that this machine
+    computed.
+
+**Row identity.**
+- `decisions`, `pair_settings` and `finalists` gain `origin` and `row_id`.
+  The first export stamps the local rows that have none: `origin` = this
+  machine, `row_id` = sha256 of origin, seq and content.
+- `pair_tests` gains `origin`. A test imported from another machine is
+  stored under `<origin>:<source>`.
+
+**In force.** The newest `created_ms` wins, then the larger `seq`, in:
+- `current_decision` and the per-pair settings;
+- `current_finalists`, `finalist_marks` and the change check of
+  `record_finalist`;
+- the pair card history.
+
+**Import** (`sync_pull`):
+1. `git pull` when a remote is set.
+2. For every other machine's files:
+   - append-only rows are added when their `row_id` (or namespaced `source`)
+     is new;
+   - a `pipeline` row replaces the local row of the same key and day only
+     when its `computed_ms` is newer.
+3. The import runs in one transaction and is idempotent.
+
+**Export** (`sync_push`):
+1. Stamp the local rows, then write this machine's files.
+2. Commit when a file changed.
+3. Push when a remote is set. A rejected push gets one pull and one retry.
+
+Export runs after:
+- the CLI `decide`, `setting`, `pipeline` and `sync`;
+- every Panel decision, threshold or mark write. On the write connection the
+  Panel stamps the rows and reads its hand-made rows into memory. A background
+  thread then writes the files, commits and pushes under the sync lock, so
+  the Panel never waits for git or the network. A sync failure never fails the write: the next write or
+  «Синхронизировать» exports again.
+
+**«Синхронизировать»** (`sync`): pull + import → refresh → liquidity →
+pipeline → workbook → export + push. Each step reports progress, and a
+failing step does not stop the next.
+
+**Acceptance.**
+- Two machines on one bare repository in a temporary folder:
+  - a decision, a threshold and a mark made on A reach B;
+  - concurrent writes on both merge with no conflict;
+  - the newer pipeline row wins;
+  - tests with the same local source stay apart;
+  - re-import changes nothing.
+- No remote means a local commit only.
+- A rejected push is retried after a pull.
+- The in-force order follows time across machines.
+- The CLI `sync-init` / `sync` steps; Panel writes trigger the export.
+
+## Stage 5 evidence (2026-10-19)
+
+- Code:
+  - `pair_registry/sync.py`: repository, export, import and push;
+  - `records.ensure_schema` adds `origin` / `row_id` to an existing
+    registry, and the in-force order is now by time;
+  - `store.RegistrySettings`: `machine` and `sync_path`;
+  - CLI `sync-init` and the export after `decide` / `setting` / `pipeline`;
+    `sync` gains the `pull` and `push` steps;
+  - `panel_main.MainScreenService._export_after_write` runs after decision,
+    setting, finalist and mark-import writes.
+- Tests (`.venv`, basetemp on drive C):
+  - `test_pair_registry_sync.py`, 14 tests:
+    - sync off; a local commit with no remote;
+    - A → B over a bare repository, with idempotent re-import and no
+      re-export;
+    - concurrent writes, with a rejected push pulled and retried;
+    - the newer pipeline row; stamping; an old registry gains the columns;
+    - `init_repo` with the `gh` credential helper;
+    - added after the independent review (`CODE_REVIEW_FAIL`: a BLOCKER on
+      the machine name and a MAJOR on the missing cross-process lock and
+      non-atomic writes):
+      - a safe machine name from the system;
+      - the lock;
+      - an older snapshot never drops a row;
+      - a broken file;
+      - two machines with one name;
+      - CLI `sync-init` + `decide` pushing to a bare remote.
+  - `test_panel_main.py::test_a_panel_write_exports_the_registry_to_the_sync_repository`:
+    sync off without a repository; with one, a Panel write exports and commits
+    in the background.
+  - Registry, Panel main-screen and «Стратегии» suites pass (see
+    `progress.md`).
+- On GitHub (2026-10-19): the user asked for the private sync repository, and
+  `gh repo create --private` created it. `sync-init --remote` was then run on
+  the first machine, and the first export was pushed (pair tests and
+  pipeline). Before the `gh` credential helper was added, the push failed with
+  «Repository not found», because the system credential manager held a
+  different GitHub account. The second machine runs the same `sync-init`.
+- **Stage 5 implemented ✅ 2026-10-19.**
 
 ## Decisions taken (2026-10-18)
 
