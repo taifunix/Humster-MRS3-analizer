@@ -65,6 +65,9 @@ h2 { font-size: 1.05rem; }
 .main-toolbar, .main-view-bar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; }
 .main-view-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .main-view-tools input { width: min(320px, 100%); }
+.main-strategy-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px; }
+.main-mark { min-height: 30px; padding: 3px 6px; font-size: .74rem; }
+.main-mark-rank { width: 4.5rem; }
 .segmented { display: inline-flex; padding: 3px; border: 1px solid var(--line); border-radius: 9px; background: #f7f9fc; }
 .segmented-button { min-height: 34px; padding: 6px 13px; border: 0; border-radius: 7px; color: var(--muted); background: transparent; font-size: .8rem; font-weight: 750; cursor: pointer; }
 .segmented-button[aria-pressed="true"] { color: #fff; background: var(--navy-soft); }

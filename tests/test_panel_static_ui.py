@@ -3108,7 +3108,7 @@ def test_main_screen_plan_dialog_has_row_checkboxes_select_all_and_run() -> None
 def test_main_screen_views_pair_card_and_safe_errors() -> None:
     main = _main_screen_html()
     views = re.findall(r'data-main-view="([a-z]+)"', main)
-    assert views == ["pairs", "reference", "liquidity", "changes"]
+    assert views == ["pairs", "strategies", "reference", "liquidity", "changes"]
     for element in ('id="main-filter" type="search"', 'id="main-columns"', 'id="main-excel"', 'id="main-columns-panel"',
                     'id="main-table"', '<dialog id="main-pair"', 'id="main-pair-decision"', 'id="main-pair-setting"',
                     'id="main-author"', 'id="main-decision-reason"', 'id="main-setting-value"'):
@@ -3183,3 +3183,27 @@ assert.deepEqual(got, __EXPECTED__);
         script = script.replace(name, json.dumps(value))
     completed = subprocess.run(["node", "-e", script], capture_output=True, text=True, encoding="utf-8")
     assert completed.returncode == 0, completed.stderr
+
+
+def test_strategies_view_has_toggles_marks_metrics_and_mark_upload() -> None:
+    # Panel rework stage 4a: docs/specs/2026-10-18-panel-simulation-workflow.md, «Stage 4 contract»; ADR-0080
+    main = _main_screen_html()
+    tools = main.split('<div id="main-strategy-tools"', 1)[1].split("</div>", 1)[0]
+    assert "hidden" in tools.split(">", 1)[0]
+    for element in ('id="main-strategy-hard" type="checkbox" checked', 'id="main-strategy-top5" type="checkbox" checked',
+                    'id="main-strategy-hide" type="checkbox"', 'id="main-strategy-metrics"', 'id="main-strategy-upload"',
+                    'id="main-strategy-file" type="file" accept=".xlsx"'):
+        assert element in tools, element
+    assert ">Жёсткие отсечки<" in tools and "Топ-5 &gt; 80 %" in tools and ">Скрыть отсечённые<" in tools
+    js = _read("app.js")
+    block = js.split("const mainScreen = document.querySelector('#main-screen');", 1)[1]
+    assert "remoteRequest('/api/v2/main/finalist', {" in block
+    assert "['', 'FINALIST', 'RESERVE', 'REJECTED'].forEach" in block
+    assert "`/api/v2/main/finalists.xlsx?exchange=${encodeURIComponent(mainState.exchange)}`" in block
+    assert "'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }, body: file" in block
+    assert "remoteRequest('/api/v2/strategies/performance-v2/recalculate-all', {})" in block
+    assert "requestJson('/api/v2/strategies/performance-v2/recalculate-all/progress')" in block
+    assert "&hard=${mainEl('strategy-hard')?.checked ? 1 : 0}" in block
+    assert "params.set(key, mainEl(`strategy-${key}`)?.checked ? '1' : '0')" in block       # Excel = what is shown
+    assert "mainState.document?.default_columns" in block
+    assert "innerHTML" not in block

@@ -26,6 +26,10 @@ from .pair_registry.liquidity import read_liquidity
 from .pair_registry.records import FILTERS, effective_ready_rule, record_decision, record_setting
 from .pair_registry.store import DATABASE, RegistryError, connect, load_registry_settings
 from .error_sanitization import redact_local_paths
+from .panel_strategies import (
+    ALL_COLUMNS as STRATEGY_COLUMNS, DEFAULT_COLUMNS as STRATEGY_DEFAULT_COLUMNS, MARK_LABELS, StrategiesError,
+    hide_cut, parse_rank, parse_status, strategy_rows,
+)
 from .panel_tasks import TaskRunner, TaskRunnerError
 from .ready_store import ReadyRule, inputs_sha256, pair_periods
 
@@ -59,6 +63,7 @@ VIEWS: dict[str, tuple[tuple[str, str], ...]] = {
                   ("missing_days", "Нет дней"), ("reason", "Причина")),
     "changes": (("changed", "Когда (UTC)"), ("symbol", "Пара"), ("kind", "Событие"), ("field", "Поле"),
                 ("old_value", "Было"), ("new_value", "Стало")),
+    "strategies": STRATEGY_COLUMNS,             # Panel stage 4a (panel_strategies)
 }
 
 
@@ -193,10 +198,12 @@ class MainScreenService:
 
     # -- views ----------------------------------------------------------------------------------------------
 
-    def view(self, name: str, exchange: str) -> dict:
+    def view(self, name: str, exchange: str, options: Mapping | None = None) -> dict:
         if not isinstance(name, str) or name not in VIEWS:
             raise MainScreenError(f"неизвестный вид {name!r}")
         exchange = self._exchange(exchange)
+        if name == "strategies":
+            return self._view_strategies(exchange, dict(options or {}))
         con = self._read()
         try:
             rows = getattr(self, f"_view_{name}")(con, exchange)
@@ -242,6 +249,164 @@ class MainScreenService:
             out[symbol] = entry.get("newest_source") or entry.get("latest_source")
         return out
 
+    # -- «Стратегии» (Panel stage 4a): READY structures + tick tests, marks in the registry -----------------------
+
+    def _performance_db(self) -> Path | None:
+        try:
+            from .performance_v2_store import load_performance_v2_config, performance_v2_database_path
+
+            return performance_v2_database_path(load_performance_v2_config(
+                self.config_path.with_name("config.performance.json")))
+        except Exception:                        # no PerformanceDB configured: READY rows only
+            return None
+
+    def _selection_config(self):
+        from .performance_v2_selection import SelectionConfig, load_selection_config
+
+        path = self.config_path.with_name("config.performance.json")
+        try:
+            return load_selection_config(path) if path.is_file() else SelectionConfig()
+        except Exception:
+            return SelectionConfig()
+
+    @staticmethod
+    def _flag(options: Mapping, key: str, default: bool) -> bool:
+        value = options.get(key, default)
+        return value in (True, "1", "true", 1) if not isinstance(value, bool) else value
+
+    def _view_strategies(self, exchange: str, options: Mapping, *, metrics: bool = True) -> dict:
+        hard, top5 = self._flag(options, "hard", True), self._flag(options, "top5", True)
+        hide = self._flag(options, "hide", False)
+        try:
+            store_root = self._store_root()
+        except MainScreenError:
+            store_root = None
+        from .pair_registry.records import current_finalists
+
+        database = self._settings().root / DATABASE
+        marks: list[dict] = []
+        if database.is_file():                   # a short connection: the slow PerformanceDB read holds no registry lock
+            try:
+                with duckdb.connect(str(database), read_only=True) as con:
+                    marks = current_finalists(con, exchange)
+            except duckdb.Error:
+                raise MainScreenError("реестр занят задачей: повторите, когда она закончится") from None
+        config = self._selection_config()
+        try:
+            rows, notes = strategy_rows(exchange=exchange, store_root=store_root, performance_db=self._performance_db(),
+                                        marks=marks, config=config, hard=hard, top5=top5, metrics=metrics)
+        except duckdb.Error:
+            raise MainScreenError("хранилище или PerformanceDB заняты: повторите") from None
+        if hide:
+            rows = hide_cut(rows)
+        return {"name": "strategies", "exchange": exchange,
+                "columns": [{"key": key, "label": label} for key, label in VIEWS["strategies"]],
+                "default_columns": list(STRATEGY_DEFAULT_COLUMNS), "rows": rows, "notes": notes,
+                "options": {"hard": hard, "top5": top5, "hide": hide},
+                "top5_share_pct": float(config.top5_share_pct)}
+
+    def finalist(self, payload: Mapping) -> dict:
+        """A mark set in the table: written to the registry `finalists` (ADR-0080), source `panel`."""
+        from .pair_registry.records import record_finalist
+
+        from .pair_registry.records import current_finalists
+
+        exchange = self._exchange(payload.get("exchange"))
+        strategy = payload.get("strategy")
+        if not isinstance(strategy, str) or not strategy.strip():
+            raise MainScreenError("стратегия: строка")
+        strategy = strategy.strip()
+        try:
+            status, rank = parse_status(payload.get("status")), parse_rank(payload.get("user_rank"))
+        except StrategiesError as error:
+            raise MainScreenError(str(error)) from None
+        row = next((item for item in self._view_strategies(exchange, {}, metrics=False)["rows"]
+                    if item["strategy"] == strategy), None)
+        if row is None:                          # pair and side come from the view, never from the browser
+            raise MainScreenError(f"стратегии {strategy} нет в виде «Стратегии»")
+        rank = rank if status != "NONE" else None
+        con = self._write()
+        try:
+            in_force = {item["strategy"]: item for item in current_finalists(con, exchange)}
+            if status == "NONE" and strategy not in in_force:
+                changed = False                  # no mark to clear: nothing is written
+            else:
+                changed = record_finalist(con, exchange, str(row["symbol"]), str(row["side"] or "LONG"), strategy,
+                                          status, "panel", user_rank=rank)
+        except RegistryError as error:
+            raise MainScreenError(str(error)) from None
+        finally:
+            con.close()
+        return {"strategy": strategy, "status": None if status == "NONE" else status, "user_rank": rank,
+                "changed": changed}
+
+    def import_marks(self, exchange: str, data: bytes) -> dict:
+        """«Загрузить отметки»: rows matched by «Стратегия»; «Отметка» and «Ранг» read; only changes written
+        (source `excel`); nothing is written when a row is invalid."""
+        from openpyxl import load_workbook
+
+        from .pair_registry.records import current_finalists, record_finalist
+
+        exchange = self._exchange(exchange)
+        try:
+            sheet = load_workbook(BytesIO(data), read_only=True, data_only=True).active
+            rows = list(sheet.iter_rows(values_only=True))
+        except Exception:
+            raise MainScreenError("файл не читается как книга Excel") from None
+        if not rows:
+            raise MainScreenError("книга пуста")
+        header = [str(value).strip() if value is not None else "" for value in rows[0]]
+        index = {MARK_LABELS[label]: position for position, label in enumerate(header) if label in MARK_LABELS}
+        if not {"strategy", "status"} <= set(index):
+            raise MainScreenError("нужны столбцы «Стратегия» и «Отметка»")
+        known = {row["strategy"]: row for row in self._view_strategies(exchange, {}, metrics=False)["rows"]}
+        planned, unknown, errors, seen = [], [], [], set()
+        for number, values in enumerate(rows[1:], start=2):
+            name = values[index["strategy"]] if index["strategy"] < len(values) else None
+            if name is None or not str(name).strip():
+                continue
+            name = str(name).strip()
+            if name in seen:
+                errors.append({"row": number, "strategy": name, "error": "стратегия повторяется в книге"})
+                continue
+            seen.add(name)
+            if name not in known:
+                unknown.append(name)
+                continue
+            try:
+                status = parse_status(values[index["status"]] if index["status"] < len(values) else None)
+                rank = parse_rank(values[index["user_rank"]]) if "user_rank" in index and index["user_rank"] < len(
+                    values) else None
+            except StrategiesError as error:
+                errors.append({"row": number, "strategy": name, "error": str(error)})
+                continue
+            planned.append((known[name], status, rank if status != "NONE" else None))
+        if errors:
+            return {"changed": [], "unchanged": 0, "unknown": unknown, "errors": errors, "written": False}
+        con = self._write()
+        try:
+            in_force = {row["strategy"]: (row["status"], row["user_rank"]) for row in current_finalists(con, exchange)}
+            changed, unchanged = [], 0
+            con.begin()
+            for row, status, rank in planned:
+                before = in_force.get(row["strategy"], ("NONE", None))
+                if before == (status, rank) or (status == "NONE" and row["strategy"] not in in_force):
+                    unchanged += 1
+                    continue
+                record_finalist(con, exchange, str(row["symbol"]), str(row["side"] or "LONG"), row["strategy"],
+                                status, "excel", user_rank=rank)
+                changed.append({"strategy": row["strategy"], "from": before[0], "to": status, "user_rank": rank})
+            con.commit()
+        except BaseException:
+            try:
+                con.rollback()
+            except duckdb.Error:
+                pass
+            raise
+        finally:
+            con.close()
+        return {"changed": changed, "unchanged": unchanged, "unknown": unknown, "errors": [], "written": True}
+
     def _view_reference(self, con, exchange: str) -> list[dict]:
         tiers = dict(con.execute(
             "select symbol, count(*) from risk_tiers where exchange = ? and as_of_day = "
@@ -277,13 +442,14 @@ class MainScreenService:
                 for row in rows]
 
     def view_xlsx(self, name: str, exchange: str, columns: Sequence[str] | None, text: str = "",
-                  sort: str | None = None, descending: bool = False) -> tuple[str, bytes]:
+                  sort: str | None = None, descending: bool = False,
+                  options: Mapping | None = None) -> tuple[str, bytes]:
         """Exactly the rows and columns shown: same filter and sort as the table; no data is changed."""
         from openpyxl import Workbook
 
-        document = self.view(name, exchange)
+        document = self.view(name, exchange, options)
         known = [column["key"] for column in document["columns"]]
-        shown = [key for key in (columns or known) if key in known] or known
+        shown = [key for key in (columns or document.get("default_columns") or known) if key in known] or known
         rows = sort_rows(filter_rows(document["rows"], shown, text), sort if sort in shown else None, descending)
         labels = {column["key"]: column["label"] for column in document["columns"]}
         book = Workbook()

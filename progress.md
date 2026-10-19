@@ -8,7 +8,37 @@ Use [PRD.md](PRD.md) for the feature registry and [docs/README.md](docs/README.m
 for the documentation map. Read the linked contract only for the active task;
 do not treat this file as a replacement for a feature specification.
 
-## Pair registry stage 4: the consumers read the registry (2026-10-19, branch `wip/period-csv-generator`)
+## Panel rework stage 4a: the «Стратегии» view and finalist marks (2026-10-19, branch `wip/period-csv-generator`)
+
+Contract: [Panel for the simulation workflow](docs/specs/2026-10-18-panel-simulation-workflow.md)
+(«Stage 4 contract», «Stage 4a evidence»), decision
+[ADR-0080](docs/decisions/0080-finalist-marks-in-the-pair-registry.md).
+
+- The «Стратегии» view shows the READY structures and the tick-tested
+  strategies joined by name, with:
+  - read-only metrics, including the report columns;
+  - the hard cutoffs and top-5 toggles with «Причина», and «скрыть
+    отсечённые»;
+  - rank in pair;
+  - «Посчитать метрики» (the existing cache preparation).
+- Marks (FINALIST / RESERVE / REJECTED, rank) are set in the table or loaded
+  from Excel. They are written only to the registry `finalists`.
+- The Excel export writes nothing.
+- The PerformanceDB reviews seed the marks once.
+- **Verification:**
+  - `tests/test_panel_strategies.py` (7) plus the main-screen, static UI and
+    registry suites: 200 passed. The selection suite after the shared-rule
+    extraction: 423 passed.
+  - Live read of the real data: 1,812 rows in 6.6 s, a repeat read in 0.3 s.
+  - Independent review: `CODE_REVIEW_PASS`; the MINOR findings are fixed, and
+    the re-review returned `CODE_REVIEW_PASS`.
+- **Next:**
+  - 4b: the finalist retest and the optimizer read the registry marks;
+  - 4c: remove the A/B card and the Pareto screen.
+- **Note:** until 4b, a mark set in the Panel is not yet seen by the retest
+  or the optimizer, which still read the PerformanceDB reviews.
+
+## Pair registry stage 4: the consumers read the registry (2026-10-19, branch `wip/period-csv-generator`, committed `d2f18cd`)
 
 Contract: [pair registry](docs/specs/2026-10-18-pair-registry.md) («Stage 4
 contract», «Stage 4 evidence»), decision

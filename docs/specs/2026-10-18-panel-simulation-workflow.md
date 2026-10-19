@@ -479,6 +479,143 @@ POST routes require JSON.
     return 200;
   - `/api/v2/store/status` returns 404.
 
+## Stage 4 contract: the «Стратегии» view and finalist marks (2026-10-19)
+
+Decision: [ADR-0080](../decisions/0080-finalist-marks-in-the-pair-registry.md).
+The marks are stored only in the registry `finalists` table. Three parts, each
+committed after review:
+
+- **4a:** the view, marks in the registry, and the Excel round trip.
+- **4b:** the finalist retest and the optimizer read the registry marks.
+- **4c:** the A/B card and the Pareto/filters screen are removed.
+
+**4a. Rows** (`panel_strategies.strategy_rows`) are the union of:
+- the READY structures of the latest READY catalog row of every pair of the
+  exchange (pair, TF, orders, score, training DD, category, READY rank);
+- the ACTIVE PerformanceDB strategies of that exchange (`database_exchange`).
+
+They are joined by strategy name: names are stable because
+`prepare_tick_batch` refuses a renamed strategy. A READY row without a test
+shows empty metrics; a tested strategy outside READY shows empty READY
+fields.
+
+**Metrics** are read-only:
+- the strategy result: PnL %, MaxDD %, trades, report window;
+- the cached selection metrics of `load_selection_candidates(cache_only=True)`:
+  PnL/30, history days, top-5 share, B PnL/30 and the others;
+- every column of `strategy_report_metrics` when the table exists (Ulcer,
+  time under water, Sharpe, …), labelled from the report profile. A new
+  report column appears in the view without code changes.
+
+Missing cache means empty metrics. «Посчитать метрики» runs the existing
+cache preparation (`/api/v2/strategies/performance-v2/recalculate-all`).
+
+**Filter toggles** are computed on the fly and never stored:
+- «Жёсткие отсечки»: hard cutoffs
+  ([filter sequence §3](2026-10-01-performance-v2-filter-sequence.md));
+- «Топ-5 > 80 %»: §5.
+
+A row cut by an enabled toggle shows the triggered rules and values in
+«Причина»; «скрыть отсечённые» hides it. Both toggles are on by default, and
+hiding is off.
+
+**Rank in pair:** category (low → moderate → high), then score descending,
+then the lower Ulcer of the strategy's tick test (empty last), then the name.
+Only rows with a category are ranked.
+
+**Marks.** A status (FINALIST / RESERVE / REJECTED / empty) and a user rank
+are set in the table. `POST /api/v2/main/finalist` writes them with
+`records.record_finalist(source="panel")`. The «Стратегии» view reads the
+marks in force from the registry.
+
+**Excel round trip:**
+- «Excel» exports exactly the rows and columns shown (the same filter and
+  sort), with the strategy name as the stable id. It writes nothing.
+- «Загрузить отметки» is `POST /api/v2/main/finalists.xlsx` with the
+  workbook body:
+  - rows are matched by the «Стратегия» column; the «Отметка» and «Ранг»
+    columns are read;
+  - only changes are written, with `source="excel"`;
+  - the answer lists changed, unchanged and unknown strategies and per-row
+    errors.
+
+**Pipeline.** `import_finalists` runs only while the registry holds no
+finalist row of the exchange: this is the one-time migration of the old
+PerformanceDB marks.
+
+**Routes.**
+- `GET /api/v2/main/view?name=strategies&exchange=…&hard=1&top5=1&hide=0`
+- `GET /api/v2/main/view.xlsx?name=strategies&…`
+- `POST /api/v2/main/finalist {exchange, strategy, symbol, side, status, user_rank}`
+- `POST /api/v2/main/finalists.xlsx` (body: the workbook)
+
+The column choice is saved like the other views.
+
+**Acceptance (4a).**
+- Row union and join by name; metrics from a fixture PerformanceDB.
+- Toggles and «Причина» use the selection module's own rule functions.
+- Rank in pair; marks written and read back; the Excel export has no
+  PerformanceDB writes.
+- Round trip: changed, unchanged, unknown and invalid rows.
+- One-time migration only.
+- Static UI tests.
+- A live read of the real registry, store and PerformanceDB.
+
+## Stage 4a evidence: the «Стратегии» view and marks in the registry (2026-10-19)
+
+**Code**
+- `panel_strategies` builds the rows, metrics, toggles, rank and mark parsing.
+  The PerformanceDB metrics are reused while the file and its WAL are
+  unchanged.
+- `performance_v2_selection.top5_evidence` and `hard_cutoff_evidence` are
+  shared by the selection stage and the view; the selection suite has
+  423 passed.
+- `panel_main`: the `strategies` view, `finalist`, `import_marks`.
+- Panel routes:
+  - view options `hard` / `top5` / `hide`;
+  - `POST /api/v2/main/finalist`;
+  - `POST /api/v2/main/finalists.xlsx`, xlsx only (415 otherwise),
+    20 MB at most.
+- Pipeline: the one-time seed of the marks.
+- UI:
+  - a «Стратегии» view button;
+  - toggles;
+  - «Посчитать метрики» (the existing cache preparation, with progress);
+  - «Загрузить отметки»;
+  - a status select and a rank input in the table.
+
+**Tests.**
+- `tests/test_panel_strategies.py` (7):
+  - row union and name join, report metrics, rank in pair;
+  - toggles and «Причина»;
+  - marks;
+  - the Excel round trip and no PerformanceDB writes on export;
+  - the one-time seed, including a Panel mark set before the first sync;
+  - routes.
+- One new static UI test.
+
+**Review.** The independent review returned `CODE_REVIEW_PASS` with MINOR
+findings, all fixed:
+- the registry is read on a short connection, never during the slow
+  PerformanceDB read;
+- a repeated strategy row in the workbook is a row error;
+- `finalist()` takes the pair and side from the view and refuses unknown
+  strategies; clearing a strategy without a mark writes nothing;
+- the seed runs until PerformanceDB marks have been imported once, and never
+  overrides a registry mark;
+- the mark message is no longer overwritten;
+- NaN-safe rank in pair; report metrics joined through a dict; one `stat()`
+  per file; the light read is not cached;
+- the top-5 label follows the config;
+- a pointer to ADR-0080 in the registry spec.
+
+**Live** (read only): the real registry, store and PerformanceDB give 1,812
+rows: 1,805 tested strategies plus 7 READY structures.
+- No window cache is prepared in this database, so PnL/30 is empty until
+  «Посчитать метрики» runs. The top-5 rule is evaluated now and cuts 4 rows.
+- The first read takes 6.6 s; a repeat read takes 0.3 s.
+- The Excel export returns 200.
+
 ## Stage 1b evidence, part B: retired screens removed and three-screen shell (2026-10-18)
 
 **Removed and disconnected**

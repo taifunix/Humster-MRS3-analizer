@@ -73,6 +73,7 @@
             <div class="main-view-bar">
               <div class="segmented" role="group" aria-label="Вид">
                 <button type="button" class="segmented-button" data-main-view="pairs" aria-pressed="true">Пары</button>
+                <button type="button" class="segmented-button" data-main-view="strategies" aria-pressed="false">Стратегии</button>
                 <button type="button" class="segmented-button" data-main-view="reference" aria-pressed="false">Справочник</button>
                 <button type="button" class="segmented-button" data-main-view="liquidity" aria-pressed="false">Ликвидность</button>
                 <button type="button" class="segmented-button" data-main-view="changes" aria-pressed="false">Изменения</button>
@@ -83,6 +84,14 @@
                 <button type="button" id="main-columns" class="button button-secondary" aria-expanded="false" aria-controls="main-columns-panel">Столбцы</button>
                 <button type="button" id="main-excel" class="button button-secondary">Excel</button>
               </div>
+            </div>
+            <div id="main-strategy-tools" class="main-strategy-tools" hidden>
+              <label class="check"><input id="main-strategy-hard" type="checkbox" checked><span>Жёсткие отсечки</span></label>
+              <label class="check"><input id="main-strategy-top5" type="checkbox" checked><span id="main-strategy-top5-label">Топ-5 &gt; 80 %</span></label>
+              <label class="check"><input id="main-strategy-hide" type="checkbox"><span>Скрыть отсечённые</span></label>
+              <button type="button" id="main-strategy-metrics" class="button button-secondary">Посчитать метрики</button>
+              <button type="button" id="main-strategy-upload" class="button button-secondary">Загрузить отметки</button>
+              <input id="main-strategy-file" type="file" accept=".xlsx" hidden>
             </div>
             <fieldset id="main-columns-panel" class="main-columns" hidden><legend>Показывать столбцы</legend></fieldset>
             <p id="main-view-status" class="card-status" role="status" aria-live="polite">Загрузка вида…</p>

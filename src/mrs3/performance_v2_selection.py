@@ -3109,6 +3109,32 @@ def _research_decisions(frame: pd.DataFrame, stage_id: str, config: SelectionCon
     return _research_stage3(rows, config)
 
 
+def top5_evidence(row: Mapping[str, object] | pd.Series, config: SelectionConfig) -> tuple[str, str | None]:
+    """Filter sequence §5 (top-five profitable trades): ("cut", evidence), ("insufficient", None) when the facts are
+    not reliable or incomplete, else ("pass", None). Shared by the selection stage and the Panel «Стратегии» view."""
+    reliable_value = row.get("completed_cycles_reliable", row.get("top5_reliable", False))
+    reliable = _is_bool(reliable_value, True)
+    history = _decimal_or_none(row.get("history_days"))
+    count = _integer(row.get("completed_profitable_cycle_count"))
+    share = _decimal_or_none(row.get("top5_share_pct"))
+    net = _decimal_or_none(row.get("completed_cycle_net_pnl"))
+    if (
+        reliable and history is not None and history >= config.top5_min_history_days
+        and count is not None and count >= config.top5_min_profitable_cycles
+        and net is not None and net > 0 and share is not None and share > config.top5_share_pct
+    ):
+        return "cut", (f"FILTER_BEST_TRADE_DEPENDENCY;TOP5_SHARE(share={share},net={net},"
+                       f"remainder={_decimal_or_none(row.get('pnl_after_top5'))})")
+    if not reliable or any(value is None for value in (history, count, net, share)):
+        return "insufficient", None
+    return "pass", None
+
+
+def hard_cutoff_evidence(row: Mapping[str, object] | pd.Series, config: SelectionConfig) -> tuple[bool, str | None]:
+    """Filter sequence §3 (hard cutoffs), shared by the selection stage and the Panel «Стратегии» view."""
+    return _hard_cutoff_evidence(row, config)
+
+
 def _hard_cutoff_evidence(row: pd.Series, config: SelectionConfig) -> tuple[bool, str | None]:
     dd = _decimal_or_none(row.get("max_drawdown_pct"))
     pnl = _decimal_or_none(row.get("pnl_30d_pct"))
@@ -3658,20 +3684,11 @@ def run_selection(
             elif stage.id == "filter_best_trade_dependency":
                 eliminated = []
                 for index, row in group.iterrows():
-                    reliable_value = row.get("completed_cycles_reliable", row.get("top5_reliable", False))
-                    reliable = _is_bool(reliable_value, True)
-                    history = _decimal_or_none(row.get("history_days"))
-                    count = _integer(row.get("completed_profitable_cycle_count"))
-                    share = _decimal_or_none(row.get("top5_share_pct"))
-                    net = _decimal_or_none(row.get("completed_cycle_net_pnl"))
-                    if (
-                        reliable and history is not None and history >= config.top5_min_history_days
-                        and count is not None and count >= config.top5_min_profitable_cycles
-                        and net is not None and net > 0 and share is not None and share > config.top5_share_pct
-                    ):
+                    outcome, evidence = top5_evidence(row, config)
+                    if outcome == "cut":
                         eliminated.append(index)
-                        stage_evidence[index] = f"FILTER_BEST_TRADE_DEPENDENCY;TOP5_SHARE(share={share},net={net},remainder={_decimal_or_none(row.get('pnl_after_top5'))})"
-                    elif not reliable or any(value is None for value in (history, count, net, share)):
+                        stage_evidence[index] = evidence
+                    elif outcome == "insufficient":
                         if result.at[index, "elimination_reason"] is None:
                             result.at[index, "elimination_reason"] = "TOP5_NOT_EVALUATED_INSUFFICIENT_DATA"
             elif stage.id == "filter_time_consistency":

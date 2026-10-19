@@ -346,8 +346,8 @@ def test_excel_never_writes_registry_text_as_a_formula(tmp_path: Path, monkeypat
     service, _runner, _store = _world(tmp_path)
     real = service.view
 
-    def view(name, exchange):
-        document = real(name, exchange)
+    def view(name, exchange, options=None):
+        document = real(name, exchange, options)
         document["rows"][0]["symbol"] = "=HYPERLINK(\"x\")"
         return document
 

@@ -188,6 +188,10 @@ HISTORY (≥ 2 periods) → NEW (< 2 periods).
 - `finalists`: FINALIST / RESERVE status changes per pair and strategy with time
   and source (PerformanceDB User Status import or Panel). Append-only.
 
+Since Panel stage 4 the `finalists` table is the only store of the marks
+([ADR-0080](../decisions/0080-finalist-marks-in-the-pair-registry.md)). The PerformanceDB reviews
+seed it once and never override a registry mark.
+
 ### 4c. `pair_settings` — personal filter thresholds per pair (append-only; synced)
 
 User request: a filter's thresholds can be set per pair (and side), e.g. a

@@ -5827,7 +5827,9 @@ class _PanelHandler(BaseHTTPRequestHandler):
     # -- «Пары и стратегии» main screen routes (docs/specs/2026-10-18-panel-simulation-workflow.md, «Stage 3»)
 
     _MAIN_POST = ("/api/v2/main/view-settings", "/api/v2/main/decision", "/api/v2/main/setting",
-                  "/api/v2/main/plan", "/api/v2/main/run", "/api/v2/main/stop")
+                  "/api/v2/main/plan", "/api/v2/main/run", "/api/v2/main/stop", "/api/v2/main/finalist")
+    _MAIN_MARKS_UPLOAD = "/api/v2/main/finalists.xlsx"
+    _XLSX_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
     def _main_error(self, error: Exception) -> None:
         if isinstance(error, EvaluationProtocolError):
@@ -5857,13 +5859,14 @@ class _PanelHandler(BaseHTTPRequestHandler):
         service = self.server.controller.main_screen()
         workbook = None
         try:
+            options = {key: query[key] for key in ("hard", "top5", "hide") if key in query}
             if parsed.path == "/api/v2/main/view":
-                result = service.view(query.get("name", ""), query.get("exchange", ""))
+                result = service.view(query.get("name", ""), query.get("exchange", ""), options)
             elif parsed.path == "/api/v2/main/view.xlsx":
                 columns = [key for key in query.get("columns", "").split(",") if key] or None
                 workbook = service.view_xlsx(query.get("name", ""), query.get("exchange", ""), columns,
                                              query.get("text", ""), query.get("sort") or None,
-                                             query.get("desc") in ("1", "true"))
+                                             query.get("desc") in ("1", "true"), options)
             elif parsed.path == "/api/v2/main/view-settings":
                 result = service.view_settings()
             elif parsed.path == "/api/v2/main/pair":
@@ -5889,6 +5892,27 @@ class _PanelHandler(BaseHTTPRequestHandler):
             return
         self._json(200, result)
 
+    def _main_marks_upload(self) -> None:
+        """«Загрузить отметки»: the workbook is the body (Content-Type xlsx, at most 20 MB); the exchange in the query."""
+        if self.headers.get("Content-Type", "").partition(";")[0].strip().casefold() != self._XLSX_TYPE:
+            self._json(415, {"error": f"Content-Type: {self._XLSX_TYPE}"})
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            length = 0
+        if not 0 < length <= 20 * 1024 * 1024:
+            self._json(400, {"error": "книга: от 1 байта до 20 МБ"})
+            return
+        data = self.rfile.read(length)
+        exchange = parse_qs(urlparse(self.path).query).get("exchange", [""])[-1]
+        try:
+            result = self.server.controller.main_screen().import_marks(exchange, data)
+        except Exception as error:
+            self._main_error(error)
+            return
+        self._json(200, result)
+
     def _main_post(self, endpoint: str) -> None:
         if not self._json_request():
             return
@@ -5908,6 +5932,8 @@ class _PanelHandler(BaseHTTPRequestHandler):
                 result = service.decision(document)
             elif endpoint == "/api/v2/main/setting":
                 result = service.setting(document)
+            elif endpoint == "/api/v2/main/finalist":
+                result = service.finalist(document)
             elif endpoint == "/api/v2/main/plan":
                 result = service.plan(str(document.get("action", "")), str(document.get("exchange", "")))
             elif endpoint == "/api/v2/main/run":
@@ -5962,6 +5988,9 @@ class _PanelHandler(BaseHTTPRequestHandler):
             return
         if endpoint in self._MAIN_POST:
             self._main_post(endpoint)
+            return
+        if endpoint == self._MAIN_MARKS_UPLOAD:
+            self._main_marks_upload()
             return
         if endpoint == "/api/v2/strategies/store-ready/prepare":
             self._store_ready_post()

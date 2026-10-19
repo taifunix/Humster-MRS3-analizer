@@ -3957,8 +3957,53 @@ if (typeof globalThis !== 'undefined') globalThis.portfolioSelectionHelpers = po
       const columns = (mainState.document?.columns || []).map((column) => column.key);
       const saved = mainState.settings[mainState.view]?.columns || [];
       const chosen = saved.filter((key) => columns.includes(key));
-      return chosen.length ? chosen : columns;
+      const defaults = (mainState.document?.default_columns || []).filter((key) => columns.includes(key));
+      return chosen.length ? chosen : defaults.length ? defaults : columns;
     };
+    // «Стратегии» (Panel stage 4a): filter toggles, marks in the table, metrics, marks from Excel
+    const strategyQuery = () => mainState.view !== 'strategies' ? ''
+      : `&hard=${mainEl('strategy-hard')?.checked ? 1 : 0}&top5=${mainEl('strategy-top5')?.checked ? 1 : 0}&hide=${mainEl('strategy-hide')?.checked ? 1 : 0}`;
+    const markCell = (row, key) => {
+      const td = document.createElement('td');
+      if (key === 'status') {
+        const select = node('select', null, 'main-mark');
+        select.setAttribute('aria-label', `Отметка ${row.strategy}`);
+        ['', 'FINALIST', 'RESERVE', 'REJECTED'].forEach((value) => {
+          const option = node('option', value || '—');
+          option.value = value;
+          select.append(option);
+        });
+        select.value = row.status || '';
+        select.addEventListener('change', () => saveMark(row, { status: select.value, user_rank: row.user_rank }));
+        td.append(select);
+      } else {
+        const input = document.createElement('input');
+        input.type = 'number';
+        input.min = '1';
+        input.step = '1';
+        input.className = 'main-mark main-mark-rank';
+        input.setAttribute('aria-label', `Ранг ${row.strategy}`);
+        input.value = row.user_rank ?? '';
+        input.disabled = !row.status;
+        input.addEventListener('change', () => saveMark(row, { status: row.status || '', user_rank: input.value === '' ? null : input.value }));
+        td.append(input);
+      }
+      return td;
+    };
+    async function saveMark(row, mark) {
+      try {
+        const saved = await remoteRequest('/api/v2/main/finalist', {
+          exchange: mainState.exchange, strategy: row.strategy, symbol: row.symbol, side: row.side || 'LONG', ...mark,
+        });
+        row.status = saved.status;
+        row.user_rank = saved.user_rank;
+        renderTable();
+        viewStatus(`Отметка ${row.strategy}: ${saved.status || 'снята'}${saved.user_rank ? `, ранг ${saved.user_rank}` : ''}.`);
+      } catch (error) {
+        renderTable();                           // the select and the rank go back to the stored mark
+        viewStatus(errorText(error, 'Отметка не сохранена.'));
+      }
+    }
     const visibleRows = () => {
       const shown = shownColumns();
       const filtered = mainScreenHelpers.filterRows(mainState.document?.rows || [], shown, mainEl('filter')?.value || '');
@@ -4014,6 +4059,10 @@ if (typeof globalThis !== 'undefined') globalThis.portfolioSelectionHelpers = po
         const tr = document.createElement('tr');
         shown.forEach((key) => {
           const td = document.createElement('td');
+          if (mainState.view === 'strategies' && (key === 'status' || key === 'user_rank')) {
+            tr.append(markCell(row, key));
+            return;
+          }
           if (key === 'symbol' && withCard && row.symbol) {
             const link = node('button', row.symbol, 'main-pair-link');
             link.type = 'button';
@@ -4024,15 +4073,18 @@ if (typeof globalThis !== 'undefined') globalThis.portfolioSelectionHelpers = po
         });
         return tr;
       }));
-      viewStatus(`Строк: ${rows.length} из ${(mainState.document.rows || []).length} · ${mainState.exchange === 'bingx' ? 'BingX' : 'Bybit'}`);
+      const notes = (mainState.document.notes || []).length ? ` · ${mainState.document.notes.join('; ')}` : '';
+      viewStatus(`Строк: ${rows.length} из ${(mainState.document.rows || []).length} · ${mainState.exchange === 'bingx' ? 'BingX' : 'Bybit'}${notes}`);
     }
     async function loadView() {
       const exchange = mainState.exchange;
       const view = mainState.view;
       try {
-        const document_ = await requestJson(`/api/v2/main/view?name=${encodeURIComponent(view)}&exchange=${encodeURIComponent(exchange)}`);
+        const document_ = await requestJson(`/api/v2/main/view?name=${encodeURIComponent(view)}&exchange=${encodeURIComponent(exchange)}${strategyQuery()}`);
         if (exchange !== mainState.exchange || view !== mainState.view) return;      // a newer choice won
         mainState.document = document_;
+        const top5Label = mainEl('strategy-top5-label');
+        if (top5Label && typeof document_.top5_share_pct === 'number') top5Label.textContent = `Топ-5 > ${document_.top5_share_pct} %`;
         renderColumnsPanel();
         renderTable();
       } catch (error) {
@@ -4047,11 +4099,47 @@ if (typeof globalThis !== 'undefined') globalThis.portfolioSelectionHelpers = po
         mainState.view = button.dataset.mainView;
         mainState.sort = null;
         mainState.desc = false;
+        const tools = mainEl('strategy-tools');
+        if (tools) tools.hidden = mainState.view !== 'strategies';
         document.querySelectorAll('[data-main-view]').forEach((item) => item.setAttribute('aria-pressed', String(item === button)));
         loadView();
       });
     });
     mainEl('filter')?.addEventListener('input', renderTable);
+    ['hard', 'top5', 'hide'].forEach((key) => mainEl(`strategy-${key}`)?.addEventListener('change', loadView));
+    mainEl('strategy-metrics')?.addEventListener('click', async () => {
+      const button = mainEl('strategy-metrics');
+      button.disabled = true;
+      const poll = window.setInterval(async () => {
+        try {
+          const progress = await requestJson('/api/v2/strategies/performance-v2/recalculate-all/progress');
+          viewStatus(`Метрики: ${progress.completed_pairs ?? 0} из ${progress.planned_pairs ?? progress.total_pairs ?? 0} пар${progress.current_pair ? ` · ${progress.current_pair}` : ''}`);
+        } catch (_) { /* the progress line is optional */ }
+      }, 2000);
+      try {
+        const result = await remoteRequest('/api/v2/strategies/performance-v2/recalculate-all', {});
+        viewStatus(`Метрики посчитаны: ${result.recalculated_pairs ?? 0} пар.`);
+        loadView();
+      } catch (error) { viewStatus(errorText(error, 'Метрики не посчитаны.')); }
+      finally { window.clearInterval(poll); button.disabled = false; }
+    });
+    mainEl('strategy-upload')?.addEventListener('click', () => mainEl('strategy-file')?.click());
+    mainEl('strategy-file')?.addEventListener('change', async () => {
+      const input = mainEl('strategy-file');
+      const file = input.files && input.files[0];
+      input.value = '';
+      if (!file) return;
+      try {
+        const result = await requestJson(`/api/v2/main/finalists.xlsx?exchange=${encodeURIComponent(mainState.exchange)}`, {
+          method: 'POST', headers: { 'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }, body: file,
+        });
+        if (!result.written) viewStatus(`Отметки не загружены: ${result.errors.map((item) => `строка ${item.row}: ${item.error}`).join('; ')}`);
+        else {
+          viewStatus(`Отметки загружены: изменено ${result.changed.length}, без изменений ${result.unchanged}, неизвестных ${result.unknown.length}.`);
+          loadView();
+        }
+      } catch (error) { viewStatus(errorText(error, 'Отметки не загружены.')); }
+    });
     mainEl('columns')?.addEventListener('click', () => {
       const panel = mainEl('columns-panel');
       panel.hidden = !panel.hidden;
@@ -4061,6 +4149,9 @@ if (typeof globalThis !== 'undefined') globalThis.portfolioSelectionHelpers = po
       const params = new URLSearchParams({ name: mainState.view, exchange: mainState.exchange, columns: shownColumns().join(','),
         text: mainEl('filter')?.value || '' });
       if (mainState.sort) { params.set('sort', mainState.sort); params.set('desc', mainState.desc ? '1' : '0'); }
+      if (mainState.view === 'strategies') {
+        ['hard', 'top5', 'hide'].forEach((key) => params.set(key, mainEl(`strategy-${key}`)?.checked ? '1' : '0'));
+      }
       const link = document.createElement('a');
       link.href = `/api/v2/main/view.xlsx?${params.toString()}`;
       link.download = '';

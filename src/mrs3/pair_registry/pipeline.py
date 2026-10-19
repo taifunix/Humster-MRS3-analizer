@@ -78,7 +78,12 @@ def _compute(con, store, exchange, as_of_day, machine, performance_db, now, trac
     imported = {"tester_samples": import_tester_samples(con, store, exchange, now_ms=now)}
     if performance_db is not None and Path(performance_db).is_file():
         imported["tick_tests"] = import_tick_tests(con, performance_db, exchange, now_ms=now)
-        imported["finalist_changes"] = import_finalists(con, performance_db, exchange, now_ms=now)
+        # ADR-0080: the registry is the only store of marks; the PerformanceDB reviews seed it once (migration) and
+        # never override a strategy that already has a registry mark (e.g. set in the Panel before the first Sync)
+        seeded = con.execute("select count(*) from finalists where exchange = ? and source = 'performance_db'",
+                             [exchange]).fetchone()[0]
+        imported["finalist_changes"] = 0 if seeded else import_finalists(con, performance_db, exchange, now_ms=now,
+                                                                         skip_marked=True)
     ready = _latest_ready(store, exchange)
     finalists = {}
     for row in current_finalists(con, exchange):

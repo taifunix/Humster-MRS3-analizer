@@ -219,8 +219,9 @@ def database_exchange(source: duckdb.DuckDBPyConnection) -> str:
 
 
 def import_finalists(con: duckdb.DuckDBPyConnection, performance_db: Path, exchange: str,
-                     *, now_ms: int | None = None) -> int:
-    """Each strategy's latest User Status (FINALIST / RESERVE / REJECTED) from the PerformanceDB selection reviews."""
+                     *, now_ms: int | None = None, skip_marked: bool = False) -> int:
+    """Each strategy's latest User Status (FINALIST / RESERVE / REJECTED) from the PerformanceDB selection reviews.
+    `skip_marked` leaves every strategy that already has a registry row alone (the ADR-0080 one-time seed)."""
     with _performance(performance_db) as source:
         tables = {row[0] for row in source.execute("select table_name from information_schema.tables").fetchall()}
         if not {"selection_review_rows", "selection_review_imports", "strategies"} <= tables:
@@ -236,6 +237,8 @@ def import_finalists(con: duckdb.DuckDBPyConnection, performance_db: Path, excha
     in_force = {row["strategy"]: row["status"] for row in current_finalists(con, exchange)}
     changes = 0
     for symbol, side, name, status, rank in rows:
+        if skip_marked and name in in_force:
+            continue
         if status in ("FINALIST", "RESERVE", "REJECTED"):
             changes += record_finalist(con, exchange, symbol, side, name, status, "performance_db", user_rank=rank,
                                        now_ms=now_ms)
