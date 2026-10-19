@@ -45,8 +45,6 @@ def test_a_v1_database_refuses_every_mrs3_flow_before_rendering(tmp_path: Path, 
         lambda: controller.strategies_performance_v2_retest_start({}),
         lambda: controller.strategies_performance_v2_finalist_retest_start({}),
         lambda: controller.strategies_tester_runs_start({}),
-        lambda: controller.strategies_fresh_generate({"analysis_run_id": "a" * 64}),
-        lambda: controller.strategies_fresh_generate_runs({"analysis_run_id": "a" * 64}),
         lambda: controller.strategies_tester_start(
             {"analysis_run_id": "a" * 64, "start_date": "2026-01-01", "end_date": "2026-01-31"}
         ),

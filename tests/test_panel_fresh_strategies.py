@@ -5,15 +5,13 @@ import json
 from hashlib import sha256
 import os
 from pathlib import Path
-import shutil
 import threading
 from time import monotonic, sleep
 from types import SimpleNamespace
 
-import pandas as pd
 import pytest
 
-from tests._protocol_v2 import protocol_v2_run_snapshot, use_protocol_v2_target
+from tests._protocol_v2 import use_protocol_v2_target
 
 
 @pytest.fixture(autouse=True)
@@ -21,520 +19,11 @@ def _protocol_v2_database(monkeypatch: pytest.MonkeyPatch):
     """MRS3 evaluation flows need a protocol v2 PerformanceDB (protocol v2 §7a)."""
     return use_protocol_v2_target(monkeypatch)
 
-from mrs3.config import AlgorithmConfig
 from mrs3.panel import PanelController, create_panel_server
 import mrs3.panel_jobs as panel_jobs_module
 from mrs3.panel_report_collection import PanelReportCollection
 from mrs3.panel_jobs import PanelJobError
 from mrs3.panel_tester_runs import LocalRunsBatchService, _RunsJob
-
-
-def test_fresh_shortlist_options_requires_version_for_new_flags() -> None:
-    parse = PanelController._fresh_shortlist_options
-
-    assert parse({"pretest_ab_enabled": True}) == (True, False, False)
-    assert parse({
-        "filter_version": "shortlist-v2",
-        "pretest_ab_enabled": True,
-        "ladder_enabled": True,
-        "pareto_enabled": False,
-    }) == (True, True, False)
-
-    with pytest.raises(ValueError, match="filter_version=shortlist-v2"):
-        parse({"ladder_enabled": False})
-    with pytest.raises(ValueError, match="_fresh_shortlist_settings"):
-        parse({
-            "filter_version": "shortlist-v2",
-            "min_shift_enabled": True,
-            "min_shift_pct": "0.300",
-        })
-
-
-@pytest.mark.parametrize("payload", [
-    {"filter_version": None},
-    {"filter_version": "shortlist-v3"},
-])
-def test_fresh_shortlist_options_rejects_unknown_versions(payload: dict[str, object]) -> None:
-    with pytest.raises(ValueError, match="unsupported filter_version"):
-        PanelController._fresh_shortlist_options(payload)
-
-
-@pytest.mark.parametrize("payload", [
-    {"filters": {"source_pnl": True}},
-    {"filters": {"source_pnl": False}, "efficiency": True},
-])
-def test_fresh_shortlist_options_rejects_enabled_legacy_flags_at_either_location(
-    payload: dict[str, object],
-) -> None:
-    with pytest.raises(ValueError, match="stale shortlist client"):
-        PanelController._fresh_shortlist_options(payload)
-
-
-@pytest.mark.parametrize("payload", [
-    {"filters": None},
-    {"filters": {"unknown": False}},
-    {"filters": {"source_pnl": 0}},
-    {"pareto_enabled": 1, "filter_version": "shortlist-v2"},
-    {"pretest_ab_enabled": "true"},
-])
-def test_fresh_shortlist_options_rejects_malformed_fields(payload: dict[str, object]) -> None:
-    with pytest.raises(ValueError):
-        PanelController._fresh_shortlist_options(payload)
-
-
-def test_fresh_selection_consumers_share_version_validation(tmp_path: Path) -> None:
-    config = tmp_path / "config.local.json"
-    config.write_text("{}", encoding="utf-8")
-    controller = PanelController(tmp_path, config, analysis_config_loader=lambda _: AlgorithmConfig.defaults())
-    invalid = {"filter_version": None}
-    calls = (
-        lambda: controller.strategies_fresh_shortlist(invalid),
-        lambda: controller.strategies_fresh_shortlist({**invalid, "audit": True}),
-        lambda: controller.strategies_fresh_filter_audit(invalid),
-        lambda: controller.strategies_fresh_generate(invalid),
-        lambda: controller.strategies_fresh_generate_runs(invalid),
-    )
-
-    for call in calls:
-        with pytest.raises(ValueError, match="unsupported filter_version"):
-            call()
-
-
-def test_fresh_shortlist_executor_uses_shared_duckdb_worker_setting(tmp_path: Path) -> None:
-    config = tmp_path / "config.local.json"
-    config.write_text(json.dumps({"duckdb_import": {"workers": 7}}), encoding="utf-8")
-    controller = PanelController(tmp_path, config, analysis_config_loader=lambda _: AlgorithmConfig.defaults())
-    observed: dict[str, object] = {}
-
-    def evaluate(*args: object, **kwargs: object) -> str:
-        observed["args"] = args
-        observed.update(kwargs)
-        return "result"
-
-    controller._fresh_shortlist_executor.evaluate_with_prepared = evaluate
-    assert controller._evaluate_fresh_shortlist_snapshot(Path("analysis.duckdb"), "analysis-id", (False, True, False)) == "result"
-    assert observed["workers"] == 7
-
-
-def test_panel_keeps_runs_backend_but_hides_legacy_run_controls() -> None:
-    panel_source = Path("src/mrs3/panel.py").read_text(encoding="utf-8")
-    panel_html = Path("src/mrs3/panel_web/index.html").read_text(encoding="utf-8")
-    web_source = Path("src/mrs3/panel_web/app.js").read_text(encoding="utf-8")
-
-    assert "/api/v2/strategies/fresh/runs" in panel_source
-    assert "strategies.tester.fast.start" not in panel_source
-    assert "strategies.tester.fast.retry" not in panel_source
-    assert "self._fast_strategy_test" not in panel_source
-    assert "LocalFastStrategyTestService" not in panel_source
-    assert 'id="shortlist-generate-runs"' not in panel_html
-    assert 'id="tester-start-runs"' not in panel_html
-    assert "strategies.tester.runs" not in web_source
-    assert 'id="tester-start"' in panel_html
-    assert "SINGLE_MODE" in panel_html
-    # The legacy single-page panel that carried these was removed in Panel rework stage 1a.
-    assert "async function analysisShortlist()" not in panel_source
-    assert "async function analysisStrategies()" not in panel_source
-
-
-def test_generation_validation_does_not_poison_the_next_request(tmp_path: Path) -> None:
-    config = tmp_path / "config.local.json"
-    config.write_text("{}", encoding="utf-8")
-    controller = PanelController(tmp_path, config, analysis_config_loader=lambda _: AlgorithmConfig.defaults())
-    controller._fresh_analysis_paths["a" * 64] = tmp_path / "run.analysis-v6.duckdb"
-
-    with pytest.raises(ValueError, match="Phase 2 filters must be booleans"):
-        controller.strategies_fresh_generate({
-            "analysis_run_id": "a" * 64,
-            "candidate_ids": ["candidate"],
-            "selected_scopes": [["BTCUSDT", "LONG", "1h"]],
-            "filters": {"source_pnl": "true"},
-        })
-
-
-def test_pretest_ab_flag_is_a_strict_top_level_boolean(tmp_path: Path) -> None:
-    config = tmp_path / "config.local.json"
-    config.write_text("{}", encoding="utf-8")
-    controller = PanelController(tmp_path, config, analysis_config_loader=lambda _: AlgorithmConfig.defaults())
-    analysis_id = "a" * 64
-    controller._fresh_analysis_paths[analysis_id] = tmp_path / "run.analysis-v6.duckdb"
-
-    with pytest.raises(ValueError, match="pretest_ab_enabled must be a boolean"):
-        controller.strategies_fresh_shortlist({
-            "analysis_run_id": analysis_id,
-            "filters": {},
-            "pretest_ab_enabled": "true",
-        })
-
-    with pytest.raises(ValueError, match="pretest_ab_enabled must be a boolean"):
-        controller.strategies_fresh_generate({
-            "analysis_run_id": analysis_id,
-            "candidate_ids": ["candidate"],
-            "selected_scopes": [["BTCUSDT", "LONG", "1h"]],
-            "pretest_ab_enabled": 1,
-        })
-
-    assert controller._fresh_generation_job is None
-
-
-def test_fresh_generation_worker_keeps_pretest_ab_flag_strict(tmp_path: Path, monkeypatch) -> None:
-    config = tmp_path / "config.local.json"
-    config.write_text("{}", encoding="utf-8")
-    controller = PanelController(tmp_path, config, analysis_config_loader=lambda _: AlgorithmConfig.defaults())
-    analysis_id = "a" * 64
-    controller._fresh_analysis_paths[analysis_id] = tmp_path / "run.analysis-v6.duckdb"
-    monkeypatch.setattr(controller, "_workflow_default", lambda *_args, **_kwargs: tmp_path / "template.json")
-    monkeypatch.setattr(
-        "mrs3.panel.generate_fresh_analysis_strategies",
-        lambda *_args, **_kwargs: SimpleNamespace(
-            manifest_path=tmp_path / "manifest.json", run_id="a" * 64, surface_id="surface", strategy_count=0,
-        ),
-    )
-
-    with pytest.raises(ValueError, match="pretest_ab_enabled must be a boolean"):
-        controller._generate_fresh_strategies({
-            "analysis_run_id": analysis_id,
-            "candidate_ids": ["candidate"],
-            "selected_scopes": [["BTCUSDT", "LONG", "1h"]],
-            "pretest_ab_enabled": 1,
-        })
-
-
-def test_generation_thread_start_failure_does_not_poison_the_next_request(tmp_path: Path, monkeypatch) -> None:
-    from tests.test_fresh_analysis_strategies import _make_analysis
-
-    config = tmp_path / "config.local.json"
-    config.write_text("{}", encoding="utf-8")
-    analysis_path = tmp_path / "run.analysis-v6.duckdb"
-    analysis_id, _ = _make_analysis(analysis_path)
-    controller = PanelController(tmp_path, config, analysis_config_loader=lambda _: AlgorithmConfig.defaults())
-    controller._fresh_analysis_paths[analysis_id] = analysis_path
-    snapshot = controller.strategies_fresh_shortlist({
-        "analysis_run_id": analysis_id, "filter_version": "shortlist-v2",
-        "pretest_ab_enabled": False, "ladder_enabled": False, "pareto_enabled": False,
-        "min_shift_enabled": True, "min_shift_pct": "0.3",
-    })
-
-    class FailingThread:
-        def __init__(self, **_kwargs) -> None:
-            pass
-
-        def start(self) -> None:
-            raise RuntimeError("thread capacity unavailable")
-
-    monkeypatch.setattr("mrs3.panel.threading.Thread", FailingThread)
-
-    with pytest.raises(RuntimeError, match="thread capacity unavailable"):
-        controller.strategies_fresh_generate({
-            "analysis_run_id": analysis_id,
-            "filter_version": "shortlist-v2",
-            "pretest_ab_enabled": False, "ladder_enabled": False, "pareto_enabled": False,
-            "min_shift_enabled": True, "min_shift_pct": "0.3",
-            "selection_token": snapshot["selection_token"],
-            "candidate_ids": ["browser-id"],
-            "selected_scopes": [["BTCUSDT", "LONG", "1h"]],
-            "filters": {},
-        })
-
-    assert controller._fresh_generation_job is None
-
-
-def test_http_generation_start_failure_reports_actionable_reason(tmp_path: Path, monkeypatch) -> None:
-    config = tmp_path / "config.local.json"
-    config.write_text("{}", encoding="utf-8")
-    controller = PanelController(tmp_path, config, analysis_config_loader=lambda _: AlgorithmConfig.defaults())
-
-    def fail_start(_payload):
-        raise RuntimeError("thread capacity unavailable")
-
-    monkeypatch.setattr(controller, "strategies_fresh_generate", fail_start)
-    server = create_panel_server("127.0.0.1", 0, controller)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
-    try:
-        payload = json.dumps({}).encode("utf-8")
-        connection.request("POST", "/api/v2/strategies/fresh/generate", payload, {"Content-Type": "application/json"})
-        response = connection.getresponse()
-        body = json.loads(response.read().decode("utf-8"))
-    finally:
-        connection.close()
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=2)
-
-    assert response.status == 409
-    assert body == {"error": "thread capacity unavailable"}
-
-
-def test_http_generation_reports_missing_content_type(tmp_path: Path) -> None:
-    config = tmp_path / "config.local.json"
-    config.write_text("{}", encoding="utf-8")
-    controller = PanelController(tmp_path, config, analysis_config_loader=lambda _: AlgorithmConfig.defaults())
-    server = create_panel_server("127.0.0.1", 0, controller)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
-    try:
-        connection.request("POST", "/api/v2/strategies/fresh/generate", b"{}")
-        response = connection.getresponse()
-        body = json.loads(response.read().decode("utf-8"))
-    finally:
-        connection.close()
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=2)
-
-    assert response.status == 415
-    assert body == {"error": "Content-Type must be application/json"}
-
-
-def test_http_fresh_analysis_reports_missing_listing_dates_actionably(tmp_path: Path, monkeypatch) -> None:
-    config = tmp_path / "config.local.json"
-    config.write_text(json.dumps({"panel_workflow": {"listing_dates_path": "Input/dates.xlsx"}}), encoding="utf-8")
-    surface = tmp_path / "surface.surface-v6.duckdb"
-    surface.write_bytes(b"surface")
-    monkeypatch.setattr("mrs3.panel.read_multiscope_surface", lambda *_args, **_kwargs: {"surface_id": "surface"})
-    controller = PanelController(tmp_path, config, analysis_config_loader=lambda _: AlgorithmConfig.defaults())
-    server = create_panel_server("127.0.0.1", 0, controller)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
-    try:
-        payload = json.dumps({"surface_path": str(surface)}).encode("utf-8")
-        connection.request("POST", "/api/v2/strategies/fresh/analyze", payload, {"Content-Type": "application/json"})
-        response = connection.getresponse()
-        body = json.loads(response.read().decode("utf-8"))
-    finally:
-        connection.close()
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=2)
-
-    assert response.status == 400
-    assert body == {"error": "Listing dates XLSX is missing. Add it and save Settings > Analysis profile."}
-
-
-@pytest.mark.parametrize(
-    ("raw_error", "expected"),
-    [
-        (
-            "invalid analysis inputs: duplicate listing dates: ['AMCUSDT']",
-            "Listing dates file contains duplicate symbols. Fix it or choose another file in Settings > Analysis profile.",
-        ),
-        (
-            "invalid analysis inputs: invalid listing dates: Permission denied",
-            "Listing dates file is locked or unreadable. Close it and try again, or choose another file in Settings > Analysis profile.",
-        ),
-        (
-            "invalid analysis inputs: invalid listing dates: unsupported workbook",
-            "Listing dates file has an invalid or unsupported format. Choose a two-column dates file or the liquidity registry in Settings > Analysis profile.",
-        ),
-    ],
-)
-def test_fresh_analysis_listing_date_errors_are_not_reported_as_missing(
-    raw_error: str, expected: str
-) -> None:
-    from mrs3.panel import _fresh_analysis_error
-
-    assert _fresh_analysis_error(raw_error) == expected
-
-
-def test_http_fresh_analysis_reports_corrupt_listing_dates_as_invalid_format(
-    tmp_path: Path, monkeypatch
-) -> None:
-    corrupt = tmp_path / "corrupt.xlsx"
-    corrupt.write_bytes(b"not-an-xlsx-archive")
-    config = tmp_path / "config.local.json"
-    config.write_text(
-        json.dumps({"panel_workflow": {"listing_dates_path": str(corrupt)}}),
-        encoding="utf-8",
-    )
-    surface = tmp_path / "surface.surface-v6.duckdb"
-    surface.write_bytes(b"surface")
-    monkeypatch.setattr(
-        "mrs3.panel.read_multiscope_surface", lambda *_args, **_kwargs: {"surface_id": "surface"}
-    )
-    controller = PanelController(
-        tmp_path, config, analysis_config_loader=lambda _: AlgorithmConfig.defaults()
-    )
-    server = create_panel_server("127.0.0.1", 0, controller)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
-    try:
-        payload = json.dumps({"surface_path": str(surface)}).encode("utf-8")
-        connection.request(
-            "POST",
-            "/api/v2/strategies/fresh/analyze",
-            payload,
-            {"Content-Type": "application/json"},
-        )
-        response = connection.getresponse()
-        status = response.status
-        body = json.loads(response.read().decode("utf-8"))
-    finally:
-        connection.close()
-        server.shutdown(); server.server_close(); thread.join(timeout=2)
-
-    assert status == 200
-    assert body == {
-        "phase": "FAILED",
-        "error": "Listing dates file has an invalid or unsupported format. Choose a two-column dates file or the liquidity registry in Settings > Analysis profile."
-    }
-
-
-def test_http_fresh_analysis_reports_incomplete_registry_as_invalid_format(
-    tmp_path: Path, monkeypatch
-) -> None:
-    registry = tmp_path / "incomplete-registry.xlsx"
-    pd.DataFrame({"Пара": ["AAAUSDT"], "wrong date": ["2026-07-01"]}).to_excel(
-        registry, sheet_name="Пары", index=False
-    )
-    config = tmp_path / "config.local.json"
-    config.write_text(
-        json.dumps({"panel_workflow": {"listing_dates_path": str(registry)}}),
-        encoding="utf-8",
-    )
-    surface = tmp_path / "surface.surface-v6.duckdb"
-    surface.write_bytes(b"surface")
-    monkeypatch.setattr(
-        "mrs3.panel.read_multiscope_surface", lambda *_args, **_kwargs: {"surface_id": "surface"}
-    )
-    controller = PanelController(
-        tmp_path, config, analysis_config_loader=lambda _: AlgorithmConfig.defaults()
-    )
-
-    result = controller.strategies_fresh_analyze({"surface_path": str(surface)})
-
-    assert result == {
-        "phase": "FAILED",
-        "error": "Listing dates file has an invalid or unsupported format. Choose a two-column dates file or the liquidity registry in Settings > Analysis profile.",
-    }
-
-
-def test_http_generation_accepts_a_large_ready_selection_payload(tmp_path: Path) -> None:
-    config = tmp_path / "config.local.json"
-    config.write_text("{}", encoding="utf-8")
-    controller = PanelController(tmp_path, config, analysis_config_loader=lambda _: AlgorithmConfig.defaults())
-    server = create_panel_server("127.0.0.1", 0, controller)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
-    try:
-        payload = json.dumps({"padding": "x" * 70_000}).encode("utf-8")
-        connection.request("POST", "/api/v2/strategies/fresh/generate", payload, {"Content-Type": "application/json"})
-        response = connection.getresponse()
-        body = json.loads(response.read().decode("utf-8"))
-    finally:
-        connection.close()
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=2)
-
-    assert response.status == 400
-    assert body == {"error": "selected_scopes must be a list"}
-
-
-def test_run_files_uses_filtered_ready_candidates(tmp_path: Path, monkeypatch) -> None:
-    from tests.test_fresh_analysis_strategies import _make_analysis
-
-    config = tmp_path / "config.local.json"; config.write_text("{}", encoding="utf-8")
-    template_root = tmp_path / "templates" / "exchanges" / "Bybit"
-    template_root.mkdir(parents=True)
-    shutil.copyfile(
-        Path(__file__).parents[1] / "templates" / "exchanges" / "Bybit" / "mrs3-tester.json",
-        template_root / "mrs3-tester.json",
-    )
-    template = tmp_path / "Input" / "run_snapshot_2.json"; template.parent.mkdir()
-    template.write_text(json.dumps(protocol_v2_run_snapshot()), encoding="utf-8")
-    tester_config = tmp_path / "bot" / "tester" / "config_tester.json"; tester_config.parent.mkdir(parents=True)
-    tester_config.write_text('{"use_runs": false}', encoding="utf-8")
-    monkeypatch.setattr("mrs3.panel.RunnerConfig.from_json", lambda _path: SimpleNamespace(
-        bot_root=tmp_path / "bot", tester_config=tester_config, max_parallel_submissions=7,
-    ))
-    analysis_path = tmp_path / "run.analysis-v6.duckdb"
-    analysis_id, _ = _make_analysis(analysis_path)
-    controller = PanelController(tmp_path, config, analysis_config_loader=lambda _: AlgorithmConfig.defaults())
-    controller._fresh_analysis_paths[analysis_id] = analysis_path
-    snapshot = controller.strategies_fresh_shortlist({
-        "analysis_run_id": analysis_id, "filter_version": "shortlist-v2",
-        "pretest_ab_enabled": False, "ladder_enabled": False, "pareto_enabled": False,
-        "min_shift_enabled": True, "min_shift_pct": "0.3",
-    })
-
-    result = controller.strategies_fresh_generate_runs({
-        "analysis_run_id": analysis_id, "filter_version": "shortlist-v2",
-        "pretest_ab_enabled": False, "ladder_enabled": False, "pareto_enabled": False,
-        "min_shift_enabled": True, "min_shift_pct": "0.3",
-        "selection_token": snapshot["selection_token"],
-        "selected_scopes": [["BTCUSDT", "LONG", "1h"]],
-        "start_date": "2026-08-01", "end_date": "2026-08-18",
-    })
-
-    assert result["run_count"] == 1
-    assert len(list((tmp_path / "bot" / "tester" / "runs").glob("*.json"))) == 1
-    global_config = json.loads(tester_config.read_text(encoding="utf-8"))
-    assert global_config["use_runs"] is True
-    assert global_config["max_parallel_runs"] == 7
-    runs_manifest = json.loads((tmp_path / "bot" / "tester" / "runs_manifest.json").read_text(encoding="utf-8"))
-    assert runs_manifest["shortlist_v2"]["selection_token"] == snapshot["selection_token"]
-    assert runs_manifest["shortlist_v2"]["selected_candidate_ids"] == ["STR-READY"]
-    assert runs_manifest["shortlist_v2"]["applied_options"] == {
-        "pretest_ab_enabled": False, "ladder_enabled": False, "pareto_enabled": False,
-        "min_shift_enabled": True, "min_shift_pct": "0.300",
-    }
-
-
-def test_fresh_generation_uses_config_workflow_defaults_not_browser_paths(tmp_path: Path, monkeypatch) -> None:
-    from tests.test_fresh_analysis_strategies import _make_analysis
-
-    config = tmp_path / "config.local.json"
-    config.write_text(json.dumps({
-        "panel_workflow": {
-            "listing_dates_path": "input/dates.xlsx",
-            "strategy_templates": {"LONG": "input/long.json", "SHORT": "input/short.json"},
-        },
-    }), encoding="utf-8")
-    analysis_path = tmp_path / "run.analysis-v6.duckdb"
-    analysis_id, _ = _make_analysis(analysis_path)
-    captured: dict[str, object] = {}
-
-    def generate(*args, **kwargs):
-        captured["args"] = args
-        captured["kwargs"] = kwargs
-        return SimpleNamespace(
-            run_id="a" * 64, surface_id="surface", strategy_count=1,
-            manifest_path=tmp_path / "output" / "strategy_manifest.json",
-        )
-
-    monkeypatch.setattr("mrs3.panel.generate_fresh_analysis_strategies", generate)
-    controller = PanelController(tmp_path, config, analysis_config_loader=lambda _: AlgorithmConfig.defaults())
-    controller._fresh_analysis_paths[analysis_id] = analysis_path
-    snapshot = controller.strategies_fresh_shortlist({
-        "analysis_run_id": analysis_id, "filter_version": "shortlist-v2",
-        "pretest_ab_enabled": False, "ladder_enabled": False, "pareto_enabled": False,
-    })
-    started = controller.strategies_fresh_generate({
-        "analysis_path": "run.analysis-v6.duckdb", "analysis_run_id": analysis_id,
-        "filter_version": "shortlist-v2",
-        "pretest_ab_enabled": False, "ladder_enabled": False, "pareto_enabled": False,
-        "selection_token": snapshot["selection_token"],
-        "candidate_ids": ["BROWSER-FORGED-ID"], "selected_scopes": [["BTCUSDT", "LONG", "1h"]],
-    })
-
-    deadline = monotonic() + 1
-    result = controller.strategies_fresh_generation_status(str(started["job_id"]))
-    while result["running"] and monotonic() < deadline:
-        sleep(0.01)
-        result = controller.strategies_fresh_generation_status(str(started["job_id"]))
-
-    args = captured["args"]
-    assert Path(args[4]).name == "long.json"
-    assert Path(args[5]).parent == tmp_path / "Output" / "fresh-shortlist-v2" / analysis_id
-    assert args[2] == ("STR-READY",)
-    assert captured["kwargs"]["selection"].selection_token == snapshot["selection_token"]
-    assert result["phase"] == "COMMITTED"
-    assert result["strategy_count"] == 1
 
 
 def test_fresh_batch_is_recovered_from_output_after_panel_restart(tmp_path: Path, monkeypatch) -> None:
@@ -548,7 +37,7 @@ def test_fresh_batch_is_recovered_from_output_after_panel_restart(tmp_path: Path
         provenance={"strategy_json_sha256": {"S0.json": "0" * 64}},
     ))
 
-    controller = PanelController(tmp_path, config, analysis_config_loader=lambda _: AlgorithmConfig.defaults())
+    controller = PanelController(tmp_path, config)
 
     assert controller.strategies_fresh_batch() == {
         "phase": "COMMITTED", "analysis_run_id": "a" * 64, "strategy_count": 1,
@@ -572,82 +61,13 @@ def test_fresh_batch_recovery_ignores_unpublished_and_malformed_directories(
     monkeypatch.setattr("mrs3.panel.validate_strategy_manifest", lambda path: SimpleNamespace(
         manifest_path=Path(path), analysis_run_id=analysis_id,
     ))
-    controller = PanelController(tmp_path, tmp_path / "config.local.json", analysis_config_loader=lambda _: AlgorithmConfig.defaults())
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
 
     assert controller._fresh_strategy_manifest(analysis_id) == published / "strategy_manifest.json"
 
 
-def test_generation_status_keeps_safe_generation_error(tmp_path: Path, monkeypatch) -> None:
-    from tests.test_fresh_analysis_strategies import _make_analysis
-
-    config = tmp_path / "config.local.json"
-    config.write_text(json.dumps({
-        "panel_workflow": {
-            "strategy_templates": {"LONG": "input/long.json", "SHORT": "input/short.json"},
-        },
-    }), encoding="utf-8")
-    analysis_path = tmp_path / "run.analysis-v6.duckdb"
-    analysis_id, _ = _make_analysis(analysis_path)
-    controller = PanelController(tmp_path, config, analysis_config_loader=lambda _: AlgorithmConfig.defaults())
-    controller._fresh_analysis_paths[analysis_id] = analysis_path
-    snapshot = controller.strategies_fresh_shortlist({
-        "analysis_run_id": analysis_id, "filter_version": "shortlist-v2",
-        "pretest_ab_enabled": False, "ladder_enabled": False, "pareto_enabled": False,
-    })
-    monkeypatch.setattr("mrs3.panel.generate_fresh_analysis_strategies", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("panel workflow default is unavailable")))
-
-    started = controller.strategies_fresh_generate({
-        "analysis_run_id": analysis_id, "filter_version": "shortlist-v2",
-        "pretest_ab_enabled": False, "ladder_enabled": False, "pareto_enabled": False,
-        "selection_token": snapshot["selection_token"], "candidate_ids": ["candidate"],
-        "selected_scopes": [["BTCUSDT", "LONG", "1h"]],
-    })
-    deadline = monotonic() + 1
-    result = controller.strategies_fresh_generation_status(str(started["job_id"]))
-    while result["running"] and monotonic() < deadline:
-        sleep(0.01)
-        result = controller.strategies_fresh_generation_status(str(started["job_id"]))
-
-    assert result["phase"] == "FAILED"
-    assert result["error"] == "READY JSON generation failed: panel workflow default is unavailable"
-
-
-def test_generation_status_redacts_path_from_permission_error(tmp_path: Path, monkeypatch) -> None:
-    from tests.test_fresh_analysis_strategies import _make_analysis
-
-    config = tmp_path / "config.local.json"
-    config.write_text(json.dumps({"panel_workflow": {"strategy_templates": {"LONG": "input/long.json"}}}), encoding="utf-8")
-    analysis_path = tmp_path / "run.analysis-v6.duckdb"
-    analysis_id, _ = _make_analysis(analysis_path)
-    controller = PanelController(tmp_path, config, analysis_config_loader=lambda _: AlgorithmConfig.defaults())
-    controller._fresh_analysis_paths[analysis_id] = analysis_path
-    snapshot = controller.strategies_fresh_shortlist({
-        "analysis_run_id": analysis_id, "filter_version": "shortlist-v2",
-        "pretest_ab_enabled": False, "ladder_enabled": False, "pareto_enabled": False,
-    })
-    monkeypatch.setattr(
-        "mrs3.panel.generate_fresh_analysis_strategies",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(PermissionError(13, "Access is denied", tmp_path / "Output" / "strategies")),
-    )
-
-    started = controller.strategies_fresh_generate({
-        "analysis_run_id": analysis_id, "filter_version": "shortlist-v2",
-        "pretest_ab_enabled": False, "ladder_enabled": False, "pareto_enabled": False,
-        "selection_token": snapshot["selection_token"], "candidate_ids": ["candidate"],
-        "selected_scopes": [["BTCUSDT", "LONG", "1h"]],
-    })
-    deadline = monotonic() + 1
-    result = controller.strategies_fresh_generation_status(str(started["job_id"]))
-    while result["running"] and monotonic() < deadline:
-        sleep(0.01)
-        result = controller.strategies_fresh_generation_status(str(started["job_id"]))
-
-    assert result["error"] == "READY JSON generation failed: permission denied while publishing strategy files"
-    assert str(tmp_path) not in result["error"]
-
-
 def test_tester_job_uses_the_ui_recovery_kind(tmp_path: Path, monkeypatch) -> None:
-    controller = PanelController(tmp_path, tmp_path / "config.local.json", analysis_config_loader=lambda _: AlgorithmConfig.defaults())
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
     captured: dict[str, object] = {}
     monkeypatch.setattr(controller, "_fresh_strategy_manifest", lambda _analysis_id: tmp_path / "strategy_manifest.json")
     monkeypatch.setattr(controller, "_start_tracked_panel_job", lambda kind, request, _keys, submit, **_kwargs: captured.update(kind=kind, request=request, submit=submit))
@@ -664,7 +84,7 @@ def test_tester_job_uses_the_ui_recovery_kind(tmp_path: Path, monkeypatch) -> No
 
 
 def test_tester_start_http_rejects_a_start_balance_before_creating_job(tmp_path: Path) -> None:
-    controller = PanelController(tmp_path, tmp_path / "config.local.json", analysis_config_loader=lambda _: AlgorithmConfig.defaults())
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
     server = create_panel_server("127.0.0.1", 0, controller)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -691,7 +111,7 @@ def test_tester_start_http_rejects_a_start_balance_before_creating_job(tmp_path:
 
 
 def test_tester_start_http_reports_journal_write_failure_without_ghost_job(tmp_path: Path, monkeypatch) -> None:
-    controller = PanelController(tmp_path, tmp_path / "config.local.json", analysis_config_loader=lambda _: AlgorithmConfig.defaults())
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
     monkeypatch.setattr(controller, "_fresh_strategy_manifest", lambda _analysis_id: tmp_path / "strategy_manifest.json")
     tester_started: list[str] = []
     monkeypatch.setattr(
@@ -733,7 +153,7 @@ def test_tester_start_http_reports_journal_write_failure_without_ghost_job(tmp_p
 def test_tester_start_http_reports_collection_journal_failure(tmp_path: Path, monkeypatch) -> None:
     config_path = tmp_path / "config.local.json"
     config_path.write_text("{}", encoding="utf-8")
-    controller = PanelController(tmp_path, config_path, analysis_config_loader=lambda _: AlgorithmConfig.defaults())
+    controller = PanelController(tmp_path, config_path)
     monkeypatch.setattr(controller, "_fresh_strategy_manifest", lambda _analysis_id: tmp_path / "strategy_manifest.json")
     monkeypatch.setattr(controller, "_manifest_strategy_names", lambda _manifest: ("strategy-a",))
     collection = PanelReportCollection(
@@ -788,7 +208,7 @@ def test_tester_start_http_reports_collection_journal_failure(tmp_path: Path, mo
 
 @pytest.mark.parametrize("kind", ("strategies.tester.fast.start", "strategies.tester.fast.retry"))
 def test_fast_tester_routes_are_removed(tmp_path: Path, kind: str) -> None:
-    controller = PanelController(tmp_path, tmp_path / "config.local.json", analysis_config_loader=lambda _: AlgorithmConfig.defaults())
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
     with pytest.raises(PanelJobError, match="UNSUPPORTED_ROUTE"):
         controller.panel_job_submit({
             "kind": kind,
@@ -799,7 +219,7 @@ def test_fast_tester_routes_are_removed(tmp_path: Path, kind: str) -> None:
 
 
 def test_committed_tester_inbox_readiness_survives_panel_reload(tmp_path: Path) -> None:
-    controller = PanelController(tmp_path, tmp_path / "config.local.json", analysis_config_loader=lambda _: AlgorithmConfig.defaults())
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
     job = controller._panel_jobs.submit("strategies.tester.runs", {}, "tester", ("strategies.tester",))
     controller._panel_jobs.transition(job["job_id"], "RUNNING")
 
@@ -809,7 +229,7 @@ def test_committed_tester_inbox_readiness_survives_panel_reload(tmp_path: Path) 
 
 
 def test_tester_progress_does_not_rewrite_registry_until_phase_or_evidence_changes(tmp_path: Path, monkeypatch) -> None:
-    controller = PanelController(tmp_path, tmp_path / "config.local.json", analysis_config_loader=lambda _: AlgorithmConfig.defaults())
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
     job = controller._panel_jobs.submit("strategies.tester.start", {}, "tester-progress", ("strategies.tester",))
     controller._panel_jobs.transition(job["job_id"], "RUNNING")
     saves = 0
@@ -864,7 +284,7 @@ def test_tester_progress_does_not_rewrite_registry_until_phase_or_evidence_chang
 
 
 def test_panel_jobs_projects_only_tester_verified_report_maps(tmp_path: Path) -> None:
-    controller = PanelController(tmp_path, tmp_path / "config.local.json", analysis_config_loader=lambda _: AlgorithmConfig.defaults())
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
     tester = controller._panel_jobs.submit("strategies.tester.start", {}, "tester-public", ("strategies.tester",))
     source = controller._panel_jobs.submit("source.local-import", {}, "source-public", ("source",))
     controller._panel_jobs.sync(
@@ -886,7 +306,7 @@ def test_panel_jobs_projects_only_tester_verified_report_maps(tmp_path: Path) ->
 def test_failed_native_tester_can_start_a_tracked_retry(
     tmp_path: Path, source_kind: str, source_phase: str, _protocol_v2_database,
 ) -> None:
-    controller = PanelController(tmp_path, tmp_path / "config.local.json", analysis_config_loader=lambda _: AlgorithmConfig.defaults())
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
     source = controller._panel_jobs.submit(
         source_kind, {}, "native-source", ("strategies.tester",),
         runtime=PanelController._protocol_v2_runtime(_protocol_v2_database),
@@ -917,7 +337,7 @@ def test_existing_committed_tester_inbox_is_marked_ready_on_panel_reload(tmp_pat
     config.write_text("{}", encoding="utf-8")
     inbox_root = tmp_path / "inbox"
     monkeypatch.setattr("mrs3.panel.RunnerConfig.from_json", lambda _path: SimpleNamespace(inbox_root=inbox_root))
-    controller = PanelController(tmp_path, config, analysis_config_loader=lambda _: AlgorithmConfig.defaults())
+    controller = PanelController(tmp_path, config)
     job = controller._panel_jobs.submit(kind, {}, "tester", job_id="batch-1")
     controller._panel_jobs.transition(job["job_id"], "RUNNING")
     inbox = inbox_root / job["job_id"]
@@ -937,7 +357,7 @@ def test_interrupted_single_mode_commit_is_recovered_from_durable_inbox(tmp_path
     inbox = inbox_root / "single-job"
     inbox.mkdir(parents=True)
     monkeypatch.setattr("mrs3.panel.RunnerConfig.from_json", lambda _path: SimpleNamespace(inbox_root=inbox_root))
-    controller = PanelController(tmp_path, config, analysis_config_loader=lambda _: AlgorithmConfig.defaults())
+    controller = PanelController(tmp_path, config)
     job = controller._panel_jobs.submit(
         "strategies.tester.retry", {}, "single", ("strategies.tester",), job_id="single-job"
     )
@@ -961,7 +381,7 @@ def test_interrupted_finalist_retest_releases_resource_and_keeps_frozen_cohort(t
         "mrs3.panel.RunnerConfig.from_json",
         lambda _path: SimpleNamespace(inbox_root=tmp_path / "inbox"),
     )
-    controller = PanelController(tmp_path, config, analysis_config_loader=lambda _: AlgorithmConfig.defaults())
+    controller = PanelController(tmp_path, config)
     job = controller._panel_jobs.submit(
         "strategies.performance.v2.finalist-retest", {"scope": "ALL"}, "bulk-finalist",
         ("strategies.tester", "performance-v2-finalist-retest"), job_id="bulk-finalist",
@@ -982,7 +402,7 @@ def test_interrupted_finalist_retest_releases_resource_and_keeps_frozen_cohort(t
     assert controller._panel_jobs.get(job["job_id"])["progress"]["current"] == 72
     assert controller._panel_jobs.progress_directory.is_dir()
 
-    restarted = PanelController(tmp_path, config, analysis_config_loader=lambda _: AlgorithmConfig.defaults())
+    restarted = PanelController(tmp_path, config)
 
     recovered = restarted._panel_jobs.get(job["job_id"])
     assert recovered["state"] == "FAILED"
@@ -1005,7 +425,7 @@ def test_single_mode_verify_routes_through_existing_performance_inbox_button(tmp
     config.write_text("{}", encoding="utf-8")
     inbox = tmp_path / "inbox" / "single-job"
     inbox.mkdir(parents=True)
-    controller = PanelController(tmp_path, config, analysis_config_loader=lambda _: AlgorithmConfig.defaults())
+    controller = PanelController(tmp_path, config)
     job = controller._panel_jobs.submit(
         "strategies.tester.start", {"mode": "SINGLE_MODE"}, "single", ("strategies.tester",), job_id="single-job"
     )
@@ -1043,7 +463,7 @@ def test_single_mode_repeated_verify_reuses_the_verified_inbox(tmp_path: Path, m
     inbox = inbox_root / "single-job"
     inbox.mkdir(parents=True)
     (inbox / "inbox_manifest.json").write_text(json.dumps({"batch_id": "single-job"}), encoding="utf-8")
-    controller = PanelController(tmp_path, config, analysis_config_loader=lambda _: AlgorithmConfig.defaults())
+    controller = PanelController(tmp_path, config)
     job = controller._panel_jobs.submit(
         "strategies.tester.start", {"mode": "SINGLE_MODE"}, "single", ("strategies.tester",), job_id="single-job"
     )
@@ -1075,7 +495,7 @@ def test_single_mode_verify_rejects_an_inbox_owned_by_another_job(tmp_path: Path
     inbox = inbox_root / "single-job"
     inbox.mkdir(parents=True)
     (inbox / "inbox_manifest.json").write_text(json.dumps({"batch_id": "other-job"}), encoding="utf-8")
-    controller = PanelController(tmp_path, config, analysis_config_loader=lambda _: AlgorithmConfig.defaults())
+    controller = PanelController(tmp_path, config)
     job = controller._panel_jobs.submit(
         "strategies.tester.start", {"mode": "SINGLE_MODE"}, "single", ("strategies.tester",), job_id="single-job"
     )
@@ -1112,7 +532,7 @@ def test_pre_v2_native_tester_job_rebuilds_its_metadata_inbox(tmp_path: Path, mo
     config.write_text("{}", encoding="utf-8")
     inbox = tmp_path / "inbox" / "native-job"
     inbox.mkdir(parents=True)
-    controller = PanelController(tmp_path, config, analysis_config_loader=lambda _: AlgorithmConfig.defaults())
+    controller = PanelController(tmp_path, config)
     job = controller._panel_jobs.submit(
         "strategies.tester.native.start", {}, "native", ("strategies.tester",), job_id="native-job"
     )
@@ -1145,7 +565,7 @@ def test_committed_retest_without_inbox_uses_explicit_capture(tmp_path: Path, mo
     config.write_text("{}", encoding="utf-8")
     inbox = tmp_path / "inbox" / "retest-job"
     inbox.mkdir(parents=True)
-    controller = PanelController(tmp_path, config, analysis_config_loader=lambda _: AlgorithmConfig.defaults())
+    controller = PanelController(tmp_path, config)
     job = controller._panel_jobs.submit(
         "strategies.tester.native.start", {"retest": True}, "native", ("strategies.tester",), job_id="retest-job"
     )
@@ -1180,7 +600,7 @@ def test_runs_tester_rejects_an_empty_runs_directory(tmp_path: Path, monkeypatch
     (bot_root / "tester" / "runs").mkdir(parents=True)
     (bot_root / "run_tester.bat").write_text("@echo off\n", encoding="utf-8")
     monkeypatch.setattr("mrs3.panel.RunnerConfig.from_json", lambda _path: SimpleNamespace(bot_root=bot_root))
-    controller = PanelController(tmp_path, config, analysis_config_loader=lambda _: AlgorithmConfig.defaults())
+    controller = PanelController(tmp_path, config)
 
     try:
         controller.strategies_tester_runs_start({})
@@ -1242,7 +662,7 @@ def test_runs_terminal_state_is_hidden_until_target_is_finalized(tmp_path: Path)
 
 def test_runs_and_regular_tester_share_the_panel_job_resource(tmp_path: Path) -> None:
     config = tmp_path / "config.local.json"; config.write_text("{}", encoding="utf-8")
-    controller = PanelController(tmp_path, config, analysis_config_loader=lambda _: AlgorithmConfig.defaults())
+    controller = PanelController(tmp_path, config)
     job = controller._panel_jobs.submit("strategies.tester.start", {}, "regular", ("strategies.tester",))
     controller._panel_jobs.transition(job["job_id"], "RUNNING")
 
@@ -1266,7 +686,7 @@ def test_completed_tester_batch_is_recovered_after_panel_restart(tmp_path: Path,
             report_dir=tmp_path / "reports",
         ),
     )
-    controller = PanelController(tmp_path, config, analysis_config_loader=lambda _: AlgorithmConfig.defaults())
+    controller = PanelController(tmp_path, config)
     job = controller._panel_jobs.submit("strategies.tester.start", {"analysis_run_id": "a" * 64}, "tester", job_id="batch-1")
     controller._panel_jobs.transition(job["job_id"], "RUNNING")
     inbox = inbox_root / job["job_id"]
@@ -1278,7 +698,7 @@ def test_completed_tester_batch_is_recovered_after_panel_restart(tmp_path: Path,
         "state": "COMPLETED", "expected_names": ["one"], "inbox_path": str(inbox),
     }), encoding="utf-8")
 
-    restarted = PanelController(tmp_path, config, analysis_config_loader=lambda _: AlgorithmConfig.defaults())
+    restarted = PanelController(tmp_path, config)
 
     assert restarted.strategies_tester_status(job["job_id"])["state"] == "FAILED"
 
@@ -1298,7 +718,7 @@ def test_verified_tester_batch_finishes_inbox_capture_after_restart(tmp_path: Pa
     monkeypatch.setattr("mrs3.panel.plan_batch", lambda *_args, **_kwargs: SimpleNamespace(resume_remaining_names=()))
     inbox = inbox_root / "batch-1"
     monkeypatch.setattr("mrs3.panel.run_batch", lambda *_args, **_kwargs: SimpleNamespace(inbox_path=inbox))
-    controller = PanelController(tmp_path, config, analysis_config_loader=lambda _: AlgorithmConfig.defaults())
+    controller = PanelController(tmp_path, config)
     job = controller._panel_jobs.submit("strategies.tester.start", {"analysis_run_id": "a" * 64}, "tester", job_id="batch-1")
     controller._panel_jobs.transition(job["job_id"], "RUNNING")
     inbox_root.mkdir()
@@ -1310,7 +730,7 @@ def test_verified_tester_batch_finishes_inbox_capture_after_restart(tmp_path: Pa
         "output_csv": str(inbox_root / "batch-1.csv"), "v6_provenance": {"analysis_run_id": "a" * 64},
     }), encoding="utf-8")
 
-    restarted = PanelController(tmp_path, config, analysis_config_loader=lambda _: AlgorithmConfig.defaults())
+    restarted = PanelController(tmp_path, config)
     deadline = monotonic() + 1
     while restarted._panel_jobs.get(job["job_id"])["state"] != "COMMITTED" and monotonic() < deadline:
         sleep(0.01)

@@ -8,7 +8,27 @@ Use [PRD.md](PRD.md) for the feature registry and [docs/README.md](docs/README.m
 for the documentation map. Read the linked contract only for the active task;
 do not treat this file as a replacement for a feature specification.
 
-## Pair registry stage 1 (2026-10-18, branch `wip/period-csv-generator`)
+## Panel rework stage 1b, part B and the three-screen shell (2026-10-18, branch `wip/period-csv-generator`)
+
+Contract: [Panel for the simulation workflow](docs/specs/2026-10-18-panel-simulation-workflow.md)
+(«Stage 1b evidence, part B»).
+
+- Removed from the Panel:
+  - the Source DB screen (local and remote);
+  - the surfaces screen;
+  - the old fresh analysis, shortlist and «Generate READY JSON».
+
+  Their routes, controller code and the modules `panel_source_db`,
+  `panel_source_jobs`, `panel_remote_source_db`, `panel_remote_testing` and
+  `panel_surfaces` went with them, together with their tests.
+- Navigation: «Пары и стратегии» (MRS2 STORE, tick test from a READY folder,
+  PerformanceDB cards) / «Портфели» / «Настройки».
+- **Verification:** panel suites pass apart from the two baseline failures and
+  the flaky portfolio stage-2 test. The full suite is compared against the
+  baseline. Removed routes answer 404.
+- **Next:** registry stage 2 (weekday liquidity, `LOT_MODEL_V2`).
+
+## Pair registry stage 1 (2026-10-18, branch `wip/period-csv-generator`, committed `d699dff`)
 
 Contract: [pair registry](docs/specs/2026-10-18-pair-registry.md) («Stage 1
 contract», «Stage 1 evidence»).

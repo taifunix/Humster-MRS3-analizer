@@ -3230,7 +3230,6 @@ def test_panel_controller_defers_registry_recovery_until_portfolio_startup(monke
 
     monkeypatch.setattr(panel_module, "PanelJobRegistry", registry_factory_with_capture)
     monkeypatch.setattr(panel_module, "PortfolioPanelService", FakePortfolioService)
-    monkeypatch.setattr(PanelController, "_reconcile_interrupted_remote_source_jobs", lambda self: None)
     monkeypatch.setattr(PanelController, "_reconcile_interrupted_tester_jobs", lambda self: None)
     PanelController(tmp_path, tmp_path / "panel-config.json")
     assert calls == [("registry", False), "portfolio_recover"]

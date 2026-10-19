@@ -97,12 +97,10 @@ def _open_regular_artifact(path: Path) -> tuple[BinaryIO, int]:
 import duckdb
 import pandas as pd
 
-from .analysis_filter_export import export_fresh_shortlist_audit
-from .config import AlgorithmConfig, load_panel_path_settings
+from .config import load_panel_path_settings
 from .config import (
     DuckDBImportSettings,
     load_duckdb_import_settings,
-    load_source_v6_import_settings,
 )
 from .exchange_profiles import (
     ExchangeProfile,
@@ -123,8 +121,6 @@ from .duckdb_direct import (
 )
 from .models import Side
 from .performance_import import _canonical, _canonical_contract, _sha256
-from .source_v6_surface_fresh import read_multiscope_surface
-from .source_v6_analysis_fresh import run_multiscope_analysis
 from .panel_settings import (
     PanelSettingsError,
     bootstrap as panel_bootstrap,
@@ -135,12 +131,6 @@ from .panel_settings import (
 from .panel_jobs import TERMINAL, PanelJobError, PanelJobRegistry
 from .panel_report_collection import PanelReportCollection
 from .panel_portfolio import PortfolioPanelError, PortfolioPanelService
-from .locking import TesterTargetLock
-from .panel_remote_testing import RemoteTestingService
-from .panel_remote_source_db import RemoteSourceDbExecutor, RemoteSourceDbError
-from .panel_source_db import LocalSourceDbService
-from .panel_source_jobs import LocalSourceDbJobRunner
-from .panel_surfaces import LocalSurfacesService
 from .panel_testing import (
     LocalTestingService,
     PanelTestingError,
@@ -148,14 +138,6 @@ from .panel_testing import (
 )
 from .panel_store import StoreTaskError, StoreTaskService
 from .store_ready_tick import StoreReadyError, list_ready_folders, prepare_tick_batch, resolve_ready_folder
-from .fresh_analysis_strategies import (
-    fresh_shortlist_response,
-    generate_fresh_analysis_strategies,
-    load_fresh_ready_candidates,
-    read_fresh_analysis_identity,
-)
-from .fresh_shortlist import ShortlistBusyError, parse_fresh_shortlist_request, serialize_applied_options
-from .tester_run_files import publish_run_snapshots
 from .evaluation_protocol import (
     EvaluationProtocolError,
     EvaluationTarget,
@@ -265,7 +247,6 @@ from .performance_v2_finalist_retest import (
 from .runner.config import RunnerConfig
 from .runner.inbox import capture_verified_inbox
 from .runner.workflow import BatchPlan, _load_saved_result_evidence, _load_saved_results, plan_batch, run_batch
-from .error_sanitization import has_local_path
 
 
 def _control_score(value: object) -> object:
@@ -285,57 +266,6 @@ def _control_score(value: object) -> object:
     return int(number) if number == number.to_integral_value() else float(number)
 
 
-_DIRECT_GENERIC_ERROR = "direct build failed"
-_FRESH_ANALYSIS_LISTING_DATES_ERROR = (
-    "Listing dates XLSX is missing. Add it and save Settings > Analysis profile."
-)
-
-
-def _fresh_analysis_error(message: str | None) -> str:
-    """Map fresh-analysis failures to stable, non-sensitive operator guidance."""
-    value = (message or "").casefold()
-    if "duplicate listing dates" in value:
-        return "Listing dates file contains duplicate symbols. Fix it or choose another file in Settings > Analysis profile."
-    if "listing" in value and ("permission denied" in value or "used by another process" in value or "locked" in value):
-        return "Listing dates file is locked or unreadable. Close it and try again, or choose another file in Settings > Analysis profile."
-    if "invalid listing dates" in value:
-        return "Listing dates file has an invalid or unsupported format. Choose a two-column dates file or the liquidity registry in Settings > Analysis profile."
-    if "listing" in value and ("date" in value or "snapshot" in value):
-        return _FRESH_ANALYSIS_LISTING_DATES_ERROR
-    if "panel workflow default" in value:
-        return _FRESH_ANALYSIS_LISTING_DATES_ERROR
-    if "fresh source v6 surface" in value or ("surface" in value and "required" in value):
-        return "Select a valid published Source v6 surface before starting analysis."
-    if "analysis config" in value:
-        return "Fresh analysis configuration is unavailable. Check the local config file."
-    return "Fresh analysis setup failed. Check the selected surface and Analysis profile."
-
-
-def _safe_direct_error(message: str | None) -> str | None:
-    """Return a client-safe direct error, suppressing local path details."""
-    if message is None:
-        return None
-    if has_local_path(message):
-        return _DIRECT_GENERIC_ERROR
-    return message
-
-
-def _fresh_generation_error(error: BaseException) -> str:
-    """Return the actionable part of a READY-generation failure without paths."""
-    if isinstance(error, PermissionError):
-        return "permission denied while publishing strategy files"
-    if isinstance(error, FileNotFoundError):
-        return "required strategy template or analysis artifact is unavailable"
-    message = str(error).strip()
-    if not message:
-        return "generation request failed"
-    if has_local_path(message):
-        return "generation failed while accessing a local file"
-    return message
-
-
-
-
 
 
 class PanelController:
@@ -343,9 +273,6 @@ class PanelController:
         self,
         root: Path,
         default_config: Path,
-        analysis_config_loader: Callable[[Path], object] = AlgorithmConfig.from_json,
-        source_v6_listing_dates_loader: Callable[[Path], Mapping[str, object]] = load_listing_dates,
-        remote_ownership_adapter: object | None = None,
     ) -> None:
         self.root = root.resolve()
         self.default_config = self._path(default_config)
@@ -378,31 +305,14 @@ class PanelController:
         )
         self._portfolio_service.startup_recover()
         self._local_testing_service_instance: LocalTestingService | None = None
-        self._remote_testing_service_instance: RemoteTestingService | None = None
-        self._remote_ownership_adapter = remote_ownership_adapter
-        self._panel_source_service: LocalSourceDbService | None = None
-        self._panel_source_jobs: LocalSourceDbJobRunner | None = None
-        self._remote_source_executor: RemoteSourceDbExecutor | None = None
-        self._remote_source_targets: dict[str, Path] = {}
-        self._panel_surfaces: LocalSurfacesService | None = None
-        self._fresh_analysis_paths: dict[str, Path] = {}
-        self._fresh_analysis_surfaces: dict[str, Path] = {}
-        from .fresh_shortlist import FreshShortlistExecutor
-        self._fresh_shortlist_executor = FreshShortlistExecutor()
         self._fresh_strategy_manifests: dict[str, Path] = {}
-        self._fresh_generation_job: dict[str, object] | None = None
         self._strategy_batch_service: LocalStrategyBatchService | None = None
         self._runs_batch_service: LocalRunsBatchService | None = None
         self._single_mode_strategy_test_service: LocalSingleModeStrategyTestService | None = None
         self._strategy_batch_inboxes: dict[str, Path] = {}
         self._performance_v2_jobs: LocalPerformanceV2Jobs | None = None
         self._collection_import_claim_ids: set[str] = set()
-        self._reconcile_interrupted_remote_source_jobs()
         self._reconcile_interrupted_tester_jobs()
-        self._analysis_config_loader = analysis_config_loader
-        self._source_v6_listing_dates_loader = source_v6_listing_dates_loader
-        self._source_v6_lock = threading.RLock()
-        self._source_v6_job: dict[str, object] | None = None
 
     def _path(self, value: str | Path) -> Path:
         candidate = Path(value).expanduser()
@@ -611,11 +521,6 @@ class PanelController:
         except ValueError:
             return None
         return inbox
-
-    @staticmethod
-    def _optional_string(payload: Mapping[str, object], name: str) -> str:
-        value = payload.get(name)
-        return value.strip() if isinstance(value, str) else ""
 
     def panel_bootstrap(self) -> dict[str, object]:
         """Return only validated, non-sensitive v2 panel capabilities."""
@@ -923,7 +828,7 @@ class PanelController:
             self._runs_batch_service is not None and self._runs_batch_service.has_active_job()
         ) or (
             self._single_mode_strategy_test_service is not None and self._single_mode_strategy_test_service.has_active_job()
-        ) or bool(self._fresh_generation_job and self._fresh_generation_job.get("running"))
+        )
 
     def panel_job_submit(self, payload: Mapping[str, object]) -> dict:
         kind = payload.get("kind")
@@ -953,10 +858,6 @@ class PanelController:
         if not isinstance(kind, str) or not isinstance(request, dict) or not isinstance(idempotency_key, str) or not isinstance(resource_keys, list):
             raise PanelJobError("INVALID_REQUEST")
         return self._panel_jobs.submit(kind, request, idempotency_key, tuple(resource_keys))
-
-    @staticmethod
-    def _panel_resource(value: str) -> str:
-        return sha256(value.encode("utf-8")).hexdigest()
 
     def _start_tracked_panel_job(
         self,
@@ -1200,7 +1101,7 @@ class PanelController:
             document = status(job_id)
             self._record_special_job(document)
             return self._sync_tracked_panel_job(document)
-        except (KeyError, RemoteSourceDbError, ValueError):
+        except (KeyError, ValueError):
             return self._panel_jobs.get(job_id)
 
     def _local_testing_service(self) -> LocalTestingService:
@@ -1251,287 +1152,6 @@ class PanelController:
         return {"ready": folder.name, **{key: result[key] for key in
                                          ("analysis_run_id", "strategy_count", "pairs", "ready_pairs", "reused")}}
 
-    def _remote_testing_service(self) -> RemoteTestingService:
-        if self._remote_testing_service_instance is not None:
-            return self._remote_testing_service_instance
-        try:
-            document = json.loads(self.default_config.read_text(encoding="utf-8"))
-            kwargs = ({"ownership_adapter": self._remote_ownership_adapter}
-                      if self._remote_ownership_adapter is not None else {})
-            self._remote_testing_service_instance = RemoteTestingService(document, **kwargs)
-            return self._remote_testing_service_instance
-        except Exception:
-            raise PanelTestingError("invalid testing request") from None
-
-    def _local_source_jobs(self) -> tuple[LocalSourceDbService, LocalSourceDbJobRunner]:
-        try:
-            workers, source_settings, writer_limit = self._source_v6_import_options()
-            import_options = {
-                "write_batch_size": source_settings.write_batch_size,
-                "worker_chunk_size": source_settings.worker_chunk_size,
-                "max_in_flight_chunks": source_settings.max_in_flight_chunks,
-                "segment_writer_limit": writer_limit,
-                "hydrate_fragments": False,
-            }
-        except Exception:
-            workers = 1
-            import_options = {}
-        if self._panel_source_service is None or self._panel_source_jobs is None:
-            self._panel_source_service = LocalSourceDbService(workers=workers, import_options=import_options)
-            self._panel_source_jobs = LocalSourceDbJobRunner(self._panel_source_service, on_update=self._record_special_job)
-        else:
-            # The service is cached for preflight tokens, but each new job must
-            # observe the current machine-wide import limit.
-            self._panel_source_service.workers = workers
-            self._panel_source_service.import_options = dict(import_options)
-        return self._panel_source_service, self._panel_source_jobs
-
-    def source_db_local_import_preflight(self, payload: Mapping[str, object]) -> dict[str, object]:
-        service, _ = self._local_source_jobs()
-        return service.preflight_import(
-            self._path(self._required(payload, "html_root")),
-            self._path(self._required(payload, "target_path")),
-        )
-
-    def source_db_local_merge_preflight(self, payload: Mapping[str, object]) -> dict[str, object]:
-        inputs = payload.get("input_paths")
-        if not isinstance(inputs, list) or not inputs or not all(isinstance(item, str) for item in inputs):
-            raise ValueError("input_paths must be a non-empty list")
-        service, _ = self._local_source_jobs()
-        return service.preflight_merge(
-            tuple(self._path(item) for item in inputs),
-            self._path(self._required(payload, "target_path")),
-        )
-
-    def source_db_local_start(self, payload: Mapping[str, object], *, merge: bool) -> dict[str, object]:
-        token = self._required(payload, "preflight_token")
-        target = self._path(self._required(payload, "target_path"))
-        service, jobs = self._local_source_jobs()
-        if service.target_for(token, merge=merge) != target.resolve():
-            raise ValueError("Source DB target does not match preflight")
-        resource = self._panel_resource(str(target).casefold())
-        return self._start_tracked_panel_job(
-            "source.local-merge" if merge else "source.local-import",
-            {"operation": "merge" if merge else "import"},
-            (f"source:{resource}",),
-            lambda job_id: (
-                jobs.start_merge(token, str(target).casefold(), job_id=job_id)
-                if merge else jobs.start_import(token, str(target).casefold(), job_id=job_id)
-            ),
-        )
-
-    def source_db_local_jobs(self) -> list[dict[str, object]]:
-        _, jobs = self._local_source_jobs()
-        live = [self._sync_tracked_panel_job(job) for job in jobs.list()]
-        live_ids = {str(job["job_id"]) for job in live}
-        restarted = [
-            job for job in self._panel_jobs.list()
-            if str(job.get("kind", "")).startswith("source.local-") and str(job.get("job_id")) not in live_ids
-        ]
-        return live + restarted
-
-    def source_db_local_cancel(self, job_id: str) -> dict[str, object]:
-        _, jobs = self._local_source_jobs()
-        try:
-            result = jobs.cancel(job_id)
-            self._panel_jobs.cancel(job_id)
-            return self._sync_tracked_panel_job(result)
-        except KeyError:
-            try:
-                return self._panel_jobs.get(job_id)
-            except PanelJobError:
-                raise ValueError("Source DB job not found") from None
-
-    def _remote_source_db(self) -> RemoteSourceDbExecutor:
-        if self._remote_source_executor is None:
-            try:
-                self._remote_source_executor = RemoteSourceDbExecutor(
-                    self._remote_testing_service().config
-                )
-            except Exception:
-                raise RemoteSourceDbError("invalid remote source db request") from None
-        return self._remote_source_executor
-
-    def _reconcile_interrupted_remote_source_jobs(self) -> None:
-        """A restart never leaves a remote importer running without a stop attempt."""
-        for job in self._panel_jobs.list():
-            if job.get("kind") != "source.remote-import" or job.get("error") != {"code": "INTERRUPTED"}:
-                continue
-            try:
-                runtime = self._panel_jobs.runtime(str(job["job_id"]))
-                html, target = runtime.get("remote_html_path"), runtime.get("remote_db_target")
-                if not isinstance(html, str) or not isinstance(target, str):
-                    continue
-                executor = self._remote_source_db()
-                executor.resume_import(str(job["job_id"]), html, target)
-                executor.cancel(str(job["job_id"]))
-            except Exception:
-                continue
-
-    def source_db_remote_start(self, payload: Mapping[str, object]) -> dict[str, object]:
-        executor = self._remote_source_db()
-        target = self._path(self._required(payload, "local_target_path"))
-        if target.exists() or target.is_symlink():
-            raise ValueError("local source db target already exists")
-        remote_html = str(payload.get("remote_html_path") or "").strip()
-        remote_target = str(payload.get("remote_db_target") or "").strip()
-        remote_html_subdir = payload.get("remote_html_subdir")
-        if remote_html_subdir is not None:
-            if not isinstance(remote_html_subdir, str):
-                raise RemoteSourceDbError("invalid remote source db request")
-            remote_html_subdir = remote_html_subdir.strip()
-            if remote_html_subdir.startswith(("/", "\\")):
-                raise RemoteSourceDbError("invalid remote source db request")
-            remote_html_subdir = remote_html_subdir.strip("/")
-            if remote_html_subdir and any(
-                not part or part in {".", ".."} or "\\" in part
-                for part in remote_html_subdir.split("/")
-            ):
-                raise RemoteSourceDbError("invalid remote source db request")
-        if not remote_html or not remote_target:
-            config = getattr(executor, "config", None)
-            reports_root = getattr(config, "reports_archive_root", "")
-            source_root = getattr(config, "source_db_root", "")
-            if not isinstance(reports_root, str) or not isinstance(source_root, str) or not reports_root or not source_root:
-                raise RemoteSourceDbError("invalid remote source db request")
-            remote_html = reports_root.rstrip("/")
-            if remote_html_subdir:
-                remote_html = f"{remote_html}/{remote_html_subdir}"
-            remote_target = source_root.rstrip("/") + "/" + target.name
-        job = self._start_tracked_panel_job(
-            "source.remote-import", {"operation": "remote-import"},
-            (f"source:{self._panel_resource(str(target).casefold())}",),
-            lambda job_id: executor.start_import(
-                remote_html, remote_target, job_id=job_id,
-            ),
-            runtime={"remote_html_path": remote_html, "remote_db_target": remote_target, "local_target_path": str(target)},
-        )
-        self._remote_source_targets[str(job["job_id"])] = target
-        return job
-
-    def source_db_local_catalog(self) -> dict[str, object]:
-        """List only local Source DB candidates from the configured directory."""
-        try:
-            source = self._import_settings().source_duckdb_path
-            root = self._path(source).parent if source is not None else None
-        except (OSError, ValueError):
-            root = None
-        if root is None:
-            return {"databases": []}
-        try:
-            candidates = sorted(
-                (
-                    path for path in root.iterdir()
-                    if path.suffix.casefold() == ".duckdb" and path.is_file() and not path.is_symlink()
-                ),
-                key=lambda path: path.name.casefold(),
-            )
-        except OSError:
-            candidates = []
-        return {"databases": [{"name": path.name, "path": str(path)} for path in candidates]}
-
-    def surface_catalog(self) -> dict[str, object]:
-        """List manifest-validated fresh-surface candidates without blocking the UI."""
-        try:
-            directory = self._panel_path("surface_target_path")
-            candidates = sorted(
-                (path for path in directory.rglob("*.surface-v6.duckdb") if path.is_file() and not path.is_symlink()),
-                key=lambda path: str(path).casefold(),
-            )
-        except (OSError, ValueError):
-            candidates = []
-        surfaces = []
-        for path in candidates:
-            try:
-                read_multiscope_surface(path, decode=False)
-            except (OSError, ValueError, duckdb.Error):
-                continue
-            surfaces.append({"name": path.name, "path": str(path)})
-        return {"surfaces": surfaces}
-
-    def source_db_remote_status(self, job_id: str) -> dict[str, object]:
-        executor = self._remote_source_db()
-        status = self._tracked_job_or_interrupted(job_id, executor.status)
-        if status.get("state") == "REMOTE_IMPORTED":
-            tracked = self._panel_jobs.get(job_id)
-            if tracked.get("state") in {"CANCELLING", "CANCELLED"}:
-                status = executor.cancel(job_id)
-                return self._sync_tracked_panel_job(status)
-            target = self._remote_source_targets.get(job_id)
-            if target is None:
-                raise RemoteSourceDbError("remote source db job not found")
-            status = executor.start_delivery(job_id, target)
-        if status.get("state") in {"COMMITTED", "FAILED", "CANCELLED"}:
-            self._remote_source_targets.pop(job_id, None)
-        return self._sync_tracked_panel_job(status)
-
-    def source_db_remote_cancel(self, job_id: str) -> dict[str, object]:
-        try:
-            result = self._remote_source_db().cancel(job_id)
-        except RemoteSourceDbError:
-            return self._panel_jobs.get(job_id)
-        self._panel_jobs.cancel(job_id)
-        return self._sync_tracked_panel_job(result)
-
-    def _surfaces(self) -> LocalSurfacesService:
-        try:
-            workers = max(1, int(self._import_settings().workers))
-        except Exception:
-            workers = 1
-        if self._panel_surfaces is None:
-            self._panel_surfaces = LocalSurfacesService(workers=workers)
-        else:
-            # Preserve preflight state while refreshing the worker knob for a
-            # subsequent publication.
-            self._panel_surfaces._workers = workers
-        return self._panel_surfaces
-
-    def surface_preflight(self, payload: Mapping[str, object]) -> dict[str, object]:
-        try:
-            return self._surfaces().preflight(self._path(self._required(payload, "source_db")))
-        except Exception:
-            raise ValueError("invalid surface request") from None
-
-    def surface_gaps(self, payload: Mapping[str, object]) -> dict[str, object]:
-        return self._surfaces().gaps(
-            self._required(payload, "preflight_token"), self._required(payload, "scope_key")
-        )
-
-    def surface_select(self, payload: Mapping[str, object]) -> dict[str, object]:
-        scopes = payload.get("scope_keys")
-        if not isinstance(scopes, list):
-            raise ValueError("scope_keys must be a list")
-        return self._surfaces().select(self._required(payload, "preflight_token"), scopes)
-
-    def surface_publish(self, payload: Mapping[str, object]) -> dict[str, object]:
-        scopes = payload.get("scope_keys")
-        if not isinstance(scopes, list):
-            raise ValueError("scope_keys must be a list")
-        try:
-            return self._surfaces().publish(
-                self._required(payload, "preflight_token"), scopes,
-                self._panel_path("surface_target_path"),
-                self._optional_string(payload, "filename") or None,
-            )
-        except Exception as error:
-            raise ValueError(_safe_direct_error(str(error)) or "invalid surface request") from None
-
-    def surface_publish_start(self, payload: Mapping[str, object]) -> dict[str, object]:
-        scopes = payload.get("scope_keys")
-        if not isinstance(scopes, list):
-            raise ValueError("scope_keys must be a list")
-        try:
-            return self._surfaces().start_publish(
-                self._required(payload, "preflight_token"), scopes,
-                self._panel_path("surface_target_path"),
-                self._optional_string(payload, "filename") or None,
-            )
-        except Exception as error:
-            raise ValueError(_safe_direct_error(str(error)) or "invalid surface request") from None
-
-    def surface_publish_status(self) -> dict[str, object]:
-        return self._surfaces().publish_status()
-
     def _workflow_default(self, name: str, *, side: str | None = None) -> Path:
         try:
             document = json.loads(self.default_config.read_text(encoding="utf-8"))
@@ -1544,18 +1164,6 @@ class PanelController:
             return self._path(value)
         except Exception:
             raise ValueError("panel workflow default is unavailable") from None
-
-    def _workflow_algorithm_version(self, value: object) -> str:
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-        try:
-            workflow = json.loads(self.default_config.read_text(encoding="utf-8")).get("panel_workflow", {})
-            configured = workflow.get("algorithm_version") if isinstance(workflow, Mapping) else None
-            if isinstance(configured, str) and configured.strip():
-                return configured.strip()
-        except Exception:
-                pass
-        return "0.7-canonical-phase1"
 
     def _reconcile_interrupted_tester_jobs(self) -> None:
         """Restore a batch only from its durable completed inbox, never its progress counter."""
@@ -1711,219 +1319,6 @@ class PanelController:
             except PanelJobError:
                 pass
 
-    def strategies_fresh_analyze(self, payload: Mapping[str, object]) -> dict[str, object]:
-        """Run the only supported fresh multi-scope analysis contour."""
-        surface = self._path(self._required(payload, "surface_path"))
-        listing_dates = self._workflow_default("listing_dates_path")
-        if not listing_dates.is_file():
-            raise ValueError(_FRESH_ANALYSIS_LISTING_DATES_ERROR)
-        result = self.source_v6_start_fresh_analysis({
-            "surface_path": str(surface),
-            "listing_dates_path": str(listing_dates),
-            "config_path": str(self.default_config),
-            "algorithm_version": self._workflow_algorithm_version(payload.get("algorithm_version")),
-            "target_path": self._optional_string(payload, "target_path"),
-        })
-        if result.get("phase") != "COMMITTED":
-            return {"phase": str(result.get("phase", "FAILED")), "error": _fresh_analysis_error(str(result.get("error") or ""))}
-        artifact = Path(str(result.get("analysis_path", "")))
-        try:
-            connection = duckdb.connect(str(artifact), read_only=True)
-            try:
-                analysis_id = str(connection.execute("select value from manifest where key='analysis_id'").fetchone()[0])
-            finally:
-                connection.close()
-            if len(analysis_id) != 64:
-                raise ValueError
-        except Exception:
-            raise ValueError("fresh analysis artifact is invalid") from None
-        self._fresh_analysis_paths[analysis_id] = artifact
-        self._fresh_analysis_surfaces[analysis_id] = surface
-        return {"phase": "COMMITTED", "analysis_run_id": analysis_id}
-
-    def strategies_fresh_generate(self, payload: Mapping[str, object]) -> dict[str, object]:
-        if "output_dir" in payload:
-            raise ValueError("output_dir is server-controlled")
-        self._evaluation_target()
-        if any(not isinstance(key, str) or key.startswith("_") for key in payload):
-            raise ValueError("private fields are not allowed")
-        options, min_shift_enabled, min_shift_pct = self._fresh_shortlist_settings(payload)
-        candidates = payload.get("candidate_ids")
-        scopes = payload.get("selected_scopes")
-        if candidates is not None and (not isinstance(candidates, list) or not all(isinstance(item, str) for item in candidates)):
-            raise ValueError("candidate_ids must be a list")
-        if not isinstance(scopes, list) or not all(isinstance(item, list) and len(item) == 3 and all(isinstance(value, str) for value in item) for item in scopes):
-            raise ValueError("selected_scopes must be a list")
-        analysis_id = self._required(payload, "analysis_run_id")
-        path = self._fresh_analysis_paths.get(analysis_id)
-        if path is None:
-            raise ValueError("fresh analysis is not available in this panel session")
-        prepared, evaluation = self._verified_fresh_shortlist(
-            path, analysis_id, options, payload,
-            min_shift_enabled=min_shift_enabled, min_shift_pct=min_shift_pct,
-        )
-        scopes, selected_ids = self._selected_fresh_ready(
-            prepared, evaluation, scopes, require_one_side=True,
-        )
-        scope_sides = {scope[1] for scope in scopes}
-        if len(scope_sides) != 1:
-            raise ValueError("fresh strategy generation requires one side per batch")
-        with self._lock:
-            if self._fresh_generation_job and self._fresh_generation_job["running"]:
-                raise ValueError("READY JSON generation is already running")
-            job = {"job_id": uuid.uuid4().hex, "phase": "RUNNING", "running": True}
-            self._fresh_generation_job = job
-        thread_payload = {
-            "analysis_run_id": analysis_id,
-            "selected_scopes": [list(item) for item in scopes],
-            "pretest_ab_enabled": options[0],
-            "ladder_enabled": options[1],
-            "pareto_enabled": options[2],
-            **({"min_shift_enabled": True, "min_shift_pct": min_shift_pct}
-               if min_shift_enabled else {}),
-            "filter_version": "shortlist-v2",
-            "selection_token": evaluation.selection_token,
-            "_shortlist_prepared": prepared,
-            "_shortlist_evaluation": evaluation,
-        }
-        thread = threading.Thread(
-            target=self._run_fresh_strategy_generation,
-            args=(job, thread_payload),
-            name="mrs3-panel-fresh-strategies",
-            daemon=True,
-        )
-        try:
-            thread.start()
-        except RuntimeError:
-            with self._lock:
-                if self._fresh_generation_job is job:
-                    self._fresh_generation_job = None
-            raise
-        return dict(job)
-
-    def strategies_fresh_generate_runs(self, payload: Mapping[str, object]) -> dict[str, object]:
-        """Publish the selected filtered candidates as tester run snapshots."""
-        self._evaluation_target()
-        options, min_shift_enabled, min_shift_pct = self._fresh_shortlist_settings(payload)
-        if set(payload).difference({"analysis_run_id", "filter_version", "filters", "pretest_ab_enabled", "ladder_enabled", "pareto_enabled", "min_shift_enabled", "min_shift_pct", "selection_token", "selected_scopes", "start_date", "end_date"}):
-            raise ValueError("tester run request contains unsupported fields")
-        scopes = payload.get("selected_scopes")
-        if not isinstance(scopes, list) or not all(
-            isinstance(item, list) and len(item) == 3 and all(isinstance(value, str) for value in item)
-            for item in scopes
-        ):
-            raise ValueError("selected_scopes must be a list")
-        start_date, end_date = payload.get("start_date"), payload.get("end_date")
-        if not isinstance(start_date, str) or not isinstance(end_date, str):
-            raise ValueError("start_date and end_date are required")
-        analysis_id = self._required(payload, "analysis_run_id")
-        analysis_path = self._fresh_analysis_paths.get(analysis_id)
-        if analysis_path is None:
-            raise ValueError("fresh analysis is not available in this panel session")
-        prepared, evaluation = self._verified_fresh_shortlist(
-            analysis_path, analysis_id, options, payload,
-            min_shift_enabled=min_shift_enabled, min_shift_pct=min_shift_pct,
-        )
-        scopes, selected_ids = self._selected_fresh_ready(
-            prepared, evaluation, scopes, require_one_side=False,
-        )
-        manifest, _points, structures = load_fresh_ready_candidates(
-            analysis_path, analysis_id, selected_ids, scopes,
-            expected_artifact_sha256=evaluation.artifact_sha256,
-        )
-        runner = RunnerConfig.from_json(self.default_config)
-        target = self._evaluation_target()
-        with TesterTargetLock(runner.bot_root):
-            result = publish_run_snapshots(
-                self.root / "Input" / "run_snapshot_2.json", runner.bot_root, runner.tester_config, structures,
-                start_date, end_date, runner.max_parallel_submissions, self._analysis_config_loader(self.default_config),
-                analysis_run_id=analysis_id,
-                tester_config_template=self._mrs3_tester_template(target),
-                pretest_ab_provenance=self._pretest_ab_provenance(options[0]),
-                analysis_input_digest=manifest.get("analysis_input_digest"),
-                shortlist_provenance=self._fresh_shortlist_provenance(evaluation, selected_ids),
-                before_publish=lambda: self._assert_fresh_analysis_digest(
-                    analysis_path, evaluation.artifact_sha256,
-                ),
-                evaluation=target,
-            )
-        return {"phase": "COMMITTED", "analysis_run_id": analysis_id, **result}
-
-    def _run_fresh_strategy_generation(self, job: dict[str, object], payload: Mapping[str, object]) -> None:
-        try:
-            result = self._generate_fresh_strategies(payload)
-        except Exception as error:
-            with self._lock:
-                job.update(phase="FAILED", running=False, error=f"READY JSON generation failed: {_fresh_generation_error(error)}")
-        else:
-            with self._lock:
-                job.update(result, phase="COMMITTED", running=False)
-
-    def strategies_fresh_generation_status(self, job_id: str) -> dict[str, object]:
-        with self._lock:
-            if self._fresh_generation_job is None or self._fresh_generation_job["job_id"] != job_id:
-                raise ValueError("fresh strategy generation job is not available")
-            return dict(self._fresh_generation_job)
-
-    def _generate_fresh_strategies(self, payload: Mapping[str, object]) -> dict[str, object]:
-        options, min_shift_enabled, min_shift_pct = self._fresh_shortlist_settings(payload)
-        scopes = payload["selected_scopes"]
-        assert isinstance(scopes, list)
-        analysis_id = self._required(payload, "analysis_run_id")
-        analysis_path = self._fresh_analysis_paths.get(analysis_id)
-        if analysis_path is None:
-            raise ValueError("fresh analysis is not available in this panel session")
-        prepared = payload.get("_shortlist_prepared")
-        evaluation = payload.get("_shortlist_evaluation")
-        if prepared is None or evaluation is None:
-            prepared, evaluation = self._verified_fresh_shortlist(
-                analysis_path, analysis_id, options, payload,
-                min_shift_enabled=min_shift_enabled, min_shift_pct=min_shift_pct,
-            )
-        if payload.get("selection_token") != evaluation.selection_token:
-            raise ValueError("STALE_SHORTLIST_SELECTION")
-        scopes, selected_ids = self._selected_fresh_ready(
-            prepared, evaluation, scopes, require_one_side=True,
-        )
-        scope_sides = {scope[1] for scope in scopes}
-        target = self._evaluation_target()
-        config = self._analysis_config_loader(self.default_config)
-        output_root = self.root / "Output" / "fresh-shortlist-v2" / analysis_id
-        output_root.mkdir(parents=True, exist_ok=True)
-        staging = Path(tempfile.mkdtemp(prefix=".stage-", dir=output_root))
-        final = output_root / f"{evaluation.selection_token}-{uuid.uuid4().hex}"
-        try:
-            result = generate_fresh_analysis_strategies(
-                analysis_path,
-                analysis_id,
-                selected_ids,
-                scopes,
-                self._ready_strategy_template(target, next(iter(scope_sides))),
-                staging,
-                config,
-                surface_path=self._fresh_analysis_surfaces.get(analysis_id),
-                pretest_ab_enabled=options[0],
-                **({"min_shift_enabled": True, "min_shift_pct": min_shift_pct}
-                   if min_shift_enabled else {}),
-                selection=evaluation,
-                evaluation=target,
-            )
-            self._assert_fresh_analysis_digest(analysis_path, evaluation.artifact_sha256)
-            staging.replace(final)
-        finally:
-            if staging.exists():
-                shutil.rmtree(staging)
-        manifest_path = final / "strategy_manifest.json"
-        self._fresh_strategy_manifests[analysis_id] = manifest_path
-        return {
-            "phase": "COMMITTED",
-            "analysis_run_id": result.run_id,
-            "surface_id": result.surface_id,
-            "strategy_count": result.strategy_count,
-            "manifest": manifest_path.name,
-            "output_dir": str(final),
-        }
-
     def _fresh_strategy_manifest(self, analysis_id: str | None = None) -> Path:
         candidates = []
         if analysis_id and analysis_id in self._fresh_strategy_manifests:
@@ -1969,232 +1364,6 @@ class PanelController:
             "phase": "COMMITTED",
             "analysis_run_id": validated.analysis_run_id,
             "strategy_count": len(hashes) if isinstance(hashes, Mapping) else 0,
-        }
-
-    def analysis_catalog(self) -> dict[str, object]:
-        """List validated root-level fresh analysis artifacts for reopening.
-
-        Mirrors `surface_catalog`: a file that does not validate is skipped
-        rather than offered, because offering it would only fail on open.
-        """
-        try:
-            directory = self._panel_path("analysis_root")
-            if directory.is_file() or directory.suffix.casefold() == ".duckdb":
-                directory = directory.parent
-            candidates = sorted(
-                (
-                    path for path in directory.glob("*.analysis-v6.duckdb")
-                    if path.is_file() and not path.is_symlink()
-                ),
-                key=lambda path: str(path).casefold(),
-            )
-        except (OSError, ValueError):
-            candidates = []
-        analyses = []
-        for path in candidates:
-            try:
-                identity = read_fresh_analysis_identity(path)
-            except (OSError, ValueError, KeyError, duckdb.Error):
-                continue
-            analyses.append({
-                "name": path.name,
-                "analysis_ref": path.relative_to(directory).as_posix(),
-                "analysis_run_id": identity["analysis_run_id"],
-                "surface_id": identity["surface_id"],
-                "scopes": len(identity["scope_keys"]),
-            })
-        return {"analyses": analyses}
-
-    def strategies_fresh_open(self, payload: Mapping[str, object]) -> dict[str, object]:
-        """Register a committed analysis so its shortlist can be read without a rerun."""
-        root = self._panel_path("analysis_root")
-        if root.is_file() or root.suffix.casefold() == ".duckdb":
-            root = root.parent
-        reference = payload.get("analysis_ref")
-        if isinstance(reference, str) and reference.strip():
-            candidate = Path(reference.strip().replace("\\", "/"))
-            if candidate.is_absolute() or ".." in candidate.parts:
-                raise PanelJobError("ANALYSIS_PATH_NOT_ALLOWED")
-            path = (root / candidate).resolve()
-        else:
-            try:
-                path = self._path(self._required(payload, "analysis_path"))
-            except ValueError:
-                raise PanelJobError("ANALYSIS_PATH_REQUIRED") from None
-        try:
-            path.relative_to(root.resolve())
-        except ValueError:
-            raise PanelJobError("ANALYSIS_PATH_NOT_ALLOWED") from None
-        try:
-            identity = read_fresh_analysis_identity(path)
-        except (OSError, ValueError, KeyError, duckdb.Error):
-            # A safe code, not the exception text: v2 responses must not carry
-            # local paths, and "invalid settings" tells the operator nothing.
-            raise PanelJobError("ANALYSIS_NOT_READABLE") from None
-        analysis_id = str(identity["analysis_run_id"])
-        self._fresh_analysis_paths[analysis_id] = path
-        # The surface file is not required: generation binds identity from the
-        # analysis manifest, and the physical surface is only an extra check.
-        return {
-            "phase": "COMMITTED",
-            "analysis_run_id": analysis_id,
-            "surface_id": identity["surface_id"],
-            "algorithm_version": identity["algorithm_version"],
-            "scopes": len(identity["scope_keys"]),
-        }
-
-    def strategies_fresh_shortlist(self, payload: Mapping[str, object]) -> dict[str, object]:
-        options, min_shift_enabled, min_shift_pct = self._fresh_shortlist_settings(payload)
-        analysis_id = self._required(payload, "analysis_run_id")
-        path = self._fresh_analysis_paths.get(analysis_id)
-        if path is None:
-            raise ValueError("fresh analysis is not available in this panel session")
-        prepared, evaluation = self._evaluate_fresh_shortlist_snapshot(
-            path, analysis_id, options,
-            min_shift_enabled=min_shift_enabled, min_shift_pct=min_shift_pct,
-        )
-        if payload.get("audit") is True:
-            self._require_fresh_selection_token(payload, evaluation)
-            output = self.root / "Output" / f"{analysis_id}.shortlist-v2.{evaluation.selection_token}.xlsx"
-            output.parent.mkdir(parents=True, exist_ok=True)
-            staged = output.with_name(f".{output.stem}.{uuid.uuid4().hex}.pending.xlsx")
-            try:
-                export_fresh_shortlist_audit(prepared, evaluation, staged)
-                self._assert_fresh_analysis_digest(path, evaluation.artifact_sha256)
-                staged.replace(output)
-            finally:
-                staged.unlink(missing_ok=True)
-            return {"filename": output.name}
-        return fresh_shortlist_response(prepared, evaluation)
-
-    def strategies_fresh_filter_audit(self, payload: Mapping[str, object]) -> dict[str, object]:
-        options, min_shift_enabled, min_shift_pct = self._fresh_shortlist_settings(payload)
-        analysis_id = self._required(payload, "analysis_run_id")
-        path = self._fresh_analysis_paths.get(analysis_id)
-        if path is None:
-            raise ValueError("fresh analysis is not available in this panel session")
-        prepared, evaluation = self._verified_fresh_shortlist(
-            path, analysis_id, options, payload,
-            min_shift_enabled=min_shift_enabled, min_shift_pct=min_shift_pct,
-        )
-        output = self.root / "Output" / f"{analysis_id}.shortlist-v2.{evaluation.selection_token}.xlsx"
-        output.parent.mkdir(parents=True, exist_ok=True)
-        staged = output.with_name(f".{output.stem}.{uuid.uuid4().hex}.pending.xlsx")
-        try:
-            export_fresh_shortlist_audit(prepared, evaluation, staged)
-            self._assert_fresh_analysis_digest(path, evaluation.artifact_sha256)
-            staged.replace(output)
-        finally:
-            staged.unlink(missing_ok=True)
-        return {"filename": output.name}
-
-    @staticmethod
-    def _fresh_shortlist_options(payload: Mapping[str, object]) -> tuple[bool, bool, bool]:
-        """Backward-compatible view of the centralized fresh request parser."""
-        if "min_shift_enabled" in payload or "min_shift_pct" in payload:
-            raise ValueError("Minimum Shift settings require _fresh_shortlist_settings")
-        return parse_fresh_shortlist_request(payload)[0]
-
-    @staticmethod
-    def _fresh_shortlist_settings(
-        payload: Mapping[str, object],
-    ) -> tuple[tuple[bool, bool, bool], bool, str | None]:
-        return parse_fresh_shortlist_request(payload)
-
-    def _evaluate_fresh_shortlist_snapshot(
-        self, path: Path, analysis_id: str, options: tuple[bool, bool, bool],
-        *, min_shift_enabled: bool = False, min_shift_pct: str | None = None,
-    ) -> tuple[object, object]:
-        """Prepare and evaluate through the single content-bound executor."""
-        return self._fresh_shortlist_executor.evaluate_with_prepared(
-            path, analysis_id, options, workers=self._import_settings().workers,
-            **({"min_shift_enabled": True, "min_shift_pct": min_shift_pct}
-               if min_shift_enabled else {"min_shift_enabled": False}),
-        )
-
-    def _verified_fresh_shortlist(
-        self, path: Path, analysis_id: str, options: tuple[bool, bool, bool], payload: Mapping[str, object],
-        *, min_shift_enabled: bool = False, min_shift_pct: str | None = None,
-    ) -> tuple[object, object]:
-        prepared, evaluation = self._evaluate_fresh_shortlist_snapshot(
-            path, analysis_id, options,
-            min_shift_enabled=min_shift_enabled, min_shift_pct=min_shift_pct,
-        )
-        self._require_fresh_selection_token(payload, evaluation)
-        return prepared, evaluation
-
-    @staticmethod
-    def _require_fresh_selection_token(payload: Mapping[str, object], evaluation: object) -> None:
-        token = payload.get("selection_token")
-        if not isinstance(token, str) or token != evaluation.selection_token:
-            raise ValueError("STALE_SHORTLIST_SELECTION")
-
-    @staticmethod
-    def _selected_fresh_ready(
-        prepared: object,
-        evaluation: object,
-        requested_scopes: Sequence[object],
-        *,
-        require_one_side: bool,
-    ) -> tuple[tuple[tuple[str, str, str], ...], tuple[str, ...]]:
-        from .analysis_strategies import normalize_analysis_scopes
-
-        if not requested_scopes:
-            raise ValueError("EMPTY_READY_SELECTION")
-        scopes = normalize_analysis_scopes(requested_scopes)
-        groups = {group.scope_key for group in evaluation.groups}
-        if any("|".join(scope) not in groups for scope in scopes):
-            raise ValueError("selected scope is absent from shortlist")
-        if require_one_side and len({scope[1] for scope in scopes}) != 1:
-            raise ValueError("fresh strategy generation requires one side per batch")
-        scope_keys = {"|".join(scope) for scope in scopes}
-        ready_ids = tuple(sorted(
-            item.candidate_id for item in evaluation.candidates
-            if item.filter_status == "READY_AFTER_FILTERS" and item.scope_key in scope_keys
-        ))
-        if not ready_ids:
-            raise ValueError("EMPTY_READY_SELECTION")
-        prepared_scopes = {fact.scope_key for fact in prepared.scopes}
-        if not scope_keys.issubset(prepared_scopes):
-            raise ValueError("selected scope is absent from shortlist")
-        return scopes, ready_ids
-
-    @staticmethod
-    def _assert_fresh_analysis_digest(path: Path, expected_digest: str) -> None:
-        from .fresh_analysis_strategies import _file_digest
-
-        if _file_digest(path) != expected_digest:
-            raise ValueError("STALE_SHORTLIST_SELECTION")
-
-    @staticmethod
-    def _fresh_shortlist_provenance(evaluation: object, selected_ids: Sequence[str]) -> dict[str, object]:
-        return {
-            "filter_version": evaluation.filter_version,
-            "filter_engine_version": evaluation.filter_engine_version,
-            "selection_token": evaluation.selection_token,
-            "artifact_sha256": evaluation.artifact_sha256,
-            "applied_options": serialize_applied_options(
-                evaluation.options,
-                **({"min_shift_enabled": True, "min_shift_pct": evaluation.min_shift_pct}
-                   if evaluation.min_shift_enabled else {}),
-            ),
-            "selected_candidate_ids": list(selected_ids),
-        }
-
-    @staticmethod
-    def _pretest_ab_enabled(payload: Mapping[str, object]) -> bool:
-        value = payload.get("pretest_ab_enabled", False)
-        if type(value) is not bool:
-            raise ValueError("pretest_ab_enabled must be a boolean")
-        return value
-
-    @staticmethod
-    def _pretest_ab_provenance(enabled: bool) -> dict[str, object]:
-        return {
-            "enabled": enabled,
-            "window_days": 14,
-            "decline_threshold_pct": "95",
-            "contract_version": "source-v6-pretest-ab-v1",
         }
 
     def _strategy_batch(self) -> LocalStrategyBatchService:
@@ -2831,29 +2000,6 @@ class PanelController:
         if inbox is None or not inbox.is_dir():
             raise ValueError("committed tester inbox is not available")
         return inbox.resolve()
-
-    def _tester_dates(self, job_id: str) -> tuple[str, str]:
-        job = self._panel_jobs.get(job_id)
-        request = job.get("request")
-        start = request.get("start_date") if isinstance(request, dict) else None
-        end = request.get("end_date") if isinstance(request, dict) else None
-        if not isinstance(start, str) or not isinstance(end, str):
-            try:
-                manifest = json.loads((self._tester_inbox(job_id) / "inbox_manifest.json").read_text(encoding="utf-8"))
-                start, end = manifest.get("test_start"), manifest.get("test_end")
-            except (OSError, ValueError, TypeError):
-                start, end = None, None
-        if not isinstance(start, str) or not isinstance(end, str):
-            config = RunnerConfig.from_json(self.default_config)
-            snapshot = Path(config.inbox_root) / f".{job_id}.tester-config.snapshot"
-            try:
-                saved = json.loads(snapshot.read_text(encoding="utf-8"))
-            except (OSError, ValueError) as error:
-                raise ValueError("tester dates are not available") from error
-            start, end = saved.get("StartDate"), saved.get("EndDate")
-        if not isinstance(start, str) or not isinstance(end, str):
-            raise ValueError("tester dates are not available")
-        return start, end
 
     @staticmethod
     def _performance_v2_window(payload: Mapping[str, object], name: str) -> tuple[object, object] | None:
@@ -6005,44 +5151,6 @@ class PanelController:
             return result
         return DuckDBImportSettings(**{name: path(name) for name in paths}, workers=number("workers"), transaction_batch_size=number("transaction_batch_size"))
 
-    def _source_v6_import_options(self) -> tuple[int, object, int]:
-        workers = max(1, self._import_settings().workers)
-        settings = load_source_v6_import_settings(self.default_config)
-        config_document = json.loads(self.default_config.read_text(encoding="utf-8")) if self.default_config.exists() else {}
-        source_section = config_document.get("source_v6_import") if isinstance(config_document, dict) else None
-        if isinstance(source_section, dict) and "segment_writer_limit" in source_section:
-            settings.validate_for_workers(workers)
-            limit = settings.segment_writer_limit
-        else:
-            limit = min(settings.segment_writer_limit, workers)
-        return workers, settings, limit
-
-    def source_v6_start_fresh_analysis(self, payload: Mapping[str, object]) -> dict[str, object]:
-        surface = self._path(self._required(payload, "surface_path"))
-        if not surface.name.endswith(".surface-v6.duckdb"):
-            raise ValueError("fresh Source v6 surface is required")
-        read_multiscope_surface(surface, decode=False)
-        dates_path, config_path = self._path(self._required(payload, "listing_dates_path")), self._path(self._required(payload, "config_path"))
-        if not dates_path.is_file() or not config_path.is_file():
-            raise ValueError("listing-date snapshot and analysis config files are required")
-        with self._source_v6_lock:
-            if self._source_v6_job and self._source_v6_job.get("phase") == "RUNNING":
-                raise RuntimeError("another Source v6 write is already running")
-            job = {"phase": "RUNNING", "current": 0, "total": 1, "progress": 0.0, "error": None, "cancel_requested": False}
-            self._source_v6_job = job
-        try:
-            target_value = self._optional_string(payload, "target_path")
-            target = self._path(target_value) if target_value else None
-            explicit_target = target if target and target.name.endswith(".analysis-v6.duckdb") else None
-            directory = explicit_target.parent if explicit_target else (target or self.root / "Output" / "analysis-v6-compact")
-            artifact = run_multiscope_analysis(surface, directory, self._analysis_config_loader(config_path), listing_dates=self._source_v6_listing_dates_loader(dates_path), algorithm_version=str(payload.get("algorithm_version") or "0.7-canonical-phase1"), workers=max(1, self._import_settings().workers), cancel_check=lambda: bool(job["cancel_requested"]), filename=explicit_target.name if explicit_target else None)
-            with self._source_v6_lock:
-                job.update({"phase": "COMMITTED", "current": 1, "progress": 1.0, "analysis_path": str(artifact), "analysis_id": artifact.stem})
-        except BaseException as error:
-            with self._source_v6_lock:
-                job.update({"phase": "CANCELLED" if job["cancel_requested"] or "cancel" in str(error).casefold() else "FAILED", "error": str(error)})
-        return dict(job)
-
     def artifact(self, name: str) -> Path | tuple[str, bytes] | None:
         if name.startswith("performance-v2-failure-report:"):
             return self.performance_v2_failure_report(name.partition(":")[2])
@@ -6464,15 +5572,6 @@ class _PanelHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/v2/jobs":
             self._json(200, {"jobs": self.server.controller.panel_jobs()})
             return
-        if parsed.path == "/api/v2/source/local/jobs":
-            self._json(200, {"jobs": self.server.controller.source_db_local_jobs()})
-            return
-        if parsed.path == "/api/v2/source/local/catalog":
-            self._json(200, self.server.controller.source_db_local_catalog())
-            return
-        if parsed.path == "/api/v2/strategies/analysis/catalog":
-            self._json(200, self.server.controller.analysis_catalog())
-            return
         if parsed.path == "/api/v2/strategies/performance-v2/catalog":
             try:
                 self._json(200, self.server.controller.strategies_performance_v2_catalog())
@@ -6507,36 +5606,6 @@ class _PanelHandler(BaseHTTPRequestHandler):
             except Exception:
                 _LOGGER.exception("Performance v2 selection settings failed")
                 self._json(500, {"error": {"code": "INTERNAL", "message": "Selection settings unavailable"}})
-            return
-        if parsed.path == "/api/v2/surfaces/catalog":
-            self._json(200, self.server.controller.surface_catalog())
-            return
-        if parsed.path == "/api/v2/source/remote/status":
-            try:
-                job_id = parse_qs(parsed.query).get("job_id", [""])[0]
-                self._json(200, self.server.controller.source_db_remote_status(job_id))
-            except (RemoteSourceDbError, ValueError):
-                self._json(400, {"error": "invalid source db request"})
-            return
-        if parsed.path == "/api/v2/surfaces/gaps":
-            try:
-                query = parse_qs(parsed.query)
-                self._json(200, self.server.controller.surface_gaps({
-                    "preflight_token": query.get("preflight_token", [""])[0],
-                    "scope_key": query.get("scope_key", [""])[0],
-                }))
-            except ValueError:
-                self._json(400, {"error": "invalid surface request"})
-            return
-        if parsed.path == "/api/v2/surfaces/publish/status":
-            self._json(200, self.server.controller.surface_publish_status())
-            return
-        if parsed.path == "/api/v2/strategies/fresh/generate/status":
-            try:
-                job_id = parse_qs(parsed.query).get("job_id", [""])[0]
-                self._json(200, self.server.controller.strategies_fresh_generation_status(job_id))
-            except ValueError:
-                self._json(400, {"error": "invalid fresh strategy generation request"})
             return
         if parsed.path == "/api/v2/strategies/fresh/batch":
             try:
@@ -6812,7 +5881,6 @@ class _PanelHandler(BaseHTTPRequestHandler):
         bulk_control_import_endpoint = urlparse(self.path).path == "/api/v2/strategies/performance-v2/finalist-retest/control-import"
         if bulk_control_import_endpoint:
             endpoint = "/api/v2/strategies/performance-v2/selection-review-import"
-        fresh_generation = endpoint == "/api/v2/strategies/fresh/generate"
         performance_v2_windows_endpoint = endpoint == "/api/v2/strategies/performance-v2/windows"
         performance_v2_selection_endpoint = endpoint == "/api/v2/strategies/performance-v2/selection"
         performance_v2_selection_aggregate_import_endpoint = endpoint == "/api/v2/strategies/performance-v2/selection/aggregate-import"
@@ -6827,7 +5895,7 @@ class _PanelHandler(BaseHTTPRequestHandler):
         portfolio_submission_route = bool(re.fullmatch(r"/api/v2/portfolio/campaigns/[^/]+/tester-submissions", endpoint))
         if equity_filter_endpoint:
             pass
-        elif bulk_retest_endpoint is None and endpoint != "/api/v2/strategies/performance-v2/selection-settings" and endpoint not in {"/api/v2/panel/restart", "/api/v2/settings/validate", "/api/v2/settings/save", "/api/v2/settings/performance-databases/activate", "/api/v2/settings/performance-databases/create", "/api/v2/jobs", "/api/v2/strategies/tester/verify-inbox", "/api/v2/strategies/tester/report-collection/clear", "/api/v2/source/local/import/preflight", "/api/v2/source/local/import/start", "/api/v2/source/local/merge/preflight", "/api/v2/source/local/merge/start", "/api/v2/source/local/cancel", "/api/v2/source/remote/start", "/api/v2/source/remote/cancel", "/api/v2/surfaces/preflight", "/api/v2/surfaces/select", "/api/v2/surfaces/publish", "/api/v2/surfaces/publish/start", "/api/v2/strategies/fresh/analyze", "/api/v2/strategies/fresh/generate", "/api/v2/strategies/fresh/runs", "/api/v2/strategies/fresh/shortlist", "/api/v2/strategies/fresh/open", "/api/v2/strategies/performance-v2/windows", "/api/v2/strategies/performance-v2/selection", "/api/v2/strategies/performance-v2/selection-preview", "/api/v2/strategies/performance-v2/selection-cache-status", "/api/v2/strategies/performance-v2/recalculate", "/api/v2/strategies/performance-v2/recalculate-all", "/api/v2/strategies/performance-v2/selection-review-import", "/api/v2/strategies/performance-v2/selection-user-fields-import", "/api/v2/strategies/performance-v2/retest-tags-import", "/api/v2/strategies/performance-v2/selection/aggregate-import", "/api/v2/strategies/performance-v2/retest/start", "/api/v2/strategies/performance-v2/retest/import"} and not portfolio_route and not performance_v2_maintenance_endpoint:
+        elif bulk_retest_endpoint is None and endpoint != "/api/v2/strategies/performance-v2/selection-settings" and endpoint not in {"/api/v2/panel/restart", "/api/v2/settings/validate", "/api/v2/settings/save", "/api/v2/settings/performance-databases/activate", "/api/v2/settings/performance-databases/create", "/api/v2/jobs", "/api/v2/strategies/tester/verify-inbox", "/api/v2/strategies/tester/report-collection/clear", "/api/v2/strategies/performance-v2/windows", "/api/v2/strategies/performance-v2/selection", "/api/v2/strategies/performance-v2/selection-preview", "/api/v2/strategies/performance-v2/selection-cache-status", "/api/v2/strategies/performance-v2/recalculate", "/api/v2/strategies/performance-v2/recalculate-all", "/api/v2/strategies/performance-v2/selection-review-import", "/api/v2/strategies/performance-v2/selection-user-fields-import", "/api/v2/strategies/performance-v2/retest-tags-import", "/api/v2/strategies/performance-v2/selection/aggregate-import", "/api/v2/strategies/performance-v2/retest/start", "/api/v2/strategies/performance-v2/retest/import"} and not portfolio_route and not performance_v2_maintenance_endpoint:
             self._json(404, {"error": "not found"})
             return
         if endpoint in {"/api/v2/strategies/performance-v2/selection-review-import", "/api/v2/strategies/performance-v2/selection-user-fields-import", "/api/v2/strategies/performance-v2/retest-tags-import", "/api/v2/strategies/performance-v2/selection/aggregate-import"}:
@@ -6872,26 +5940,26 @@ class _PanelHandler(BaseHTTPRequestHandler):
                 code = "PORTFOLIO_JOB_CANCEL_INVALID" if portfolio_cancel_route else "PORTFOLIO_CAMPAIGN_INVALID"
                 self._portfolio_error(PortfolioPanelError(code, "portfolio request is invalid", status=415))
                 return
-            self._json(400 if performance_v2_windows_endpoint else 415, {"error": {"code": "INVALID_REQUEST", "message": "Content-Type must be application/json"}} if performance_v2_windows_endpoint else ({"error": "Content-Type must be application/json"} if fresh_generation else (
+            self._json(400 if performance_v2_windows_endpoint else 415, {"error": {"code": "INVALID_REQUEST", "message": "Content-Type must be application/json"}} if performance_v2_windows_endpoint else (
                 {"error": "invalid settings"} if endpoint.startswith("/api/v2/") else {"error": "Content-Type must be application/json"}
-            )))
+            ))
             return
-        max_body_length = 1_048_576 if fresh_generation else 65_536
+        max_body_length = 65_536
         try:
             length = int(self.headers.get("Content-Length", "0"))
         except ValueError:
-            self._json(400, {"error": {"code": "INVALID_REQUEST", "message": "invalid Content-Length"}} if performance_v2_windows_endpoint else ({"error": "invalid Content-Length"} if fresh_generation else (
+            self._json(400, {"error": {"code": "INVALID_REQUEST", "message": "invalid Content-Length"}} if performance_v2_windows_endpoint else (
                 {"error": "invalid settings"} if endpoint.startswith("/api/v2/") else {"error": "invalid Content-Length"}
-            )))
+            ))
             return
         if length <= 0 or length > max_body_length:
             if portfolio_route:
                 code = "PORTFOLIO_JOB_CANCEL_INVALID" if portfolio_cancel_route else "PORTFOLIO_CAMPAIGN_INVALID"
                 self._portfolio_error(PortfolioPanelError(code, "portfolio request is invalid", status=400))
                 return
-            self._json(400, {"error": {"code": "INVALID_REQUEST", "message": "invalid JSON body length"}} if performance_v2_windows_endpoint else ({"error": f"JSON body must be between 1 and {max_body_length} bytes"} if fresh_generation else (
+            self._json(400, {"error": {"code": "INVALID_REQUEST", "message": "invalid JSON body length"}} if performance_v2_windows_endpoint else (
                 {"error": "invalid settings"} if endpoint.startswith("/api/v2/") else {"error": "JSON body must be between 1 and 65536 bytes"}
-            )))
+            ))
             return
         try:
             document = json.loads(self.rfile.read(length).decode("utf-8"))
@@ -6934,38 +6002,6 @@ class _PanelHandler(BaseHTTPRequestHandler):
                 result = self.server.controller.strategies_tester_verify_inbox(self.server.controller._required(document, "job_id"))
             elif endpoint == "/api/v2/strategies/tester/report-collection/clear":
                 result = self.server.controller.strategies_tester_report_collection_clear(document)
-            elif endpoint == "/api/v2/source/local/import/preflight":
-                result = self.server.controller.source_db_local_import_preflight(document)
-            elif endpoint == "/api/v2/source/local/import/start":
-                result = self.server.controller.source_db_local_start(document, merge=False)
-            elif endpoint == "/api/v2/source/local/merge/preflight":
-                result = self.server.controller.source_db_local_merge_preflight(document)
-            elif endpoint == "/api/v2/source/local/merge/start":
-                result = self.server.controller.source_db_local_start(document, merge=True)
-            elif endpoint == "/api/v2/source/local/cancel":
-                result = self.server.controller.source_db_local_cancel(str(document.get("job_id", "")))
-            elif endpoint == "/api/v2/source/remote/start":
-                result = self.server.controller.source_db_remote_start(document)
-            elif endpoint == "/api/v2/source/remote/cancel":
-                result = self.server.controller.source_db_remote_cancel(str(document.get("job_id", "")))
-            elif endpoint == "/api/v2/surfaces/preflight":
-                result = self.server.controller.surface_preflight(document)
-            elif endpoint == "/api/v2/surfaces/select":
-                result = self.server.controller.surface_select(document)
-            elif endpoint == "/api/v2/surfaces/publish":
-                result = self.server.controller.surface_publish(document)
-            elif endpoint == "/api/v2/surfaces/publish/start":
-                result = self.server.controller.surface_publish_start(document)
-            elif endpoint == "/api/v2/strategies/fresh/analyze":
-                result = self.server.controller.strategies_fresh_analyze(document)
-            elif endpoint == "/api/v2/strategies/fresh/generate":
-                result = self.server.controller.strategies_fresh_generate(document)
-            elif endpoint == "/api/v2/strategies/fresh/runs":
-                result = self.server.controller.strategies_fresh_generate_runs(document)
-            elif endpoint == "/api/v2/strategies/fresh/open":
-                result = self.server.controller.strategies_fresh_open(document)
-            elif endpoint == "/api/v2/strategies/fresh/shortlist":
-                result = self.server.controller.strategies_fresh_shortlist(document)
             elif endpoint == "/api/v2/strategies/performance-v2/windows":
                 result = self.server.controller.strategies_performance_v2_windows(document)
             elif endpoint == "/api/v2/strategies/performance-v2/maintenance/preview":
@@ -7040,15 +6076,8 @@ class _PanelHandler(BaseHTTPRequestHandler):
         except PerformanceV2ApiError as error:
             self._json(error.status, {"error": {"code": error.code, "message": str(error)}})
             return
-        except ShortlistBusyError:
-            self._json(
-                409,
-                {"error": {"code": "SHORTLIST_BUSY", "message": "SHORTLIST_BUSY"}},
-                headers={"Retry-After": "1"},
-            )
-            return
         except RuntimeError as error:
-            self._json(409, {"error": _fresh_generation_error(error)} if endpoint == "/api/v2/strategies/fresh/generate" else ({"error": "invalid settings"} if endpoint.startswith("/api/v2/") else {"error": str(error)}))
+            self._json(409, {"error": "invalid settings"} if endpoint.startswith("/api/v2/") else {"error": str(error)})
             return
         except (UnicodeDecodeError, json.JSONDecodeError, InvalidOperation, ValueError) as error:
             if portfolio_route:
@@ -7058,12 +6087,8 @@ class _PanelHandler(BaseHTTPRequestHandler):
                 self._json(400, {"error": {"code": "INVALID_REQUEST", "message": str(error)}})
             elif direct_retest_endpoint is not None:
                 self._json(400, {"error": str(error)})
-            elif endpoint == "/api/v2/strategies/fresh/generate":
-                self._json(400, {"error": _fresh_generation_error(error)})
-            elif endpoint == "/api/v2/strategies/fresh/analyze":
-                self._json(400, {"error": _fresh_analysis_error(str(error))})
             else:
-                self._json(400, {"error": str(error)} if endpoint == "/api/v2/strategies/tester/verify-inbox" else ({"error": _safe_direct_error(str(error)) or "invalid surface request"} if endpoint.startswith("/api/v2/surfaces/") else ({"error": "invalid settings"} if endpoint.startswith("/api/v2/") else {"error": str(error)})))
+                self._json(400, {"error": str(error)} if endpoint == "/api/v2/strategies/tester/verify-inbox" else ({"error": "invalid settings"} if endpoint.startswith("/api/v2/") else {"error": str(error)}))
             return
         except Exception:
             if performance_v2_windows_endpoint:
@@ -7082,7 +6107,7 @@ class _PanelHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(data)
             return
-        accepted = portfolio_preparation_route or portfolio_cancel_route or portfolio_submission_route or performance_v2_maintenance_apply_endpoint or endpoint in {"/api/v2/jobs", "/api/v2/surfaces/publish/start", "/api/v2/strategies/performance-v2/retest/start", "/api/v2/strategies/performance-v2/retest/import", "/api/v2/strategies/performance-v2/finalist-retest/start", "/api/v2/strategies/performance-v2/finalist-retest/import", "/api/v2/portfolio/campaigns"}
+        accepted = portfolio_preparation_route or portfolio_cancel_route or portfolio_submission_route or performance_v2_maintenance_apply_endpoint or endpoint in {"/api/v2/jobs", "/api/v2/strategies/performance-v2/retest/start", "/api/v2/strategies/performance-v2/retest/import", "/api/v2/strategies/performance-v2/finalist-retest/start", "/api/v2/strategies/performance-v2/finalist-retest/import", "/api/v2/portfolio/campaigns"}
         self._json(202 if accepted else 200, result)
 
     def do_PATCH(self) -> None:

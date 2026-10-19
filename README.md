@@ -24,16 +24,16 @@ Copy-Item config.local.json.example config.local.json
 .\.venv\Scripts\python.exe -m pytest -q
 ```
 
-В `config.local.json` задайте локальный `tester_runner.bot_root`. Для fresh
-Source v6 analysis также добавьте ваш private listing-date workbook в
-`input/dates.xlsx` (или укажите другой путь в
+В `config.local.json` задайте локальный `tester_runner.bot_root` и
+`trade_store.root`. Для импорта результатов тик-теста в PerformanceDB добавьте
+ваш private listing-date workbook в `input/dates.xlsx` (или укажите другой путь в
 `panel_workflow.listing_dates_path`). Файл игнорируется Git и не должен
-публиковаться. Без этого входа панель не начнёт анализ и явно сообщит причину.
+публиковаться. Без этого входа импорт не начнётся и панель явно сообщит причину.
 
-The shared worker count in Settings changes processing speed for import,
-publication and analysis, but does not change calculated results. The
-"1. Analysis of published surface" picker lists valid analysis DBs only from
-the configured root folder; nested folders are not searched.
+Панель состоит из трёх экранов: «Пары и стратегии» (история и READY из
+хранилища сделок, тик-тест MRS3 по папке READY, импорт в PerformanceDB, отбор
+финалистов), «Портфели» и «Настройки». Общее число рабочих процессов в
+настройках влияет на скорость импорта, но не на результаты.
 
 ## Основные команды
 

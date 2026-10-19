@@ -219,7 +219,6 @@ def test_import_quarantines_only_m7_report_and_exposes_detail(tmp_path: Path) ->
 def test_quarantined_database_blocks_preflight_and_materialization(tmp_path: Path) -> None:
     from mrs3.source_v6_importer import import_source_v6, preflight_source_v6
     from mrs3.source_v6_materializer import materialize_source_v6_from_database
-    from mrs3.panel_surfaces import LocalSurfacesService
 
     reports = tmp_path / "reports"
     reports.mkdir()
@@ -228,8 +227,5 @@ def test_quarantined_database_blocks_preflight_and_materialization(tmp_path: Pat
     target = tmp_path / "source-v6.duckdb"
     import_source_v6(reports, target, preflight=preflight_source_v6(reports, target), workers=1)
 
-    service = LocalSurfacesService()
-    preflight = service.preflight(target)
-    assert preflight["rows"] and all(row["status"] != "READY" for row in preflight["rows"])
     with pytest.raises(ValueError, match=r"quarantine.*bad.html"):
         materialize_source_v6_from_database(target, ("ONUSDT|LONG|1h",))

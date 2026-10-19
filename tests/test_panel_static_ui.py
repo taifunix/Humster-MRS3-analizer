@@ -59,7 +59,7 @@ vm.createContext(context);
 vm.runInContext(source, context);
 vm.runInContext("renderTester({job_id:'job-1', state:'RUNNING', kind:'strategies.tester.start', progress:{stage:'BOT_RUN', total:3, current:1}})", context);
 assert.equal(context.generateDisabled, true);
-assert.match(testerStatus.textContent, /BOT_RUN.*Generate READY JSON.*Performance v2/s);
+assert.match(testerStatus.textContent, /BOT_RUN.*подготовка нового пакета READY заблокирована.*Performance v2/s);
 const once = testerStatus.textContent;
 vm.runInContext("renderTester({job_id:'job-1', state:'RUNNING', kind:'strategies.tester.start', progress:{stage:'BOT_RUN', total:3, current:1}})", context);
 assert.equal(testerStatus.textContent, once);
@@ -345,9 +345,14 @@ def test_static_shell_starts_with_all_accordions_collapsed_and_status_in_header(
 def test_static_shell_has_approved_navigation_and_exclusions() -> None:
     html = _read("index.html")
 
-    for href in ("#testing", "#source-db", "#surfaces", "#strategies-dd5", "#settings"):
-        assert f'href="{href}"' in html
-    assert "Testing /" in html
+    # Panel rework stage 1b: three screens «Пары и стратегии» / «Портфели» / «Настройки».
+    nav = html.split('<nav class="workflow-nav"', 1)[1].split("</nav>", 1)[0]
+    assert re.findall(r'data-screen-link="([^"]+)"', nav) == ["strategies-dd5", "portfolio", "settings"]
+    for label in (">Пары и стратегии<", ">Портфели<", ">Настройки<"):
+        assert label in nav
+    for retired in ('href="#testing"', 'href="#source-db"', 'href="#surfaces"', '<section id="testing"',
+                    '<section id="source-db"', '<section id="surfaces"'):
+        assert retired not in html
     assert ">Оптимизатор портфеля" in html
     assert 'disabled' in html
     assert 'aria-disabled="true"' in html
@@ -364,25 +369,6 @@ def test_static_shell_does_not_claim_unverified_artifacts() -> None:
     assert "2 / 2 scopes" not in html
     assert "selected-set.surface-v6.duckdb В· READY scopes" not in html
     assert "CXUSDT В· SHORT</th><td>1h" not in html
-
-
-def test_source_surfaces_and_strategies_screens_have_approved_workflow_cards() -> None:
-    html = _read("index.html")
-
-    source = html.split('id="source-db"', 1)[1].split('id="surfaces"', 1)[0]
-    assert source.count("<details") == 4
-    assert "Manual merge" in source
-    for control in ('id="source-local-html"', 'id="source-remote-html"', 'id="merge-start"'):
-        assert control in source
-
-    surfaces = html.split('id="surfaces"', 1)[1].split('id="strategies-dd5"', 1)[0]
-    for label in ("Source DB", "Coverage preflight", "READY", "surface-publish-card"):
-        assert label in surfaces
-
-    strategies = html.split('id="strategies-dd5"', 1)[1].split('id="settings"', 1)[0]
-    for label in ("Shortlist", "Tester", "DD5", "native SINGLE_MODE tester"):
-        assert label in strategies
-    assert "Source PnL" not in strategies
 
 
 def test_settings_semantic_ids_and_static_js_use_v2_testing_endpoints() -> None:
@@ -405,102 +391,7 @@ def test_settings_semantic_ids_and_static_js_use_v2_testing_endpoints() -> None:
     assert "/api/ui/" not in js
     assert "duckdb-direct" not in js
     assert "title.tabIndex = -1" in js
-    assert "let jobTarget = ''" in js
-    assert "algorithm_version: document.querySelector('#settings-algorithm')" in js
     assert "requestJson('/api/v2/settings/reload')" in js
-
-
-def test_every_path_save_button_uses_the_settings_save_endpoint() -> None:
-    html = _read("index.html")
-    js = _read("app.js")
-
-    assert 'id="local-paths-save"' not in html
-    assert 'id="remote-paths-save"' not in html
-    assert "savePathDefaults" in js
-    for path_key in ("local_reports_root", "local_source_db_root", "local_merge_target"):
-        assert path_key in js
-    assert "['settings-local-runner', 'local_runner_root']" in js
-    assert 'id="source-remote-html"' in html
-    assert 'id="source-remote-staging"' in html
-    assert 'remote_import_html_root' in js
-    assert 'remote_import_staging_path' in js
-    assert 'remote_html_path: document.querySelector' in js
-    assert 'remote_db_target: document.querySelector' in js
-    assert "/api/v2/settings/save" in js
-    assert js.index("['source-remote-html', 'remote_import_html_root']") < js.index("if (remoteHtml && !remoteHtml.value")
-    assert "remoteHtml?.addEventListener('change', () => updateRemoteTarget(true))" in js
-
-
-def test_local_source_target_derives_a_new_file_from_the_saved_directory() -> None:
-    """A saved Source DB directory must never be posted to v6 preflight as target."""
-    js = _read("app.js")
-
-    assert "function sourceTargetDirectory(value)" in js
-    assert js.index("function sourceTargetDirectory(value)") < js.index("async function loadSafeDefaults()")
-    assert "value.toLowerCase().endsWith('.duckdb')" in js
-    assert "localTarget.value = sourceTargetPath(paths.local_source_db_root, localHtml?.value || '');" in js
-    assert "remoteLocalTarget.value = sourceTargetPath(paths.local_source_db_root, remoteHtml?.value || '');" in js
-    assert "local_source_db_root: sourceTargetDirectory(inputValue('source-local-target'))" in js
-
-
-def test_source_job_failure_shows_its_safe_backend_message() -> None:
-    js = _read("app.js")
-
-    assert "job.error?.message || 'Source DB operation failed.'" in js
-    assert "sourceStatus(card, `FAILED: ${failure}`);" in js
-
-
-def test_merge_card_offers_catalog_choices_and_visible_progress() -> None:
-    html = _read("index.html")
-    js = _read("app.js")
-
-    assert 'list="merge-source-options"' in html
-    assert 'id="merge-source-options"' in html
-    assert 'id="merge-progress"' in html
-    assert "merge-source-options" in js
-    assert "input_paths: [document.querySelector('#merge-source-a')?.value || '', document.querySelector('#merge-source-b')?.value || '']" in js
-    assert "progressTrack.style.width" in js
-    assert "progressTrack.style.width = '100%'" in js
-    assert "card.id === 'local-merge-card'" in js
-
-
-def test_remote_source_card_renders_two_stage_progress_and_elapsed_time() -> None:
-    js = _read("app.js")
-
-    for text in ("renderRemoteSourceProgress", "SHA-256", "formatDuration", "formatBytes"):
-        assert text in js
-    assert "remoteSourceTrack.style.width" in js
-    assert "stage_elapsed_seconds" in js
-    assert "sourceEvidenceSummary" in js
-    assert "accepted_count" in js
-    assert "imported ${accepted}" in js
-    assert "safe_to_delete" in js
-    assert "source_content_digest" in js
-
-
-def test_surface_materializer_loads_the_configured_source_db_catalog() -> None:
-    html = _read("index.html")
-    js = _read("app.js")
-
-    assert 'id="surface-source-refresh"' in html
-    assert "loadSourceCatalog" in js
-    assert "'/api/v2/source/local/catalog'" in js
-    assert "source.dispatchEvent(new Event('change'))" in js
-    assert "surfacePreflightRunV2" in js
-    assert "preflight must be started again" in js
-    assert "sourceCatalogRun" in js
-    assert "surfacePublishActive" in js
-    assert "surfaceSource.disabled = true" in js
-    assert "sourceRefresh.disabled = true" in js
-
-
-def test_strategies_loads_the_persisted_valid_surface_catalog() -> None:
-    html = _read("index.html")
-    js = _read("app.js")
-
-    assert 'id="analysis-surface"' in html
-    assert "loadSurfaceCatalog" in js
-    assert "'/api/v2/surfaces/catalog'" in js
 
 
 def test_performance_v2_handoff_exposes_ready_gated_controls() -> None:
@@ -514,9 +405,10 @@ def test_performance_v2_handoff_exposes_ready_gated_controls() -> None:
     assert 'id="performance-import-start"' in html
     assert 'id="performance-import-start" class="button button-primary" disabled' in html
     rows = re.findall(r'<div class="button-row">(.*?)</div>', card, re.S)
-    actions = [row for row in rows if "shortlist-generate" in row or "performance-inbox-verify" in row]
+    actions = [row for row in rows if "tester-start" in row or "performance-inbox-verify" in row]
     assert len(actions) == 2
-    assert actions[0].index("shortlist-generate") < actions[0].index("tester-start") < actions[0].index("tester-stop")
+    assert "shortlist-generate" not in card                      # READY JSON now comes from the trade store
+    assert actions[0].index("tester-start") < actions[0].index("tester-stop")
     assert actions[1].index("performance-inbox-verify") < actions[1].index("performance-import-start")
     assert "let normalImportAuthorized = false;" in js
     assert "normalImportAuthorized = true;" in js
@@ -1189,88 +1081,6 @@ def test_selection_responsive_breakpoint_does_not_change_portfolio_breakpoint() 
     assert "@media (max-width: 1279px) {\n  .selection-preview-layout" in css
 
 
-def test_analysis_start_immediately_shows_running_phase_and_elapsed_time() -> None:
-    js = _read("app.js")
-
-    assert "analysisProgress" in js
-    assert "Analysis is running" in js
-    assert "Reading and validating surface" in js
-    assert "analyzeFresh.disabled = true" in js
-    assert "setInterval" in js
-
-
-def test_surface_async_status_keeps_atomic_phases_indeterminate_and_ignores_stale_errors() -> None:
-    js = _read("app.js")
-
-    assert "const determinate = ['HYDRATING', 'MATERIALIZING', 'WRITING', 'VALIDATING'].includes(result.phase);" in js
-    assert "publishProgressV2('running', details, determinate ? result.completed : 0, determinate ? result.total : 0);" in js
-    assert "if (run === surfacePreflightRunV2 && sourcePath === (surfaceSource?.value || ''))" in js
-    assert "result.error || result.phase || 'Analysis failed.'" in js
-
-
-def test_surface_preflight_has_visible_progress_and_reveals_ready_results() -> None:
-    html = _read("index.html")
-    js = _read("app.js")
-
-    assert 'id="surface-preflight-progress"' in html
-    assert "renderSurfacePreflightProgress" in js
-    assert "surfaceCards[1].open = true" in js
-    assert "surfaceCards[2].open = true" in js
-    assert "is-running" in js
-    assert "'55%'" not in js
-
-
-def test_surfaces_restore_the_approved_four_stage_accordion_and_scope_table() -> None:
-    html = _read("index.html")
-    css = _read("app.css")
-
-    surfaces = html.split('id="surfaces"', 1)[1].split('id="strategies-dd5"', 1)[0]
-    for control in (
-        'id="surface-source-card"',
-        'id="surface-preflight-card"',
-        'id="surface-ready-card"',
-        'id="surface-publish-card"',
-        'id="scope-filter-pair"',
-        'id="scope-filter-side"',
-        'id="scope-filter-status"',
-        'id="scope-select-all"',
-        'id="scope-select-none"',
-        'id="scope-select-visible"',
-        'id="surface-publish-progress"',
-    ):
-        assert control in surfaces
-    assert ".scope-table" in css
-    assert ".scope-group" in css
-
-
-def test_surface_publish_uses_a_polled_job_and_selection_changes_require_confirmation() -> None:
-    html = _read("index.html")
-    js = _read("app.js")
-
-    assert "'/api/v2/surfaces/publish/start'" in js
-    assert "'/api/v2/surfaces/publish/status'" in js
-    assert "confirmedSurfaceScopesV2" in js
-    assert "surface selection changed; confirm it before publishing" in js
-    assert 'id="surface-target-save"' not in html
-    assert 'name="surface_target_path"' in html
-    assert 'name="surface_target_path" type="text" value=""' in html
-    assert 'id="surface-target"' in html and 'readonly' in html
-    assert 'placeholder="data/surfaces"' in html
-
-
-def test_active_surface_publish_handler_uses_confirmed_snapshot_and_committed_file_path() -> None:
-    js = _read("app.js")
-
-    active = js.split("document.querySelector('#surface-publish-start')?.addEventListener", 1)[1]
-    assert "'/api/v2/surfaces/publish/start'" in active
-    assert "'/api/v2/surfaces/publish'" not in active
-    assert "const selectionSnapshot" in active
-    assert "const outputDir" in active
-    assert "`${outputDir}\\\\${result.target}`" in active
-    assert "result.error || 'surface publication failed'" in active
-    assert "error instanceof Error ? error.message" in active
-
-
 def test_surface_timeframe_rows_override_generic_scope_list_label_style() -> None:
     css = _read("app.css")
 
@@ -1279,33 +1089,6 @@ def test_surface_timeframe_rows_override_generic_scope_list_label_style() -> Non
     assert "color: #e3eaf5;" in css
     assert ".scope-table { --scope-grid-template:" in css
     assert "overflow-x: auto;" in css
-
-
-def test_surface_scope_preview_uses_the_approved_columns_and_aggregate_contract() -> None:
-    js = _read("app.js")
-    css = _read("app.css")
-
-    assert "'Период данных'" in js
-    assert "'PnL > 10%'" in js
-    assert "'PnL медиана / максимум'" in js
-    assert "pnl_gt_10_count" in js
-    assert "aggregate.common_interval" in js
-    assert "aggregate.pnl_preview" in js
-    assert "surfaceNumberV2(preview.pnl_gt_10_percent, 1)" in js
-    assert "READY · ${ready.count} / ${ready.total}" in js
-    assert "'Grid'" not in js
-    assert "36px 190px 90px 170px 150px 170px" in css
-
-
-def test_surface_gap_link_opens_a_visible_report_dialog() -> None:
-    html = _read("index.html")
-    js = _read("app.js")
-
-    assert 'id="surface-gap-dialog"' in html
-    assert 'id="surface-gap-report"' in html
-    assert "showModal()" in js
-    assert "gapRun !== surfacePreflightRunV2" in js
-    assert "missing_witnesses" in js
 
 
 def test_strategies_screen_hides_removed_dd5_result_stage_and_live_status() -> None:
@@ -1337,14 +1120,6 @@ def test_dd5_screen_has_no_dead_control_handlers_or_payload_fields() -> None:
     for text in ("analysis-lineage", "strategies-output", "tester-batch", "tester-output"):
         assert text not in html
         assert text not in js
-
-
-def test_analysis_catalog_uses_relative_analysis_ref_for_open() -> None:
-    js = _read("app.js")
-
-    assert "row.analysis_ref" in js
-    assert "analysis_ref: selected" in js
-    assert "row.path" not in js
 
 
 def test_tester_dates_and_local_ranges_are_sent_only_on_tester_start() -> None:
@@ -1575,384 +1350,8 @@ def test_normal_tester_jobs_default_to_single_mode_without_metadata() -> None:
     assert "inboxVerifyV2.disabled = !verifiable || importAllowed;" in render
 
 
-def test_shortlist_active_selection_uses_ready_after_filters_without_http() -> None:
-    html = _read("index.html")
-    js = _read("app.js")
-
-    assert 'id="shortlist-select-active"' in html
-    assert "ready_after_filters" in js
-
-
-def test_shortlist_controls_stay_in_the_card_and_indent_tf_rows() -> None:
-    html = _read("index.html")
-    css = _read("app.css")
-
-    card = html.split("<b>2. Shortlist и READY JSON</b>", 1)[1].split("</details>", 1)[0]
-    assert '<div class="shortlist-filter-controls">' in card
-    assert 'id="shortlist-filter-recalculate"' in card
-    assert ".shortlist-table tbody tr.is-timeframe > td:first-child { padding-left: 2.1rem; }" in css
-
-
-def test_shortlist_controls_match_requested_compact_typography() -> None:
-    css = _read("app.css")
-    js = _read("app.js")
-
-    assert "#shortlist-summary { display: none; }" in css
-    assert ".shortlist-group-checkbox, .shortlist-tf-checkbox { width: 16px; min-width: 16px; height: 16px; min-height: 16px; vertical-align: middle; }" in css
-    assert "disclosure.textContent = open ?" in js
-    assert ".shortlist-disclosure { display: inline-flex; align-items: center; justify-content: center; vertical-align: middle; position: relative; top: -1px;" in css
-
-
-def test_shortlist_ready_counts_use_named_cells_without_column_indexes() -> None:
-    js = _read("app.js")
-    render = js.split("const renderShortlist = () => {", 1)[1].split("const applyShortlist", 1)[0]
-
-    assert "const readyCell = countCell(group.ready_after_filters ?? group.ready, true);" in render
-    assert "countCell(pair.ready_after_filters ?? pair.ready, true)" in render
-    assert "children[" not in render
-
-
-def test_shortlist_v2_state_machine() -> None:
-    html = _read("index.html")
-    assert '<input id="shortlist-filter-pretest-ab" type="checkbox">' in html
-    assert '<input id="shortlist-filter-ladder" type="checkbox">' in html
-    assert '<input id="shortlist-filter-pareto" type="checkbox">' in html
-    controls = html.index('<div class="shortlist-filter-controls">')
-    last_control = html.index('id="shortlist-filter-pareto"')
-    apply_button = html.index('id="shortlist-filter-recalculate"')
-    assert controls < last_control < apply_button
-
-    script = f"""
-const fs = require('node:fs');
-const vm = require('node:vm');
-const assert = require('node:assert/strict');
- (async () => {{
-const source = fs.readFileSync({json.dumps(str(PANEL_WEB / 'app.js'))}, 'utf8');
-const start = source.indexOf('const freshShortlistStateHelpers = (() => {{');
-const end = source.indexOf('\\nconst ORDER_BUCKETS', start);
-assert.notEqual(start, -1, 'production shortlist state helper missing');
-assert.notEqual(end, -1, 'production shortlist state helper boundary missing');
-const context = {{}};
-vm.runInNewContext(source.slice(start, end), context, {{ filename: 'app.js' }});
-const {{ create, readyGroups, sumPlateauCounts, pruneReadyScopes, canonicalPctForComparison, validatePctForRequest }} = context.freshShortlistStateHelpers;
-assert.equal(canonicalPctForComparison('0.3'), '0.300');
-assert.equal(canonicalPctForComparison(' .300 '), '0.300');
-assert.equal(canonicalPctForComparison('.3'), '0.300');
-assert.equal(canonicalPctForComparison('3e-1'), '0.300');
-assert.equal(canonicalPctForComparison('0.0001'), '0.0001');
-assert.equal(validatePctForRequest('0.0001'), 'Minimum Shift may use at most three decimal places.');
-assert.equal(validatePctForRequest('1e-3'), '');
-assert.match(validatePctForRequest('101'), /at most 100%/);
-class FakeCheckbox {{
-  constructor(checked) {{ this.checked = checked; this.listeners = {{}}; }}
-  addEventListener(name, handler) {{ (this.listeners[name] ||= []).push(handler); }}
-  change(value) {{ this.checked = value; for (const handler of this.listeners.change || []) handler(); }}
-}}
-const controls = {{
-  pretest_ab_enabled: new FakeCheckbox(true),
-  ladder_enabled: new FakeCheckbox(true),
-  pareto_enabled: new FakeCheckbox(true),
-}};
-const calls = [];
-const request = (endpoint, body) => new Promise((resolve, reject) => calls.push({{ endpoint, body, resolve, reject }}));
-const response = (id, token, options, scope) => ({{
-  filter_version: 'shortlist-v2', filter_engine_version: 'test-engine',
-  analysis_run_id: id, applied_options: options, selection_token: token,
-  groups: [{{ scope_key: scope, pair: 'BTCUSDT', side: 'LONG', timeframe: 'H1', ready_after_filters: 1, candidate_ids: [scope], plateau_count: 0 }}],
-  items: [{{ candidate_id: scope }}],
-}});
-let rendered = null;
-let lastState = null;
-const state = create({{
-  controls, request,
-  onChange(next) {{
-    lastState = next;
-    rendered = next.snapshot && {{ token: next.snapshot.selection_token, options: next.snapshot.applied_options, scope: next.snapshot.groups[0].scope_key }};
-  }},
-}});
-assert.deepEqual(Object.values(controls).map((item) => item.checked), [false, false, false], 'restored checkbox state must be reset OFF');
-assert.equal(calls.length, 0, 'initial reset must not request a shortlist');
-const rev1 = state.beginAnalysis();
-assert.equal(state.setAnalysis('run-1', rev1), true);
-const initialLoad = state.load(rev1);
-assert.deepEqual(JSON.parse(JSON.stringify(calls[0].body)), {{
-  analysis_run_id: 'run-1', filter_version: 'shortlist-v2',
-  pretest_ab_enabled: false, ladder_enabled: false, pareto_enabled: false,
-}});
-calls[0].resolve(response('run-1', 'token-off', {{ pretest_ab_enabled: false, ladder_enabled: false, pareto_enabled: false }}, 'off-scope'));
-assert.equal(await initialLoad, true);
-assert.equal(rendered.token, 'token-off');
-assert.equal(rendered.scope, 'off-scope');
-
-controls.pretest_ab_enabled.change(true);
-controls.ladder_enabled.change(true);
-assert.equal(calls.length, 1, 'draft changes must not request a shortlist');
-assert.equal(lastState.pending, true);
-assert.equal(state.snapshot.selection_token, 'token-off');
-assert.deepEqual(JSON.parse(JSON.stringify(state.actionPayload())), {{
-  analysis_run_id: 'run-1', filter_version: 'shortlist-v2',
-  pretest_ab_enabled: false, ladder_enabled: false, pareto_enabled: false,
-  selection_token: 'token-off',
-}}, 'draft-only changes leave the applied output usable');
-const apply = state.applyDraft();
-assert.equal(calls.length, 2);
-assert.deepEqual(JSON.parse(JSON.stringify(calls[1].body)), {{
-  analysis_run_id: 'run-1', filter_version: 'shortlist-v2',
-  pretest_ab_enabled: true, ladder_enabled: true, pareto_enabled: false,
-}});
-controls.pareto_enabled.change(true);
-assert.equal(lastState.pending, true, 'edits during apply remain draft-only');
-assert.equal(await state.applyDraft(), false, 'duplicate apply must be ignored');
-assert.equal(calls.length, 2);
-assert.equal(state.actionPayload({{ audit: true }}), null, 'output is disabled during replacement');
-calls[1].resolve(response('run-1', 'token-applied', {{ pretest_ab_enabled: true, ladder_enabled: true, pareto_enabled: false }}, 'applied-scope'));
-assert.equal(await apply, true);
-assert.equal(rendered.token, 'token-applied');
-assert.equal(rendered.scope, 'applied-scope', 'table and token replace together');
-assert.deepEqual(JSON.parse(JSON.stringify(rendered.options)), {{ pretest_ab_enabled: true, ladder_enabled: true, pareto_enabled: false }});
-assert.equal(lastState.pending, true);
-const refresh = state.refresh();
-assert.deepEqual(JSON.parse(JSON.stringify(calls[2].body)), {{
-  analysis_run_id: 'run-1', filter_version: 'shortlist-v2',
-  pretest_ab_enabled: true, ladder_enabled: true, pareto_enabled: false,
-}});
-calls[2].resolve(response('run-1', 'token-refreshed', {{ pretest_ab_enabled: true, ladder_enabled: true, pareto_enabled: false }}, 'refreshed-scope'));
-assert.equal(await refresh, true);
-assert.equal(controls.pareto_enabled.checked, true, 'refresh must preserve draft edits');
-let finishGeneration;
-let generationFinished = false;
-const generationPending = new Promise((resolve) => {{ finishGeneration = () => {{ generationFinished = true; resolve(); }}; }});
-state.setGenerateBusy(true);
-controls.pretest_ab_enabled.change(false);
-assert.equal(lastState.generateBusy, true, 'draft notification must preserve in-flight generation state');
-assert.equal(generationFinished, false, 'the simulated generation promise remains pending while the checkbox changes');
-finishGeneration();
-await generationPending;
-state.setGenerateBusy(false);
-assert.equal(lastState.generateBusy, false);
-const action = state.actionPayload({{ audit: true }});
-assert.deepEqual(JSON.parse(JSON.stringify(action)), {{
-  analysis_run_id: 'run-1', filter_version: 'shortlist-v2',
-  pretest_ab_enabled: true, ladder_enabled: true, pareto_enabled: false,
-  selection_token: 'token-refreshed', audit: true,
-}}, 'audit must use applied options and token, not draft');
-assert.deepEqual(JSON.parse(JSON.stringify(state.actionPayload({{ candidate_ids: ['applied-scope'] }}))), {{
-  analysis_run_id: 'run-1', filter_version: 'shortlist-v2',
-  pretest_ab_enabled: true, ladder_enabled: true, pareto_enabled: false,
-  selection_token: 'token-refreshed', candidate_ids: ['applied-scope'],
-}}, 'generation must use the same applied snapshot');
-
-const failedApply = state.applyDraft();
-calls[3].reject(new Error('recalc failed'));
-assert.equal(await failedApply, false);
-assert.equal(state.snapshot.selection_token, 'token-refreshed');
-assert.equal(rendered.token, 'token-refreshed');
-assert.equal(rendered.scope, 'refreshed-scope');
-assert.deepEqual(JSON.parse(JSON.stringify(rendered.options)), {{ pretest_ab_enabled: true, ladder_enabled: true, pareto_enabled: false }});
-assert.match(lastState.error, /recalc failed/);
-
-const previousSnapshot = state.snapshot;
-const failedOpenRevision = state.beginAnalysis();
-assert.equal(state.snapshot, previousSnapshot, 'starting an open must retain the visible snapshot until identity changes');
-assert.equal(state.analysisRunId, 'run-1');
-assert.equal(lastState.busy, true);
-assert.equal(state.actionPayload(), null, 'actions pause while a new analysis is opening');
-assert.equal(state.failAnalysis(failedOpenRevision, new Error('open failed')), true);
-assert.equal(state.snapshot, previousSnapshot, 'failed open must preserve the applied snapshot');
-assert.equal(state.analysisRunId, 'run-1');
-assert.equal(lastState.busy, false);
-assert.deepEqual(JSON.parse(JSON.stringify(state.actionPayload())), {{
-  analysis_run_id: 'run-1', filter_version: 'shortlist-v2',
-  pretest_ab_enabled: true, ladder_enabled: true, pareto_enabled: false,
-  selection_token: 'token-refreshed',
-}}, 'previous applied actions resume after open failure');
-
-const staleRefresh = state.refresh();
-const staleRevision = state.beginAnalysis();
-const newestRevision = state.beginAnalysis();
-assert.equal(state.setAnalysis('stale-run', staleRevision), false);
-assert.equal(state.setAnalysis('run-2', newestRevision), true);
-const newLoad = state.load(newestRevision);
-assert.equal(calls.length, 6);
-calls[5].resolve(response('run-2', 'token-new', {{ pretest_ab_enabled: false, ladder_enabled: false, pareto_enabled: false }}, 'new-scope'));
-assert.equal(await newLoad, true);
-calls[4].resolve(response('run-1', 'token-stale', {{ pretest_ab_enabled: true, ladder_enabled: true, pareto_enabled: false }}, 'stale-scope'));
-assert.equal(await staleRefresh, false);
-assert.equal(state.analysisRunId, 'run-2');
-assert.equal(state.isCurrent(newestRevision, 'run-1'), false, 'analysis identity must also guard a matching revision');
-assert.equal(state.snapshot.selection_token, 'token-new');
-assert.equal(rendered.scope, 'new-scope');
-assert.equal(state.analysisRunId, 'run-2', 'batch restore must not change active analysis');
-assert.equal(state.restoreBatch, undefined, 'generated-batch metadata is not shortlist analysis state');
-const restoreRevision = state.generationRevision;
-const readyJson = {{ count: 0, status: '' }};
-let releaseDelayedRestore;
-const delayedRestore = new Promise((resolve) => {{ releaseDelayedRestore = resolve; }}).then((batch) => {{
-  if (!state.isGenerationCurrent(restoreRevision)) return false;
-  readyJson.count = batch.strategy_count;
-  readyJson.status = `READY JSON restored: ${{batch.strategy_count}}.`;
-  return true;
-}});
-state.setGenerateBusy(true);
-readyJson.count = 3;
-readyJson.status = 'READY JSON committed: 3.';
-state.setGenerateBusy(false);
-releaseDelayedRestore({{ strategy_count: 1 }});
-assert.equal(await delayedRestore, false, 'late restore is stale after a committed generation');
-assert.equal(readyJson.count, 3);
-assert.equal(readyJson.status, 'READY JSON committed: 3.');
-assert.equal(sumPlateauCounts([{{ plateau_count: 0 }}, {{ plateau_count: 2 }}, {{ plateau_count: 3 }}]), 5);
-assert.equal(sumPlateauCounts([{{ plateau_count: 0 }}]), 0, 'verified zero must remain numeric zero');
-assert.equal(sumPlateauCounts([{{}}]), null, 'missing plateau evidence is not zero');
-assert.deepEqual(JSON.parse(JSON.stringify(readyGroups([
-  {{ scope_key: 'empty', ready_after_filters: 0, ready: 4 }},
-  {{ scope_key: 'ready', ready_after_filters: 2 }},
-]))), [{{ scope_key: 'ready', ready_after_filters: 2 }}], 'zero-READY scope is not selectable');
-const selectedScopes = new Set(['keep', 'missing', 'empty']);
-pruneReadyScopes(selectedScopes, [
-  {{ scope_key: 'keep', ready_after_filters: 1 }},
-  {{ scope_key: 'empty', ready_after_filters: 0 }},
-]);
-assert.deepEqual([...selectedScopes], ['keep'], 'successful replacement prunes absent and non-READY scopes');
- }})().catch((error) => {{ console.error(error); process.exitCode = 1; }});
-"""
-    completed = subprocess.run(("node", "-e", script), capture_output=True, text=True)
-    assert completed.returncode == 0, completed.stderr
-
-
-def test_shortlist_min_shift_enabled_payload_reaches_applied_actions() -> None:
-    script = r"""
-const fs = require('node:fs');
-const vm = require('node:vm');
-const assert = require('node:assert/strict');
-const source = fs.readFileSync(__APP_JS__, 'utf8');
-const start = source.indexOf('const freshShortlistStateHelpers = (() => {');
-const end = source.indexOf('\nconst ORDER_BUCKETS', start);
-const context = {};
-vm.runInNewContext(source.slice(start, end), context, { filename: 'app.js' });
-class Control {
-  constructor({ checked = false, value = '' } = {}) { this.checked = checked; this.value = value; this.listeners = {}; }
-  addEventListener(name, handler) { (this.listeners[name] ||= []).push(handler); }
-}
-const controls = {
-  pretest_ab_enabled: new Control(), ladder_enabled: new Control(), pareto_enabled: new Control(),
-  min_shift_enabled: new Control(), min_shift_pct: new Control({ value: '0.3' }),
-};
-const calls = [];
-const request = (_endpoint, body) => new Promise((resolve, reject) => calls.push({ body, resolve, reject }));
-const response = (options, token) => ({
-  filter_version: 'shortlist-v2', filter_engine_version: options.min_shift_enabled ? 'shortlist-v2-engine-2' : 'shortlist-v2-engine-1',
-  analysis_run_id: 'run-1', applied_options: options, selection_token: token,
-  groups: [{ scope_key: 'BTCUSDT|LONG|1h', ready_after_filters: 1, candidate_ids: ['C'] }], items: [{ candidate_id: 'C' }],
-});
-const state = context.freshShortlistStateHelpers.create({ controls, request });
-const revision = state.beginAnalysis();
-state.setAnalysis('run-1', revision);
-const initial = state.load(revision);
-assert.deepEqual(JSON.parse(JSON.stringify(calls[0].body)), {
-  analysis_run_id: 'run-1', filter_version: 'shortlist-v2',
-  pretest_ab_enabled: false, ladder_enabled: false, pareto_enabled: false,
-});
-calls[0].resolve(response({ pretest_ab_enabled: false, ladder_enabled: false, pareto_enabled: false }, 'off-token'));
-(async () => {
-  assert.equal(await initial, true);
-  controls.min_shift_enabled.checked = true;
-  const apply = state.applyDraft();
-  assert.deepEqual(JSON.parse(JSON.stringify(calls[1].body)), {
-    analysis_run_id: 'run-1', filter_version: 'shortlist-v2',
-    pretest_ab_enabled: false, ladder_enabled: false, pareto_enabled: false,
-    min_shift_enabled: true, min_shift_pct: '0.300',
-  });
-  calls[1].resolve(response({
-    pretest_ab_enabled: false, ladder_enabled: false, pareto_enabled: false,
-    min_shift_enabled: true, min_shift_pct: '0.300',
-  }, 'enabled-token'));
-  assert.equal(await apply, true);
-  assert.deepEqual(JSON.parse(JSON.stringify(state.actionPayload({ audit: true }))), {
-    analysis_run_id: 'run-1', filter_version: 'shortlist-v2',
-    pretest_ab_enabled: false, ladder_enabled: false, pareto_enabled: false,
-    min_shift_enabled: true, min_shift_pct: '0.300', selection_token: 'enabled-token', audit: true,
-  });
-})().catch((error) => { console.error(error); process.exitCode = 1; });
-""".replace('__APP_JS__', json.dumps(str(PANEL_WEB / 'app.js')))
-    completed = subprocess.run(("node", "-e", script), capture_output=True, text=True)
-    assert completed.returncode == 0, completed.stderr
-
-
-def test_shortlist_renderer_keeps_ready_plateau_and_order_bucket_cells_aligned() -> None:
-    script = r"""
-const fs = require('node:fs');
-const vm = require('node:vm');
-const assert = require('node:assert/strict');
-const source = fs.readFileSync(__APP_JS__, 'utf8');
-const helperStart = source.indexOf('const freshShortlistStateHelpers = (() => {');
-const helperEnd = source.indexOf('\nconst performanceV2ExportHelpers', helperStart);
-const renderStart = source.indexOf('const ORDER_BUCKETS', helperEnd);
-const renderEnd = source.indexOf('\n(() => {', renderStart);
-assert.notEqual(helperStart, -1);
-assert.notEqual(helperEnd, -1);
-assert.notEqual(renderStart, -1);
-assert.notEqual(renderEnd, -1);
-class Element {
-  constructor(tag) {
-    this.tagName = tag; this.children = []; this.attributes = {}; this.classes = new Set();
-    this._textContent = '';
-    this.classList = { add: (name) => this.classes.add(name), toggle: (name, value) => value ? this.classes.add(name) : this.classes.delete(name) };
-  }
-  get textContent() { return this._textContent; }
-  set textContent(value) { this._textContent = String(value ?? ''); }
-  append(...nodes) { this.children.push(...nodes); }
-  replaceChildren(...nodes) { this.children = [...nodes]; }
-  setAttribute(name, value) { this.attributes[name] = value; }
-  addEventListener() {}
-}
-const elements = new Map(['#shortlist-body', '#shortlist-empty', '#shortlist-summary', '#shortlist-badge'].map((selector) => [selector, new Element(selector)]));
-const context = {
-  window: { retestRecovery: { selectCommittedRetestTester() {}, selectRetestTester() {} } },
-  document: {
-    createElement: (tag) => new Element(tag),
-    querySelector: (selector) => elements.get(selector) || null,
-  },
-};
-vm.runInNewContext(source.slice(helperStart, helperEnd) + '\n' + source.slice(renderStart, renderEnd) + '\nglobalThis.applyShortlist = applyShortlist;', context, { filename: 'app.js' });
-const dash = String.fromCharCode(0x2014);
-context.applyShortlist({ items: [], groups: [
-  { scope_key: 'scope-1h', pair: 'BTCUSDT', side: 'LONG', timeframe: '1h', counts: { '1ORD': 1, '2ORD': 0, '3ORD': 0, '4ORD': 0 }, ready: 8, ready_after_filters: 1, deferred: 1, total: 2, plateau_count: 0, period: '1h', candidate_ids: ['one'] },
-  { scope_key: 'scope-4h', pair: 'BTCUSDT', side: 'LONG', timeframe: '4h', counts: { '1ORD': 0, '2ORD': 1, '3ORD': 0, '4ORD': 0 }, ready: 9, ready_after_filters: 1, deferred: 1, total: 2, plateau_count: 2, period: '4h', candidate_ids: ['two'] },
-] });
-const rows = elements.get('#shortlist-body').children;
-const texts = (row) => row.children.map((cell) => cell.textContent);
-assert.deepEqual(texts(rows[0]), ['', 'BTCUSDT ' + String.fromCharCode(0x00b7) + ' LONG', '2 TF', '1', '1', dash, dash, '2', '2', '2', '4', dash]);
-assert.deepEqual(texts(rows[1]), ['', '', '1h', '1', dash, dash, dash, '0', '1', '1', '2', '1h']);
-assert.deepEqual(texts(rows[2]), ['', '', '4h', dash, '1', dash, dash, '2', '1', '1', '2', '4h']);
-const parent = texts(rows[0]);
-assert.equal(parent.slice(3, 7).reduce((sum, count) => sum + Number(count === dash ? 0 : count), 0), Number(parent[8]), 'parent bucket counts agree with after-filter READY count');
-assert.equal(parent[7], String(rows.slice(1).reduce((sum, row) => sum + Number(texts(row)[7]), 0)), 'parent plateau total includes every timeframe');
-const readyCount = (row) => Number(row.children.find((cell) => cell.classes.has('count-ready'))?.textContent || 0);
-assert.equal(readyCount(rows[0]), rows.slice(1).reduce((sum, row) => sum + readyCount(row), 0), 'parent READY equals the sum of child READY counts');
-""".replace("__APP_JS__", json.dumps(str(PANEL_WEB / "app.js")))
-    completed = subprocess.run(("node", "-e", script), capture_output=True, text=True)
-    assert completed.returncode == 0, completed.stderr
-
-
 def test_accordion_status_badges_align_to_the_right() -> None:
     assert ".accordion > summary > .state-badge { margin-left: auto; }" in _read("app.css")
-
-
-def test_shortlist_bulk_handlers_preserve_non_selection_state() -> None:
-    js = _read("app.js")
-
-    handlers = "\n".join(
-        js.split(f"document.querySelector('{selector}')", 1)[1].split("});", 1)[0]
-        for selector in ("#shortlist-select-all", "#shortlist-select-active", "#shortlist-select-none")
-    )
-    assert all(selector in js for selector in ("#shortlist-select-all", "#shortlist-select-active", "#shortlist-select-none"))
-    assert handlers.count("renderShortlist();") == 3
-    assert "remoteRequest" not in handlers
-    assert "expandedPairs.add" not in handlers
-    assert "expandedPairs.delete" not in handlers
-    assert "tester-start-date" not in handlers
-    assert "tester-end-date" not in handlers
 
 
 def test_tester_date_guard_is_iso_validated_before_network_request() -> None:
@@ -1977,170 +1376,7 @@ def test_tester_start_uses_the_restored_generated_batch_identity() -> None:
     assert "if (!generatedBatchAnalysisId)" in tester
     assert "analysis_run_id: generatedBatchAnalysisId" in tester
     assert "analysis_run_id: currentAnalysisId" not in tester
-    assert "Generate or restore READY JSON first." in tester
-
-
-def test_shortlist_table_has_phase_one_optional_group_columns_and_fallbacks() -> None:
-    html = _read("index.html")
-    js = _read("app.js")
-
-    shortlist = html.split('class="shortlist-table"', 1)[1].split("</table>", 1)[0]
-    assert shortlist.split("</thead>", 1)[0].count("<th ") == 12
-    for field in ("plateau_count", "period", "deferred"):
-        assert f"group.{field}" in js
-    assert "—" in js
-
-
-def test_shortlist_snapshot_replacement_prunes_all_nonready_or_missing_selections() -> None:
-    js = _read("app.js")
-
-    apply = js.split("const applyShortlist = (payload) => {", 1)[1].split("\n  };", 1)[0]
-    assert "freshShortlistStateHelpers.pruneReadyScopes(selectedScopeKeys, shortlistGroups);" in apply
-
-
-def test_generation_busy_survives_filter_notifications_and_tester_updates() -> None:
-    js = _read("app.js")
-
-    on_change = js.split("onChange: (state) => {", 1)[1].split("\n  });", 1)[0]
-    generate = js.split("if (generateFresh) generateFresh.addEventListener('click', async () => {", 1)[1].split("const refreshFresh", 1)[0]
-    tester_controls = js.split("const setTesterControls = (busy) => {", 1)[1].split("\n  };", 1)[0]
-    restore = js.split("const restoreGeneratedBatch = async () => {", 1)[1].split("\n  };", 1)[0]
-    assert "state.generateBusy" in on_change
-    assert "freshShortlistState.generateBusy" in generate
-    assert "freshShortlistState.setGenerateBusy(true)" in generate
-    assert "freshShortlistState.setGenerateBusy(false)" in generate
-    assert "testerControlsBusy || !freshShortlistState.actionPayload()" in generate
-    assert "freshShortlistState.generateBusy" in tester_controls
-    assert "const restoreGenerationRevision = freshShortlistState.generationRevision;" in restore
-    assert "!freshShortlistState.isGenerationCurrent(restoreGenerationRevision)" in restore
-
-
-def test_generation_completion_from_old_analysis_cannot_overwrite_current_status() -> None:
-    script = r"""
-const fs = require('node:fs');
-const vm = require('node:vm');
-const assert = require('node:assert/strict');
-const source = fs.readFileSync(__APP_JS__, 'utf8');
-const helperStart = source.indexOf('const freshShortlistStateHelpers = (() => {');
-const helperEnd = source.indexOf('\nconst ORDER_BUCKETS', helperStart);
-const generateStart = source.indexOf("if (generateFresh) generateFresh.addEventListener('click', async () => {");
-const generateEnd = source.indexOf('\n  const refreshFresh', generateStart);
-assert.notEqual(helperStart, -1);
-assert.notEqual(helperEnd, -1);
-assert.notEqual(generateStart, -1);
-assert.notEqual(generateEnd, -1);
-const visible = { readyCount: 4, status: 'Previous READY JSON' };
-const outcomes = [];
-const context = {
-  console: {
-    info(message, details) { outcomes.push({ level: 'info', message, details }); },
-    warn(message, details) { outcomes.push({ level: 'warn', message, details }); },
-  },
-  currentAnalysisId: '',
-  shortlistGroups: [{ scope_key: 'scope-1', pair: 'BTCUSDT', side: 'LONG', timeframe: '1h' }],
-  selectedScopeKeys: new Set(['scope-1']),
-  selectedCandidateIds: () => ['candidate-1'],
-  testerControlsBusy: false,
-  generateFresh: { disabled: false, addEventListener(_name, handler) { this.handler = handler; } },
-  setTesterReadyCount(count) { visible.readyCount = count; },
-  generateStatus(status) { visible.status = status; },
-  requestJson() { throw new Error('status polling is not expected for a terminal result'); },
-};
-let releaseGeneration;
-let rejectGeneration;
-let generationRequest;
-context.remoteRequest = (endpoint, body) => {
-  generationRequest = { endpoint, body };
-  return new Promise((resolve, reject) => { releaseGeneration = resolve; rejectGeneration = reject; });
-};
-vm.createContext(context);
-vm.runInContext(source.slice(helperStart, helperEnd), context, { filename: 'app.js' });
-const flags = { pretest_ab_enabled: false, ladder_enabled: false, pareto_enabled: false };
-const state = context.freshShortlistStateHelpers.create({
-  controls: Object.fromEntries(Object.keys(flags).map((key) => [key, { checked: true, addEventListener() {} }])),
-  request: async (_endpoint, body) => ({
-    filter_version: 'shortlist-v2', filter_engine_version: 'test-engine',
-    analysis_run_id: body.analysis_run_id, applied_options: flags, selection_token: 'token-run-1',
-    groups: [{ scope_key: 'scope-1', pair: 'BTCUSDT', side: 'LONG', timeframe: '1h', ready_after_filters: 1, candidate_ids: ['candidate-1'] }],
-    items: [{ candidate_id: 'candidate-1' }],
-  }),
-  onChange(next) { context.currentAnalysisId = next.analysisRunId; },
-});
-context.freshShortlistState = state;
-(async () => {
-  const firstRevision = state.beginAnalysis();
-  state.setAnalysis('run-1', firstRevision);
-  assert.equal(await state.load(firstRevision), true);
-  vm.runInContext(source.slice(generateStart, generateEnd), context, { filename: 'app.js' });
-  const pendingGeneration = context.generateFresh.handler();
-  assert.equal(generationRequest.endpoint, '/api/v2/strategies/fresh/generate');
-  assert.equal(state.generateBusy, true);
-
-  const nextRevision = state.beginAnalysis();
-  state.setAnalysis('run-2', nextRevision);
-  visible.readyCount = 0;
-  visible.status = 'Current analysis status';
-  releaseGeneration({ phase: 'COMMITTED', strategy_count: 99 });
-  await pendingGeneration;
-
-  assert.equal(state.analysisRunId, 'run-2');
-  assert.equal(visible.readyCount, 0, 'a stale generation must not replace the current analysis READY count');
-  assert.equal(visible.status, 'Current analysis status', 'a stale generation must not replace the current analysis status');
-  assert.equal(state.generateBusy, false, 'completion must release the shared busy state');
-  assert.equal(context.generateFresh.disabled, true, 'stale completion must not enable generation without a current snapshot');
-  assert.equal(outcomes.length, 1, 'the server outcome remains observable when its UI result is stale');
-  assert.equal(outcomes[0].details.analysis_run_id, 'run-1');
-  assert.equal(outcomes[0].details.phase, 'COMMITTED');
-
-  assert.equal(await state.load(nextRevision), true);
-  visible.readyCount = 2;
-  visible.status = 'Current analysis status before stale failure';
-  const pendingFailure = context.generateFresh.handler();
-  const newestRevision = state.beginAnalysis();
-  state.setAnalysis('run-3', newestRevision);
-  visible.readyCount = 0;
-  visible.status = 'Newest analysis status';
-  rejectGeneration(new Error('stale server failure'));
-  await pendingFailure;
-  assert.equal(visible.readyCount, 0, 'a stale failure must not change the current READY count');
-  assert.equal(visible.status, 'Newest analysis status', 'a stale failure must not replace the current analysis status');
-  assert.equal(state.generateBusy, false);
-  assert.equal(context.generateFresh.disabled, true);
-  assert.equal(outcomes.length, 2);
-  assert.equal(outcomes[1].level, 'warn');
-  assert.equal(outcomes[1].details.analysis_run_id, 'run-2');
-  assert.equal(outcomes[1].details.error, 'stale server failure');
-
-  assert.equal(await state.load(newestRevision), true);
-  visible.readyCount = 1;
-  visible.status = 'Current analysis before committed generation';
-  context.remoteRequest = async () => ({ phase: 'COMMITTED', strategy_count: 7 });
-  await context.generateFresh.handler();
-  assert.equal(visible.readyCount, 7, 'a current committed result updates the READY count');
-  assert.equal(visible.status, 'READY JSON committed: 7.', 'a current committed result updates the status');
-
-  context.remoteRequest = async () => ({ running: true, job_id: 'job-poll' });
-  context.requestJson = async () => ({ phase: 'COMMITTED', strategy_count: 88 });
-  let releasePoll;
-  context.setTimeout = (resolve) => { releasePoll = resolve; return 1; };
-  const pendingPoll = context.generateFresh.handler();
-  for (let turn = 0; turn < 10 && !releasePoll; turn += 1) await Promise.resolve();
-  assert.equal(typeof releasePoll, 'function', 'the running job reaches its poll wait');
-  const pollSwitchRevision = state.beginAnalysis();
-  state.setAnalysis('run-4', pollSwitchRevision);
-  visible.readyCount = 0;
-  visible.status = 'Analysis changed during poll';
-  releasePoll();
-  await pendingPoll;
-  assert.equal(visible.readyCount, 0, 'a poll result for an old analysis cannot replace its READY count');
-  assert.equal(visible.status, 'Analysis changed during poll', 'a poll result for an old analysis cannot replace its status');
-  assert.equal(outcomes.length, 3);
-  assert.equal(outcomes[2].details.analysis_run_id, 'run-3');
-  assert.equal(outcomes[2].details.strategy_count, 88);
-})().catch((error) => { console.error(error); process.exitCode = 1; });
-""".replace("__APP_JS__", json.dumps(str(PANEL_WEB / "app.js")))
-    completed = subprocess.run(("node", "-e", script), capture_output=True, text=True)
-    assert completed.returncode == 0, completed.stderr
+    assert "Сначала подготовьте пакет: выберите папку READY и нажмите «Подготовить»." in tester
 
 
 def test_generated_batch_recovery_does_not_touch_active_shortlist_analysis() -> None:
@@ -2153,117 +1389,6 @@ def test_generated_batch_recovery_does_not_touch_active_shortlist_analysis() -> 
     assert "generatedBatchAnalysisId = batch.analysis_run_id" in recovery
 
 
-def test_delayed_batch_restore_tracks_global_batch_not_shortlist_analysis() -> None:
-    script = r"""
-const fs = require('node:fs');
-const vm = require('node:vm');
-const assert = require('node:assert/strict');
-const source = fs.readFileSync(__APP_JS__, 'utf8');
-const helperStart = source.indexOf('const freshShortlistStateHelpers = (() => {');
-const helperEnd = source.indexOf('\nconst ORDER_BUCKETS', helperStart);
-const restoreStart = source.indexOf('const restoreGeneratedBatch = async () => {');
-const restoreEnd = source.indexOf('\n  };', restoreStart) + '\n  };'.length;
-assert.notEqual(helperStart, -1);
-assert.notEqual(helperEnd, -1);
-assert.notEqual(restoreStart, -1);
-assert.ok(restoreEnd > restoreStart);
-const visible = { readyCount: 3, status: 'Previous batch' };
-const run1 = 'a'.repeat(64);
-const run2 = 'b'.repeat(64);
-const warnings = [];
-let releaseBatch;
-const context = {
-  console: { warn(...args) { warnings.push(args); } },
-  setTesterReadyCount(count) { visible.readyCount = count; },
-  generateStatus(status) { visible.status = status; },
-  requestJson() { return new Promise((resolve) => { releaseBatch = resolve; }); },
-  generatedBatchAnalysisId: '',
-  storeReadyBatchChosen: false,
-};
-vm.createContext(context);
-vm.runInContext(source.slice(helperStart, helperEnd), context, { filename: 'app.js' });
-const flags = { pretest_ab_enabled: false, ladder_enabled: false, pareto_enabled: false };
-const state = context.freshShortlistStateHelpers.create({
-  controls: Object.fromEntries(Object.keys(flags).map((key) => [key, { checked: false, addEventListener() {} }])),
-  request: async () => ({}),
-});
-const firstRevision = state.beginAnalysis();
-state.setAnalysis('run-1', firstRevision);
-context.freshShortlistState = state;
-vm.runInContext(source.slice(restoreStart, restoreEnd) + '\nglobalThis.restoreForTest = restoreGeneratedBatch;', context, { filename: 'app.js' });
-process.exitCode = 1;
-(async () => {
-  const pendingRestore = context.restoreForTest();
-  assert.equal(typeof releaseBatch, 'function');
-  const firstRelease = releaseBatch;
-  const nextRevision = state.beginAnalysis();
-  state.setAnalysis('run-2', nextRevision);
-  releaseBatch({ strategy_count: 6, analysis_run_id: run1 });
-  await pendingRestore;
-  assert.equal(state.analysisRunId, 'run-2');
-  assert.equal(context.generatedBatchAnalysisId, run1);
-  assert.equal(visible.readyCount, 6, 'the published tester batch remains global across analysis changes');
-  assert.equal(visible.status, 'READY JSON restored: 6.');
-  const currentRestore = context.restoreForTest();
-  assert.notEqual(releaseBatch, firstRelease, 'each restore must request its own batch');
-  releaseBatch({ strategy_count: 4, analysis_run_id: run2 });
-  await currentRestore;
-  assert.equal(context.generatedBatchAnalysisId, run2);
-  assert.equal(visible.readyCount, 4, 'a current restore must still publish the saved batch count');
-  assert.equal(visible.status, 'READY JSON restored: 4.');
-  const malformedRestore = context.restoreForTest();
-  releaseBatch({ strategy_count: 'bad', analysis_run_id: run1 });
-  await malformedRestore;
-  assert.equal(context.generatedBatchAnalysisId, run2);
-  assert.equal(visible.readyCount, 4, 'invalid metadata must not clear a valid published-batch count');
-  assert.equal(visible.status, 'READY JSON restored: 4.');
-  const malformedIdentityRestore = context.restoreForTest();
-  releaseBatch({ strategy_count: 8, analysis_run_id: 'bad' });
-  await malformedIdentityRestore;
-  assert.equal(context.generatedBatchAnalysisId, run2);
-  assert.equal(visible.readyCount, 4, 'invalid identity must not replace visible batch metadata');
-  const staleRestore = context.restoreForTest();
-  state.setGenerateBusy(true);
-  releaseBatch({ strategy_count: 9, analysis_run_id: run1 });
-  await staleRestore;
-  assert.equal(visible.readyCount, 4, 'a newer generation invalidates an old restore response');
-  assert.equal(visible.status, 'READY JSON restored: 4.');
-  state.setGenerateBusy(false);
-  const priorWarnings = warnings.length;
-  context.requestJson = () => Promise.reject(new Error('network failed'));
-  await context.restoreForTest();
-  assert.equal(warnings.length, priorWarnings + 1, 'unexpected restore failures remain diagnosable');
-  context.requestJson = () => Promise.reject(new Error('fresh strategy batch is not available'));
-  await context.restoreForTest();
-  assert.equal(warnings.length, priorWarnings + 1, 'the expected absent-batch case stays quiet');
-  process.exitCode = 0;
-})().catch((error) => { console.error(error); process.exitCode = 1; });
-""".replace("__APP_JS__", json.dumps(str(PANEL_WEB / "app.js")))
-    completed = subprocess.run(("node", "-e", script), capture_output=True, text=True)
-    assert completed.returncode == 0, completed.stderr
-
-
-def test_shortlist_parent_deferred_uses_pair_sum_and_value_cell_keeps_zero() -> None:
-    js = _read("app.js")
-
-    pair_groups = js.split("const pairGroups = () => {", 1)[1].split("  const valueCell", 1)[0]
-    render = js.split("const renderShortlist = () => {", 1)[1].split("const applyShortlist", 1)[0]
-    assert "entry.deferred += Number(group.deferred || 0);" in pair_groups
-    assert "valueCell(pair.deferred, 0)" in render
-    assert "value === null || value === undefined || value === '' ? fallback : String(value);" in js
-
-
-def test_shortlist_rows_append_order_buckets_before_new_columns() -> None:
-    js = _read("app.js")
-
-    render = js.split("const renderShortlist", 1)[1].split("const applyShortlist", 1)[0]
-    assert render.count("for (const bucket of ORDER_BUCKETS)") == 2
-    assert "for (const bucket of ORDER_BUCKETS) row.append" in render
-    assert "for (const bucket of ORDER_BUCKETS) child.append" in render
-    assert "row.append(valueCell(freshShortlistStateHelpers.sumPlateauCounts(pair.timeframes)" in render
-    assert "child.append(valueCell(group.plateau_count" in render
-
-
 def test_tester_range_shortcuts_are_local_only() -> None:
     js = _read("app.js")
 
@@ -2273,57 +1398,6 @@ def test_tester_range_shortcuts_are_local_only() -> None:
     assert "testerEndDate.max = testerMaxDate();" in js
     assert "const maxDate = testerMaxDate();" in ranges
     assert "remoteRequest" not in ranges and "fetch(" not in ranges
-
-
-def test_surface_and_analysis_paths_have_editable_descriptive_names_and_saves() -> None:
-    html = _read("index.html")
-    js = _read("app.js")
-
-    assert 'id="surface-name"' in html
-    assert 'id="analysis-target-save"' in html
-    assert 'data-path-root="analysis_db_root"' in html
-    assert "suggested_filename" in js
-    assert "analysis_db_root" in js
-    assert "normalImportAuthorized" in js
-
-
-def test_shortlist_has_one_grouped_renderer_and_shared_candidate_state() -> None:
-    js = _read("app.js")
-
-    assert js.count("const renderShortlist =") == 1
-    assert js.count("let shortlistItems = [];") == 1
-    assert js.index("let shortlistItems = [];") < js.index("const renderShortlist = () =>")
-    assert "for (const item of shortlistItems)" not in js
-    assert "shortlistItems = payload?.items || [];" in js
-    assert "applyShortlist(state.snapshot);" in js
-
-
-def test_shortlist_keeps_native_nine_columns_and_independent_selection_controls() -> None:
-    html = _read("index.html")
-    js = _read("app.js")
-
-    shortlist = html.split('class="shortlist-table"', 1)[1].split("</table>", 1)[0]
-    assert shortlist.split("</thead>", 1)[0].count("<th ") == 12
-    assert "shortlist-group-checkbox" in js
-    assert "shortlist-tf-checkbox" in js
-    assert "Select all READY TFs" in js
-    assert "Expand/collapse" in js
-    assert "const selectable = freshShortlistStateHelpers.readyGroups(pair.timeframes);" in js
-
-
-def test_surface_selection_is_model_driven_and_preserves_open_groups() -> None:
-    js = _read("app.js")
-
-    update = js.split("const updateSurfaceV2", 1)[1].split("const showGapReportV2", 1)[0]
-    assert "querySelectorAll" not in update
-    assert "const filteredReadySurfaceKeysV2" in js
-    assert "selectFilteredScopesV2" in js
-    assert "setSelectedSurfaceScopesV2([...selectedSurfaceScopes, ...filteredReadySurfaceKeysV2()]);" in js
-    assert "scope-select-visible" in js
-    assert "selectFilteredButtonV2.textContent" in js
-    assert "const expandedSurfacePairs = new Set();" in js
-    assert "expandedSurfacePairs.has(groupKey)" in js
-    assert "groupNode.addEventListener('toggle'" in js
 
 
 def test_surface_table_reuses_one_grid_template_for_header_groups_and_timeframes() -> None:
@@ -2375,14 +1449,6 @@ console.log(JSON.stringify({
     }
 
 
-def test_bulk_shortlist_actions_do_not_touch_pair_expansion_state() -> None:
-    js = _read("app.js")
-
-    for selector in ("#shortlist-select-all", "#shortlist-select-none", "#shortlist-refresh"):
-        segment = js.split(f"document.querySelector('{selector}')", 1)[1].split("});", 1)[0]
-        assert "expandedPairs" not in segment
-
-
 def test_shared_json_requests_fail_safely_and_busy_job_controls_cleanup() -> None:
     js = _read("app.js")
 
@@ -2391,7 +1457,7 @@ def test_shared_json_requests_fail_safely_and_busy_job_controls_cleanup() -> Non
     assert "response.ok" in helper
     assert "response.json()" in helper
     assert "Backend connection unavailable." in helper
-    assert "requestJson('/api/v2/source/local/catalog')" in js
+    assert "requestJson('/api/v2/strategies/store-ready/catalog')" in js
     assert "requestJson('/api/v2/strategies/tester/status?job_id='" in js
     assert "setTesterControls(true)" in js
     assert "finally" in js
@@ -2859,7 +1925,8 @@ def test_request_json_distinguishes_non_json_and_server_validation_safely() -> N
     assert "Backend returned invalid JSON." in helper
     assert "Server validation failed." in helper
     assert "panelRequestErrorHelpers.allowsSafeString(endpoint)" in helper
-    assert "'/api/v2/surfaces/'" in js
+    assert "'/api/v2/strategies/store-ready/'" in js
+    assert "'/api/v2/surfaces/'" not in js
     assert "Backend connection unavailable." in helper
 
 
@@ -2871,7 +1938,6 @@ def test_status_and_dynamic_controls_have_accessible_announcements() -> None:
     assert 'role="status"' in html
     assert 'aria-live="polite"' in html
     assert 'caption class="sr-only"' in html
-    assert 'aria-expanded' in js
     assert 'aria-label' in js
 
 
@@ -3924,3 +2990,73 @@ def test_test_and_import_card_prepares_a_store_ready_batch() -> None:
     assert "generatedBatchAnalysisId = result.analysis_run_id;" in handler
     assert "setTesterReadyCount(result.strategy_count);" in handler
     assert "'/api/v2/strategies/store-ready/'," in js.split("const safeStringPrefixes", 1)[1].split("];", 1)[0]
+
+
+def test_batch_restore_validates_metadata_and_never_overwrites_a_prepared_batch() -> None:
+    # Adapted from the shortlist-era restore test (Panel rework stage 1b): each restore requests its own batch,
+    # malformed metadata never clobbers a valid batch, and a batch prepared on the page wins over a late restore.
+    script = r"""
+const fs = require('node:fs');
+const vm = require('node:vm');
+const assert = require('node:assert/strict');
+const source = fs.readFileSync(__APP_JS__, 'utf8');
+const restoreStart = source.indexOf('const restoreGeneratedBatch = async () => {');
+const restoreEnd = source.indexOf('\n  };', restoreStart) + '\n  };'.length;
+assert.notEqual(restoreStart, -1);
+const visible = { readyCount: 3, status: 'Previous batch' };
+const run1 = 'a'.repeat(64);
+const run2 = 'b'.repeat(64);
+let releaseBatch;
+const context = {
+  console: { warn() {} },
+  setTesterReadyCount(count) { visible.readyCount = count; },
+  generateStatus(status) { visible.status = status; },
+  requestJson() { return new Promise((resolve) => { releaseBatch = resolve; }); },
+  generatedBatchAnalysisId: '',
+  storeReadyBatchChosen: false,
+};
+vm.createContext(context);
+vm.runInContext(source.slice(restoreStart, restoreEnd) + '\nglobalThis.restoreForTest = restoreGeneratedBatch;', context, { filename: 'app.js' });
+process.exitCode = 1;
+(async () => {
+  const first = context.restoreForTest();
+  const firstRelease = releaseBatch;
+  releaseBatch({ strategy_count: 6, analysis_run_id: run1 });
+  await first;
+  assert.equal(context.generatedBatchAnalysisId, run1);
+  assert.equal(visible.readyCount, 6);
+  const second = context.restoreForTest();
+  assert.notEqual(releaseBatch, firstRelease, 'each restore must request its own batch');
+  releaseBatch({ strategy_count: 'bad', analysis_run_id: run2 });
+  await second;
+  assert.equal(context.generatedBatchAnalysisId, run1, 'invalid metadata must not replace the batch');
+  assert.equal(visible.readyCount, 6);
+  const third = context.restoreForTest();
+  releaseBatch({ strategy_count: 8, analysis_run_id: 'bad' });
+  await third;
+  assert.equal(context.generatedBatchAnalysisId, run1, 'invalid identity must not replace the batch');
+  const late = context.restoreForTest();
+  context.storeReadyBatchChosen = true;          // the user prepared a store READY batch meanwhile
+  releaseBatch({ strategy_count: 9, analysis_run_id: run2 });
+  await late;
+  assert.equal(context.generatedBatchAnalysisId, run1, 'a late restore never overwrites a prepared batch');
+  assert.equal(visible.readyCount, 6);
+  process.exitCode = 0;
+})().catch((error) => { console.error(error); process.exit(1); });
+""".replace("__APP_JS__", json.dumps(str(PANEL_WEB / "app.js")))
+    completed = subprocess.run(("node", "-e", script), capture_output=True, text=True)
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_tester_card_lookups_resolve_to_the_test_and_import_card() -> None:
+    # review of stage 1b part B: the MRS2 STORE card on the same screen must not be taken for the tester card
+    html = _read("index.html")
+    js = _read("app.js")
+    screen = html.split('<section id="strategies-dd5"', 1)[1].split('<section id="portfolio"', 1)[0]
+    card = screen.split('<details id="tester-card"', 1)[1].split("</details>", 1)[0]
+    assert "3. Test and Import to Performance DB" in card and 'class="state-badge' in card
+    assert 'class="progress-block"' in card and "progress-track" in card
+    assert screen.index('id="store-local"') < screen.index('id="tester-card"')
+    assert "const strategyCards = [document.querySelector('#tester-card')].filter(Boolean);" in js
+    assert "const testerCard = strategyCards[0];" in js
+    assert screen.count('id="strategies-title"') == 1

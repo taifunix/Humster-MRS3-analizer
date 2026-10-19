@@ -138,52 +138,6 @@ def test_panel_helpers_use_server_owned_fixed_roots_without_request_paths(tmp_pa
     assert controller._panel_path("strategies_root") != (tmp_path / "attacker").resolve()
 
 
-def test_panel_surface_path_comes_from_config_not_request(tmp_path: Path) -> None:
-    config = tmp_path / "config.local.json"
-    configured = tmp_path / "data" / "surfaces"
-    config.write_text(json.dumps({"panel": {"path_defaults": {"surface_target_path": str(configured)}}}), encoding="utf-8")
-    controller = PanelController(tmp_path, config)
-    calls = []
-    controller._panel_surfaces = type("Surfaces", (), {
-        "start_publish": lambda _self, token, scopes, target, filename: calls.append(target) or {"phase": "QUEUED"},
-    })()
-
-    controller.surface_publish_start({
-        "preflight_token": "token",
-        "scope_keys": ["BTCUSDT|LONG|1h"],
-        "target_path": str(tmp_path / "attacker"),
-    })
-
-    assert calls == [configured.resolve()]
-
-
-def test_panel_surface_publish_start_keeps_safe_validation_reason(tmp_path: Path) -> None:
-    controller = PanelController(tmp_path, tmp_path / "config.local.json")
-    controller._panel_surfaces = type("Surfaces", (), {
-        "start_publish": lambda _self, token, scopes, target, filename: (
-            (_ for _ in ()).throw(ValueError("stale coverage token"))
-        ),
-    })()
-
-    with pytest.raises(ValueError, match="stale coverage token"):
-        controller.surface_publish_start({
-            "preflight_token": "old-token",
-            "scope_keys": ["BTCUSDT|LONG|1h"],
-        })
-
-
-def test_surface_publish_start_http_returns_validation_reason(panel_http) -> None:
-    _, _, connection = panel_http
-
-    status, result = _request(connection, "POST", "/api/v2/surfaces/publish/start", {
-        "preflight_token": "old-token",
-        "scope_keys": ["BTCUSDT|LONG|1h"],
-    })
-
-    assert status == 400
-    assert result == {"error": "stale coverage token"}
-
-
 def test_panel_surface_default_is_anchored_to_project_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     other = tmp_path / "other"
     other.mkdir()
@@ -223,66 +177,6 @@ def test_bootstrap_malformed_or_missing_config_fails_closed(panel_http, content:
     assert body["defaults"]["remote"] == {"configured": False}
     assert str(config) not in encoded
     assert "JSONDecodeError" not in encoded
-
-
-def test_source_catalog_lists_only_duckdb_files_from_configured_source_directory(panel_http) -> None:
-    root, config, connection = panel_http
-    source_root = root / "source-db"
-    source_root.mkdir()
-    (source_root / "zeta.duckdb").write_bytes(b"db")
-    (source_root / "alpha.duckdb").write_bytes(b"db")
-    (source_root / "note.txt").write_text("ignore", encoding="utf-8")
-    document = json.loads(config.read_text(encoding="utf-8"))
-    document["duckdb_import"] = {"source_duckdb_path": "source-db/default.duckdb"}
-    config.write_text(json.dumps(document), encoding="utf-8")
-
-    status, body = _request(connection, "GET", "/api/v2/source/local/catalog")
-
-    assert status == 200
-    assert body == {"databases": [
-        {"name": "alpha.duckdb", "path": str(source_root / "alpha.duckdb")},
-        {"name": "zeta.duckdb", "path": str(source_root / "zeta.duckdb")},
-    ]}
-
-
-def test_source_catalog_is_empty_for_invalid_import_settings(panel_http) -> None:
-    _, config, connection = panel_http
-    document = json.loads(config.read_text(encoding="utf-8"))
-    document["duckdb_import"] = {"source_duckdb_path": 42}
-    config.write_text(json.dumps(document), encoding="utf-8")
-
-    status, body = _request(connection, "GET", "/api/v2/source/local/catalog")
-
-    assert status == 200
-    assert body == {"databases": []}
-
-
-def test_surface_catalog_lists_manifest_validated_surfaces_recursively_from_the_configured_directory(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from mrs3.panel import PanelController
-
-    config = tmp_path / "config.local.json"
-    config.write_text(json.dumps({
-        "duckdb_import": {"source_v6_surface_dir": str(tmp_path / "stale-surfaces")},
-        "panel": {"path_defaults": {"surface_target_path": str(tmp_path / "data" / "surfaces")}},
-    }), encoding="utf-8")
-    good = tmp_path / "data" / "surfaces" / "CXMT.duckdb" / "CXMT.surface-v6.duckdb"
-    bad = tmp_path / "data" / "surfaces" / "broken.surface-v6.duckdb"
-    good.parent.mkdir(parents=True)
-    good.write_bytes(b"good")
-    bad.write_bytes(b"bad")
-    def validate(path: str | Path, *, decode: bool = True) -> dict[str, str]:
-        assert decode is False
-        if Path(path) == good:
-            return {"surface_id": "valid"}
-        raise ValueError("broken")
-
-    monkeypatch.setattr("mrs3.panel.read_multiscope_surface", validate)
-
-    catalog = PanelController(tmp_path, config).surface_catalog()
-
-    assert catalog == {"surfaces": [{"name": good.name, "path": str(good)}]}
 
 
 def test_surface_publication_path_default_is_accepted_by_settings_save(panel_http) -> None:
@@ -470,27 +364,6 @@ def test_panel_restart_endpoint_rejects_live_tester_not_yet_in_registry(tmp_path
             return True
 
     controller._strategy_batch_service = LiveTester()  # type: ignore[assignment]
-    launched: list[bool] = []
-    server = create_panel_server("127.0.0.1", 0, controller, restart_launcher=lambda: launched.append(True))
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
-    try:
-        status, _ = _request(connection, "POST", "/api/v2/panel/restart", {})
-        assert status == 409
-        assert launched == []
-    finally:
-        connection.close()
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=2)
-
-
-def test_panel_restart_endpoint_rejects_live_ready_json_generation(tmp_path: Path) -> None:
-    config = tmp_path / "config.local.json"
-    config.write_text(json.dumps(_runner_config()), encoding="utf-8")
-    controller = PanelController(tmp_path, config)
-    controller._fresh_generation_job = {"running": True}
     launched: list[bool] = []
     server = create_panel_server("127.0.0.1", 0, controller, restart_launcher=lambda: launched.append(True))
     thread = threading.Thread(target=server.serve_forever, daemon=True)

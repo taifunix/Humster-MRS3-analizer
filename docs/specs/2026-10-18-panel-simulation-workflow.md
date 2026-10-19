@@ -1,9 +1,9 @@
 # Panel for the simulation workflow: three screens, obsolete parts removed
 
 **Status:** Approved by the user 2026-10-18 («вноси эти правки и начинай с
-этапа 1»). Stage 1a implemented (see «Stage 1a evidence»); stage 1b part A
-(tick test from a store READY folder) implemented; 1b part B and stages 2–5
-pending.
+этапа 1»). Stage 1 implemented: 1a, 1b part A (tick test from a store READY
+folder) and 1b part B (retired screens removed, three-screen shell); see the
+evidence sections. Stages 2–5 pending (stage 2 = pair registry, in progress).
 **Depends on:** [pair registry](2026-10-18-pair-registry.md) (pairs, decisions,
 settings, finalists, sync), [MRS2 trade store](2026-10-17-mrs2-history-store-and-tester-sampling.md)
 (history, READY, tester sampling), PerformanceDB (MRS3 tick-test results).
@@ -308,6 +308,52 @@ themselves must meet protocol v2 for the active PerformanceDB.
 - A run on the real store and the real tester for a few strategies, then the
   import into PerformanceDB.
 
+## Stage 1b evidence, part B: retired screens removed and three-screen shell (2026-10-18)
+
+**Removed and disconnected**
+- Routes:
+  - `/api/v2/source/*` (local and remote Source DB);
+  - `/api/v2/surfaces/*`;
+  - `/api/v2/strategies/fresh/*` except `/batch`, which the card uses to
+    restore the last batch;
+  - `/api/v2/strategies/analysis/catalog`.
+- Controller methods, constructor parameters and job state that only those
+  routes used. Among them: the remote Source DB start-up reconciliation and
+  the fresh-generation busy flag of `has_active_panel_jobs`.
+- Modules `panel_source_db`, `panel_source_jobs`, `panel_remote_source_db`,
+  `panel_remote_testing` and `panel_surfaces`, with their tests.
+- UI:
+  - the Source DB and surfaces screens;
+  - cards 1–2 of the strategies screen (fresh analysis, shortlist,
+    «Generate READY JSON»);
+  - their JS: the fresh-shortlist state helpers, the shortlist renderer, the
+    source and surface workflows and the source path defaults.
+- The analysis modules (`fresh_shortlist`, `fresh_analysis_strategies`,
+  `source_v6_*`) stay, because CLI tools and other modules still import
+  them. Only their Panel wiring is gone.
+
+**Shell.** The navigation is «Пары и стратегии» / «Портфели» / «Настройки».
+«Пары и стратегии» (`#strategies-dd5`, the default screen) now holds:
+- the MRS2 STORE card, moved from the retired «Тестирование» screen;
+- the «Test and Import» card with the READY picker;
+- the PerformanceDB cards, as they were.
+
+Retired hashes (`#testing`, `#source-db`, `#surfaces`) fall back to the first
+screen.
+
+**Tests.** The tests of the removed features were deleted. Mixed tests were
+updated:
+- navigation;
+- card 3 action rows;
+- JSON request helpers;
+- protocol v2 flows;
+- the store card placement;
+- the portfolio start-up order.
+
+`test_root_serves_the_static_panel_and_legacy_routes_are_gone` now also
+checks that the part B routes answer 404 (GET and POST). Panel suites: only
+the two baseline failures and the known flaky portfolio stage-2 test remain.
+
 ## Stage 1b evidence, part A: the tick test from a store READY folder (2026-10-18)
 
 **Code**
@@ -409,7 +455,7 @@ is not caused by stage 1b.
 ## Order of work
 
 1. Remove the obsolete screens and their backend (1a, 1b above); three-screen
-   shell. ✅ 1a done (2026-10-18, reviewed); ✅ 1b part A done; ⏳ 1b part B and the shell.
+   shell. ✅ 1a, 1b part A, 1b part B and the shell done (2026-10-18, reviewed).
 2. ⏳ Registry stages 1–3 ([pair registry](2026-10-18-pair-registry.md)).
 3. ⏳ «Пары и стратегии»: exchange switch, actions with plan dialogs, task area
    with progress/ETA/errors, views, pair card.
