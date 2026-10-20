@@ -8,6 +8,46 @@ Use [PRD.md](PRD.md) for the feature registry and [docs/README.md](docs/README.m
 for the documentation map. Read the linked contract only for the active task;
 do not treat this file as a replacement for a feature specification.
 
+## Panel stage 5e-2: the optimizer by exchange (2026-10-20, branch `wip/period-csv-generator`)
+
+Contract: [Panel for the simulation workflow](docs/specs/2026-10-18-panel-simulation-workflow.md)
+(«Stage 5e contract», 5e-2). The user chose the scope: a selector and a
+filter. Full BingX optimization (BingX market snapshot, Stage 2 on the
+BingX tester) is a later stage.
+
+- «Портфели» has a new setting «Биржа оптимизатора»: `inputs.exchange`,
+  optional, absent means Bybit. Existing settings and digests are
+  unchanged.
+- The optimizer's finalists (registry marks or selection reviews) and the
+  selection candidates are those of the chosen exchange only. A BingX
+  strategy never joins a Bybit ranking.
+- Stage 1/2 on BingX: `EXCHANGE_DATA_UNAVAILABLE` before any work. The
+  database marker no longer blocks the optimizer.
+- **Invariants:**
+  - selection-run JSON and hashes are byte-identical for home-exchange
+    requests;
+  - a stale finalist still fails closed.
+- **Verification:**
+  - new tests: the setting; finalists and candidates by exchange; Stage 1
+    on BingX refused, while the marker does not block;
+  - the old marker tests were rewritten for the selector;
+  - broad run (performance_v2_*, performance_import, Panel, databases,
+    registry, finalists, portfolio_*, static UI): 3,902 passed, 26 failed.
+    All 26 are pre-existing: portfolio_input 14, v5_read_compat 6,
+    equity_regime_selection 3, the flaky panel_portfolio stage 2 test, and
+    portfolio_store cross-process, which fails on HEAD too. Plus
+    finalists_from_registry, which was fixed afterwards (10 passed).
+  - Independent review `CODE_REVIEW_FAIL`. MAJOR: «Стратегии» on BingX
+    lost its candidate metrics, because the cohort was asked for the home
+    exchange. Fixed: the cohort carries the view's exchange; an explicit
+    cohort is never emptied by the default exchange; a selection run of an
+    explicit exchange is not stored. Tests were added for these and for
+    `canonical_contract` and the optimizer with BingX marks.
+  - Related suites after the fixes: 1,015 passed, 15 failed (portfolio_input
+    14 and the flaky stage 2 test, both pre-existing).
+  - Re-review `CODE_REVIEW_PASS` (open MINOR: no unit test for the JS `settingsPatch` exchange field).
+- **Next:** 5e-3, the BingX tick test and retest.
+
 ## Panel stage 5e-1: one PerformanceDB for both exchanges (2026-10-19, branch `wip/period-csv-generator`)
 
 Contract: [Panel for the simulation workflow](docs/specs/2026-10-18-panel-simulation-workflow.md)

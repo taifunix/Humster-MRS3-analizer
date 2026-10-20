@@ -128,6 +128,8 @@ def canonical_contract(request: SelectionRequest, config: SelectionConfig) -> tu
     request_data = asdict(request)
     if not request.finalists_only:
         request_data.pop("finalists_only")
+    if request.exchange is None:                # ADR-0083: a request of the home exchange keeps its byte-exact JSON
+        request_data.pop("exchange")
     for stage in request_data["stages"]:
         if stage["method"] in (None, "robust_v1") or not stage["enabled"]:
             stage.pop("method")
@@ -858,6 +860,10 @@ def persist_selection_snapshots(
             config = item["config"]
             result = item["result"]
             metadata = item["metadata"]
+            if request.exchange is not None:
+                # ADR-0083: runs and review imports are keyed by pair and side only; a run of an explicit exchange
+                # would shadow the home exchange's latest run, so it is not stored until they carry the exchange
+                raise ValueError("selection runs of an explicit exchange are not stored yet")
             connection.execute(
                 """insert into selection_runs (
                     selection_run_id, database_instance_id, symbol, side, selection_contract_version,

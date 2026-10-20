@@ -269,7 +269,7 @@
                 <details id="portfolio-settings-history">
                   <summary>Подготовка истории и воспроизводимость</summary>
                   <div class="field-grid">
-                    <div class="field-group"><label for="portfolio-settings-seed">Seed расчёта</label><input id="portfolio-settings-seed" type="number" inputmode="numeric" min="0" step="1"><small>Фиксирует случайную bootstrap-выборку: одинаковые входы и seed дают воспроизводимый расчёт.</small></div>
+                    <div class="field-group"><label for="portfolio-settings-exchange">Биржа оптимизатора</label><select id="portfolio-settings-exchange"><option value="Bybit">Bybit</option><option value="BingX">BingX</option></select><small>Оптимизатор берёт финалистов и стратегии только этой биржи из общей PerformanceDB. Stage 1/2 для BingX ещё недоступны: рыночные данные BingX (маржа, плечо, mark price) не подключены.</small></div><div class="field-group"><label for="portfolio-settings-seed">Seed расчёта</label><input id="portfolio-settings-seed" type="number" inputmode="numeric" min="0" step="1"><small>Фиксирует случайную bootstrap-выборку: одинаковые входы и seed дают воспроизводимый расчёт.</small></div>
                     <div class="field-group"><label for="portfolio-settings-minimum-common-days">Минимальное общее окно истории (дни)</label><input id="portfolio-settings-minimum-common-days" type="number" inputmode="numeric" min="1" step="1"><small>Минимальная длина общего периода всех стратегий, допускаемого к взвешенному поиску.</small></div>
                   </div>
                 </details>

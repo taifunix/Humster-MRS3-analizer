@@ -1189,9 +1189,56 @@ It follows the user's decision of 2026-10-19 and rests on its audit:
 - The optimizer, portfolios and the finalist retest stay on the database's
   home exchange (its marker, Bybit) until 5e-2.
 
-**5e-2 — the optimizer by exchange:** an exchange selector on «Портфели».
-The optimizer, its finalists and its strategy selection take only that
-exchange's strategies.
+**5e-2 — the optimizer by exchange** (scope chosen by the user on
+2026-10-19: a selector and a filter; full BingX optimization is a later
+stage):
+- **Setting:** `inputs.exchange` of the portfolio settings, `Bybit` or
+  `BingX`. It is optional, and absent means `Bybit`, so existing settings,
+  digests and campaigns are unchanged. «Портфели» shows it as a select
+  («Биржа оптимизатора»).
+- **Finalists of the optimizer** (`read_current_finalists(..., exchange)`):
+  - the registry marks of that exchange (`finalist_marks(con, exchange)`);
+  - without a registry, the selection reviews.
+  - In both cases only finalists whose result is of that exchange
+    (`result_exchange_sql`) are kept.
+  - Without an exchange the reader keeps the database's home exchange.
+- **Selection candidates** (`SelectionRequest.exchange`, default: the
+  database's home exchange) take only the strategies of that exchange, so a
+  BingX strategy never joins the ranking, analog deduplication or hard
+  cuts of the Bybit candidates of the same human ticker.
+- **Stage 1 and 2 on BingX** are refused before any work with
+  `EXCHANGE_DATA_UNAVAILABLE` («BingX market data is not connected to the
+  optimizer yet»): margin, leverage and the mark price come from the Bybit
+  market snapshot.
+  - The database's own marker no longer refuses the optimizer
+    (ADR-0083: it is only the home exchange).
+
+**Invariants kept, 5e-2:**
+- **Selection runs:** a request of the home exchange keeps its byte-exact
+  canonical JSON and hash. `exchange` is written only when it is set, so
+  stored runs keep their identity.
+- **A finalist whose current result is missing** still fails closed. The
+  exchange filter keeps keys without a result row for the reader's own
+  check.
+- **Injected finalist readers** (tests) get `exchange` only when they
+  accept it.
+- **«Стратегии» asks for the candidate metrics of its own exchange.** Its
+  retest cohort carries `exchange`.
+- **An explicit retest cohort** (named members, no exchange) is not
+  filtered by the default exchange, so it is never silently emptied.
+- **A selection run of an explicit exchange is not stored** (`ValueError`).
+  Runs and review imports are keyed by pair and side only, so such a run
+  would shadow the home exchange's latest run. Storing them needs the
+  exchange in the runs and review imports, which is a prerequisite for any
+  BingX selection run (5e-3 or later).
+
+**Acceptance, 5e-2:**
+- the setting is parsed, defaults to Bybit and refuses an unknown exchange;
+- the optimizer's finalists, from the registry and from the reviews, are
+  split by exchange;
+- selection candidates exclude the other exchange;
+- Stage 1 on BingX is refused with `EXCHANGE_DATA_UNAVAILABLE`;
+- the Bybit portfolio suites are unchanged.
 
 **5e-3 — BingX tick test and retest** (only after 5e-2: until then some
 readers have no exchange filter, see ADR-0083 «Stage order»):

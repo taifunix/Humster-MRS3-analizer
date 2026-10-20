@@ -253,3 +253,22 @@ def test_strategy_routes(tmp_path: Path, monkeypatch, served) -> None:
         finally:
             connection.close()
     assert body["written"] is True and body["changed"] == []
+
+
+def test_the_bingx_view_asks_for_the_bingx_candidate_metrics(tmp_path: Path, monkeypatch) -> None:
+    # review of 5e-2: the cohort of the «Стратегии» view carries its exchange, so BingX rows keep their metrics
+    import mrs3.panel_strategies as module
+    from mrs3.performance_v2_selection import SelectionConfig
+
+    database = _performance_db(tmp_path / "perf.duckdb", ["BINGX_GOODUSDT_1h_LONG_A"])
+    with duckdb.connect(str(database)) as con:
+        con.execute("update strategy_results set exchange = 'BingX'")
+    asked = []
+
+    def fake(connection, request, config, cache_only=False):
+        asked.append((request.exchange, request.ranking_scope))
+        raise RuntimeError("stop here")
+
+    monkeypatch.setattr(module, "load_selection_candidates", fake)
+    rows, notes = module._read_tested_rows(database, "bingx", SelectionConfig(), metrics=True)
+    assert list(rows) == ["BINGX_GOODUSDT_1h_LONG_A"] and asked == [("bingx", "RETEST_COHORT")]

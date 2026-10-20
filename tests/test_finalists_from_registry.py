@@ -209,7 +209,7 @@ def test_optimizer_marks_are_read_once_for_metadata(tmp_path: Path, monkeypatch)
     reads = []
     original = PortfolioPanelService._registry_marks
     monkeypatch.setattr(PortfolioPanelService, "_registry_marks",
-                        lambda self, path: reads.append(path) or original(self, path))
+                        lambda self, path, exchange="Bybit": reads.append(path) or original(self, path, exchange))
     monkeypatch.setattr(portfolio_module, "_require_exchange_data", lambda path: None)
     calls = []
     monkeypatch.setattr(portfolio_module, "read_current_finalists",
@@ -217,3 +217,23 @@ def test_optimizer_marks_are_read_once_for_metadata(tmp_path: Path, monkeypatch)
     service = PortfolioPanelService(tmp_path)
     service._current_finalist_metadata({"inputs": {"performance_db": str(database)}})
     assert len(reads) == 1 and calls[0][0] == (("GOODUSDT", "LONG"),) and set(calls[0][1]) == {A, B}
+
+
+def test_the_optimizer_on_bingx_reads_the_bingx_marks_and_asks_for_bingx_rows(tmp_path: Path, monkeypatch) -> None:
+    # review of 5e-2: the optimizer's exchange picks the registry marks and the reader's exchange
+    import mrs3.panel_portfolio as portfolio_module
+    from mrs3.panel_portfolio import PortfolioPanelService
+
+    con, database = _marked(tmp_path)
+    con.close()
+    _panel_config(tmp_path)
+    asked = []
+    monkeypatch.setattr(PortfolioPanelService, "_registry_marks",
+                        lambda self, path, exchange="Bybit": asked.append(exchange) or {})
+    calls = []
+    monkeypatch.setattr(portfolio_module, "read_current_finalists",
+                        lambda database, pairs, include_series=True, *, marks=None, exchange=None:
+                        calls.append(exchange) or ())
+    service = PortfolioPanelService(tmp_path)
+    service._current_finalist_metadata({"inputs": {"performance_db": str(database), "exchange": "BingX"}})
+    assert asked == ["BingX"] and calls == ["bingx"]

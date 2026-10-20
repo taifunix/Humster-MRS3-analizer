@@ -1395,6 +1395,7 @@ def test_read_current_finalists_can_skip_large_series_for_metadata_consumers(
     monkeypatch.setattr(portfolio_input, "require_performance_v2_readable", lambda *_args: None)
     monkeypatch.setattr(portfolio_input, "_current_review_facts", lambda *_args, **_kwargs: (facts, set(facts), ()))
     monkeypatch.setattr(portfolio_input, "_records_for_ids", unexpected_records)
+    monkeypatch.setattr(portfolio_input, "_keys_of_exchange", lambda _connection, keys, _exchange: list(keys))
 
     row = read_current_finalists(tmp_path / "performance.duckdb", [("BTCUSDT", "LONG")], False)[0]
 
@@ -2986,3 +2987,47 @@ def test_only_fixed_finalists_carry_their_lot_base(tmp_path: Path) -> None:
     assert "fixed_lot_base" not in dynamic
     assert fixed["fixed_lot_base"] == Decimal("250")
     assert fixed["initial_balance"] != Decimal("250")
+
+
+def test_the_optimizer_reads_the_finalists_and_candidates_of_one_exchange(tmp_path: Path) -> None:
+    # Panel stage 5e-2 (ADR-0083): one PerformanceDB holds both exchanges; the optimizer takes one of them
+    from dataclasses import replace
+
+    from mrs3.performance_v2_selection import load_selection_candidates, parse_selection_request
+
+    database = _database(tmp_path)
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
+    assert len(read_current_finalists(database, [("BTCUSDT", "LONG")], False)) == 1      # the home exchange
+    assert read_current_finalists(database, [("BTCUSDT", "LONG")], False, exchange="bingx") == ()
+    with duckdb.connect(str(database)) as connection:
+        assert len(load_selection_candidates(connection, request)) == 1
+        connection.execute("update strategy_results set exchange = 'BingX'")
+    assert read_current_finalists(database, [("BTCUSDT", "LONG")], False) == ()
+    assert len(read_current_finalists(database, [("BTCUSDT", "LONG")], False, exchange="bingx")) == 1
+    with duckdb.connect(str(database), read_only=True) as connection:
+        assert len(load_selection_candidates(connection, request)) == 0                  # never mixed into Bybit
+        assert len(load_selection_candidates(connection, replace(request, exchange="bingx"))) == 1
+
+
+def test_an_explicit_cohort_keeps_its_members_and_the_contract_json_names_only_a_set_exchange(tmp_path: Path) -> None:
+    # review of 5e-2: a retest cohort names its members, so the default exchange never empties it; the canonical
+    # request JSON of a home-exchange request is unchanged, and `exchange` appears only when set
+    from dataclasses import replace
+
+    from mrs3.performance_v2_selection import (
+        SelectionConfig, load_selection_candidates, parse_selection_request, retest_cohort_request,
+    )
+    from mrs3.performance_v2_selection_review import canonical_contract
+
+    database = _database(tmp_path)
+    request = parse_selection_request({"symbol": "BTCUSDT", "side": "LONG", "stages": []})
+    with duckdb.connect(str(database)) as connection:
+        member = connection.execute("select strategy_id, current_result_id from strategies").fetchone()
+        connection.execute("update strategy_results set exchange = 'BingX'")
+        cohort = retest_cohort_request(request, "job", [member])
+        assert len(load_selection_candidates(connection, cohort)) == 1
+        assert len(load_selection_candidates(connection, replace(cohort, exchange="bybit"))) == 0
+    plain, plain_sha, _config, _config_sha = canonical_contract(request, SelectionConfig())
+    assert '"exchange"' not in plain
+    tagged, tagged_sha, _config, _config_sha = canonical_contract(replace(request, exchange="bingx"), SelectionConfig())
+    assert '"exchange":"bingx"' in tagged and tagged_sha != plain_sha

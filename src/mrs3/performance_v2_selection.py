@@ -52,7 +52,9 @@ from .performance_v2_equity_regime_cache import (
     upsert_equity_regime_facts_checked,
 )
 from .performance_v2_sizing import SIZING_DYNAMIC, SIZING_FIXED, load_fixed_lot_base, load_fixed_lot_bases
-from .performance_v2_store import PerformanceV2StoreError, require_performance_v2_readable
+from .performance_v2_store import (
+    PerformanceV2StoreError, home_exchange, require_performance_v2_readable, result_exchange_sql,
+)
 from .audit import write_audit_workbook
 
 StageScope = Literal["pair_side", "pair_side_timeframe"]
@@ -152,6 +154,8 @@ class SelectionRequest:
     ranking_scope: Literal["ORDINARY", "RETEST_COHORT"] = "ORDINARY"
     bulk_retest_job_id: str | None = None
     cohort_members: tuple[tuple[int, int], ...] = ()
+    # ADR-0083: the exchange of the candidates (lower case); None = the database's home exchange
+    exchange: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1829,6 +1833,13 @@ def load_selection_candidates(
     """Load all current ACTIVE candidates for one Pair + Side without filtering them."""
     _verify_retest_cohort(connection, request)
     cohort_sql, cohort_params = _cohort_clause(request)
+    # ADR-0083: the candidates of one exchange (default: the home exchange). A retest cohort that names its members
+    # and no exchange keeps every named member, so an explicit cohort is never silently emptied.
+    if request.exchange is None and request.ranking_scope == "RETEST_COHORT":
+        exchange_sql, exchange_params = "", []
+    else:
+        exchange_sql = " and " + result_exchange_sql("r") + " = ?"
+        exchange_params = [home_exchange(connection), (request.exchange or home_exchange(connection)).lower()]
     equity_source_columns = " r.imported_at_utc, r.optimizer_source_metadata_json,"
     holding_minutes = _holding_quantiles_minutes(connection, request)
     b_holding_minutes = _window_b_holding_p95_minutes(connection, request, config)
@@ -1846,9 +1857,9 @@ def load_selection_candidates(
              join strategy_results r on r.result_id = s.current_result_id and r.strategy_id = s.strategy_id
              left join strategy_orders o on o.strategy_id = s.strategy_id
              left join analysis_plateaus p on p.analysis_run_id = o.analysis_run_id and p.plateau_id = o.plateau_id
-            where s.lifecycle_status = 'ACTIVE' and s.symbol = ? and s.side = ?""" + cohort_sql + """
+            where s.lifecycle_status = 'ACTIVE' and s.symbol = ? and s.side = ?""" + exchange_sql + cohort_sql + """
             order by s.strategy_name, s.strategy_id, o.order_id""",
-        [request.symbol, request.side, *cohort_params],
+        [request.symbol, request.side, *exchange_params, *cohort_params],
     ).fetchall()
     candidates: dict[int, dict[str, object]] = {}
     equity_source_rows: dict[int, tuple[object, ...]] = {}

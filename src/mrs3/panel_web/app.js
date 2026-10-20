@@ -125,6 +125,10 @@ const portfolioSettingsHelpers = (() => {
   const settingsPatch = (document, values) => {
     if (!validSettingsDocument(document)) throw new Error('invalid-document');
     const payload = clone(document);
+    if (values.exchange !== undefined) {   // Panel stage 5e-2: absent = Bybit, so an untouched Bybit keeps the digest
+      if (!['Bybit', 'BingX'].includes(values.exchange)) { const error = new Error('exchange'); error.field = 'exchange'; throw error; }
+      if (values.exchange !== 'Bybit' || (payload.inputs && 'exchange' in payload.inputs)) payload.inputs = { ...payload.inputs, exchange: values.exchange };
+    }
     try { payload.search.seed = settingsIntegerValue(values.seed ?? document.search.seed, true); } catch (error) { error.field = 'seed'; throw error; }
     try { payload.search.composition.parameters.minimum_common_days = settingsIntegerValue(values.minimum_common_days ?? document.search.composition.parameters.minimum_common_days); } catch (error) { error.field = 'minimum-common-days'; throw error; }
     try { payload.search.max_enumerated_combinations = settingsIntegerValue(values.max_enumerated_combinations ?? document.search.max_enumerated_combinations); } catch (error) { error.field = 'max-enumerated-combinations'; throw error; }
@@ -2722,6 +2726,7 @@ if (typeof globalThis !== 'undefined') globalThis.portfolioSelectionHelpers = po
         const weightedInput = (name) => query(`#portfolio-settings-weighted-${name.replaceAll('_', '-')}`);
        const renderDocument = () => {
           const doc = state.document; if (!doc) { controls().forEach((control) => { if (control.type === 'checkbox') control.checked = false; else control.value = ''; }); return; }
+          const exchange = query('#portfolio-settings-exchange'); if (exchange) exchange.value = doc.inputs?.exchange || 'Bybit';   // Panel stage 5e-2
           const seed = query('#portfolio-settings-seed'); if (seed) seed.value = String(doc.search.seed);
           const minimumCommonDays = query('#portfolio-settings-minimum-common-days'); if (minimumCommonDays) minimumCommonDays.value = String(doc.search.composition.parameters.minimum_common_days);
           const budget = query('#portfolio-settings-max-enumerated-combinations'); if (budget) budget.value = String(doc.search.max_enumerated_combinations);
@@ -2755,7 +2760,7 @@ if (typeof globalThis !== 'undefined') globalThis.portfolioSelectionHelpers = po
        const collect = () => {
           const weighted_search = Object.fromEntries(weightedSearchKeys.filter((name) => weightedInput(name)).map((name) => [name, weightedInput(name).type === 'checkbox' ? !!weightedInput(name).checked : weightedInput(name).value]));
           const risk_policy = Object.fromEntries(profiles.map((profile) => [profile, Object.fromEntries(riskFields.map((field) => [field, query(`#portfolio-settings-risk-${profile.toLowerCase()}-${field.replaceAll('_', '-')}`)?.value]))]));
-           const values = { seed: query('#portfolio-settings-seed')?.value, minimum_common_days: query('#portfolio-settings-minimum-common-days')?.value, max_enumerated_combinations: query('#portfolio-settings-max-enumerated-combinations')?.value, lot_model_base_coefficient: query('#portfolio-settings-lot-model-base-coefficient')?.value, lot_model_max_shift_bonus: query('#portfolio-settings-lot-model-max-shift-bonus')?.value, round_down_usdt: query('#portfolio-settings-round-down-usdt')?.value, open_fee_rate: query('#portfolio-settings-open-fee-rate')?.value, close_fee_rate: query('#portfolio-settings-close-fee-rate')?.value, minimum_coverage_pct: query('#portfolio-settings-minimum-coverage-pct')?.value, maximum_age_hours: query('#portfolio-settings-maximum-age-hours')?.value, archive_publication_lag_hours: query('#portfolio-settings-archive-publication-lag-hours')?.value, backfill_write_enabled: !!query('#portfolio-settings-backfill-write-enabled')?.checked, spread_history_bypass_pretest: !!query('#portfolio-settings-spread-history-bypass-pretest')?.checked, weighted_search, risk_policy };
+           const values = { exchange: query('#portfolio-settings-exchange')?.value, seed: query('#portfolio-settings-seed')?.value, minimum_common_days: query('#portfolio-settings-minimum-common-days')?.value, max_enumerated_combinations: query('#portfolio-settings-max-enumerated-combinations')?.value, lot_model_base_coefficient: query('#portfolio-settings-lot-model-base-coefficient')?.value, lot_model_max_shift_bonus: query('#portfolio-settings-lot-model-max-shift-bonus')?.value, round_down_usdt: query('#portfolio-settings-round-down-usdt')?.value, open_fee_rate: query('#portfolio-settings-open-fee-rate')?.value, close_fee_rate: query('#portfolio-settings-close-fee-rate')?.value, minimum_coverage_pct: query('#portfolio-settings-minimum-coverage-pct')?.value, maximum_age_hours: query('#portfolio-settings-maximum-age-hours')?.value, archive_publication_lag_hours: query('#portfolio-settings-archive-publication-lag-hours')?.value, backfill_write_enabled: !!query('#portfolio-settings-backfill-write-enabled')?.checked, spread_history_bypass_pretest: !!query('#portfolio-settings-spread-history-bypass-pretest')?.checked, weighted_search, risk_policy };
         return settingsPatch(state.document, values);
       };
       const clearInvalid = () => controls().forEach((control) => { control.removeAttribute('aria-invalid'); control.setCustomValidity(''); });

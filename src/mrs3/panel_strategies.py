@@ -163,7 +163,8 @@ def _read_tested_rows(performance_db: Path, exchange: str, config: SelectionConf
         by_id = {row["_strategy_id"]: row for row in tested.values()}
         for (symbol, side), members in cohorts.items():
             try:
-                request = retest_cohort_request(SelectionRequest(symbol, side, ()), "panel-strategies", members)
+                request = retest_cohort_request(SelectionRequest(symbol, side, (), exchange=exchange.lower()),
+                                                "panel-strategies", members)
                 frame = load_selection_candidates(connection, request, config, cache_only=True)
             except Exception as error:          # one pair never blanks the view
                 notes.append(f"{symbol} {side}: метрики не прочитаны ({type(error).__name__})")

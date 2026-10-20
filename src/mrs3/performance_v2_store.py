@@ -1240,6 +1240,23 @@ def known_exchange(name: object) -> str | None:
     return next((exchange for exchange in KNOWN_EXCHANGES if exchange.casefold() == wanted), None)
 
 
+def home_exchange(connection: duckdb.DuckDBPyConnection) -> str:
+    """The database's home exchange, lower case: `schema_info.exchange`, else `bybit` (a protocol v1 database holds
+    Bybit results only; its `strategy_results.exchange` says `tester`)."""
+    try:
+        row = connection.execute("select value from schema_info where key = 'exchange'").fetchone()
+    except duckdb.Error:
+        row = None
+    return str(row[0]).lower() if row and row[0] else "bybit"
+
+
+def result_exchange_sql(alias: str) -> str:
+    """SQL of a result's exchange, lower case (ADR-0083): a stored known exchange, else the database's home exchange
+    (one `?` parameter: `home_exchange`). Legacy results hold e.g. `tester`."""
+    known = ", ".join(f"'{exchange.lower()}'" for exchange in KNOWN_EXCHANGES)
+    return f"case when lower(trim({alias}.exchange)) in ({known}) then lower(trim({alias}.exchange)) else ? end"
+
+
 def exchange_name_tag(exchange: str) -> str:
     """The strategy-name prefix of an exchange: none for Bybit (its names stay as they are), `BINGX_` for BingX."""
     canonical = known_exchange(exchange)

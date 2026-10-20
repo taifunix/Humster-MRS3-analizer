@@ -5769,49 +5769,44 @@ def _marked_performance_db(path: Path, exchange: str) -> None:
         initialize_performance_v2(connection, evaluation_protocol="v2", exchange=exchange)
 
 
-def test_stage1_is_blocked_for_a_database_of_another_exchange(tmp_path: Path) -> None:
-    """P7 spec §2: optimizer margin and liquidity data exist only for Bybit."""
-    from mrs3.panel_portfolio import _require_exchange_data
+def test_stage1_is_blocked_on_an_exchange_without_optimizer_market_data(tmp_path: Path) -> None:
+    """Panel stage 5e-2: the optimizer's exchange comes from the settings; BingX margin, leverage and mark price are
+    not connected, so Stage 1 refuses before any work; the database marker no longer decides (ADR-0083)."""
+    from mrs3.panel_portfolio import _require_exchange_data, optimizer_exchange
 
     path = tmp_path / "portfolio_optimizer.local.json"
     _write_config(path)
-    _marked_performance_db(tmp_path / "performance.duckdb", "BingX")
-    service = PortfolioPanelService(tmp_path, path, finalists_reader=lambda *_: pytest.fail("finalists must not be read"))
-
-    readiness = service.readiness()
-
-    assert "EXCHANGE_DATA_UNAVAILABLE" in readiness["stage1"]["blockers"]
-    assert "NO_FINALISTS" not in readiness["stage1"]["blockers"]
-    with pytest.raises(PortfolioPanelError) as error:
-        _require_exchange_data(tmp_path / "performance.duckdb")
-    assert (error.value.code, error.value.status) == ("EXCHANGE_DATA_UNAVAILABLE", 422)
+    _marked_performance_db(tmp_path / "performance.duckdb", "BingX")      # a BingX home marker alone blocks nothing
+    service = PortfolioPanelService(tmp_path, path, finalists_reader=lambda *_: [])
+    assert "EXCHANGE_DATA_UNAVAILABLE" not in service.readiness()["stage1"]["blockers"]
     document = json.loads(path.read_text(encoding="utf-8"))
-    # Finalist preparation and campaign submit refuse before reading finalists.
+    assert optimizer_exchange(document) == "Bybit"                         # absent = Bybit
+    document["inputs"]["exchange"] = "BingX"
+    path.write_text(json.dumps(document), encoding="utf-8")
+    readiness = PortfolioPanelService(tmp_path, path, finalists_reader=lambda *_: []).readiness()
+    assert "EXCHANGE_DATA_UNAVAILABLE" in readiness["stage1"]["blockers"]
     with pytest.raises(PortfolioPanelError) as error:
-        service._current_finalist_metadata(document)
-    assert error.value.code == "EXCHANGE_DATA_UNAVAILABLE"
-    with pytest.raises(PortfolioPanelError) as error:
+        _require_exchange_data("BingX")
+    assert (error.value.code, error.value.status) == ("EXCHANGE_DATA_UNAVAILABLE", 422)
+    _require_exchange_data("Bybit")
+    with pytest.raises(PortfolioPanelError) as error:                    # campaign submit refuses before reading
         service._snapshot_finalists(document, {"pairs": []})
     assert error.value.code == "EXCHANGE_DATA_UNAVAILABLE"
 
 
-def test_an_unreadable_database_is_a_typed_refusal(tmp_path: Path) -> None:
-    from mrs3.panel_portfolio import _require_exchange_data
+def test_the_optimizer_exchange_setting_is_optional_and_checked(tmp_path: Path) -> None:
+    # Panel stage 5e-2: inputs.exchange, absent = Bybit; only the canonical names of known exchanges
+    from mrs3.portfolio.config import PortfolioConfigError, load_portfolio_config
 
-    broken = tmp_path / "broken.duckdb"
-    broken.write_bytes(b"not a duckdb file")
-
-    with pytest.raises(PortfolioPanelError) as error:
-        _require_exchange_data(broken)
-    assert (error.value.code, error.value.status) == ("PERFORMANCE_DB_UNAVAILABLE", 422)
-
-
-def test_bybit_and_unmarked_databases_keep_stage1(tmp_path: Path) -> None:
-    from mrs3.panel_portfolio import _require_exchange_data
-
-    _marked_performance_db(tmp_path / "bybit.duckdb", "Bybit")
-    with duckdb.connect(str(tmp_path / "plain.duckdb")) as connection:
-        connection.execute("create table selection_runs(symbol varchar, side varchar)")
-
-    _require_exchange_data(tmp_path / "bybit.duckdb")
-    _require_exchange_data(tmp_path / "plain.duckdb")
+    path = tmp_path / "portfolio_optimizer.local.json"
+    _write_config(path)
+    assert "exchange" not in load_portfolio_config(path).inputs
+    for value, valid in (("BingX", True), ("Bybit", True), ("bingx", False), ("OKX", False), (1, False)):
+        document = json.loads(path.read_text(encoding="utf-8"))
+        document["inputs"]["exchange"] = value
+        path.write_text(json.dumps(document), encoding="utf-8")
+        if valid:
+            assert load_portfolio_config(path).inputs["exchange"] == value
+        else:
+            with pytest.raises(PortfolioConfigError):
+                load_portfolio_config(path)

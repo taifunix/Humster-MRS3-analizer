@@ -430,8 +430,16 @@ def _parse_profiles(value: Any) -> Mapping[str, Profile]:
 
 
 def _parse_inputs(value: Any) -> Mapping[str, Any]:
-    raw = _object(value, "inputs", ("performance_db", "portfolio_db", "collector_root", "approved_templates", "bybit_minute_data_root"))
+    raw = _object(value, "inputs", ("performance_db", "portfolio_db", "collector_root", "approved_templates", "bybit_minute_data_root"),
+                  ("exchange",))
     result = {key: _string(raw[key], f"inputs.{key}") for key in ("performance_db", "portfolio_db", "collector_root")}
+    if "exchange" in raw:                       # ADR-0083 / Panel stage 5e-2: the optimizer's exchange, default Bybit
+        from ..performance_v2_store import KNOWN_EXCHANGES, known_exchange
+
+        exchange = known_exchange(raw["exchange"])
+        if exchange is None or raw["exchange"] != exchange:
+            raise PortfolioConfigError(f"inputs.exchange must be one of {', '.join(KNOWN_EXCHANGES)}")
+        result["exchange"] = exchange
     result["bybit_minute_data_root"] = _string(raw["bybit_minute_data_root"], "inputs.bybit_minute_data_root")
     templates = raw["approved_templates"]
     if not isinstance(templates, list) or not templates:

@@ -1249,6 +1249,24 @@ def registry_finalist_provenance(
     }
 
 
+def _keys_of_exchange(
+    connection: duckdb.DuckDBPyConnection, keys: Sequence[tuple[str, str, int, int]], exchange: str | None,
+) -> list[tuple[str, str, int, int]]:
+    """The finalist keys whose result is of `exchange` (default: the database's home exchange), ADR-0083."""
+    from ..performance_v2_store import home_exchange, result_exchange_sql
+
+    if not keys:
+        return list(keys)
+    home = home_exchange(connection)
+    wanted = (exchange or home).lower()
+    result_ids = sorted({int(key[3]) for key in keys})
+    found = dict(connection.execute(
+        f"select r.result_id, {result_exchange_sql('r')} from strategy_results r "
+        "where r.result_id in (select unnest(?::bigint[]))", [home, result_ids]).fetchall())
+    # a key without its result stays: the reader below fails closed on it, as it always did
+    return [key for key in keys if int(key[3]) not in found or found[int(key[3])] == wanted]
+
+
 def _registry_facts(
     connection: duckdb.DuckDBPyConnection,
     pair_values: Sequence[tuple[str, str]],
@@ -1370,8 +1388,12 @@ def read_current_finalists(
     include_series: bool = True,
     *,
     marks: Mapping[str, Mapping[str, Any]] | None = None,
+    exchange: str | None = None,
 ) -> tuple[dict[str, Any], ...]:
     """Read current exact User Status=FINALIST facts without source writes.
+
+    ``exchange`` (ADR-0083, Panel stage 5e-2) keeps the finalists whose result is of that exchange; None keeps the
+    database's home exchange, so one database holding both exchanges never mixes them in one portfolio.
 
     ``include_series`` is kept opt-in for callers that build an execution
     snapshot.  Metadata-only consumers such as Panel readiness can avoid
@@ -1402,6 +1424,7 @@ def read_current_finalists(
                 key for key, fact in facts.items()
                 if key[:2] in pair_values and fact.get("user_status") == "FINALIST"
             ]
+            finalist_keys = _keys_of_exchange(connection, finalist_keys, exchange)
             if not include_series:
                 pair_order = {pair: index for index, pair in enumerate(pair_values)}
                 return tuple(

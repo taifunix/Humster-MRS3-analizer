@@ -236,20 +236,17 @@ def _performance(database: Path) -> duckdb.DuckDBPyConnection:
 
 
 def result_exchange_sql(alias: str) -> str:
-    """SQL of a result's exchange (ADR-0083): a stored known exchange, else the database's home exchange (one `?`
-    parameter: `database_exchange`). Legacy results hold e.g. `tester` (the v1 PerformanceDB, live 2026-10-18)."""
-    return (f"case when lower(trim({alias}.exchange)) in ('bybit', 'bingx') then lower(trim({alias}.exchange)) "
-            "else ? end")
+    """SQL of a result's exchange (ADR-0083); see `performance_v2_store.result_exchange_sql`."""
+    from ..performance_v2_store import result_exchange_sql as store_sql
+
+    return store_sql(alias)
 
 
 def database_exchange(source: duckdb.DuckDBPyConnection) -> str:
-    """Exchange of a PerformanceDB: `schema_info.exchange` (protocol v2); a protocol v1 database has none and holds
-    Bybit results only (its `strategy_results.exchange` column says `tester`)."""
-    try:
-        row = source.execute("select value from schema_info where key = 'exchange'").fetchone()
-    except duckdb.Error:
-        row = None
-    return str(row[0]).lower() if row and row[0] else "bybit"
+    """The home exchange of a PerformanceDB (ADR-0083); see `performance_v2_store.home_exchange`."""
+    from ..performance_v2_store import home_exchange
+
+    return home_exchange(source)
 
 
 def import_finalists(con: duckdb.DuckDBPyConnection, performance_db: Path, exchange: str,

@@ -45,7 +45,6 @@ from .portfolio.config import (
     migrate_portfolio_config_document,
 )
 from .config import load_duckdb_import_settings
-from .performance_v2_store import database_identity
 from .performance_v2_optimizer import (
     MissingPreparedOptimizerInput,
     OptimizerIntegrityError,
@@ -158,30 +157,21 @@ class PortfolioPanelError(ValueError):
         super().__init__(message or code)
 
 
-def _foreign_exchange(database: Path) -> str | None:
-    """Exchange marker of a PerformanceDB other than Bybit; None for Bybit or an unmarked (v1) database."""
-    with duckdb.connect(str(database), read_only=True) as connection:
-        markers = connection.execute(
-            "select count(*) from information_schema.tables where table_name = 'schema_info'"
-        ).fetchone()[0]
-        if not markers:
-            return None
-        _protocol, exchange = database_identity(connection)
-    return exchange if exchange is not None and exchange.strip() and exchange.strip().casefold() != "bybit" else None
+def optimizer_exchange(document: Mapping[str, Any] | None) -> str:
+    """The optimizer's exchange (Panel stage 5e-2): `inputs.exchange` of the settings, absent = Bybit."""
+    inputs = document.get("inputs") if isinstance(document, Mapping) and isinstance(document.get("inputs"), Mapping) \
+        else {}
+    value = inputs.get("exchange")
+    return value if isinstance(value, str) and value else "Bybit"
 
 
-def _require_exchange_data(database: Path) -> None:
-    """Stage 1/2 use Bybit margin and liquidity data only (P7 spec §2): another exchange is refused."""
-    try:
-        exchange = _foreign_exchange(database)
-    except (OSError, duckdb.Error, ValueError) as error:
-        raise PortfolioPanelError(
-            "PERFORMANCE_DB_UNAVAILABLE", "performance database cannot be read", status=422,
-        ) from error
-    if exchange is not None:
+def _require_exchange_data(exchange: str) -> None:
+    """Stage 1/2 take margin, leverage and the mark price from the Bybit market snapshot: another exchange is refused
+    before any work (Panel stage 5e-2; the database marker no longer decides, ADR-0083)."""
+    if exchange != "Bybit":
         raise PortfolioPanelError(
             "EXCHANGE_DATA_UNAVAILABLE",
-            f"optimizer margin and liquidity data for {exchange} are not collected yet",
+            f"{exchange} market data is not connected to the optimizer yet",
             status=422,
         )
 
@@ -732,6 +722,14 @@ def _invoke(callback: Callable[..., Any], *values: Any) -> Any:
         return callback(*values)
     count = len(tuple(parameter for parameter in parameters if parameter.kind in (parameter.POSITIONAL_ONLY, parameter.POSITIONAL_OR_KEYWORD)))
     return callback(*values[:count])
+
+
+def _accepts_keyword(callback: Callable[..., Any], name: str) -> bool:
+    try:
+        parameters = inspect.signature(callback).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(parameter.name == name or parameter.kind == parameter.VAR_KEYWORD for parameter in parameters)
 
 
 def _decimal(value: Any, field: str, *, positive: bool = True) -> str:
@@ -1495,22 +1493,14 @@ class PortfolioPanelService:
             raise PortfolioPanelError("CONFIG_INVALID", "portfolio settings are invalid", status=422) from error
 
     @staticmethod
-    def _foreign_exchange_database(database: Path) -> bool:
-        try:
-            return _foreign_exchange(database) is not None
-        except (OSError, duckdb.Error, ValueError):
-            # An unreadable database is reported by the finalist readers.
-            return False
-
-    @staticmethod
     def _path_from_config(root: Path, value: Any) -> Path:
         path = Path(str(value))
         return (root / path).resolve() if not path.is_absolute() else path.resolve()
 
-    def _registry_marks(self, database: Path) -> dict[str, dict[str, Any]] | None:
-        """The pair-registry finalist marks for this PerformanceDB's exchange (ADR-0080), or None without a registry
-        (the selection reviews decide). Only the production reader uses them."""
-        from .pair_registry.records import database_exchange, finalist_marks
+    def _registry_marks(self, database: Path, exchange: str = "Bybit") -> dict[str, dict[str, Any]] | None:
+        """The pair-registry finalist marks of the optimizer's exchange (ADR-0080, ADR-0083), or None without a
+        registry (the selection reviews decide). Only the production reader uses them."""
+        from .pair_registry.records import finalist_marks
         from .pair_registry.store import DATABASE, RegistryError, load_registry_settings
 
         from .pair_registry.records import registry_decides
@@ -1523,8 +1513,7 @@ class PortfolioPanelService:
             return None
         if not registry.is_file():
             return None
-        with duckdb.connect(str(database), read_only=True) as source:
-            exchange = database_exchange(source)
+        exchange = exchange.lower()
         try:
             with duckdb.connect(str(registry), read_only=True) as con:
                 if not registry_decides(con, exchange):
@@ -1539,19 +1528,23 @@ class PortfolioPanelService:
     _NO_MARKS = object()
 
     def _invoke_finalists(self, database: Path, pairs: Sequence[tuple[str, str]], include_series: bool,
-                          marks: Any = _NO_MARKS) -> Any:
+                          marks: Any = _NO_MARKS, exchange: str = "Bybit") -> Any:
         if not self._uses_production_finalists_reader:
             return _invoke(self.finalists_reader, database, pairs, include_series)
         if marks is self._NO_MARKS:
-            marks = self._registry_marks(database)
-        if marks is None:                        # no registry: the selection reviews decide, exactly as before
+            marks = self._registry_marks(database, exchange)
+        extra = {"exchange": exchange.lower()} if _accepts_keyword(self.finalists_reader, "exchange") else {}
+        if marks is None:                        # no registry: the selection reviews decide (of this exchange)
+            if extra:
+                return self.finalists_reader(database, pairs, include_series, **extra)
             return _invoke(self.finalists_reader, database, pairs, include_series)
-        return self.finalists_reader(database, pairs, include_series, marks=marks)
+        return self.finalists_reader(database, pairs, include_series, marks=marks, **extra)
 
-    def _finalist_pairs(self, database: Path, marks: Any = _NO_MARKS) -> tuple[tuple[str, str], ...]:
+    def _finalist_pairs(self, database: Path, marks: Any = _NO_MARKS,
+                        exchange: str = "Bybit") -> tuple[tuple[str, str], ...]:
         """Pairs that can hold finalists: those of the registry FINALIST marks, else of the selection runs."""
         if marks is self._NO_MARKS:
-            marks = self._registry_marks(database)
+            marks = self._registry_marks(database, exchange)
         if marks is not None:
             return tuple(sorted({(str(mark["symbol"]).upper(), str(mark["side"]).upper()) for mark in marks.values()
                                  if mark["status"] == "FINALIST" and str(mark["side"]).upper() in {"LONG", "SHORT"}}))
@@ -1570,10 +1563,10 @@ class PortfolioPanelService:
         database = self._path_from_config(self.root, inputs.get("performance_db", ""))
         if not database.is_file():
             raise PortfolioPanelError("PERFORMANCE_DB_UNAVAILABLE", "performance database is unavailable", status=422)
-        _require_exchange_data(database)
-        marks = self._registry_marks(database)          # read once: the pairs and the rows see the same marks
-        pair_keys = self._finalist_pairs(database, marks)
-        rows = self._invoke_finalists(database, pair_keys, False, marks)
+        exchange = optimizer_exchange(document)             # the finalists of the selected exchange (stage 5e-2)
+        marks = self._registry_marks(database, exchange)    # read once: the pairs and the rows see the same marks
+        pair_keys = self._finalist_pairs(database, marks, exchange)
+        rows = self._invoke_finalists(database, pair_keys, False, marks, exchange)
         finalists: dict[str, int] = {}
         result_ids: list[int] = []
         for index, row in enumerate(rows or ()):
@@ -1726,9 +1719,9 @@ class PortfolioPanelService:
             database = self._path_from_config(self.root, inputs.get("performance_db", ""))
             if not database.is_file():
                 stage1.append("PERFORMANCE_DB_UNAVAILABLE")
-            elif self._foreign_exchange_database(database):
-                stage1.append("EXCHANGE_DATA_UNAVAILABLE")
             else:
+                if optimizer_exchange(document) != "Bybit":      # its finalists are shown, Stage 1 is not possible
+                    stage1.append("EXCHANGE_DATA_UNAVAILABLE")
                 try:
                     finalist_rows: list = []
                     database, pairs, finalists, result_ids = self._current_finalist_metadata(
@@ -1779,8 +1772,8 @@ class PortfolioPanelService:
     def _snapshot_finalists(self, document: Mapping[str, Any], launch: Mapping[str, Any]) -> tuple[tuple[dict[str, Any], ...], tuple[dict[str, Any], ...]]:
         inputs = document.get("inputs") if isinstance(document.get("inputs"), Mapping) else {}
         database = self._path_from_config(self.root, inputs.get("performance_db", ""))
-        if database.is_file():
-            _require_exchange_data(database)
+        exchange = optimizer_exchange(document)
+        _require_exchange_data(exchange)
         pairs = tuple(
             (pair["pair"], side)
             for pair in launch["pairs"]
@@ -1788,7 +1781,7 @@ class PortfolioPanelService:
             if maximum > 0
         )
         try:
-            loaded = self._invoke_finalists(database, pairs, True)
+            loaded = self._invoke_finalists(database, pairs, True, exchange=exchange)
             finalists_list = []
             weighted_input_rows = []
             weighted_fields = (
