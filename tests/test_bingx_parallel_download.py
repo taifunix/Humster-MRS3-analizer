@@ -5,7 +5,7 @@ Contract: docs/specs/2026-10-20-panel-sync-by-exchange.md, «Part 2 contract». 
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timezone
 import threading
 import time
 from pathlib import Path
@@ -33,6 +33,11 @@ class SlowBingX(FakeBingX):
             self.peak = max(self.peak, self.active)
         try:
             time.sleep(0.02)
+            if interval == "1h":                      # like BingX: the candles of every day of the range
+                first = datetime.fromtimestamp(start_ms / 1000, timezone.utc).date()
+                last = datetime.fromtimestamp(end_ms / 1000, timezone.utc).date()
+                self.calls.append((interval, first))
+                return [candle for day in sorted(self.hours) if first <= day <= last for candle in self.hours[day]]
             return super().klines(API, start_ms, end_ms, interval)
         finally:
             with self.lock:
@@ -192,6 +197,7 @@ def test_the_history_prepares_share_the_rate_only_when_two_run_at_once(monkeypat
         def start_run(self, *args, **kwargs) -> None: ...
         def finish_run(self, *args, **kwargs) -> None: ...
         def statuses(self, exchange, symbol) -> dict: return {}
+        def instruments(self, exchange, symbol) -> dict: return {}
 
     seen: list[int] = []
     monkeypatch.setattr(trade_history, "ProcessPoolExecutor", ThreadPoolExecutor)      # the patches reach the worker

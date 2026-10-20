@@ -8,6 +8,25 @@ Use [PRD.md](PRD.md) for the feature registry and [docs/README.md](docs/README.m
 for the documentation map. Read the linked contract only for the active task;
 do not treat this file as a replacement for a feature specification.
 
+## BingX gap check: one hourly request per 40 days (2026-10-20, branch `panel-sync-liquidity`)
+
+Contract: [sync by exchange](docs/specs/2026-10-20-panel-sync-by-exchange.md),
+«Part 3 contract».
+
+- A day with minute gaps is checked against the hour candles. The candles of
+  up to 40 days now come in one request (BingX gives at most 1,000 candles
+  per request), only when the chunk has a gap day, and once for all threads.
+- The rule (ADR-0082) is unchanged.
+- **Real measurement** (40 pairs, 437 days): 3 hourly requests, 226 s
+  instead of 238 s. The gain is small on the liquidity window; the full
+  history, with stock weekends, is not measured.
+- **Tests:**
+  - new `tests/test_bingx_hour_batch.py`: one request per span, chunks of
+    40, no gap no request, a failed request is tried again;
+  - two fakes of earlier tests now answer an hourly range like BingX;
+  - one history stub got `instruments()` (my mistake in the previous
+    commit's test).
+
 ## History: tick and qty step from the registry, recompute on change, «пересчёт не требуется» (2026-10-20, branch `panel-sync-liquidity`)
 
 Contract: [history spec](docs/specs/2026-10-20-panel-history-incremental.md),

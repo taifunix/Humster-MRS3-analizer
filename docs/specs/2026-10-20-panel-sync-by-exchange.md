@@ -153,6 +153,30 @@ layer», «BingX minute verification»), [BingX data downloader](2026-10-10-bing
     in one 1h request (`limit 1440` = 60 days) instead of one per day with
     gaps. Every no-trade day (stock weekends) costs such a request today.
 
+## Part 3 contract: one hourly request per 40 days (implemented 2026-10-20)
+
+The user approved it («Эти проверки можно собрать в один запрос на 60 дней
+по паре… делай»). BingX answers at most 1,000 candles per request, so a
+request takes 40 days of 1h candles (960), not 60.
+
+- **`HourBatches`** (`minute_days`) serves the 1h candles of the days of one
+  `verify_bingx_days` call:
+  - the days of the call, in order, are cut into chunks of
+    `HOUR_DAYS_PER_REQUEST = 40` consecutive days;
+  - a chunk is requested **only when one of its days has a gap to check**,
+    and once: the days of a chunk, also in parallel threads, wait for the
+    same request;
+  - a failed request is not remembered. Its day is refused as before, and
+    the next gap day of the chunk asks again.
+- **The rule does not change:** a day with gaps is compared with the hour
+  candles as in ADR-0082 (`differing_hours`); only where the candles come
+  from changes. `_verify_day` without batches asks per day, as before.
+- **Measured** (40 BingX pairs, 437 days, 2026-10-20): 437 minute requests
+  and 3 hourly ones; 226 s against 238 s before. On the 7-weekday window the
+  hourly requests were only about 9 % of all, so the gain there is small.
+  The full history of a pair, with the no-trade stock weekends, should gain
+  more. That is not measured yet.
+
 ## Measured 2026-10-20 (read-only: a copy of the registry, public kline requests)
 
 - **Registry journal of today's two syncs.** The BingX window step itself is

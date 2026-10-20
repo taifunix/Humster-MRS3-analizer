@@ -144,8 +144,44 @@ def differing_hours(rows: Sequence[Sequence[str]], hours: Sequence[Mapping], day
     return differ
 
 
+# BingX answers at most 1,000 candles per request: 40 days of 1h candles (960) fit in one
+HOUR_DAYS_PER_REQUEST = 40
+
+
+class HourBatches:
+    """The 1h candles of the days of one verification, fetched in chunks of `HOUR_DAYS_PER_REQUEST` consecutive days
+    and only when a day of the chunk has a gap to check (docs/specs/2026-10-20-panel-sync-by-exchange.md, «Part 3
+    contract»). Thread-safe: the days of a chunk wait for one request; a failed request is not remembered, so the
+    next gap day asks again."""
+
+    def __init__(self, client, api_symbol: str, days: Sequence[date]):
+        import threading
+
+        self._client, self._api_symbol, self._days = client, api_symbol, list(days)
+        self._index = {day: position for position, day in enumerate(self._days)}
+        self._chunks: dict[int, dict[date, list]] = {}
+        self._locks = [threading.Lock() for _ in range(len(self._days) // HOUR_DAYS_PER_REQUEST + 1)]
+
+    def hours_of(self, day: date) -> list:
+        chunk = self._index[day] // HOUR_DAYS_PER_REQUEST
+        with self._locks[chunk]:
+            if chunk not in self._chunks:
+                members = self._days[chunk * HOUR_DAYS_PER_REQUEST:(chunk + 1) * HOUR_DAYS_PER_REQUEST]
+                start, end = _day_start_ms(members[0]), _day_start_ms(members[-1]) + DAY_MS - 1
+                by_day: dict[date, list] = {member: [] for member in members}
+                for candle in self._client.klines(self._api_symbol, start, end, interval="1h"):
+                    try:                                  # by arithmetic: an absurd or missing time never raises
+                        offset = (int(candle["time"]) - start) // DAY_MS
+                    except (KeyError, TypeError, ValueError, OverflowError):
+                        continue                          # a candle of no day: its hour then counts as missing
+                    if 0 <= offset < len(members):
+                        by_day[members[offset]].append(candle)
+                self._chunks[chunk] = by_day
+            return self._chunks[chunk][day]
+
+
 def _verify_day(client, data_root: Path, symbol: str, api_symbol: str, launch_ms: int, day: date,
-                known: Mapping | None, mode: str, now_ms: int) -> tuple[str | None, dict | None]:
+                known: Mapping | None, mode: str, now_ms: int, hours_of=None) -> tuple[str | None, dict | None]:
     """(refusal reason or None, new record or None when the known record is reused or nothing was verified).
 
     The fetched minutes are a candidate: the file on disk changes only when the candidate is accepted, so a valid
@@ -166,8 +202,11 @@ def _verify_day(client, data_root: Path, symbol: str, api_symbol: str, launch_ms
             status = "OK"
             break
         if hours is None:
-            start = _day_start_ms(day)
-            hours = client.klines(api_symbol, start, start + DAY_MS - 1, interval="1h")
+            if hours_of is not None:
+                hours = hours_of(day)
+            else:
+                start = _day_start_ms(day)
+                hours = client.klines(api_symbol, start, start + DAY_MS - 1, interval="1h")
         differ = differing_hours(rows, hours, day, launch_ms)
         if not differ:
             status = "VERIFIED_GAPS"
@@ -206,10 +245,13 @@ def verify_bingx_days(data_root: Path, symbol: str, api_symbol: str, launch_ms: 
         client = BingXClient() if rate_share == 1 else BingXClient(
             request_delay_seconds=REQUEST_INTERVAL_SECONDS * rate_share)
     now_ms = int(now.timestamp() * 1000)
+    days = planned_days(first, last, launch_ms, last_available_day(now))
+    batches = HourBatches(client, api_symbol, days)             # one hourly request per 40 days with a gap
 
     def one(day: date) -> tuple[str | None, dict | None]:
         try:
-            return _verify_day(client, Path(data_root), symbol, api_symbol, launch_ms, day, known.get(day), mode, now_ms)
+            return _verify_day(client, Path(data_root), symbol, api_symbol, launch_ms, day, known.get(day), mode, now_ms,
+                               batches.hours_of)
         except BingXDownloadError as error:
             return f"download failed: {error}", None
         except (OSError, CandleDayError) as error:
@@ -217,7 +259,6 @@ def verify_bingx_days(data_root: Path, symbol: str, api_symbol: str, launch_ms: 
         except (ValueError, TypeError, KeyError, InvalidOperation) as error:   # a malformed klines answer
             return f"unexpected klines answer: {type(error).__name__}", None
 
-    days = planned_days(first, last, launch_ms, last_available_day(now))
     if threads > 1 and len(days) > 1:
         from concurrent.futures import ThreadPoolExecutor
 
