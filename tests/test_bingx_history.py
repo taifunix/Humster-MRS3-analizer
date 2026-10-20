@@ -146,7 +146,7 @@ def test_the_script_runs_bingx_history_from_the_registry(tmp_path: Path, monkeyp
     import mrs3.pair_registry.minute_days as minute_days
 
     client = FakeBingX()
-    monkeypatch.setattr(minute_days, "BingXClient", lambda: client)
+    monkeypatch.setattr(minute_days, "BingXClient", lambda **_options: client)
     script = runpy.run_path(str(REPO / "scripts" / "simulate_history.py"), run_name="not_main")
     config = _registry_config(tmp_path)
     code = script["main"](["--config", str(config), "--exchange", "bingx", "--pairs", "TESTUSDT", "--workers", "1",
@@ -226,7 +226,7 @@ def test_the_script_skips_a_bingx_pair_without_tick_size_and_runs_the_others(tmp
         [], now_ms=ms("2026-10-19"))
     con.close()
     client = FakeBingX()
-    monkeypatch.setattr(minute_days, "BingXClient", lambda: client)
+    monkeypatch.setattr(minute_days, "BingXClient", lambda **_options: client)
     script = runpy.run_path(str(REPO / "scripts" / "simulate_history.py"), run_name="not_main")
     code = script["main"](["--config", str(config), "--exchange", "bingx", "--pairs", "TESTUSDT,BAREUSDT",
                            "--workers", "1", "--timeframes", "4h", "--end-day", "2026-07-20"])

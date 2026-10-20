@@ -18,6 +18,7 @@ import os
 from pathlib import Path
 import re
 from tempfile import NamedTemporaryFile
+import threading
 import time
 from typing import Callable, Iterable, Mapping, Sequence
 import urllib.error
@@ -38,6 +39,11 @@ DAY_MS = 86_400_000
 AVAILABILITY_LAG = timedelta(hours=9)
 # BingX gateway codes that mean "retry later": rate limit, system busy, internal error, network exception.
 RETRYABLE_CODES = frozenset({100410, 100500, 109500, 109701})
+# The minimum interval between the starts of two requests of one client, over all its threads: 2 requests/s.
+# Measured 2026-10-20 on the klines (docs/specs/2026-10-20-panel-sync-by-exchange.md, «Part 2 contract»): 60 requests
+# at 2/s passed; at 3/s the 41st and at 5/s the 32nd got 100410 (about 30 requests per 10 s per IP). One by one the
+# old client made about 1.15 requests/s (a request takes 0.45-0.9 s, plus a 0.2 s pause).
+REQUEST_INTERVAL_SECONDS = 0.5
 _TICKER = re.compile(r"^[A-Z0-9]+$")
 
 
@@ -171,7 +177,8 @@ def _default_fetch_json(url: str, headers: dict[str, str]) -> object:
 
 
 class BingXClient:
-    """Minimal BingX swap REST client with bounded retries and `code` checks."""
+    """Minimal BingX swap REST client with bounded retries and `code` checks. Thread-safe: the threads of one client
+    share one request rate (`request_delay_seconds` between the starts of two requests)."""
 
     def __init__(
         self,
@@ -180,8 +187,9 @@ class BingXClient:
         sleep: Callable[[float], None] = time.sleep,
         retries: int = 4,
         backoff_seconds: float = 1.0,
-        request_delay_seconds: float = 0.2,
+        request_delay_seconds: float = REQUEST_INTERVAL_SECONDS,
         credentials: tuple[str, str] | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._fetch_json = fetch_json
         self._sleep = sleep
@@ -189,6 +197,20 @@ class BingXClient:
         self._backoff = backoff_seconds
         self._delay = request_delay_seconds
         self._credentials = credentials
+        self._clock = clock
+        self._turn = threading.Lock()
+        self._next_start = 0.0
+
+    def _wait_turn(self) -> None:
+        """Wait for this request's slot of the shared rate (the slots are taken in call order)."""
+        if not self._delay:
+            return
+        with self._turn:
+            now = self._clock()
+            start = max(now, self._next_start)
+            self._next_start = start + self._delay
+        if start > now:
+            self._sleep(start - now)
 
     def _get(self, path: str, params: Mapping[str, object], *, signed: bool = False) -> object:
         query_params = dict(params)
@@ -209,8 +231,7 @@ class BingXClient:
         for attempt in range(self._retries):
             if attempt:
                 self._sleep(self._backoff * 2 ** (attempt - 1))
-            elif self._delay:
-                self._sleep(self._delay)
+            self._wait_turn()
             try:
                 payload = self._fetch_json(url, headers)
             except urllib.error.HTTPError as error:

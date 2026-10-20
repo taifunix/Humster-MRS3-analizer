@@ -129,6 +129,8 @@ def ensure_window(con: duckdb.DuckDBPyConnection, settings: RegistrySettings, ex
     first, _end, _last = window_span(first_today, settings.liquidity_window_weekdays)
     symbols = [row[0] for row in con.execute(query).fetchall()]
     counts: dict = {"pairs": len(symbols), "accepted": 0, "refused": 0, "failed_pairs": 0, "failed": {}}
+    if exchange == "bingx":
+        return _ensure_bingx_pairs(con, settings, symbols, first, last_day, counts, client=client, now=now)
     for symbol in symbols:
         try:
             days = minute_days.ensure_minute_days(con, settings, exchange, symbol, first, last_day, client=client,
@@ -139,6 +141,52 @@ def ensure_window(con: duckdb.DuckDBPyConnection, settings: RegistrySettings, ex
             continue
         counts["accepted"] += len(days.accepted)
         counts["refused"] += len(days.refused)
+    return counts
+
+
+def _ensure_bingx_pairs(con: duckdb.DuckDBPyConnection, settings: RegistrySettings, symbols: Sequence[str],
+                        first: date, last_day: date, counts: dict, *, client=None,
+                        now: datetime | None = None) -> dict:
+    """The BingX pairs in parallel (docs/specs/2026-10-20-panel-sync-by-exchange.md, part 2): a sync usually needs one
+    new day per pair, so the pairs, not the days, overlap. The threads share one client (one request rate) and never
+    touch the registry: its rows are read before, and each pair's new records are written in this thread as soon as the
+    pair is done (an interrupted run keeps the pairs already done)."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    from . import minute_days
+
+    pairs = {row[0]: (row[1], int(row[2] or 0)) for row in con.execute(
+        "select symbol, api_symbol, listing_ms from pairs where exchange = 'bingx'").fetchall()}
+    known = {symbol: minute_days.known_records(con, "bingx", symbol, first, last_day) for symbol in symbols}
+    client = client or minute_days.BingXClient()        # one client: one request rate for every thread
+    now = now or datetime.now(timezone.utc)
+
+    def one(symbol: str):
+        try:
+            api_symbol, launch_ms = pairs[symbol]
+            if not api_symbol:
+                raise RegistryError(f"bingx: {symbol} has no API symbol")
+            return symbol, minute_days.verify_bingx_days(settings.bingx_data_root, symbol, api_symbol, launch_ms, first,
+                                                         last_day, known=known[symbol], client=client, now=now,
+                                                         mode=settings.bingx_download_mode), None
+        except Exception as error:                      # one pair failing never stops the others
+            return symbol, None, error
+
+    with ThreadPoolExecutor(max_workers=max(1, min(settings.workers, len(symbols) or 1))) as pool:
+        for future in as_completed([pool.submit(one, symbol) for symbol in symbols]):
+            symbol, days, error = future.result()
+            if error is None:
+                try:                                    # the registry is written in this thread only
+                    minute_days.write_records(con, days.records)
+                except Exception as failure:            # one pair failing never stops the others
+                    error = failure
+            if error is not None:
+                counts["failed_pairs"] += 1
+                counts["failed"][symbol] = type(error).__name__
+                continue
+            counts["accepted"] += len(days.accepted)
+            counts["refused"] += len(days.refused)
+    counts["failed"] = dict(sorted(counts["failed"].items()))
     return counts
 
 

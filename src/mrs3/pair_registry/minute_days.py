@@ -20,8 +20,8 @@ from typing import Mapping, Sequence
 import duckdb
 
 from ..bingx_downloader import (
-    DAY_MS, MINUTE_MS, BingXClient, BingXDownloadError, _day_start_ms, _first_minute_ms, _rows_from_klines, _text,
-    last_available_day, planned_days, validate_day_file, write_day_file,
+    DAY_MS, MINUTE_MS, REQUEST_INTERVAL_SECONDS, BingXClient, BingXDownloadError, _day_start_ms, _first_minute_ms,
+    _rows_from_klines, _text, last_available_day, planned_days, validate_day_file, write_day_file,
 )
 from ..minute_data import ensure_days
 from ..tester_candles import HEADER, CandleDayError, read_day
@@ -194,25 +194,39 @@ def _verify_day(client, data_root: Path, symbol: str, api_symbol: str, launch_ms
 
 def verify_bingx_days(data_root: Path, symbol: str, api_symbol: str, launch_ms: int, first: date, last: date, *,
                       known: Mapping[date, Mapping], client=None, now: datetime | None = None,
-                      mode: str = "incremental") -> MinuteDays:
+                      mode: str = "incremental", threads: int = 1, rate_share: int = 1) -> MinuteDays:
     """Ensure and verify the BingX days of [first, last] without the registry (a process-pool worker can call it);
-    days before the listing day or not yet available are left out."""
+    days before the listing day or not yet available are left out. `threads` > 1 verifies days in parallel (each day
+    has its own file; the client spaces the requests); the result is in day order either way. Without a client, one
+    is made whose request rate is the 1/`rate_share` part of the full rate (processes running at the same time)."""
+    if rate_share < 1:
+        raise ValueError("rate_share: a whole number of 1 or more")
     now = now or datetime.now(timezone.utc)
-    client = client or BingXClient()
-    result = MinuteDays()
-    for day in planned_days(first, last, launch_ms, last_available_day(now)):
+    if client is None:
+        client = BingXClient() if rate_share == 1 else BingXClient(
+            request_delay_seconds=REQUEST_INTERVAL_SECONDS * rate_share)
+    now_ms = int(now.timestamp() * 1000)
+
+    def one(day: date) -> tuple[str | None, dict | None]:
         try:
-            reason, record = _verify_day(client, Path(data_root), symbol, api_symbol, launch_ms, day, known.get(day),
-                                         mode, int(now.timestamp() * 1000))
+            return _verify_day(client, Path(data_root), symbol, api_symbol, launch_ms, day, known.get(day), mode, now_ms)
         except BingXDownloadError as error:
-            result.refused[day] = f"download failed: {error}"
-            continue
+            return f"download failed: {error}", None
         except (OSError, CandleDayError) as error:
-            result.refused[day] = f"download failed: {type(error).__name__}"
-            continue
+            return f"download failed: {type(error).__name__}", None
         except (ValueError, TypeError, KeyError, InvalidOperation) as error:   # a malformed klines answer
-            result.refused[day] = f"unexpected klines answer: {type(error).__name__}"
-            continue
+            return f"unexpected klines answer: {type(error).__name__}", None
+
+    days = planned_days(first, last, launch_ms, last_available_day(now))
+    if threads > 1 and len(days) > 1:
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=min(threads, len(days))) as pool:
+            outcomes = list(pool.map(one, days))
+    else:
+        outcomes = [one(day) for day in days]
+    result = MinuteDays()
+    for day, (reason, record) in zip(days, outcomes):
         if record is not None:
             result.records.append(record)
         if reason is None:
@@ -269,7 +283,7 @@ def ensure_bingx_days_shared(settings: RegistrySettings, symbol: str, first: dat
         # pre-listing hours are accepted as VERIFIED_GAPS by the hourly check (no candle there); days after it are
         # unaffected
         return verify_bingx_days(settings.bingx_data_root, symbol, api_symbol, 0, first, last, known={},
-                                 client=client, now=now, mode=settings.bingx_download_mode)
+                                 client=client, now=now, mode=settings.bingx_download_mode, threads=settings.workers)
     try:
         pair = reader.execute("select api_symbol, listing_ms from pairs where exchange = 'bingx' and symbol = ?",
                               [symbol]).fetchone()
@@ -279,7 +293,7 @@ def ensure_bingx_days_shared(settings: RegistrySettings, symbol: str, first: dat
     finally:
         reader.close()
     return verify_bingx_days(settings.bingx_data_root, symbol, pair[0], int(pair[1] or 0), first, last, known=known,
-                             client=client, now=now, mode=settings.bingx_download_mode)
+                             client=client, now=now, mode=settings.bingx_download_mode, threads=settings.workers)
 
 
 def ensure_minute_days(con: duckdb.DuckDBPyConnection, settings: RegistrySettings, exchange: str, symbol: str,
@@ -305,6 +319,6 @@ def ensure_minute_days(con: duckdb.DuckDBPyConnection, settings: RegistrySetting
         raise RegistryError(f"bingx: {symbol} is not in the registry")
     result = verify_bingx_days(settings.bingx_data_root, symbol, pair[0], int(pair[1] or 0), first, last,
                                known=known_records(con, "bingx", symbol, first, last), client=client, now=now,
-                               mode=settings.bingx_download_mode)
+                               mode=settings.bingx_download_mode, threads=settings.workers)
     write_records(con, result.records)
     return result

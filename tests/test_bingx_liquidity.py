@@ -151,14 +151,14 @@ def test_one_pair_failing_never_stops_the_others(tmp_path: Path, monkeypatch) ->
         {"symbol": "AMDUSDT", "status": "TRADING", "api_symbol": API, "listing_ms": _ms(NOW) - 200 * 86_400_000},
         {"symbol": "BADUSDT", "status": "TRADING", "api_symbol": "NCSKBAD2USD-USDT", "listing_ms": 0}], [],
         now_ms=_ms(NOW))
-    original = minute_days.ensure_minute_days
+    original = minute_days.verify_bingx_days          # the pairs run in parallel threads (sync part 2)
 
-    def flaky(con, settings, exchange, symbol, *args, **kwargs):
+    def flaky(data_root, symbol, *args, **kwargs):
         if symbol == "BADUSDT":
             raise RegistryError("broken")
-        return original(con, settings, exchange, symbol, *args, **kwargs)
+        return original(data_root, symbol, *args, **kwargs)
 
-    monkeypatch.setattr(minute_days, "ensure_minute_days", flaky)
+    monkeypatch.setattr(minute_days, "verify_bingx_days", flaky)
     counts = ensure_bingx_window(con, _settings(tmp_path), TODAY, TODAY,
                                  client=FakeBingX({day: _full_day(day) for day in DAYS}, {}), now=NOW)
     assert counts["failed"] == {"BADUSDT": "RegistryError"} and counts["accepted"] == 5

@@ -117,7 +117,7 @@ def simulate_segment(minutes: MinuteBars, start: date, end: date, *, tick: float
 
 
 def prepare_pair(symbol: str, listing: date, data_root: str, end_day: date, download: bool, warmup_days: int,
-                 download_threads: int, bingx: BingXMinutes | None = None
+                 download_threads: int, bingx: BingXMinutes | None = None, rate_share: int = 1
                  ) -> tuple[list[tuple[date, date]], dict, frozenset[date] | None, list[dict]]:
     """Plan the pair's segments and ensure the candle days of the plan.
 
@@ -140,8 +140,11 @@ def prepare_pair(symbol: str, listing: date, data_root: str, end_day: date, down
                                  == row["file_sha256"])
             return plan, {**record, "status": "PLANNED", "segments": len(plan)}, accepted, []
         api_symbol, launch_ms = bingx.pairs[symbol]
+        # the days of the pair in parallel (docs/specs/2026-10-20-panel-sync-by-exchange.md, part 2); the pairs
+        # prepared at the same time share the request rate, so each worker's client takes its share of it
         days = verify_bingx_days(Path(bingx.data_root), symbol, api_symbol, launch_ms, first, last, known=known,
-                                 client=bingx.client, mode=bingx.mode)
+                                 client=bingx.client, mode=bingx.mode, threads=download_threads,
+                                 rate_share=rate_share)
         return plan, {**record, "status": "PLANNED", "segments": len(plan), "days_verified": len(days.records),
                       "days_refused": {day.isoformat(): reason for day, reason in days.refused.items()}}, \
             frozenset(days.accepted), days.records
@@ -241,6 +244,7 @@ def run_history(store: TradeStore, *, data_root: Path, pairs: Sequence[tuple[str
         progress({"progress": {"done": units["done"], "total": units["total"], "step": step, "pair": symbol}})
 
     download_threads = max(1, workers // PREPARE_IN_FLIGHT)
+    rate_share = min(PREPARE_IN_FLIGHT, workers)        # the BingX prepares running at once share the request rate
     pool: Executor = ThreadPoolExecutor(max_workers=1) if workers == 1 else ProcessPoolExecutor(max_workers=workers)
     pending: dict = {}
 
@@ -251,7 +255,7 @@ def run_history(store: TradeStore, *, data_root: Path, pairs: Sequence[tuple[str
         while queue and len(pending) < workers and in_flight_prepares() < PREPARE_IN_FLIGHT:
             symbol, listing = queue.pop()
             pending[pool.submit(prepare_pair, symbol, listing, str(data_root), end_day, download, settings.warmup_days,
-                                download_threads, bingx)] = ("prepare", symbol, None)
+                                download_threads, bingx, rate_share)] = ("prepare", symbol, None)
 
     try:
         with pool:

@@ -8,6 +8,30 @@ Use [PRD.md](PRD.md) for the feature registry and [docs/README.md](docs/README.m
 for the documentation map. Read the linked contract only for the active task;
 do not treat this file as a replacement for a feature specification.
 
+## Parallel BingX download under the BingX rate (2026-10-20, branch `panel-sync-liquidity`)
+
+Contract: [sync by exchange](docs/specs/2026-10-20-panel-sync-by-exchange.md),
+«Part 2 contract».
+
+- **Measured rate on the klines:** about 30 requests per 10 s per IP.
+  - 2/s passes; 3/s and 5/s get `100410`.
+  - The client now spaces its requests at 2/s over all threads.
+- **The sync window:** the pairs run in parallel threads. **One pair's
+  days** (tick test, retest, history) also run in parallel threads.
+- **History:** two processes, half the rate each.
+- **Real measurement** (registry copy, empty folder, 40 pairs, 437 days):
+  - 238 s, all accepted, about 0.54 s per day (the old client: about
+    0.72 s);
+  - a second run: 0.2 s, no request.
+- **The BingX rate is the limit,** not the code. The history gains nothing.
+  Proposed next: one 1h request per pair span for the gap check.
+- **Tests:**
+  - new `tests/test_bingx_parallel_download.py`;
+  - the BingX suites (downloader, minute days, liquidity, history, tick,
+    tester jobs, sync): 106 passed, with HTTP(S)_PROXY set to a closed port.
+    So no test reaches BingX: two patches had missed the new client path,
+    and they were fixed.
+
 ## Sync by exchange, the window days before the liquidity, «Пересчитать ликвидность» (2026-10-20, branch `panel-sync-liquidity`)
 
 Contract: [sync by exchange](docs/specs/2026-10-20-panel-sync-by-exchange.md),

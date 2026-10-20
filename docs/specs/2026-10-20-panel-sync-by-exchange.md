@@ -4,7 +4,8 @@
 ликвидность… нужен режим отдельно пересчитать ликвидность») and implemented:
 requirements 1 and 4 and «Пересчитать ликвидность» («Part 1 contract» below).
 Part 2, the parallel BingX download, was approved («внедряй параллельную
-закачку») and is pending.
+закачку») and is implemented («Part 2 contract»). The BingX rate limit
+bounds its gain.
 **Depends on:** [Panel for the simulation workflow](2026-10-18-panel-simulation-workflow.md)
 (main screen, stage 5), [pair registry](2026-10-18-pair-registry.md) («Minute data
 layer», «BingX minute verification»), [BingX data downloader](2026-10-10-bingx-data-downloader.md).
@@ -92,6 +93,65 @@ layer», «BingX minute verification»), [BingX data downloader](2026-10-10-bing
   `panel_testing.py` / the screening templates). That downloader is in the
   external bot, not in this repository. Today the templates use
   `UpdateData=false` and this repository downloads through its own client.
+
+## Part 2 contract: parallel BingX download under the BingX rate (implemented 2026-10-20)
+
+- **The request rate, measured on the klines** (2026-10-20, distinct pairs,
+  1m days):
+  - 60 requests at 2/s: no error;
+  - at 3/s the 41st request, and at 5/s the 32nd, got `100410` («请稍后重试»,
+    retry later). That is about 30 requests per 10 s per IP.
+  - BingX's own pages disagree:
+    - the 2025-10-16 announcement gives 500 per 10 s for all market data;
+    - the Coin-M klines reference gives 1/s.
+  - The measurement decides: `REQUEST_INTERVAL_SECONDS = 0.5` (2 requests/s).
+  - Also seen: after more than 10 errors `109425` within 15 min, BingX
+    refuses that API for 15 min (`109429`). Staying under the rate avoids
+    it.
+- **`BingXClient` is thread-safe and spaces its requests.**
+  - `request_delay_seconds` (default 0.5) is the interval between the starts
+    of two requests of the client, over all its threads, in call order.
+  - It is no longer a pause added before every request. One by one, a
+    request (0.45–0.9 s) is therefore not slowed down any more.
+  - Retries and backoff on the rate-limit codes are unchanged.
+- **The sync / liquidity window** (`ensure_window`, BingX):
+  - the pairs run in parallel threads (`duckdb_import.workers`) over one
+    shared client;
+  - the registry is read before and the new records are written after, in
+    the calling thread;
+  - one pair failing never stops the others.
+- **One pair's days** (`verify_bingx_days(..., threads)`): days in parallel.
+  - The result is in day order and the same as one by one.
+  - Used with `threads = duckdb_import.workers` by the tick test / retest data
+    step and the history.
+- **History:** two pairs are prepared at the same time in two processes.
+  Each process's client takes half of the rate (`rate_share =
+  min(PREPARE_IN_FLIGHT, workers)`), so the run as a whole stays at 2/s. With
+  one worker, one pair is prepared at a time at the full rate.
+- **The registry in the window:**
+  - each pair's records are written as soon as the pair is done, so an
+    interrupted run keeps the pairs already done;
+  - a pair without an API symbol, or with a failing write, is a failed pair.
+- **The rate is per process.** Two BingX downloads running at the same time
+  in separate processes would together exceed it, and then get `100410`
+  retries; `109429` days are refused and verified again on the next run.
+  Such downloads are a sync or liquidity task, the history, the tick-test /
+  retest data step and `tester_jobs`. The Panel's task area runs one task
+  at a time, but a tick test runs as a controller job beside it, so do not
+  start one during a BingX sync.
+- **Measured with the code** (a copy of the registry, an empty folder, 40
+  BingX pairs, the 7-weekday window up to 10-19, 437 days):
+  - 238 s, all 437 accepted, no error, about 0.54 s per day. The old client
+    took about 0.72 s per day (the first sync's journal).
+  - A second run: 0.2 s, no request.
+- **Consequence:**
+  - the BingX rate, not the code, is the limit;
+  - the sync gains about 1.3×;
+  - the history gains nothing: its two processes already made about 2.3
+    requests/s together, so they were at the limit, with retries.
+  - **Proposed next** (not decided): check the hours of a pair's whole span
+    in one 1h request (`limit 1440` = 60 days) instead of one per day with
+    gaps. Every no-trade day (stock weekends) costs such a request today.
 
 ## Measured 2026-10-20 (read-only: a copy of the registry, public kline requests)
 
