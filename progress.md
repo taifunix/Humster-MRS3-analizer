@@ -8,7 +8,20 @@ Use [PRD.md](PRD.md) for the feature registry and [docs/README.md](docs/README.m
 for the documentation map. Read the linked contract only for the active task;
 do not treat this file as a replacement for a feature specification.
 
-## Next plan: one fee schedule per exchange (2026-10-20)
+## Next plan: one button, one finished result (2026-10-20)
+
+Contract: [one-button actions](docs/specs/2026-10-20-panel-one-button-actions.md);
+plan: [T1–T6](docs/superpowers/plans/2026-10-20-panel-one-button-actions.md).
+Approved by the user; handed to another agent. Not started.
+
+- **«Тик-тест MRS3»** runs prepare → tester → report check → import → registry
+  update as one main-screen task; **«Ретест финалистов»** likewise, with the
+  equity filter as an explicit checkbox.
+- **Cards 3/4/5** move to «Настройки → Ручной режим».
+- **Why:** today the import is a manual step in card 3, and «Пары» only
+  learns about a tick test at the next sync.
+
+## Next plan after that: one fee schedule per exchange (2026-10-20)
 
 Draft contract: [fees per exchange](docs/specs/2026-10-20-fees-per-exchange.md)
 (requirements approved, not implemented).
