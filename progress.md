@@ -8,6 +8,42 @@ Use [PRD.md](PRD.md) for the feature registry and [docs/README.md](docs/README.m
 for the documentation map. Read the linked contract only for the active task;
 do not treat this file as a replacement for a feature specification.
 
+## Sync by exchange, the window days before the liquidity, «Пересчитать ликвидность» (2026-10-20, branch `panel-sync-liquidity`)
+
+Contract: [sync by exchange](docs/specs/2026-10-20-panel-sync-by-exchange.md),
+«Part 1 contract».
+
+- **Found on the real data:**
+  - The first sync on this machine (09:06–09:17 UTC) computed the Bybit
+    liquidity on an empty Bybit minute folder. All 274 pairs became
+    `LIQUIDITY_MODEL_WINDOW_UNAVAILABLE`.
+  - The first «Пересчитать историю» (09:26–11:21 UTC) downloaded the days
+    afterwards, and nothing recomputed the liquidity.
+- **Fix:**
+  - the sync runs for the Panel's exchange only (`sync --exchange`);
+  - it ensures the window days (`ensure_window`: Bybit from the archive,
+    never a day not yet archived; BingX verified) before the liquidity;
+  - `refresh_liquidity` keeps the last rows before the 9 h lag on Bybit
+    too;
+  - the new Panel action «Пересчитать ликвидность» (no history).
+- **Liquidity recomputed on the real registry** (`liquidity --exchange
+  bybit`, 2026-10-20 ~12:40 UTC):
+  - 274 pairs: 266 READY, 8 UNAVAILABLE;
+  - 2,987 window days accepted, 27 refused;
+  - the 8 pairs were listed on 10-12/10-13 and have fewer window weekdays
+    than 7.
+- **Tests:**
+  - new `tests/test_sync_by_exchange.py`;
+  - the time-dependent liquidity tests now pass an explicit `now`;
+  - the `--days 3` CLI test no longer reaches the Bybit archive.
+  - Related suites: 228 passed.
+- **Next:**
+  - part 2: parallel BingX download (approved);
+  - ADR-0084: the exchange tag on every strategy name (`BYBIT_`, approved);
+  - Bybit tick and qty step from the registry;
+  - «Пересчитать историю» says «пересчёт не требуется»;
+  - fees per exchange in «Настройки».
+
 ## Panel stage 5e-3b follow-up: the retest preview by exchange (2026-10-20, branch `wip/period-csv-generator`)
 
 - The finalist-retest preview follows the start's exchange rules (marks,

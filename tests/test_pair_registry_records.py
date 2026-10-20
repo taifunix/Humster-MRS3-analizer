@@ -280,10 +280,11 @@ def test_cli_sync_runs_refresh_liquidity_and_pipeline_with_progress(tmp_path: Pa
     code = cli.main(["sync", "--config", str(config), "--today", "2026-10-19", "--machine", "pc1", "--skip-track"])
     events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     steps = [event["progress"]["step"] for event in events if "progress" in event]
-    assert steps == ["pull", "refresh", "liquidity", "liquidity_bingx", "pipeline", "pipeline_bingx", "workbook",
-                     "push", "done"]                                                     # sync off: no-ops
+    assert steps == ["pull", "refresh", "minute_days", "liquidity", "pipeline", "minute_days_bingx", "liquidity_bingx",
+                     "pipeline_bingx", "workbook", "push", "done"]   # without --exchange: both; sync off: no-ops
     errors = [event for event in events if "error" in event]
-    assert code == 1 and [error["step"] for error in errors] == ["liquidity", "liquidity_bingx"]   # no data folder
+    assert code == 1 and [error["step"] for error in errors] == ["minute_days", "liquidity", "minute_days_bingx",
+                                                                 "liquidity_bingx"]          # no data folder
     summary = events[-1]["sync"]
     assert summary["refresh"]["bybit"]["pairs"] == 3 and summary["pipeline"]["pairs"] == 3
     assert summary["workbook"]["bybit"] == 3 and (tmp_path / "registry" / "pairs.xlsx").is_file()   # registry stage 4

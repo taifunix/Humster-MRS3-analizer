@@ -17,6 +17,7 @@ from typing import Mapping, Sequence
 
 import duckdb
 
+from ..minute_data import last_archived_day
 from ..portfolio.minute_capacity import (
     MinuteCapacityError, MinuteCapacityResult, MinuteLiquidityFeatures, _day_path, _day_start_ms, _read_day_bytes,
     _type7_q25,
@@ -103,29 +104,48 @@ def window_span(today: date, weekdays: int) -> tuple[date, date, date]:
     return min(window), end, last_day
 
 
-def ensure_bingx_window(con: duckdb.DuckDBPyConnection, settings: RegistrySettings, first_today: date,
-                        today: date, *, client=None, now: datetime | None = None) -> dict[str, int]:
-    """Download and verify the window days of every TRADING BingX pair (BingX has no market collector): from the
-    window of `first_today` to the day before `today`. One pair failing never stops the others."""
-    from .minute_days import ensure_minute_days
+def ensure_window(con: duckdb.DuckDBPyConnection, settings: RegistrySettings, exchange: str, first_today: date,
+                  today: date, *, client=None, now: datetime | None = None) -> dict[str, int]:
+    """Make sure the window days of every TRADING pair of the exchange are on disk before the liquidity reads them
+    (docs/specs/2026-10-20-panel-sync-by-exchange.md): from the window of `first_today` to the day before `today`.
+    Bybit: the missing days from the Bybit trade archive, never a day not yet archived; BingX: downloaded and
+    verified (no market collector). A day already there is not downloaded again. One pair failing never stops the
+    others."""
+    from . import minute_days
 
-    if settings.bingx_data_root is None:
-        raise RegistryError("the BingX minute data folder is unknown: set tester_runner.bot_root")
+    if exchange == "bybit":
+        if settings.liquidity_data_root is None:
+            raise RegistryError("the Bybit minute data folder is unknown: set tester_runner.bot_root")
+        last_day = min(today - timedelta(days=1), last_archived_day(now or datetime.now(timezone.utc)))
+        query = "select symbol from pairs where exchange = 'bybit' and status = 'TRADING' order by symbol"
+    elif exchange == "bingx":
+        if settings.bingx_data_root is None:
+            raise RegistryError("the BingX minute data folder is unknown: set tester_runner.bot_root")
+        last_day = today - timedelta(days=1)            # `verify_bingx_days` leaves out the days not yet available
+        query = ("select symbol from pairs where exchange = 'bingx' and status = 'TRADING' and api_symbol is not null "
+                 "order by symbol")
+    else:
+        raise RegistryError(f"unknown exchange: {exchange}")
     first, _end, _last = window_span(first_today, settings.liquidity_window_weekdays)
-    last_day = today - timedelta(days=1)
-    symbols = [row[0] for row in con.execute("select symbol from pairs where exchange = 'bingx' and status = 'TRADING' "
-                                             "and api_symbol is not null order by symbol").fetchall()]
+    symbols = [row[0] for row in con.execute(query).fetchall()]
     counts: dict = {"pairs": len(symbols), "accepted": 0, "refused": 0, "failed_pairs": 0, "failed": {}}
     for symbol in symbols:
         try:
-            days = ensure_minute_days(con, settings, "bingx", symbol, first, last_day, client=client, now=now)
-        except (RegistryError, OSError, duckdb.Error) as error:
+            days = minute_days.ensure_minute_days(con, settings, exchange, symbol, first, last_day, client=client,
+                                                  now=now)
+        except Exception as error:                      # a network or archive error of one pair included
             counts["failed_pairs"] += 1
             counts["failed"][symbol] = type(error).__name__
             continue
         counts["accepted"] += len(days.accepted)
         counts["refused"] += len(days.refused)
     return counts
+
+
+def ensure_bingx_window(con: duckdb.DuckDBPyConnection, settings: RegistrySettings, first_today: date,
+                        today: date, *, client=None, now: datetime | None = None) -> dict[str, int]:
+    """`ensure_window` of BingX (Panel stage 5d)."""
+    return ensure_window(con, settings, "bingx", first_today, today, client=client, now=now)
 
 
 def select_window(available: Mapping[date, object], end_day: date, weekdays: int) -> tuple[list[date], list[date]]:
@@ -208,11 +228,13 @@ def _refresh_liquidity(con: duckdb.DuckDBPyConnection, exchange: str, today: dat
         from ..bingx_downloader import last_available_day
 
         available = last_available_day(now or datetime.now(timezone.utc))
-        if end > available:
-            # BingX days appear about 9 h after midnight UTC: an early run keeps the last computed rows instead of
-            # writing every window as UNAVAILABLE (Bybit's collector writes yesterday's file at once)
-            return {"pairs": 0, "ready": 0, "unavailable": 0, "day_rows": 0, "unreadable_days": 0,
-                    "not_yet_available": end.isoformat()}
+    else:
+        available = last_archived_day(now or datetime.now(timezone.utc))
+    if end > available:
+        # the day files appear about 9 h after midnight UTC (the BingX klines, the Bybit trade archive): an early run
+        # keeps the last computed rows instead of writing every window as UNAVAILABLE
+        return {"pairs": 0, "ready": 0, "unavailable": 0, "day_rows": 0, "unreadable_days": 0,
+                "not_yet_available": end.isoformat()}
     span = [first + timedelta(days=offset) for offset in range((last_day - first).days + 1)]
     pairs = con.execute("select symbol, api_symbol from pairs where exchange = ? and status = 'TRADING' "
                         "order by symbol", [exchange]).fetchall()

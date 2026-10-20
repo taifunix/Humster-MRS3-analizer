@@ -266,7 +266,8 @@ def test_the_listing_workbook_is_read_by_the_loader_on_both_sheets(tmp_path: Pat
 def test_registry_capacity_uses_the_anchor_window_after_a_later_sync_and_skips_non_trading(tmp_path: Path) -> None:
     con = _ready_registry(tmp_path)
     root = tmp_path / "data"
-    refresh_liquidity(con, "bybit", date(2026, 10, 21), RegistrySettings(liquidity_data_root=root))   # files end 18
+    refresh_liquidity(con, "bybit", date(2026, 10, 21), RegistrySettings(liquidity_data_root=root),   # files end 18
+                      now=datetime(2026, 10, 21, 12, tzinfo=timezone.utc))
     assert read_liquidity(con, "bybit", "XOMUSDT") is None              # the newest window is UNAVAILABLE
     retried = registry_capacity(con, "bybit", "XOMUSDT", anchor_created_at=ANCHOR)        # a frozen Campaign retry
     assert retried.window_end == date(2026, 10, 16)
@@ -378,12 +379,20 @@ def test_generate_period_csv_takes_the_registry_order_and_any_status_for_explici
     assert seen == ["OLDUSDT"]
 
 
-def test_registry_cli_workbook_and_liquidity_days(tmp_path: Path, capsys) -> None:
+def test_registry_cli_workbook_and_liquidity_days(tmp_path: Path, monkeypatch, capsys) -> None:
     import json
 
     import duckdb
 
     from mrs3.pair_registry import cli
+    import mrs3.pair_registry.minute_days as minute_days
+
+    # the window days are ensured first: no Bybit archive here, the missing day 10-19 stays missing
+    monkeypatch.setattr(minute_days, "ensure_days", lambda root, symbol, first, last, **options: {
+        "existing": [], "created": [], "failed": [last]})
+    import mrs3.pair_registry.liquidity as liquidity
+
+    monkeypatch.setattr(liquidity, "last_archived_day", lambda now: date(2026, 10, 19))      # not the wall clock
 
     config = tmp_path / "config.local.json"
     config.write_text(json.dumps({"pair_registry": {"root": "registry"},

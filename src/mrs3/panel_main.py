@@ -34,10 +34,11 @@ from .panel_strategies import (
 from .panel_tasks import TaskRunner, TaskRunnerError
 from .ready_store import ReadyRule, inputs_sha256, pair_periods
 
-ACTIONS = ("sync", "history", "ready", "tester", "tick", "retest")
+ACTIONS = ("sync", "liquidity", "history", "ready", "tester", "tick", "retest")
 EXCHANGES = ("bybit", "bingx")
+EXCHANGE_LABELS = {"bybit": "Bybit", "bingx": "BingX"}
 BINGX_PENDING = "BingX — этап 5: ретест финалистов BingX ещё не подключён"
-BINGX_READY_ACTIONS = ("sync", "history", "ready", "tester", "tick", "retest")   # Panel stages 5b, 5c, 5e-3a, 5e-3b
+BINGX_READY_ACTIONS = ("sync", "liquidity", "history", "ready", "tester", "tick", "retest")   # Panel stages 5b-5e
 
 
 class MainScreenError(ValueError):
@@ -656,7 +657,14 @@ class MainScreenService:
             con.close()
 
     def _plan_sync(self, exchange: str) -> dict:
-        return {"items": [], "note": "Обновить справочник обеих бирж, ликвидность, конвейер и книгу листингов."}
+        return {"items": [], "note": f"{EXCHANGE_LABELS[exchange]}: справочник, недостающие свечи окна ликвидности, "
+                                     "ликвидность, конвейер и книга листингов."}
+
+    def _plan_liquidity(self, exchange: str) -> dict:
+        weekdays = self._settings().liquidity_window_weekdays
+        return {"items": [], "note": f"{EXCHANGE_LABELS[exchange]}: окно из {weekdays} последних рабочих дней до "
+                                     "вчерашнего; недостающие свечи окна докачиваются, затем считается ликвидность. "
+                                     "Справочник и история не пересчитываются."}
 
     def _history_end_day(self, exchange: str = "bybit") -> date:
         """The day after the last day with minute data: the Bybit archive, or the BingX klines (both lag 9 h)."""
@@ -808,10 +816,15 @@ class MainScreenService:
         python, config = self._python, str(self.config_path)
         scripts = self.repo_root / "scripts"
         pairs = ",".join(item.strip().upper() for item in items)
-        store_root = str(self._store_root()) if action != "sync" else None
-        if action == "sync":
-            steps = [("Синхронизировать", [python, "-m", "mrs3.pair_registry", "sync", "--config", config])]
+        store_root = str(self._store_root()) if action not in ("sync", "liquidity") else None
+        if action == "sync":                        # the selected exchange only (2026-10-20 sync by exchange)
+            steps = [("Синхронизировать", [python, "-m", "mrs3.pair_registry", "sync", "--config", config,
+                                            "--exchange", exchange])]
             label, stop_file = "Синхронизировать", None
+        elif action == "liquidity":
+            steps = [("Ликвидность", [python, "-m", "mrs3.pair_registry", "liquidity", "--config", config,
+                                      "--exchange", exchange])]
+            label, stop_file = "Пересчитать ликвидность", None
         elif action == "history":
             steps = [("История", [python, str(scripts / "simulate_history.py"), "--store", store_root, "--config", config,
                                   "--pairs", pairs, "--exchange", exchange]),

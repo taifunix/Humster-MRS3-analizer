@@ -75,15 +75,16 @@ Copy-Item config.local.json.example config.local.json
 # --source minute-files keeps the old seven-calendar-day model). A sheet never mixes the two models:
 # switching a sheet needs past registry windows and one full rebuild
 .\.venv\Scripts\python.exe -m mrs3.pair_registry liquidity --days 14
-# BingX: the window days are downloaded and verified first (no market collector for BingX)
+# The missing window days are downloaded first (Bybit trade archive; BingX: downloaded and verified)
 .\.venv\Scripts\python.exe -m mrs3.pair_registry liquidity --exchange bingx
 .\scripts\calculate_bybit_base_lots.cmd --rebuild-history
 .\scripts\calculate_bybit_base_lots.cmd
 # One-time rebuild of all ten dated columns after interrupted/partial initialization
 .\scripts\calculate_bybit_base_lots.cmd --rebuild-history
 
-# Pair registry: refresh, liquidity, pipeline and the listing workbook (sheets «Пары», «Пары_BingX»)
-.\.venv\Scripts\python.exe -m mrs3.pair_registry sync
+# Pair registry: refresh, window days, liquidity, pipeline and the listing workbook (sheets «Пары», «Пары_BingX»);
+# --exchange bybit|bingx syncs one exchange (the Panel passes the selected one), without it both
+.\.venv\Scripts\python.exe -m mrs3.pair_registry sync --exchange bybit
 # Git sync between machines: once per machine; --remote is a private repository you create yourself
 # (with GitHub CLI installed and logged in, the sync repository uses its credentials)
 .\.venv\Scripts\python.exe -m mrs3.pair_registry sync-init --remote <URL>

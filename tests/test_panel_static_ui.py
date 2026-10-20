@@ -2310,7 +2310,8 @@ def test_main_screen_has_the_exchange_switch_actions_and_task_area() -> None:
     main = _main_screen_html()
     assert 'data-exchange="bybit" aria-pressed="true"' in main and 'data-exchange="bingx" aria-pressed="false"' in main
     actions = re.findall(r'data-main-action="([a-z]+)">([^<]+)<', main)
-    assert actions == [("sync", "Синхронизировать"), ("history", "Пересчитать историю"), ("ready", "Пересобрать READY"),
+    assert actions == [("sync", "Синхронизировать"), ("liquidity", "Пересчитать ликвидность"),
+                       ("history", "Пересчитать историю"), ("ready", "Пересобрать READY"),
                        ("tester", "Проверить тестером"), ("tick", "Тик-тест MRS3"), ("retest", "Ретест финалистов")]
     for element in ('id="main-task-label"', 'id="main-task-badge"', 'id="main-task-bar"', 'id="main-task-text"',
                     'id="main-task-errors"', 'id="main-task-log"', 'id="main-task-stop"'):

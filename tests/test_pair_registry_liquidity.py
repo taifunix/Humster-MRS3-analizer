@@ -179,8 +179,9 @@ def test_cli_liquidity_refreshes_the_registry_pairs(tmp_path: Path, capsys) -> N
     config.write_text(json.dumps({"pair_registry": {"root": str(tmp_path / "registry"),
                                                     "liquidity": {"data_root": str(root)}}}), encoding="utf-8")
     assert cli.main(["liquidity", "--config", str(config), "--today", "2026-10-19"]) == 0
-    assert json.loads(capsys.readouterr().out) == {"bybit": {"pairs": 1, "ready": 1, "unavailable": 0, "day_rows": 11,
-                                                             "unreadable_days": 0}}
+    result = json.loads(capsys.readouterr().out)["bybit"]
+    assert result.pop("minute_days") == {"pairs": 1, "accepted": 11, "refused": 0, "failed_pairs": 0, "failed": {}}
+    assert result == {"pairs": 1, "ready": 1, "unavailable": 0, "day_rows": 11, "unreadable_days": 0}
 
 
 def _two_weeks(root: Path, skip: tuple[date, ...] = ()) -> None:
@@ -200,7 +201,8 @@ def test_the_reader_fails_closed_on_a_newer_unavailable_window(tmp_path: Path) -
     assert read_liquidity(con, "bybit", "XOMUSDT")["as_of_day"] == "2026-10-16"
     (root / "XOMUSDT" / "XOMUSDT2026-10-14_1m.parquet").write_bytes(b"broken")
     _write_day(root, "XOMUSDT", date(2026, 10, 19), _minutes(date(2026, 10, 19)))
-    summary = refresh_liquidity(con, "bybit", date(2026, 10, 20), settings)
+    summary = refresh_liquidity(con, "bybit", date(2026, 10, 20), settings,
+                                now=datetime(2026, 10, 20, 12, tzinfo=timezone.utc))
     assert (summary["unavailable"], summary["unreadable_days"]) == (1, 1)
     assert read_liquidity(con, "bybit", "XOMUSDT") is None
     assert con.execute("select count(*) from liquidity_days where day = '2026-10-14'").fetchone()[0] == 0
@@ -212,7 +214,8 @@ def test_stale_minute_files_make_the_window_unavailable(tmp_path: Path) -> None:
     con = _registry_with_pair(tmp_path)
     settings = RegistrySettings(liquidity_data_root=root)
     refresh_liquidity(con, "bybit", date(2026, 10, 19), settings)
-    refresh_liquidity(con, "bybit", date(2026, 10, 30), settings)
+    refresh_liquidity(con, "bybit", date(2026, 10, 30), settings,              # 10-29 already in the archive
+                      now=datetime(2026, 10, 30, 12, tzinfo=timezone.utc))
     rows = con.execute("select as_of_day, status from liquidity order by as_of_day").fetchall()
     assert [(day.isoformat(), status) for day, status in rows] == [
         ("2026-10-16", "READY"), ("2026-10-29", "LIQUIDITY_MODEL_WINDOW_UNAVAILABLE")]     # the old row is kept

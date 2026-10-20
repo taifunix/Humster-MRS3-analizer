@@ -1,7 +1,8 @@
 """Pair registry CLI: `python -m mrs3.pair_registry <command> [--config config.local.json]`.
 
-Commands: refresh, liquidity, pipeline, sync (pull + refresh + liquidity of both exchanges + pipeline of both
-exchanges + listing workbook + push, the Panel's «Синхронизировать»), sync-init, workbook, decide, setting. Contract: docs/specs/2026-10-18-pair-registry.md.
+Commands: refresh, liquidity, pipeline, sync (pull + refresh + window days, liquidity and pipeline of the exchange, or
+of both without `--exchange` + listing workbook + push, the Panel's «Синхронизировать»), sync-init, workbook, decide,
+setting. Contract: docs/specs/2026-10-18-pair-registry.md, docs/specs/2026-10-20-panel-sync-by-exchange.md.
 """
 
 from __future__ import annotations
@@ -16,7 +17,7 @@ import duckdb
 
 from .bingx import fetch_bingx, normalize_contracts, unreadable_symbols
 from .bybit import fetch_bybit, normalize_instruments, normalize_risk_limits
-from .liquidity import ensure_bingx_window, refresh_liquidity
+from .liquidity import ensure_window, refresh_liquidity
 from .records import record_decision, record_setting
 from .refresh import record_failure, refresh_exchange
 from .store import RegistryError, RegistrySettings, connect, load_registry_settings
@@ -87,6 +88,15 @@ def _push(con: duckdb.DuckDBPyConnection, settings: RegistrySettings, message: s
         return {"error": f"{type(error).__name__}: {error}"}
 
 
+def _window_error(ensured: dict) -> str | None:
+    """The error of an `ensure_window` result whose pairs failed (names only, no local path), else None."""
+    failed = ensured.get("failed") or {}
+    if not ensured.get("failed_pairs"):
+        return None
+    names = ", ".join(sorted(failed)[:10]) + (" ..." if len(failed) > 10 else "")
+    return f"window days not downloaded for {ensured['failed_pairs']} pairs: {names}"
+
+
 def _pipeline(con: duckdb.DuckDBPyConnection, config: Path, today: date, machine: str | None, skip_track: bool,
               exchange: str = "bybit") -> dict:
     import os
@@ -115,13 +125,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     refresh.add_argument("--exchange", choices=("bybit", "bingx", "all"), default="all")
     liquidity = commands.add_parser("liquidity", help="weekday liquidity, LOT_MODEL_V2, for the TRADING pairs")
     liquidity.add_argument("--exchange", choices=("bybit", "bingx"), default="bybit",
-                           help="bingx: the window days are downloaded and verified first (no market collector)")
+                           help="the missing window days are downloaded first (BingX: and verified)")
     liquidity.add_argument("--days", type=int, default=1,
                            help="also the windows of the N-1 run days before, oldest first (1-31; e.g. 14 to backfill "
                                 "the base-lot history)")
     pipeline = commands.add_parser("pipeline", help="import tests and finalists, recompute the pipeline state")
-    sync = commands.add_parser("sync", help="pull the sync repository, refresh both exchanges, liquidity, the "
-                                            "pipeline, the workbook, then push")
+    sync = commands.add_parser("sync", help="pull the sync repository, refresh the exchange, its window days, "
+                                            "liquidity and pipeline, the workbook, then push")
+    sync.add_argument("--exchange", choices=("bybit", "bingx", "all"), default="all",
+                      help="the Panel passes the selected exchange; all = both, one after the other")
     sync_init = commands.add_parser("sync-init", help="create the local sync repository (git); with --remote, pull "
                                                       "and push go to that repository")
     sync_init.add_argument("--remote", default=None, help="URL of the private sync repository (created by the user)")
@@ -205,49 +217,59 @@ def main(argv: Sequence[str] | None = None) -> int:
             try:
                 from datetime import timedelta
 
-                ensured = (ensure_bingx_window(con, settings, today - timedelta(days=args.days - 1), today)
-                           if args.exchange == "bingx" else None)
+                ensured = ensure_window(con, settings, args.exchange, today - timedelta(days=args.days - 1), today)
                 runs = [refresh_liquidity(con, args.exchange, today - timedelta(days=offset), settings)
                         for offset in range(args.days - 1, -1, -1)]          # oldest first: today's window is newest
                 result = runs[-1] if args.days == 1 else {"days": args.days, "runs": runs}
-                result, code = {args.exchange: result if ensured is None else {**result, "minute_days": ensured}}, 0
+                result, code = {args.exchange: {**result, "minute_days": ensured}}, 0
+                if _window_error(ensured):
+                    _emit({"error": _window_error(ensured), "step": "minute_days", "pair": None})
+                    code = 1
             except Exception as error:
                 result, code = {args.exchange: {"error": f"{type(error).__name__}: {error}"}}, 1
             _emit(result)
             return code
         if args.command == "sync":
-            steps = ("pull", "refresh", "liquidity", "liquidity_bingx", "pipeline", "pipeline_bingx", "workbook",
-                     "push")
+            # one exchange: the Panel's selected one; without --exchange both, one after the other. The window days
+            # are ensured before the liquidity reads them (docs/specs/2026-10-20-panel-sync-by-exchange.md)
+            exchanges = ("bybit", "bingx") if args.exchange == "all" else (args.exchange,)
+            suffix = {"bybit": "", "bingx": "_bingx"}
+            steps = ("pull", "refresh",
+                     *(f"{kind}{suffix[exchange]}" for exchange in exchanges
+                       for kind in ("minute_days", "liquidity", "pipeline")),
+                     "workbook", "push")
             summary: dict[str, object] = {}
             failed = False
             for done, step in enumerate(steps):
                 _emit({"progress": {"done": done, "total": len(steps), "step": step, "pair": None}})
+                exchange = "bingx" if step.endswith("_bingx") else "bybit"
+                kind = step.removesuffix("_bingx")
                 try:
                     if step == "pull":
                         summary[step] = sync_pull(con, settings.sync_path, settings.machine)
                     elif step == "push":
                         summary[step] = sync_push(con, settings.sync_path, settings.machine, "sync")
                     elif step == "refresh":
-                        summary[step], step_failed = _refresh(con, settings, ("bybit", "bingx"))
-                        for exchange, value in summary[step].items():
+                        summary[step], step_failed = _refresh(con, settings, exchanges)
+                        for name, value in summary[step].items():
                             if isinstance(value, dict) and "error" in value:
-                                _emit({"error": value["error"], "step": f"refresh {exchange}", "pair": None})
+                                _emit({"error": value["error"], "step": f"refresh {name}", "pair": None})
                         failed = failed or step_failed
-                    elif step == "liquidity":
-                        summary[step] = refresh_liquidity(con, "bybit", today, settings)
-                    elif step == "liquidity_bingx":           # Panel stage 5d: BingX days first, no collector
-                        ensured = ensure_bingx_window(con, settings, today, today)
-                        summary[step] = {**refresh_liquidity(con, "bingx", today, settings), "minute_days": ensured}
-                    elif step == "pipeline_bingx":
-                        summary[step] = _pipeline(con, args.config, today, args.machine or settings.machine,
-                                                  args.skip_track, "bingx")
                     elif step == "workbook":
                         try:
                             summary[step] = write_listing_workbook(con, settings.root / WORKBOOK_NAME)
                         except OSError as error:          # e.g. the workbook is open in Excel; no local path
                             raise RegistryError(f"{type(error).__name__}: listing workbook not written") from None
+                    elif kind == "minute_days":
+                        summary[step] = ensure_window(con, settings, exchange, today, today)
+                        if _window_error(summary[step]):           # never a silent all-UNAVAILABLE liquidity
+                            _emit({"error": _window_error(summary[step]), "step": step, "pair": None})
+                            failed = True
+                    elif kind == "liquidity":
+                        summary[step] = refresh_liquidity(con, exchange, today, settings)
                     else:
-                        summary[step] = _pipeline(con, args.config, today, args.machine or settings.machine, args.skip_track)
+                        summary[step] = _pipeline(con, args.config, today, args.machine or settings.machine,
+                                                  args.skip_track, exchange)
                 except Exception as error:          # one step failing never stops the next one
                     summary[step] = {"error": f"{type(error).__name__}: {error}"}
                     _emit({"error": summary[step]["error"], "step": step, "pair": None})
