@@ -68,6 +68,20 @@ def listing_days(config_path: Path, exchange: str = "bybit",
     return {symbol: datetime.fromtimestamp(ms / 1000, timezone.utc).date() for symbol, ms in rows}
 
 
+def registry_instruments(config_path: Path, exchange: str = "bybit",
+                         on_busy: Callable[[str], None] | None = None) -> dict[str, tuple[float, float]] | None:
+    """(tick size, qty step) of every pair of the exchange that has both in the registry, refreshed by every
+    «Синхронизировать» (docs/specs/2026-10-20-panel-history-incremental.md, requirement 5). None without a registry
+    or while a writer holds it."""
+    con = _registry_connection(config_path, on_busy)
+    if con is None:
+        return None
+    with con:
+        rows = con.execute("select symbol, tick_size, qty_step from pairs where exchange = ? and tick_size is not null "
+                           "and qty_step is not null", [exchange]).fetchall()
+    return {symbol: (float(tick), float(qty)) for symbol, tick, qty in rows}
+
+
 def history_pairs(config_path: Path, on_busy: Callable[[str], None] | None = None,
                   exchange: str = "bybit") -> list[tuple[str, date]] | None:
     """TRADING pairs of the exchange in the registry with their listing day, the most liquid first (latest liquidity `L`

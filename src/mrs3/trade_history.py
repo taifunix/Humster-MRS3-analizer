@@ -20,7 +20,8 @@ from .minute_data import ensure_days
 from .mrs2_simulator import MinuteBars, RunSettings, load_minutes, simulate_mrs2, simulate_period
 from .period_csv import GENERATOR_VERSION, PERIOD_DAYS, Point, first_period_day, has_warmup_data, journal_append, ms_of, split_periods
 from .trade_store import (
-    SegmentKey, SegmentTables, TradeStore, TradeStoreError, build_tables, hourly_rows, metrics_columns, point_id, price_rows,
+    SegmentKey, SegmentTables, TradeStore, TradeStoreError, build_tables, hourly_rows, instrument_variant,
+    metrics_columns, point_id, price_rows,
     trade_columns, write_segment_files,
 )
 
@@ -170,7 +171,8 @@ def missing_days(data_root: Path, symbol: str, first: date, end: date) -> list[d
 
 def simulate_and_write(store_root: str, key: SegmentKey, data_root: str, tick: float, qty_step: float,
                        points: Sequence[Point], settings: RunSettings, replace_unregistered: bool = False,
-                       symbol_dir: str | None = None, accepted: frozenset[date] | None = None) -> dict:
+                       symbol_dir: str | None = None, accepted: frozenset[date] | None = None,
+                       variant: str | None = None) -> dict:
     """Simulate one segment and write its files; returns the catalog record or a skip status.
 
     Every candle day of the warm-up and the span must exist (Bybit) or be accepted by the minute verification
@@ -191,13 +193,21 @@ def simulate_and_write(store_root: str, key: SegmentKey, data_root: str, tick: f
     tables = simulate_segment(minutes, key.start, key.end, tick=tick, qty_step=qty_step, points=points,
                               settings=settings)
     record = write_segment_files(Path(store_root), key, tables, settings=settings, tick_size=tick, qty_step=qty_step,
-                                 replace_unregistered=replace_unregistered)
+                                 replace_unregistered=replace_unregistered, variant=variant)
     return {"status": "OK", "record": record}
 
 
 # -- history run ----------------------------------------------------------------------------
 
 PREPARE_IN_FLIGHT = 2
+INSTRUMENT_CHANGED = "INSTRUMENT_CHANGED"
+
+
+def same_instrument(made_with: tuple[float, float], current: tuple[float, float]) -> bool:
+    """The (tick size, qty step) of a stored segment equal the current ones (the catalog keeps doubles)."""
+    import math
+
+    return all(math.isclose(float(left), float(right), rel_tol=1e-9) for left, right in zip(made_with, current))
 
 
 def _reactivate(store: TradeStore, segment: SegmentKey, journal: Path, base: Mapping) -> bool:
@@ -247,6 +257,7 @@ def run_history(store: TradeStore, *, data_root: Path, pairs: Sequence[tuple[str
     rate_share = min(PREPARE_IN_FLIGHT, workers)        # the BingX prepares running at once share the request rate
     pool: Executor = ThreadPoolExecutor(max_workers=1) if workers == 1 else ProcessPoolExecutor(max_workers=workers)
     pending: dict = {}
+    replacing: dict[str, tuple[float, float]] = {}       # segment id -> the instrument it was simulated with
 
     def in_flight_prepares() -> int:
         return sum(1 for kind, _, _ in pending.values() if kind == "prepare")
@@ -282,27 +293,48 @@ def run_history(store: TradeStore, *, data_root: Path, pairs: Sequence[tuple[str
                         journal_append(journal, {**base, **record})
                         symbol_dir = bingx.symbol_dir(symbol) if bingx is not None else None
                         known = store.statuses(exchange, symbol)
+                        made_with = store.instruments(exchange, symbol)
                         tick, qty_step = instruments[symbol]
                         for start, end in plan:
                             segment = SegmentKey(exchange, symbol, SOURCE, start, end, engine)
                             status = known.get(segment.segment_id)
-                            if status == "active":
+                            # a segment simulated with another tick size or qty step is simulated again under the
+                            # same id (docs/specs/2026-10-20-panel-history-incremental.md, requirement 5): its new
+                            # files get their own names and the active row stays in use until the catalog swaps it,
+                            # so the pair's active chain never has a gap (a failed simulation keeps the old row)
+                            stale = segment.segment_id in made_with and not same_instrument(
+                                made_with[segment.segment_id], (tick, qty_step))
+                            if status == "active" and not stale:
                                 counts["skipped"] += 1
-                            elif status == "superseded" and _reactivate(store, segment, journal, base):
+                            elif status == "superseded" and not stale and _reactivate(store, segment, journal, base):
                                 counts["reactivated"] += 1
                             else:
-                                # absent, or superseded with damaged files: simulate again and own the files
+                                # absent, superseded with damaged files, or of another instrument: simulate again
+                                if stale:
+                                    replacing[segment.segment_id] = made_with[segment.segment_id]
+                                variant = instrument_variant(tick, qty_step) if stale else None
                                 pending[pool.submit(simulate_and_write, str(store.root), segment, str(data_root),
-                                                    tick, qty_step, points, settings, True, symbol_dir,
-                                                    accepted)] = ("segment", symbol, segment)
+                                                    tick, qty_step, points, settings, True, symbol_dir, accepted,
+                                                    variant)] = ("segment", symbol, segment)
                                 units["total"] += 1
                         units["done"] += 1
                         report(symbol, "plan")
                         fill()
                         continue
                     if result["status"] == "OK":
+                        was = replacing.pop(key.segment_id, None)
                         try:
-                            store.register(result["record"], replace_superseded=True)
+                            # the tester window of the old instrument no longer stands for it: superseded in the
+                            # same transaction as the swap (a kill in between can never leave it active)
+                            testers = store.register(result["record"], replace_superseded=True,
+                                                     replace_active=was is not None,
+                                                     supersede_span_of="tester" if was is not None else None,
+                                                     superseded_by=INSTRUMENT_CHANGED)
+                            if was is not None:
+                                journal_append(journal, {**base, "segment_id": key.segment_id,
+                                                         "status": INSTRUMENT_CHANGED, "was": list(was),
+                                                         "now": list(instruments[symbol]),
+                                                         "tester_segments_superseded": testers})
                         except Exception as error:   # a segment already registered (duplicate plan, race): count,
                             counts["failed"] += 1      # keep the files, move on
                             journal_append(journal, {**base, "segment_id": key.segment_id, "status": "ERROR",
@@ -326,4 +358,4 @@ def run_history(store: TradeStore, *, data_root: Path, pairs: Sequence[tuple[str
 
 
 __all__ = ["ENGINE", "SOURCE", "BingXMinutes", "exchange_run_settings", "missing_days", "pair_order",
-           "pair_segments", "run_history", "simulate_segment"]
+           "pair_segments", "run_history", "same_instrument", "simulate_segment"]

@@ -50,7 +50,8 @@ def _world(tmp_path: Path):
     listing = int(datetime(2026, 6, 1, tzinfo=timezone.utc).timestamp() * 1000)
     con = connect(tmp_path / "registry")
     refresh_exchange(con, "bybit", [{"symbol": s, "status": "TRADING", "api_symbol": s, "listing_ms": listing,
-                                     "tick_size": "0.01", "display_name": s} for s in ("GOODUSDT", "YOUNGUSDT", "NEWUSDT")],
+                                     "tick_size": "0.01", "qty_step": "0.01", "display_name": s}
+                                    for s in ("GOODUSDT", "YOUNGUSDT", "NEWUSDT")],
                      [{"symbol": "GOODUSDT", "tier_id": 1, "risk_limit_value": "10000", "initial_margin": "0.02",
                        "maintenance_margin": "0.01", "max_leverage": "50", "mm_deduction": "0", "is_lowest": True}],
                      now_ms=NOW)

@@ -264,16 +264,25 @@ class SegmentKey:
         return f"{self.exchange}/{self.symbol}/{self.file_name[: -len('.parquet')]}"
 
 
+def instrument_variant(tick_size: float, qty_step: float) -> str:
+    """The file-name tag of a segment simulated again under a new tick size / qty step: its files sit next to the
+    active segment's files until the catalog row is swapped (docs/specs/2026-10-20-panel-history-incremental.md)."""
+    return "i" + hashlib.sha256(f"{float(tick_size)!r}|{float(qty_step)!r}".encode()).hexdigest()[:10]
+
+
 def write_segment_files(root: Path, key: SegmentKey, tables: SegmentTables, *, settings: RunSettings,
-                        tick_size: float, qty_step: float, replace_unregistered: bool = False) -> dict:
+                        tick_size: float, qty_step: float, replace_unregistered: bool = False,
+                        variant: str | None = None) -> dict:
     """Write the three files of a segment under the store root (no catalog access, safe in worker processes)
-    and return its catalog record for `TradeStore.register`."""
+    and return its catalog record for `TradeStore.register`. `variant` (`instrument_variant`) writes them under
+    their own names, so the files of the segment's active row stay untouched."""
     record = {"segment_id": key.segment_id, "exchange": key.exchange, "symbol": key.symbol, "source": key.source,
               "start_ms": _ms(key.start), "end_ms": _ms(key.end), "engine": key.engine,
               "settings_json": json.dumps(asdict(settings), sort_keys=True), "tick_size": tick_size,
               "qty_step": qty_step}
     for kind in FILE_KINDS:
-        relative = Path(kind) / key.exchange / key.symbol / key.file_name
+        name = key.file_name if not variant else key.file_name.replace(".parquet", f".{variant}.parquet")
+        relative = Path(kind) / key.exchange / key.symbol / name
         record[f"{kind}_path"] = relative.as_posix()
         record[f"{kind}_sha256"] = _write_once(Path(root) / relative, parquet_bytes(getattr(tables, kind)),
                                                replace_unregistered)
@@ -351,6 +360,14 @@ class TradeStore:
                                [exchange, symbol]).fetchall()
         return dict(rows)
 
+    def instruments(self, exchange: str, symbol: str) -> dict[str, tuple[float, float]]:
+        """segment id -> (tick size, qty step) the segment was simulated with; rows without them are left out (they
+        count as current, as in the Panel plan)."""
+        with self.connect(read_only=True) as con:
+            rows = con.execute("select segment_id, tick_size, qty_step from segments where exchange = ? and symbol = ? "
+                               "and tick_size is not null and qty_step is not null", [exchange, symbol]).fetchall()
+        return {segment_id: (float(tick), float(qty)) for segment_id, tick, qty in rows}
+
     def _supersede_overlaps(self, con: duckdb.DuckDBPyConnection, segment_id: str, exchange: str, symbol: str,
                             source: str, start_ms: int, end_ms: int) -> None:
         con.execute("update segments set status = 'superseded', superseded_by = ? where exchange = ? and "
@@ -375,17 +392,24 @@ class TradeStore:
             con.execute("update segments set status = 'active', superseded_by = null where segment_id = ?", [segment_id])
             con.execute("commit")
 
-    def register(self, record: Mapping, *, replace_superseded: bool = False) -> None:
+    def register(self, record: Mapping, *, replace_superseded: bool = False, replace_active: bool = False,
+                 supersede_span_of: str | None = None, superseded_by: str = "") -> int:
         """Register a written segment; active segments of the same pair and source overlapping it are superseded.
 
         `replace_superseded`: the id may already be registered as superseded (its files were damaged and the
-        segment was simulated again); that row is replaced by the new record."""
+        segment was simulated again); that row is replaced by the new record. `replace_active`: the id may be the
+        active row (simulated again under a new instrument, its files under their own names); the row is swapped in
+        one transaction, so the pair's active chain never has a gap. `supersede_span_of`: in the same transaction,
+        the active segments of that source and exactly this span are superseded (`superseded_by`), e.g. the tester
+        window of a segment recomputed under a new instrument; returns how many."""
         columns = ("segment_id", "exchange", "symbol", "source", "start_ms", "end_ms", "engine", "settings_json",
                    "tick_size", "qty_step", "trades_path", "trades_sha256", "hourly_path", "hourly_sha256",
                    "metrics_path", "metrics_sha256", "points", "trades")
         with self.connect() as con:
             existing = con.execute("select status from segments where segment_id = ?", [record["segment_id"]]).fetchone()
-            if existing is not None and not (replace_superseded and existing[0] == "superseded"):
+            replaceable = (replace_superseded and existing is not None and existing[0] == "superseded") or (
+                replace_active and existing is not None and existing[0] == "active")
+            if existing is not None and not replaceable:
                 raise TradeStoreError(f"segment already registered: {record['segment_id']}")
             con.execute("begin")
             if existing is not None:
@@ -394,7 +418,16 @@ class TradeStore:
                                      record["start_ms"], record["end_ms"])
             con.execute(f"insert into segments ({', '.join(columns)}, status, created_utc) values "
                         f"({', '.join('?' * len(columns))}, 'active', ?)", [record[name] for name in columns] + [utc_now()])
+            span = 0
+            if supersede_span_of is not None:
+                where = ("exchange = ? and symbol = ? and source = ? and start_ms = ? and end_ms = ? and "
+                         "status = 'active'")
+                args = [record["exchange"], record["symbol"], supersede_span_of, record["start_ms"], record["end_ms"]]
+                span = con.execute(f"select count(*) from segments where {where}", args).fetchone()[0]
+                con.execute(f"update segments set status = 'superseded', superseded_by = ? where {where}",
+                            [superseded_by or record["segment_id"], *args])
             con.execute("commit")
+        return int(span)
 
     def segments(self, symbol: str, exchange: str = "bybit", source: str | None = None,
                  include_superseded: bool = False) -> list[dict]:

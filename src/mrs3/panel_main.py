@@ -674,11 +674,21 @@ class MainScreenService:
         latest = last_available_day if exchange == "bingx" else last_archived_day
         return latest(datetime.now(timezone.utc)) + timedelta(days=1)
 
+    def _instruments(self, exchange: str) -> dict[str, tuple[float, float]]:
+        con = self._read()
+        try:
+            rows = con.execute("select symbol, tick_size, qty_step from pairs where exchange = ? and tick_size is not "
+                               "null and qty_step is not null", [exchange]).fetchall()
+        finally:
+            con.close()
+        return {symbol: (float(tick), float(qty)) for symbol, tick, qty in rows}
+
     def _plan_history(self, exchange: str) -> dict:
-        from .trade_history import pair_segments
+        from .trade_history import pair_segments, same_instrument
 
         store = self._reader()
         end_day = self._history_end_day(exchange)
+        instruments = self._instruments(exchange)
         items = []
         for symbol, listing_ms in self._trading_pairs(exchange):
             if listing_ms is None:
@@ -686,11 +696,20 @@ class MainScreenService:
             listing = datetime.fromtimestamp(listing_ms / 1000, timezone.utc).date()
             planned = pair_segments(listing, end_day)
             stored = store.segments(symbol, exchange, source="simulator") if store is not None else []
-            have = {(_iso(s["start_ms"]), _iso(s["end_ms"])) for s in stored}
+            # a segment of another tick size or qty step than the registry's is recomputed (history spec, req. 5)
+            current = instruments.get(symbol)
+            have = {(_iso(s["start_ms"]), _iso(s["end_ms"])) for s in stored
+                    if current is None or s["tick_size"] is None or s["qty_step"] is None
+                    or same_instrument((s["tick_size"], s["qty_step"]), current)}
+            stale = len(stored) - len(have)
             have_end = max((_iso(s["end_ms"]) for s in stored), default=None)
             missing = [segment for segment in planned if (segment[0].isoformat(), segment[1].isoformat()) not in have]
             if not planned:
                 label, checked = "мало истории", False
+            elif current is None:                  # the history script skips such a pair (history spec, req. 5)
+                label, checked = "нет tick или шага лота в справочнике", False
+            elif stale and missing:
+                label, checked = f"tick или шаг лота изменились: пересчитать {_periods(len(missing), new=False)}", True
             elif not have and missing:
                 label, checked = f"новая пара: {_periods(len(missing), new=False)}", True
             elif missing == planned[-1:]:
@@ -703,7 +722,14 @@ class MainScreenService:
             else:
                 label, checked = "без изменений", False
             items.append({"key": symbol, "label": symbol, "detail": label, "checked": checked})
-        return {"items": items, "note": f"Период до {(end_day - timedelta(days=1)).isoformat()} включительно."}
+        last = (end_day - timedelta(days=1)).isoformat()
+        if not any(item["checked"] for item in items):    # e.g. pressed again the same day
+            no_tick = [item["key"] for item in items if item["detail"] == "нет tick или шага лота в справочнике"]
+            tail = f" Без tick или шага лота в справочнике: {', '.join(no_tick)}." if no_tick else ""
+            return {"items": items, "up_to_date": True,
+                    "note": f"Пересчёт не требуется: все пары с достаточной историей посчитаны до {last} "
+                            f"включительно.{tail}"}
+        return {"items": items, "note": f"Период до {last} включительно."}
 
     def _plan_ready(self, exchange: str) -> dict:
         store = self._reader()

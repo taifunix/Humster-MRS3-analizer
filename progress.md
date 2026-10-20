@@ -8,6 +8,39 @@ Use [PRD.md](PRD.md) for the feature registry and [docs/README.md](docs/README.m
 for the documentation map. Read the linked contract only for the active task;
 do not treat this file as a replacement for a feature specification.
 
+## History: tick and qty step from the registry, recompute on change, «пересчёт не требуется» (2026-10-20, branch `panel-sync-liquidity`)
+
+Contract: [history spec](docs/specs/2026-10-20-panel-history-incremental.md),
+«Contract: instrument and up-to-date plan».
+
+- **Bybit history:** the tick size and qty step come from the registry.
+  The old cache is used only without a registry. On the real data the two
+  sources agree for all 254 pairs, so nothing is recomputed now.
+- **A changed tick size or qty step:**
+  - every planned segment of the pair is simulated again under its id, into
+    its own files;
+  - the catalog row is swapped in one transaction, so the active chain never
+    has a gap;
+  - the tester window of the old instrument is superseded;
+  - a superseded segment of another instrument is never reactivated;
+  - the plan names the pair.
+- **A busy registry stops the Bybit history** instead of using the old
+  cache.
+- **The history plan with nothing to do** answers «Пересчёт не требуется …»
+  as the status.
+- **Tests:**
+  - new `tests/test_history_instrument_change.py`;
+  - with `test_trade_store`, `test_panel_main`, `test_panel_static_ui`,
+    `test_bingx_history`, `test_pair_registry_consumers`,
+    `test_bingx_tester_jobs`, `test_ready_store`: 201 passed (HTTP(S)_PROXY
+    closed).
+  - Independent review `CODE_REVIEW_FAIL`, with 2 MAJOR findings:
+    - the segments were taken out of use before the simulation, so a failure
+      left a gap that READY would build on;
+    - a busy registry fell back to the old cache.
+    Both are fixed, together with the MINOR findings (tester window, NULL
+    catalog rows, a pair without a tick in the plan, tests).
+
 ## Parallel BingX download under the BingX rate (2026-10-20, branch `panel-sync-liquidity`)
 
 Contract: [sync by exchange](docs/specs/2026-10-20-panel-sync-by-exchange.md),

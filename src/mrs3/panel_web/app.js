@@ -2946,6 +2946,7 @@ if (typeof globalThis !== 'undefined') globalThis.portfolioSelectionHelpers = po
           viewStatus(`Составляю план: ${button.textContent}…`);
           const plan = await remoteRequest('/api/v2/main/plan', { action, exchange: mainState.exchange });
           if (plan.disabled) { viewStatus(plan.disabled); return; }
+          if (plan.up_to_date) { viewStatus(plan.note); return; }                  // nothing to recompute
           viewStatus('');
           openPlan(plan, button.textContent);
         } catch (error) { viewStatus(errorText(error, 'Действие не выполнено.')); }

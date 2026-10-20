@@ -555,6 +555,13 @@ def import_window(store: TradeStore, symbol: str, *, settings: RunSettings = Run
     if status == "active":
         return {"pair": symbol, "status": "EXISTS", "segment_id": key.segment_id}
     if status == "superseded":
+        from .trade_history import same_instrument
+
+        old = store.instruments(exchange, symbol).get(key.segment_id)
+        if old is not None and not same_instrument(old, (window["tick_size"], window["qty_step"])):
+            # superseded when the window was recomputed under a new tick size / qty step: never brought back
+            # (docs/specs/2026-10-20-panel-history-incremental.md); a new plan makes a new selection
+            return {"pair": symbol, "status": "INSTRUMENT_CHANGED", "segment_id": key.segment_id}
         store.reactivate(key.segment_id)
     else:
         record = write_segment_files(store.root, key, tables, settings=settings, tick_size=window["tick_size"],

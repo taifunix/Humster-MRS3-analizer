@@ -21,7 +21,7 @@ if __package__ in {None, ""}:
 
 from mrs3.minute_data import instrument, last_archived_day  # noqa: E402
 from mrs3.period_csv import TIMEFRAMES, grid  # noqa: E402
-from mrs3.pair_registry.history import history_pairs, listing_days  # noqa: E402
+from mrs3.pair_registry.history import history_pairs, listing_days, registry_instruments  # noqa: E402
 from mrs3.trade_history import BingXMinutes, exchange_run_settings, pair_order, run_history  # noqa: E402
 from mrs3.trade_store import TradeStore  # noqa: E402
 
@@ -63,11 +63,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.limit:
         order = order[: args.limit]
     store = TradeStore(store_root)
-    cache = store.root / "instruments.json"
+    # tick size and qty step from the registry, refreshed by every sync; a changed one recomputes the pair's segments
+    # (docs/specs/2026-10-20-panel-history-incremental.md, requirement 5). Without a registry: the old Bybit cache
+    registered = registry_instruments(args.config, "bybit", on_busy=warn)
+    if registered is None and _registry_exists(args.config):
+        # held by a writer (e.g. a sync): the old cache may hold a tick the registry no longer has
+        parser.error("the pair registry is held by another process: run the history after it finishes")
     instruments = {}
-    for symbol, _ in order:
-        item = instrument(symbol, cache)
-        instruments[symbol] = (item.tick_size, item.qty_step)
+    if registered is None:
+        cache = store.root / "instruments.json"
+        for symbol, _ in order:
+            item = instrument(symbol, cache)
+            instruments[symbol] = (item.tick_size, item.qty_step)
+    else:
+        unusable = [symbol for symbol, _ in order if symbol not in registered]
+        if unusable:        # one incomplete registry row never blocks the other pairs
+            warn(f"skipped, no tick size or qty step in the registry: {', '.join(unusable)}")
+            order = [(symbol, listing) for symbol, listing in order if symbol in registered]
+        instruments = {symbol: registered[symbol] for symbol, _ in order}
     end_day = args.end_day or last_archived_day(datetime.now(timezone.utc)) + timedelta(days=1)
     timeframes = tuple(item.strip() for item in args.timeframes.split(",") if item.strip())
     started = time.monotonic()
@@ -79,6 +92,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(json.dumps({**summary, "pairs": len(order), "end_day": end_day.isoformat(),
                       "seconds": round(time.monotonic() - started, 1)}), flush=True)
     return 1 if summary["failed"] else 0
+
+
+def _registry_exists(config: Path) -> bool:
+    from mrs3.pair_registry.store import DATABASE, RegistryError, load_registry_settings
+
+    try:
+        return (load_registry_settings(config).root / DATABASE).is_file()
+    except RegistryError:
+        return False
 
 
 def _bingx(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:

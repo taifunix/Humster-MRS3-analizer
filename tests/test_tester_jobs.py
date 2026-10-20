@@ -253,6 +253,14 @@ def test_jobs_are_planned_once_run_with_restore_and_imported_as_a_tester_segment
     with store.connect(read_only=True) as con:
         assert con.execute("select count(*) from jobs where result_segment = ?",
                            [second["segment_id"]]).fetchone()[0] > 0
+    # the window recomputed under a new tick size supersedes the tester segment of the old one; importing the old
+    # plan again never brings it back (docs/specs/2026-10-20-panel-history-incremental.md)
+    with store.connect() as con:
+        con.execute("update segments set tick_size = 0.05 where source = 'simulator'")
+        con.execute("update segments set status = 'superseded', superseded_by = 'INSTRUMENT_CHANGED' "
+                    "where source = 'tester'")
+    assert import_window(store, "XOMUSDT")["status"] == "INSTRUMENT_CHANGED"
+    assert store.segments("XOMUSDT", source="tester") == []
 
 
 def test_a_failing_tester_run_still_restores_the_tester_files(tmp_path: Path):
