@@ -3404,10 +3404,15 @@ class PanelController:
         except StoreReadyError as error:
             raise FinalistRetestError("REGISTRY_UNAVAILABLE", str(error)) from None
 
-    def strategies_performance_v2_finalist_retest_preview(self, include_reserve: bool = False) -> dict[str, object]:
+    def strategies_performance_v2_finalist_retest_preview(self, include_reserve: bool = False,
+                                                          exchange: str | None = None) -> dict[str, object]:
+        """The cohort a finalist retest would take now; `exchange` (stage 5e-3b) as in the start, absent = home."""
         if type(include_reserve) is not bool:
             raise FinalistRetestError("INVALID_REQUEST", "include_reserve must be a boolean")
-        listing_path, _, listing_sheet = self._retest_listing_context()
+        if exchange not in (None, "bybit", "bingx"):
+            raise FinalistRetestError("INVALID_REQUEST", "exchange must be bybit or bingx")
+        listing_path, _, listing_sheet = (
+            self._retest_listing_context(exchange) if exchange else self._retest_listing_context())
         try:
             listing_dates = (
                 load_listing_dates(listing_path) if listing_sheet is None else load_listing_dates(listing_path, listing_sheet)
@@ -3418,12 +3423,17 @@ class PanelController:
         if not target.is_file():
             raise FinalistRetestError("PERFORMANCE_V2_NOT_FOUND", "Performance v2 database is unavailable")
         with self._performance_v2_writer_lock, duckdb.connect(str(target), read_only=True) as connection:
-            decisions = self._registry_finalist_decisions(connection)
+            decisions = (self._registry_finalist_decisions(connection, exchange) if exchange
+                         else self._registry_finalist_decisions(connection))
+            if exchange == "bingx" and decisions is None:
+                raise FinalistRetestError("REGISTRY_REQUIRED", "the BingX retest takes its finalists from the pair registry")
             start, end = self._bulk_retest_range({}, listing_dates, connection, include_reserve, decisions)
             cohort = freeze_finalist_cohort(
                 connection, test_start=start, test_end=end,
                 include_reserve=include_reserve, listing_dates=listing_dates, decisions=decisions,
             )
+            if exchange:
+                self._require_cohort_exchange(connection, cohort.members, exchange)
         return {
             "scope": cohort.scope,
             "test_start": start,
@@ -5185,10 +5195,21 @@ class _PanelHandler(BaseHTTPRequestHandler):
             if raw not in {"true", "false"}:
                 self._json(400, {"error": {"code": "INVALID_REQUEST", "message": "include_reserve must be true or false"}})
                 return
+            exchange = parse_qs(parsed.query).get("exchange", [None])[0]
+            if exchange not in (None, "bybit", "bingx"):
+                self._json(400, {"error": {"code": "INVALID_REQUEST", "message": "exchange must be bybit or bingx"}})
+                return
             try:
-                self._json(200, self.server.controller.strategies_performance_v2_finalist_retest_preview(raw == "true"))
+                self._json(200, self.server.controller.strategies_performance_v2_finalist_retest_preview(
+                    raw == "true", **({"exchange": exchange} if exchange is not None else {})))
             except FinalistRetestError as error:
                 self._json(409, {"error": {"code": error.code, "message": str(error)}})
+            except ValueError as error:           # a missing exchange profile or listing file: a code, never a path
+                self._json(409, {"error": {"code": getattr(error, "code", "RETEST_PREVIEW_UNAVAILABLE"),
+                                           "message": "the retest preview is unavailable"}})
+            except duckdb.Error:                  # e.g. another process holds the PerformanceDB
+                self._json(409, {"error": {"code": "PERFORMANCE_V2_BUSY",
+                                           "message": "the PerformanceDB is busy: retry"}})
             return
         if parsed.path == "/api/v2/strategies/performance-v2/finalist-retest/export":
             try:

@@ -767,8 +767,26 @@ class MainScreenService:
         return {"items": items, "ready": name, "note": f"Папка READY {name}."}
 
     def _plan_retest(self, exchange: str) -> dict:
-        return {"items": [], "options": {"include_reserve": False},
-                "note": "Ретест текущих финалистов на новом периоде; опция «включая резерв»."}
+        note = "Ретест текущих финалистов на новом периоде; опция «включая резерв»."
+        preview: dict = {}
+        lock = getattr(self._controller, "_performance_v2_writer_lock", None)
+        if lock is not None and not lock.acquire(blocking=False):
+            note += " Предпросмотр недоступен: база занята записью, повторите позже."
+            return {"items": [], "options": {"include_reserve": False}, "note": note}
+        if lock is not None:
+            # free now: the preview takes it again (a re-entrant lock); best effort, a writer may still start between
+            lock.release()
+        if self._controller is not None:          # the cohort of this exchange (Panel stage 5e-3b)
+            try:
+                found = self._controller.strategies_performance_v2_finalist_retest_preview(
+                    False, **({"exchange": exchange} if exchange != "bybit" else {}))
+                preview = {key: found.get(key) for key in ("cohort_count", "excluded_count", "test_start", "test_end")}
+                note += (f" Сейчас в когорте {preview['cohort_count']} (исключено {preview['excluded_count']}), "
+                         f"период {preview['test_start']}..{preview['test_end']}.")
+            except Exception as error:            # the plan stays readable; the run reports the reason with its code
+                note += f" Предпросмотр недоступен: {getattr(error, 'code', type(error).__name__)}."
+        return {"items": [], "options": {"include_reserve": False}, "note": note,
+                **({"preview": preview} if preview else {})}
 
     # -- runs ------------------------------------------------------------------------------------------------
 

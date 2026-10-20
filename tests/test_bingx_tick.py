@@ -272,3 +272,88 @@ def test_a_bingx_cohort_refuses_a_result_of_another_exchange(tmp_path: Path) -> 
         with pytest.raises(FinalistRetestError) as error:
             PanelController._require_cohort_exchange(connection, [{"result_id": 11}, {"result_id": 12}], "bingx")
     assert error.value.code == "COHORT_EXCHANGE_MISMATCH"
+
+
+def test_the_main_retest_plan_previews_the_cohort_of_its_exchange(tmp_path: Path) -> None:
+    # Panel stage 5e-3b: the plan of «Ретест» shows the cohort of the selected exchange
+    from tests.test_panel_main import _world
+
+    service, _runner, _store = _world(tmp_path)
+    asked = []
+
+    class Controller:
+        def strategies_performance_v2_finalist_retest_preview(self, include_reserve, **kwargs):
+            asked.append(kwargs)
+            if kwargs.get("exchange") == "bingx":
+                from mrs3.performance_v2_finalist_retest import FinalistRetestError
+                raise FinalistRetestError("REGISTRY_REQUIRED", "no registry")
+            return {"cohort_count": 3, "excluded_count": 1, "test_start": "2026-09-01", "test_end": "2026-10-19"}
+
+    service._controller = Controller()
+    bybit = service.plan("retest", "bybit")
+    assert bybit["preview"]["cohort_count"] == 3 and "2026-09-01..2026-10-19" in bybit["note"]
+    bingx = service.plan("retest", "bingx")
+    assert "preview" not in bingx and "REGISTRY_REQUIRED" in bingx["note"]
+    assert asked == [{}, {"exchange": "bingx"}]
+
+
+def test_the_retest_preview_refuses_an_unknown_exchange_and_bingx_without_the_registry(tmp_path: Path,
+                                                                                      monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    import mrs3.panel as panel_module
+    from mrs3.panel import PanelController
+    from mrs3.performance_v2_finalist_retest import FinalistRetestError
+
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
+    with pytest.raises(FinalistRetestError) as error:
+        controller.strategies_performance_v2_finalist_retest_preview(False, exchange="kraken")
+    assert error.value.code == "INVALID_REQUEST"
+    database = tmp_path / "performance.duckdb"
+    database.touch()
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+    asked = {}
+    monkeypatch.setattr(controller, "_retest_listing_context",
+                        lambda exchange=None: asked.update(listing=exchange) or (database, Path("d.xlsx"), None))
+    monkeypatch.setattr(controller, "_registry_finalist_decisions", lambda connection, exchange=None: None)
+    monkeypatch.setattr(controller, "_performance_v2_config", lambda: SimpleNamespace())
+    monkeypatch.setattr(panel_module, "performance_v2_database_path", lambda _config: database)
+    monkeypatch.setattr(panel_module, "load_listing_dates", lambda *_args: {})
+    monkeypatch.setattr(panel_module.duckdb, "connect", lambda *_args, **_kwargs: Connection())
+    with pytest.raises(FinalistRetestError) as error:
+        controller.strategies_performance_v2_finalist_retest_preview(False, exchange="bingx")
+    assert error.value.code == "REGISTRY_REQUIRED" and asked == {"listing": "bingx"}
+
+
+def test_the_retest_plan_does_not_wait_for_a_database_writer(tmp_path: Path) -> None:
+    import threading
+
+    from tests.test_panel_main import _world
+
+    service, _runner, _store = _world(tmp_path)
+    lock = threading.RLock()
+
+    class Controller:
+        _performance_v2_writer_lock = lock
+
+        def strategies_performance_v2_finalist_retest_preview(self, *_args, **_kwargs):
+            raise AssertionError("the preview must not run while a writer holds the lock")
+
+    service._controller = Controller()
+    holder = threading.Thread(target=lambda: (lock.acquire(), held.set(), release.wait(), lock.release()))
+    held, release = threading.Event(), threading.Event()
+    holder.start()
+    held.wait(5)
+    try:
+        plan = service.plan("retest", "bybit")
+    finally:
+        release.set()
+        holder.join(5)
+    assert "занята записью" in plan["note"] and "preview" not in plan

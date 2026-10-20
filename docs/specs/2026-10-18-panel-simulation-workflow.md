@@ -1293,9 +1293,14 @@ stage):
 - **Panel:** «Ретест» runs on BingX.
 - **Cohort guard:** every member's result must be of the retest's exchange
   (`COHORT_EXCHANGE_MISMATCH`).
-- **The retest preview and status** («Стратегии» block) stay on the home
-  exchange. Their cohort counts and default dates are the home exchange's.
-  An exchange choice there is a follow-up.
+- **The retest preview** (`finalist_retest_preview(include_reserve,
+  exchange)` and the route's optional `exchange`) follows the same rules
+  as the start: marks, listing sheet, `REGISTRY_REQUIRED`, cohort guard.
+  - The main-screen «Ретест» plan shows the cohort count, the exclusions and
+    the default period of the selected exchange. On Bybit the call has no
+    exchange, so the preview is unchanged.
+  - The older retest cards of «Стратегии» keep calling without an exchange,
+    so they show the home exchange.
 - **Found by the independent review:** `_bulk_retest_range` had its own
   allow-list and refused `exchange`. The request reaches it without
   `exchange`.

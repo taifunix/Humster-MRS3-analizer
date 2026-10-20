@@ -2491,6 +2491,38 @@ def test_finalist_retest_preview_http_uses_server_owned_scope(tmp_path: Path, mo
         thread.join(timeout=2)
 
 
+def test_finalist_retest_preview_http_takes_an_optional_exchange(tmp_path: Path, monkeypatch) -> None:
+    # Panel stage 5e-3b: the route passes a known exchange through, refuses another, and answers errors with a code
+    from mrs3.evaluation_protocol import EvaluationProtocolError
+
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
+    seen: list[dict[str, object]] = []
+
+    def preview(include_reserve: bool = False, **kwargs) -> dict[str, object]:
+        seen.append(kwargs)
+        if kwargs.get("exchange") == "bingx" and len(seen) > 2:
+            raise EvaluationProtocolError("EXCHANGE_TEMPLATES_MISSING", "C:\\secret\\templates is missing")
+        return {"scope": "FINALIST", "test_start": "2025-01-01", "test_end": "2026-09-07", "cohort_count": 1,
+                "excluded_count": 0}
+
+    monkeypatch.setattr(controller, "strategies_performance_v2_finalist_retest_preview", preview)
+    server, thread = _http_server(controller)
+    base = "/api/v2/strategies/performance-v2/finalist-retest/preview?include_reserve=false"
+    try:
+        answers = []
+        for suffix in ("", "&exchange=bingx", "&exchange=kraken", "&exchange=bingx"):
+            connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+            answers.append(_http_json(connection, "GET", base + suffix))
+            connection.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+    assert [status for status, _document in answers] == [200, 200, 400, 409]
+    assert seen == [{}, {"exchange": "bingx"}, {"exchange": "bingx"}]           # kraken never reaches the controller
+    assert answers[3][1]["error"]["code"] == "EXCHANGE_TEMPLATES_MISSING" and "secret" not in json.dumps(answers[3][1])
+
+
 def test_current_finalist_control_export_http_accepts_reserve_scope_without_job(tmp_path: Path, monkeypatch) -> None:
     controller = PanelController(tmp_path, tmp_path / "config.local.json")
     seen: list[dict[str, object]] = []

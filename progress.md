@@ -8,6 +8,29 @@ Use [PRD.md](PRD.md) for the feature registry and [docs/README.md](docs/README.m
 for the documentation map. Read the linked contract only for the active task;
 do not treat this file as a replacement for a feature specification.
 
+## Panel stage 5e-3b follow-up: the retest preview by exchange (2026-10-20, branch `wip/period-csv-generator`)
+
+- The finalist-retest preview follows the start's exchange rules (marks,
+  listing sheet, `REGISTRY_REQUIRED`, cohort guard). The route takes an
+  optional `exchange`.
+- The main-screen «Ретест» plan shows the cohort, the exclusions and the
+  period of the selected exchange. On Bybit the call is unchanged.
+- **Verification:**
+  - tests: the plan (Bybit preview shown; a BingX error as a note; no wait
+    for a database writer); the preview refuses an unknown exchange and
+    BingX without the registry;
+  - the route (HTTP test): a known exchange passes through; an unknown one
+    is 400 and never reaches the controller; a profile error is a 409 code
+    with no path. A busy database is `PERFORMANCE_V2_BUSY`.
+  - `test_bingx_tick`, `test_panel_main`, `test_panel_performance_v2`,
+    `test_panel_performance_v2_retest` and `test_performance_v2_finalist_retest`:
+    259 passed before the review fixes, 261 after them, and 262 with the
+    HTTP route test.
+  - Independent review `CODE_REVIEW_PASS`. The MINOR findings were fixed
+    (route errors, the busy writer, tests).
+  - Re-review `CODE_REVIEW_PASS`. Its route-test remark was addressed by
+    the HTTP test above.
+
 ## Panel stage 5e-3b: the BingX retest — Panel stage 5 complete (2026-10-20, branch `wip/period-csv-generator`)
 
 Contract: [Panel for the simulation workflow](docs/specs/2026-10-18-panel-simulation-workflow.md)
