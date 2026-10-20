@@ -36,8 +36,8 @@ from .ready_store import ReadyRule, inputs_sha256, pair_periods
 
 ACTIONS = ("sync", "history", "ready", "tester", "tick", "retest")
 EXCHANGES = ("bybit", "bingx")
-BINGX_PENDING = "BingX — этап 5: тик-тест и ретест ждут отдельной базы PerformanceDB для BingX"
-BINGX_READY_ACTIONS = ("sync", "history", "ready", "tester")   # Panel stages 5b, 5c; tick and retest come in 5e
+BINGX_PENDING = "BingX — этап 5: ретест финалистов BingX ещё не подключён"
+BINGX_READY_ACTIONS = ("sync", "history", "ready", "tester", "tick")   # Panel stages 5b, 5c, 5e-3a; retest: 5e-3b
 
 
 class MainScreenError(ValueError):
@@ -784,7 +784,7 @@ class MainScreenService:
         if action in ("history", "ready", "tester", "tick") and not items:
             raise MainScreenError("не отмечено ни одной строки")
         if action == "tick":
-            return self._run_tick(items, options)
+            return self._run_tick(items, options, exchange)
         if action == "retest":
             return self._run_retest(options)
         python, config = self._python, str(self.config_path)
@@ -836,19 +836,24 @@ class MainScreenService:
                 raise MainScreenError(str(error)) from None
             raise
 
-    def _run_tick(self, strategies: Sequence[str], options: Mapping) -> dict:
+    def _run_tick(self, strategies: Sequence[str], options: Mapping, exchange: str = "bybit") -> dict:
         """Prepare a batch of the checked strategies of the newest READY folder and start the SINGLE_MODE tick test
         over the chosen window (default: the last 30 days)."""
         if self._controller is None:
             raise MainScreenError("тик-тест недоступен")
         try:
-            end = options.get("end_date") or (self._today() - timedelta(days=1)).isoformat()
+            default_end = self._today() - timedelta(days=1)
+            if exchange == "bingx":                # BingX days appear ~9 h after midnight UTC (stage 5e-3a)
+                from .bingx_downloader import last_available_day
+
+                default_end = min(default_end, last_available_day(datetime.now(timezone.utc)))
+            end = options.get("end_date") or default_end.isoformat()
             start = options.get("start_date") or (date.fromisoformat(end) - timedelta(days=30)).isoformat()
             if date.fromisoformat(start) >= date.fromisoformat(end) or date.fromisoformat(end) >= self._today():
                 raise ValueError
         except (TypeError, ValueError):
             raise MainScreenError("окно тик-теста: начало раньше конца, конец не позже вчерашнего дня") from None
-        plan = self._plan_tick("bybit")
+        plan = self._plan_tick(exchange)          # the newest READY folder of this exchange (stage 5e-3a)
         if not plan.get("ready"):
             raise MainScreenError(plan.get("note") or "нет папки READY")
         prepared = self._controller.store_ready_prepare({"ready": plan["ready"]}, strategies=list(strategies))

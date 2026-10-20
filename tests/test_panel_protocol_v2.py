@@ -237,7 +237,7 @@ def test_tester_start_hands_the_exchange_template_to_its_job(tmp_path: Path, mon
     _copy_tester_template(tmp_path)
     bingx = tmp_path / "templates" / "exchanges" / "BingX" / "mrs3-tester.json"
     target = replace(use_protocol_v2_target(monkeypatch, "BingX"), tester_template=bingx)
-    monkeypatch.setattr(panel_module.PanelController, "_evaluation_target", lambda _self: target)
+    monkeypatch.setattr(panel_module.PanelController, "_evaluation_target", lambda _self, _exchange=None: target)
     monkeypatch.setattr(controller, "_fresh_strategy_manifest", lambda _analysis_id: tmp_path / "manifest.json")
     started: dict[str, object] = {}
     monkeypatch.setattr(controller, "_single_mode_strategy_test", lambda: SimpleNamespace(

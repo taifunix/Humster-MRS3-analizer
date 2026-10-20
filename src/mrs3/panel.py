@@ -1123,13 +1123,89 @@ class PanelController:
         if set(payload) != {"ready"}:
             raise StoreReadyError("запрос: только поле ready")
         folder = resolve_ready_folder(self._trade_store_root(), payload["ready"])
-        target = self._evaluation_target()
+        exchange = self._ready_exchange(folder)
+        target = self._evaluation_target(exchange)       # the folder's exchange (Panel stage 5e-3a)
+        api_symbols = self._bingx_api_symbols() if exchange != "bybit" else None
         with self._store_ready_lock:                 # one preparation at a time: no race on the batch folder
             result = prepare_tick_batch(folder, self.root / "Output" / "store-ready",
-                                        self._ready_strategy_template(target, "LONG"), target, strategies)
+                                        self._ready_strategy_template(target, "LONG"), target, strategies,
+                                        api_symbols=api_symbols)
         self._fresh_strategy_manifests[str(result["analysis_run_id"])] = Path(str(result["manifest_path"])).resolve()
         return {"ready": folder.name, **{key: result[key] for key in
                                          ("analysis_run_id", "strategy_count", "pairs", "ready_pairs", "reused")}}
+
+    @staticmethod
+    def _ready_exchange(folder: Path) -> str:
+        try:
+            document = json.loads((Path(folder) / "ready_manifest.json").read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            raise StoreReadyError("ready_manifest.json повреждён") from None
+        return str(document.get("exchange") or "bybit").lower() if isinstance(document, dict) else "bybit"
+
+    def _bingx_api_symbols(self) -> dict[str, str]:
+        """The BingX API symbol of every BingX pair of the registry (read-only), for the tick batch (5e-3a)."""
+        from .pair_registry.history import _registry_connection
+
+        con = _registry_connection(self.default_config, None)
+        if con is None:
+            raise StoreReadyError("реестр пар недоступен: нужен для API-символов BingX")
+        with con:
+            return {str(symbol): str(api) for symbol, api in con.execute(
+                "select symbol, api_symbol from pairs where exchange = 'bingx' and api_symbol is not null").fetchall()}
+
+    def _bingx_data_preparer(self, manifest: Path, start_date: str, end_date: str, tester_template: Path):
+        """The BingX minute days of every strategy of the batch over warm-up and window, ensured and verified before
+        the tester lock (the tester does not download BingX data); returns the problem text or None (5e-3a)."""
+        from .pair_registry.bingx import human_ticker
+        from .pair_registry.minute_days import ensure_bingx_days_shared
+        from .pair_registry.store import RegistryError, load_registry_settings
+
+        validated = validate_strategy_manifest(Path(manifest))
+        symbols: set[str] = set()
+        for path in Path(validated.strategy_source).glob("*.json"):
+            basic = json.loads(path.read_text(encoding="utf-8")).get("basic") or {}
+            if isinstance(basic.get("symbol"), str):
+                symbols.add(basic["symbol"])
+        warmup = int(json.loads(Path(tester_template).read_text(encoding="utf-8")).get("WarmupDays", 0) or 0)
+        first = date.fromisoformat(start_date) - timedelta(days=warmup)
+        last = date.fromisoformat(end_date)
+        listed: dict[str, date] = {}                    # no candles exist before the listing day: not required
+        con = None
+        try:
+            from .pair_registry.history import _registry_connection
+
+            con = _registry_connection(self.default_config, None)
+        except Exception:
+            con = None
+        if con is not None:
+            with con:
+                for api_symbol, listing_ms in con.execute(
+                        "select api_symbol, listing_ms from pairs where exchange = 'bingx' and listing_ms is not null"
+                ).fetchall():
+                    listed[str(api_symbol)] = datetime.fromtimestamp(int(listing_ms) / 1000, timezone.utc).date()
+
+        def prepare() -> str | None:
+            try:
+                settings = load_registry_settings(self.default_config)
+            except RegistryError:
+                return "MISSING_DAYS: the pair registry settings are unreadable"
+            for api_symbol in sorted(symbols):
+                symbol = human_ticker(api_symbol)
+                if symbol is None:
+                    return f"MISSING_DAYS: {api_symbol} is not a BingX API symbol"
+                try:
+                    days = ensure_bingx_days_shared(settings, symbol, first, last, api_symbol=api_symbol)
+                except (RegistryError, OSError, duckdb.Error) as error:
+                    return f"MISSING_DAYS: {symbol}: {type(error).__name__}"
+                accepted = set(days.accepted)
+                start = max(first, listed.get(api_symbol, first))
+                absent = [start + timedelta(days=offset) for offset in range((last - start).days + 1)
+                          if start + timedelta(days=offset) not in accepted]
+                if absent:
+                    return f"MISSING_DAYS: {symbol} {[day.isoformat() for day in absent][:10]}"
+            return None
+
+        return prepare
 
     def _workflow_default(self, name: str, *, side: str | None = None) -> Path:
         try:
@@ -1359,9 +1435,20 @@ class PanelController:
             return Path(target.strategy_template)
         return self._workflow_default("strategy_templates", side=side)
 
-    def _evaluation_target(self) -> EvaluationTarget:
-        """Protocol v2 target of the active PerformanceDB; refuses before any MRS3 render or launch (§7a)."""
+    def _evaluation_target(self, exchange: str | None = None) -> EvaluationTarget:
+        """Protocol v2 target of the active PerformanceDB; refuses before any MRS3 render or launch (§7a).
+
+        `exchange` (Panel stage 5e-3a, ADR-0083: one database holds both exchanges) takes that exchange's profile
+        instead of the configured one; None keeps the configuration's exchange."""
         config = self._performance_v2_config()
+        configured = str(getattr(config, "exchange", None) or "").casefold()
+        if exchange is not None and configured and exchange.casefold() != configured \
+                and getattr(config, "evaluation_protocol", "v1") == "v2":
+            try:
+                chosen = load_exchange_profile(self.root, exchange).exchange
+            except ExchangeProfileError as error:
+                raise EvaluationProtocolError(error.code, error.message) from error
+            config = replace(config, exchange=chosen)
         profile = self._exchange_profile(config)
         return evaluation_target(
             config, profile.mrs3_tester if profile is not None else mrs3_tester_config_template(self.root), profile,
@@ -1392,8 +1479,16 @@ class PanelController:
         templates = self._workflow_defaults().get("strategy_templates", {})
         return templates if isinstance(templates, Mapping) else {}
 
-    def _listing_dates_source(self) -> tuple[Path, str | None]:
-        """Listing dates of the active database: the file of `panel_workflow`, the sheet of the exchange (P7 spec §4)."""
+    def _listing_dates_source(self, exchange: str | None = None) -> tuple[Path, str | None]:
+        """Listing dates: the file of `panel_workflow`, the sheet of the exchange (P7 spec §4) — of `exchange` when
+        given (a BingX tick job, Panel stage 5e-3a), else of the active database's exchange."""
+        configured = str(getattr(self._performance_v2_config(), "exchange", None) or "").casefold()
+        if exchange is not None and configured and exchange.casefold() != configured:
+            try:
+                sheet = load_exchange_profile(self.root, exchange).listing_dates_sheet
+            except ExchangeProfileError as error:
+                raise EvaluationProtocolError(error.code, error.message) from error
+            return self._workflow_default("listing_dates_path"), sheet
         profile = self._exchange_profile(self._performance_v2_config())
         return self._workflow_default("listing_dates_path"), None if profile is None else profile.listing_dates_sheet
 
@@ -1413,7 +1508,7 @@ class PanelController:
     def _matches_protocol_v2(cls, runtime: Mapping[str, object], target: EvaluationTarget) -> bool:
         return all(runtime.get(key) == value for key, value in cls._protocol_v2_runtime(target).items())
 
-    def _require_import_target(self, tester_job_id: str, is_collection_job: bool) -> None:
+    def _require_import_target(self, tester_job_id: str, is_collection_job: bool) -> str | None:
         """Reports rendered for another database or profile do not enter this one (P7 spec §4).
 
         A collection is checked through every current member; jobs without a v2 marker import as before.
@@ -1430,12 +1525,18 @@ class PanelController:
                 continue
         marked = [item for item in runtimes if item.get("evaluation_protocol") == "v2"]
         if not marked:
-            return
-        target = self._evaluation_target()
+            return None
+        # ADR-0083: one database holds both exchanges; a job is checked against the target of its own exchange
+        exchanges = {str(item.get("evaluation_exchange") or "") for item in marked}
+        if len(exchanges) != 1:
+            raise EvaluationProtocolError("IMPORT_EXCHANGE_MIXED", "the collection holds jobs of different exchanges")
+        exchange = exchanges.pop() or None
+        target = self._evaluation_target(exchange)
         if any(not self._matches_protocol_v2(item, target) for item in marked):
             raise EvaluationProtocolError(
                 "IMPORT_TARGET_CHANGED", "the tester job was rendered for another PerformanceDB or exchange profile",
             )
+        return exchange
 
     def _require_protocol_v2_tester_template(self, target: EvaluationTarget) -> None:
         try:
@@ -1550,7 +1651,8 @@ class PanelController:
             raise ValueError("start_date and end_date are required")
         initial_balance = self._requested_initial_balance(payload)
         manifest = self._fresh_strategy_manifest(analysis_id)
-        evaluation = self._evaluation_target()
+        exchange = self._manifest_exchange(manifest)         # the batch's exchange (Panel stage 5e-3a)
+        evaluation = self._evaluation_target(exchange)
         self._require_protocol_v2_manifest(Path(manifest), evaluation)
         expected_names = self._manifest_strategy_names(manifest) if collect_reports else ()
         request = {"analysis_run_id": analysis_id, "start_date": start_date, "end_date": end_date, "initial_balance": initial_balance, "mode": "SINGLE_MODE", "collect_reports": collect_reports}
@@ -1566,6 +1668,8 @@ class PanelController:
             runtime["report_collection_id"] = collection_id
             self._panel_jobs.sync(job_id, {"state": "RUNNING", "phase": "RUNNING"}, runtime=runtime)
 
+        preparer = (self._bingx_data_preparer(Path(manifest), start_date, end_date, tester_template)
+                    if exchange == "bingx" else None)
         return self._start_tracked_panel_job(
             "strategies.tester.start", request,
             ("strategies.tester",),
@@ -1577,10 +1681,21 @@ class PanelController:
                 job_id=job_id,
                 tester_config_template=tester_template,
                 **({"initial_balance": initial_balance} if initial_balance is not None else {}),
+                **({"prepare_data": preparer} if preparer is not None else {}),
             ),
             runtime=self._protocol_v2_runtime(evaluation),
             before_start=register if collect_reports else None,
         )
+
+    @staticmethod
+    def _manifest_exchange(manifest: Path) -> str | None:
+        """The exchange of a generation manifest (store READY batches name it), lower case; None when absent."""
+        try:
+            document = json.loads(Path(manifest).read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return None
+        value = document.get("exchange") if isinstance(document, dict) else None
+        return value.lower() if isinstance(value, str) and value.strip() else None
 
     def strategies_tester_retry(self, payload: Mapping[str, object]) -> dict[str, object]:
         if set(payload) != {"job_id"}:
@@ -1594,6 +1709,9 @@ class PanelController:
             raise PanelJobError("RETEST_RETRY_NOT_ALLOWED")
         if source.get("state") not in {"FAILED", "CANCELLED"}:
             raise PanelJobError("TESTER_JOB_NOT_RECOVERABLE")
+        if str(source_runtime.get("evaluation_exchange") or "").casefold() == "bingx":
+            # Panel stage 5e-3a: a BingX job needs its minute days ensured first; it is started anew, not retried
+            raise PanelJobError("RETRY_BINGX_START_ANEW")
         evaluation = self._evaluation_target()
         if not self._matches_protocol_v2(source_runtime, evaluation):
             # Protocol v2 §7a: a job rendered before P6 or for another base/exchange is started anew.
@@ -2708,7 +2826,7 @@ class PanelController:
             expected_collection_id = tester_job_id
         if tester_job.get("state") != "COMMITTED" or tester_job.get("inbox_ready") is not True:
             raise ValueError("Performance v2 import requires a committed tester inbox")
-        self._require_import_target(tester_job_id, is_collection_job)
+        job_exchange = self._require_import_target(tester_job_id, is_collection_job)
         if not _internal and not is_collection_job and self._panel_jobs.runtime(tester_job_id).get("performance_v2_import_verified") is not True:
             raise ValueError("Performance v2 import requires explicit inbox verification")
         if not _internal:
@@ -2774,7 +2892,7 @@ class PanelController:
             raise ValueError("test_start and test_end must be valid ISO dates")
         if payload.get("listing_dates_path") is not None:
             raise ValueError("listing_dates_path is configured by the server")
-        listing_source, listing_dates_sheet = self._listing_dates_source()
+        listing_source, listing_dates_sheet = self._listing_dates_source(job_exchange)   # its exchange's sheet
         try:
             listing_dates_path = listing_source.resolve().relative_to(self.root.resolve())
         except ValueError:

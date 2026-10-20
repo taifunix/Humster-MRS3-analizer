@@ -11,7 +11,7 @@
   "SlippagePercent": 0.001,
   "FundingRate": 0.00025,
   "FundingIntervalHours": 8,
-  "UpdateData": true,
+  "UpdateData": false,
   "save_tick_data": false,
   "LimitOrderVolumeCheck": false,
   "order_trigger_fill_worst": false,

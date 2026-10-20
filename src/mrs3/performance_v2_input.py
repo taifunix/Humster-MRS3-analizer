@@ -317,6 +317,16 @@ def _shift_from_multiplier(multiplier: Decimal, side: str) -> int:
     return int(shift)
 
 
+def stored_symbol(exchange_name: object, symbol: str) -> str:
+    """The symbol the PerformanceDB keeps (Panel stage 5e-3a): the tester trades the BingX API symbol
+    (`NCSKAMD2USD-USDT`), the database keeps the human ticker (`AMDUSDT`); other exchanges keep the symbol."""
+    if str(exchange_name or "").strip().casefold() == "bingx":
+        from .pair_registry.bingx import human_ticker
+
+        return human_ticker(symbol) or symbol
+    return symbol
+
+
 def adapt_strategy_identity(
     strategy: Mapping[str, object],
     *,
@@ -333,7 +343,8 @@ def adapt_strategy_identity(
     mrs3 = strategy.get("mrs3")
     if not isinstance(basic, Mapping) or not isinstance(mrs3, Mapping):
         raise PerformanceV2InputError("strategy basic/mrs3 object is missing")
-    symbol = _text(basic.get("symbol"), "strategy symbol")
+    exchange = strategy.get("exchange") if isinstance(strategy.get("exchange"), Mapping) else {}
+    symbol = stored_symbol(exchange.get("name"), _text(basic.get("symbol"), "strategy symbol"))
     timeframe = _text(basic.get("time_frame", basic.get("timeframe")), "strategy timeframe")
     use_long, use_short = basic.get("use_long"), basic.get("use_short")
     if type(use_long) is not bool or type(use_short) is not bool or use_long == use_short:

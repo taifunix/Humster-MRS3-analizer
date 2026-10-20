@@ -1240,12 +1240,64 @@ stage):
 - Stage 1 on BingX is refused with `EXCHANGE_DATA_UNAVAILABLE`;
 - the Bybit portfolio suites are unchanged.
 
-**5e-3 — BingX tick test and retest** (only after 5e-2: until then some
-readers have no exchange filter, see ADR-0083 «Stage order»):
-- the BingX profile for the evaluation target;
-- strategy names `BINGX_…`;
-- the API symbol in the tester strategy;
-- the reports mapped back to the human ticker.
+**5e-3a — the BingX tick test** (2026-10-20):
+- **READY names:** `build_ready(..., exchange)` gives the strategies of an
+  exchange other than Bybit their tag (`BINGX_…`). READY strategy files keep
+  the human ticker. So the name is the same in READY, the tick batch, the
+  PerformanceDB and the registry marks.
+- **The tick batch** (`prepare_tick_batch(..., api_symbols)`):
+  - a READY folder of exchange E is prepared only for a target of E;
+    another exchange is `StoreReadyError`;
+  - for BingX the generated name gets the tag, and `basic.symbol` becomes
+    the pair's API symbol from the registry; a pair without one is refused;
+  - the API symbols are part of the batch identity.
+- **The evaluation target of the folder's exchange**
+  (`_evaluation_target(exchange)`): the active database configuration with
+  that exchange and its profile (templates, strategy exchange block, tester
+  template). The database still needs protocol v2. The tester start reads
+  the exchange from the batch manifest.
+- **Data before the run:**
+  - the tester does not download BingX data, so the BingX template is
+    `UpdateData = false`;
+  - before the tester lock is taken, the SINGLE_MODE job ensures and
+    verifies every strategy's minute days over warm-up (the template's
+    `WarmupDays`) and window (`ensure_bingx_days_shared`);
+  - a day not accepted fails the job with `MISSING_DAYS`, and the tester is
+    not touched.
+- **Import:** a strategy whose exchange is BingX and whose `basic.symbol` is
+  a BingX API symbol is stored under the human ticker
+  (`pair_registry.bingx.human_ticker`). The registry, «Стратегии» and the
+  optimizer see `AMDUSDT`, not `NCSKAMD2USD-USDT`.
+- **Panel:** the tick test on BingX plans from the newest BingX READY folder
+  and runs.
+
+**5e-3b — the BingX retest:** the finalist retest by exchange (marks,
+target, tester data), after 5e-3a.
+
+Both parts ship only after 5e-2: until then some readers had no exchange
+filter (ADR-0083 «Stage order»).
+
+**5e-3a, added after the independent review** (`CODE_REVIEW_FAIL`: two
+BLOCKERs, BingX results could not be imported):
+- **The report's symbol:** a BingX report names the API symbol it traded.
+  It is compared through the same mapping (`stored_symbol`) whenever the
+  strategy's exchange is BingX. Bybit keeps the exact comparison.
+- **The import target:** each marked job is checked against the target of
+  its own exchange (`evaluation_exchange` of its runtime marker), and that
+  exchange's listing sheet is used (`Пары_BingX`). A collection mixing
+  exchanges is `IMPORT_EXCHANGE_MIXED`.
+- **The override applies only when the job's exchange differs from the
+  configured one.** Otherwise the configured target and sheet stay, exactly
+  as before.
+- **Required days:** from the listing day, since no candles exist before
+  it. The BingX default window ends on the last available BingX day (9 h
+  lag), so a morning run is not refused.
+- **Retry:** a BingX job is refused as `RETRY_BINGX_START_ANEW`, because
+  its days must be ensured again.
+- **Cancel:** a cancel during the data step ends the job `CANCELLED`
+  before the tester lock.
+- **An old BingX READY folder** (5b, names without the tag) asks for a
+  rebuild of READY.
 
 **Acceptance, 5e-1:**
 - a database created on «Настройки» (home exchange Bybit) takes a Bybit and

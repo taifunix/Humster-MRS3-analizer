@@ -36,7 +36,7 @@ def use_protocol_v2_target(monkeypatch, exchange: str = "Bybit", *, check_launch
     from mrs3.panel_testing import mrs3_tester_config_template
 
     target = EvaluationTarget(tester_base(mrs3_tester_config_template(REPOSITORY)), exchange)
-    monkeypatch.setattr(PanelController, "_evaluation_target", lambda _self: target)
+    monkeypatch.setattr(PanelController, "_evaluation_target", lambda _self, _exchange=None: target)
     if not check_launch:
         monkeypatch.setattr(PanelController, "_require_protocol_v2_manifest", lambda _self, _manifest, _target: None)
         monkeypatch.setattr(PanelController, "_require_protocol_v2_runs", lambda _self, _target: None)

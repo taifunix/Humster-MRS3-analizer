@@ -125,7 +125,8 @@ def _digest(data: bytes) -> str:
 
 
 def prepare_tick_batch(ready_dir: Path, out_root: Path, template_path: Path, target: EvaluationTarget,
-                       strategies: Sequence[str] | None = None) -> dict[str, object]:
+                       strategies: Sequence[str] | None = None,
+                       api_symbols: Mapping[str, str] | None = None) -> dict[str, object]:
     """Publish `<out_root>/<analysis_run_id>/` (strategies + generation manifest) for one READY folder and target;
     the same folder, template, target (and strategy choice) reuse the existing batch. `strategies` limits the batch
     to those strategy names of the folder (Panel stage 3 plan dialog)."""
@@ -149,11 +150,24 @@ def prepare_tick_batch(ready_dir: Path, out_root: Path, template_path: Path, tar
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise StoreReadyError("шаблон стратегии MRS3 не читается") from error
     exchange = str(document.get("exchange") or "bybit")
+    # Panel stage 5e-3a: a folder is tested only on its own exchange; a BingX strategy carries its tag and the pair's
+    # API symbol (the tester and the bot trade the API symbol; the PerformanceDB maps it back to the human ticker)
+    if exchange.casefold() != str(target.exchange).casefold():
+        raise StoreReadyError(f"папка READY биржи {exchange}, а тест для {target.exchange}")
+    from .performance_v2_store import exchange_name_tag
+
+    tag = exchange_name_tag(exchange)
+    if tag:
+        missing = sorted({str(pair["pair"]) for pair, _item in items} - set(api_symbols or {}))
+        if missing:
+            raise StoreReadyError(f"нет API-символа в реестре: {', '.join(missing)}")
     identity = {
         "adapter": ADAPTER_VERSION, "ready_manifest_sha256": _digest(data), "template_sha256": _digest(template_bytes),
         "base": str(target.base), "exchange": target.exchange,
         "strategy_exchange": [list(pair) for pair in target.strategy_exchange],
         **({"strategies": sorted(set(strategies))} if strategies is not None else {}),
+        **({"api_symbols": {pair: api_symbols[pair] for pair in sorted({str(p["pair"]) for p, _i in items})}}
+           if tag else {}),
     }
     run_id = _digest(_canonical(identity))
     out_root = Path(out_root)
@@ -180,7 +194,12 @@ def prepare_tick_batch(ready_dir: Path, out_root: Path, template_path: Path, tar
         strategy = generate_strategy(template, structure, allocate_lots(structure["orders"], LotMethod.EQUAL, config),
                                      LotMethod.EQUAL, config)
         apply_protocol_v2(strategy, target)
+        if tag:
+            strategy["name"] = tag + str(strategy["name"])
+            strategy["basic"]["symbol"] = api_symbols[symbol]
         name = str(strategy["name"])
+        if tag and not str(item.get("strategy", "")).startswith(tag):
+            raise StoreReadyError("папка READY BingX собрана до имён BINGX_ — пересоберите READY")
         if name != item.get("strategy"):
             raise StoreReadyError(f"имя стратегии {name} не совпадает с папкой READY")
         if name in strategies:

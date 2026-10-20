@@ -27,6 +27,7 @@ from .performance_v2_html import (
 )
 from .loader import load_listing_dates
 from .performance_v2_input import (
+    stored_symbol,
     PerformanceV2InputError,
     PreparedV2Entry,
     PreparedV2Input,
@@ -1410,7 +1411,9 @@ def _validate_report(
     check_range: bool = True,
 ) -> None:
     basic = report.settings.get("basic")
-    if not isinstance(basic, Mapping) or str(basic.get("symbol", "")).strip() != entry.identity.symbol:
+    reported = str(basic.get("symbol", "")).strip() if isinstance(basic, Mapping) else ""
+    # a BingX report names the API symbol it traded; the strategy is stored under the human ticker (5e-3a)
+    if not isinstance(basic, Mapping) or stored_symbol(entry.exchange_name, reported) != entry.identity.symbol:
         raise PerformanceV2ImportError(f"report symbol does not match strategy {entry.strategy_name!r}")
     configured_start = getattr(entry, "test_start", None)
     configured_end = getattr(entry, "test_end", None)

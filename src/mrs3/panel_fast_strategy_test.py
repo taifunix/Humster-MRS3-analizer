@@ -76,6 +76,8 @@ class _Job:
     target_finalized: bool = False
     # Tester template captured at start (P7 spec §4: exchange profile fees of this job).
     tester_config_template: Path | None = None
+    # Panel stage 5e-3a: run before the tester lock; a returned text fails the job with MISSING_DAYS
+    prepare_data: object | None = None
     target_owner: TesterTargetLock | None = None
     target_snapshot: object | None = None
     cleanup_pending: bool = False
@@ -614,6 +616,20 @@ class LocalFastStrategyTestService:
                     job.error.setdefault("cleanup_error", job.cleanup_error)
             self._emit(job)
 
+        if callable(job.prepare_data):           # e.g. BingX minute days: the tester does not download them
+            try:
+                problem = job.prepare_data()
+            except Exception as error:
+                problem = f"data preparation failed: {type(error).__name__}"
+            if problem:
+                failed(RuntimeError(str(problem)), "MISSING_DAYS")
+                return
+            if job.cancel.is_set():               # cancelled while the data was prepared: the tester is not touched
+                with self._lock:
+                    job.target_finalized = True
+                    job.state = job.phase = "CANCELLED"
+                self._emit(job)
+                return
         try:
             owner = TesterTargetLock(Path(self.config.bot_root)).acquire()
             job.target_owner = owner
@@ -927,6 +943,7 @@ class LocalFastStrategyTestService:
         clear_reports: bool = False,
         initial_balance: object | None = None,
         tester_config_template: Path | None = None,
+        prepare_data: object | None = None,
     ) -> dict[str, object]:
         manifest = validate_strategy_manifest(Path(manifest_path))
         if manifest.analysis_run_id != analysis_run_id:
@@ -947,6 +964,7 @@ class LocalFastStrategyTestService:
                 raise FastStrategyTestError("Fast TEST job id is already used")
             job = _Job(identifier, Path(manifest_path).resolve(), manifest, names, names, *dates, report_dir, strategy_dir, initial_balance=balance, single_mode=self.single_mode, clear_reports=clear_reports)
             job.tester_config_template = None if tester_config_template is None else Path(tester_config_template)
+            job.prepare_data = prepare_data
             self._jobs[identifier] = job
             job.progress = {"current": 0, "total": len(names), "batch_current": 0, "batch_total": 0, "active": 0, "retries": 0, "failed": 0}
             job.thread = Thread(

@@ -8,6 +8,49 @@ Use [PRD.md](PRD.md) for the feature registry and [docs/README.md](docs/README.m
 for the documentation map. Read the linked contract only for the active task;
 do not treat this file as a replacement for a feature specification.
 
+## Panel stage 5e-3a: the BingX tick test (2026-10-20, branch `wip/period-csv-generator`)
+
+Contract: [Panel for the simulation workflow](docs/specs/2026-10-18-panel-simulation-workflow.md)
+(«Stage 5e contract», 5e-3a), [ADR-0083](docs/decisions/0083-one-performancedb-for-both-exchanges.md).
+
+- **Names:** READY of BingX names its strategies `BINGX_…`, so a strategy
+  has one name in READY, the tick batch, the PerformanceDB and the registry
+  marks.
+- **The tick batch** is built from a BingX READY folder for the BingX
+  target:
+  - the BingX profile, through `_evaluation_target(exchange)`;
+  - `basic.symbol` is the API symbol from the registry;
+  - a folder of another exchange is refused.
+- **Data:** before the tester lock, the SINGLE_MODE job ensures and
+  verifies every strategy's BingX minute days (warm-up + window). A missing
+  day is `MISSING_DAYS`, and the tester is not touched. The BingX template
+  is now `UpdateData=false`.
+- **Import:** a BingX API symbol is stored as the human ticker.
+- **Panel:** the tick test runs on BingX; the retest is still pending
+  (5e-3b).
+- **Verification:**
+  - `tests/test_bingx_tick.py`: 6 passed;
+  - test patches were adapted to `_evaluation_target(exchange)`; the
+    BingX/Bybit template-difference test now includes `UpdateData`;
+  - broad run (BingX, store READY, SINGLE_MODE, protocol v2, performance_v2_*, Panel, registry, portfolio, tester jobs, trade store): 4,273 passed, 25 failed — all pre-existing (portfolio_input 14, v5_read_compat 6, equity_regime_selection 3, flaky stage 2, portfolio_store cross-process); review: see the commit.
+- **Independent review `CODE_REVIEW_FAIL`.** Two BLOCKERs: a BingX report
+  failed the symbol check (API symbol vs ticker), and the import compared a
+  BingX job with the Bybit target. Plus a MAJOR: the Bybit listing sheet.
+  All fixed (see the 5e-3a «added after the review» part of the spec),
+  together with the MINOR findings:
+  - the required days start at the listing day;
+  - the BingX default end is the last available day;
+  - a BingX retry is refused explicitly;
+  - a cancel after the data step stops the job;
+  - an old READY folder asks for a rebuild.
+  - Tests: 8 in `test_bingx_tick.py`. Related suites: 257 passed.
+  - Re-review `CODE_REVIEW_PASS` (open: no test that the tester start attaches the BingX data step; NIT: the listing-days query is not guarded against `duckdb.Error`).
+- **After this stage, BingX READY folders built in 5b must be rebuilt**
+  (their names have no tag).
+- **Not run:** a real BingX tick test. It needs a protocol-v2 database
+  (create one on «Настройки») and the real tester.
+- **Next:** 5e-3b, the BingX retest.
+
 ## Panel stage 5e-2: the optimizer by exchange (2026-10-20, branch `wip/period-csv-generator`)
 
 Contract: [Panel for the simulation workflow](docs/specs/2026-10-18-panel-simulation-workflow.md)

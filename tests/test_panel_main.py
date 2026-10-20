@@ -178,7 +178,7 @@ def test_plans_for_history_ready_tester_and_tick(tmp_path: Path, monkeypatch) ->
     with pytest.raises(AssertionError, match="BingX end day"):                       # BingX takes its own end day
         service.plan("history", "bingx")
     assert "disabled" not in service.plan("tester", "bingx")                        # 5c: tester sampling
-    assert service.plan("tick", "bingx")["disabled"].startswith("BingX")           # 5e: a BingX PerformanceDB
+    assert "disabled" not in service.plan("tick", "bingx")                          # 5e-3a: the BingX tick test
     assert service.plan("retest", "bingx")["disabled"].startswith("BingX")
     assert "disabled" not in service.plan("ready", "bingx")                         # 5b: history and READY
     assert service.plan("retest", "bybit")["options"] == {"include_reserve": False}
@@ -203,7 +203,7 @@ def test_runs_start_one_chain_task(tmp_path: Path) -> None:
     with pytest.raises(MainScreenError):
         service.run("history", "bybit", [])
     with pytest.raises(MainScreenError):
-        service.run("tick", "bingx", ["S_A"])
+        service.run("retest", "bingx", [])                                          # 5e-3b
     service.run("tester", "bingx", ["AMDUSDT"])                                     # Panel stage 5c
     steps = json.loads(Path(runner.started[-1][2][2]).read_text(encoding="utf-8"))["steps"]
     assert [step["name"] for step in steps] == ["plan", "run", "import", "Конвейер"]

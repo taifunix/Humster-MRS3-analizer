@@ -2797,7 +2797,7 @@ if (typeof globalThis !== 'undefined') globalThis.portfolioSelectionHelpers = po
   if (mainScreen) {
     const mainEl = (id) => document.querySelector(`#main-${id}`);
     const mainState = { exchange: 'bybit', view: 'pairs', document: null, settings: {}, sort: null, desc: false, plan: null, timer: null, lastState: null, pair: null };
-    const BINGX_READY_ACTIONS = new Set(['sync', 'history', 'ready', 'tester']);   // Panel stages 5b, 5c
+    const BINGX_READY_ACTIONS = new Set(['sync', 'history', 'ready', 'tester', 'tick']);   // Panel stages 5b, 5c, 5e-3a
     const node = (tag, text, className) => {
       const element = document.createElement(tag);
       if (text !== undefined && text !== null) element.textContent = String(text);
@@ -2858,7 +2858,7 @@ if (typeof globalThis !== 'undefined') globalThis.portfolioSelectionHelpers = po
       document.querySelectorAll('[data-main-action]').forEach((button) => {
         const pending = mainState.exchange === 'bingx' && !BINGX_READY_ACTIONS.has(button.dataset.mainAction);
         button.disabled = pending || button.dataset.busy === 'true';
-        button.title = pending ? 'BingX — этап 5: тик-тест и ретест ждут отдельной базы PerformanceDB для BingX' : '';
+        button.title = pending ? 'BingX — этап 5: ретест финалистов BingX ещё не подключён' : '';
       });
     }
     document.querySelectorAll('[data-exchange]').forEach((button) => {

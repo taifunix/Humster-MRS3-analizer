@@ -23,7 +23,7 @@ def _controller(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, template: Pa
     config = tmp_path / "config.local.json"
     config.write_text(json.dumps({"trade_store": {"root": str(store)}}), encoding="utf-8")
     target = EvaluationTarget(TARGET.base, "Bybit", strategy_template=template)
-    monkeypatch.setattr(PanelController, "_evaluation_target", lambda _self: target)
+    monkeypatch.setattr(PanelController, "_evaluation_target", lambda _self, _exchange=None: target)
     return PanelController(tmp_path, config)
 
 
