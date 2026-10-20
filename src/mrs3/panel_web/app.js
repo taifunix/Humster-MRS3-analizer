@@ -2797,7 +2797,7 @@ if (typeof globalThis !== 'undefined') globalThis.portfolioSelectionHelpers = po
   if (mainScreen) {
     const mainEl = (id) => document.querySelector(`#main-${id}`);
     const mainState = { exchange: 'bybit', view: 'pairs', document: null, settings: {}, sort: null, desc: false, plan: null, timer: null, lastState: null, pair: null };
-    const BINGX_READY_ACTIONS = new Set(['sync', 'history', 'ready', 'tester', 'tick']);   // Panel stages 5b, 5c, 5e-3a
+    const BINGX_READY_ACTIONS = new Set(['sync', 'history', 'ready', 'tester', 'tick', 'retest']);   // Panel stages 5b-5e
     const node = (tag, text, className) => {
       const element = document.createElement(tag);
       if (text !== undefined && text !== null) element.textContent = String(text);

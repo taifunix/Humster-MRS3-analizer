@@ -37,7 +37,7 @@ from .ready_store import ReadyRule, inputs_sha256, pair_periods
 ACTIONS = ("sync", "history", "ready", "tester", "tick", "retest")
 EXCHANGES = ("bybit", "bingx")
 BINGX_PENDING = "BingX — этап 5: ретест финалистов BingX ещё не подключён"
-BINGX_READY_ACTIONS = ("sync", "history", "ready", "tester", "tick")   # Panel stages 5b, 5c, 5e-3a; retest: 5e-3b
+BINGX_READY_ACTIONS = ("sync", "history", "ready", "tester", "tick", "retest")   # Panel stages 5b, 5c, 5e-3a, 5e-3b
 
 
 class MainScreenError(ValueError):
@@ -786,7 +786,7 @@ class MainScreenService:
         if action == "tick":
             return self._run_tick(items, options, exchange)
         if action == "retest":
-            return self._run_retest(options)
+            return self._run_retest(options, exchange)
         python, config = self._python, str(self.config_path)
         scripts = self.repo_root / "scripts"
         pairs = ",".join(item.strip().upper() for item in items)
@@ -862,14 +862,15 @@ class MainScreenService:
             "collect_reports": False}})
         return {"tick": {**prepared, "job": job}}
 
-    def _run_retest(self, options: Mapping) -> dict:
+    def _run_retest(self, options: Mapping, exchange: str = "bybit") -> dict:
         if self._controller is None:
             raise MainScreenError("ретест недоступен")
         include_reserve = options.get("include_reserve", False)
         if type(include_reserve) is not bool:
             raise MainScreenError("«включая резерв»: да или нет")
+        request = {"include_reserve": include_reserve, **({"exchange": exchange} if exchange != "bybit" else {})}
         job = self._controller.panel_job_submit({"kind": "strategies.performance.v2.finalist-retest.start",
-                                                 "request": {"include_reserve": include_reserve}})
+                                                 "request": request})                # Bybit: the request as before
         return {"retest": {"job": job}}
 
     def stop(self) -> dict:

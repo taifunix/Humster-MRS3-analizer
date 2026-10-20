@@ -1058,7 +1058,8 @@ class PanelController:
         service = getattr(self, "_main_screen_service", None)
         return service is not None and service.task()["task"].get("state") == "running"
 
-    def _registry_finalist_decisions(self, connection: duckdb.DuckDBPyConnection) -> dict[int, tuple] | None:
+    def _registry_finalist_decisions(self, connection: duckdb.DuckDBPyConnection,
+                                     exchange: str | None = None) -> dict[int, tuple] | None:
         """The pair-registry marks as finalist decisions of this PerformanceDB (ADR-0080): strategy_id -> (status,
         rank, None), matched by strategy name; None without a registry (the selection reviews decide)."""
         from .pair_registry.records import database_exchange, finalist_marks
@@ -1072,7 +1073,7 @@ class PanelController:
             return None
         if not registry.is_file():
             return None
-        exchange = database_exchange(connection)
+        exchange = (exchange or database_exchange(connection)).lower()     # the retest's exchange (stage 5e-3b)
         try:
             with duckdb.connect(str(registry), read_only=True) as con:
                 if not registry_decides(con, exchange):
@@ -2232,8 +2233,8 @@ class PanelController:
             raise ValueError("RETEST test_start must be before test_end")
         return start, end
 
-    def _retest_listing_context(self) -> tuple[Path, Path, str | None]:
-        configured, sheet = self._listing_dates_source()
+    def _retest_listing_context(self, exchange: str | None = None) -> tuple[Path, Path, str | None]:
+        configured, sheet = self._listing_dates_source(exchange)
         try:
             relative = configured.resolve().relative_to(self.root.resolve())
         except ValueError:
@@ -3254,14 +3255,20 @@ class PanelController:
     def strategies_performance_v2_finalist_retest_start(self, payload: Mapping[str, object]) -> dict[str, object]:
         if not isinstance(payload, Mapping):
             raise FinalistRetestError("INVALID_REQUEST", "bulk retest request must be an object")
-        if set(payload).difference({"include_reserve", "clear_reports", "test_start", "test_end", "start_date", "end_date"}):
+        if set(payload).difference({"include_reserve", "clear_reports", "test_start", "test_end", "start_date", "end_date",
+                                    "exchange"}):
             raise FinalistRetestError("INVALID_REQUEST", "bulk retest request contains unsupported fields")
+        exchange = payload.get("exchange")              # Panel stage 5e-3b: the retest of one exchange's finalists
+        if exchange not in (None, "bybit", "bingx"):
+            raise FinalistRetestError("INVALID_REQUEST", "exchange must be bybit or bingx")
         include_reserve = payload.get("include_reserve", False)
         clear_reports = payload.get("clear_reports", False)
         if type(clear_reports) is not bool:
             raise FinalistRetestError("INVALID_REQUEST", "clear_reports must be a boolean")
         initial_balance = self._requested_initial_balance(payload)
-        listing_path, listing_relative, listing_sheet = self._retest_listing_context()
+        # Bybit (no exchange in the request) calls exactly as before stage 5e-3b
+        listing_path, listing_relative, listing_sheet = (
+            self._retest_listing_context(exchange) if exchange else self._retest_listing_context())
         try:
             listing_dates = (
                 load_listing_dates(listing_path) if listing_sheet is None else load_listing_dates(listing_path, listing_sheet)
@@ -3280,17 +3287,24 @@ class PanelController:
         target = performance_v2_database_path(config)
         if not target.is_file():
             raise FinalistRetestError("PERFORMANCE_V2_NOT_FOUND", "Performance v2 database is unavailable")
-        evaluation = self._evaluation_target()
+        evaluation = self._evaluation_target(exchange) if exchange else self._evaluation_target()
         templates = self._mrs3_strategy_templates(evaluation)
         self._require_protocol_v2_tester_template(evaluation)
         tester_template = self._mrs3_tester_template(evaluation)
         with self._performance_v2_writer_lock, duckdb.connect(str(target), read_only=True) as connection:
-            decisions = self._registry_finalist_decisions(connection)
-            start, end = self._bulk_retest_range(payload, listing_dates, connection, include_reserve, decisions)
+            decisions = (self._registry_finalist_decisions(connection, exchange) if exchange
+                         else self._registry_finalist_decisions(connection))
+            if exchange == "bingx" and decisions is None:
+                # without registry marks the selection reviews of the whole database would decide (ADR-0083)
+                raise FinalistRetestError("REGISTRY_REQUIRED", "the BingX retest takes its finalists from the pair registry")
+            range_payload = {key: value for key, value in payload.items() if key != "exchange"}
+            start, end = self._bulk_retest_range(range_payload, listing_dates, connection, include_reserve, decisions)
             current_cohort = freeze_finalist_cohort(
                 connection, test_start=start, test_end=end,
                 include_reserve=include_reserve, listing_dates=listing_dates, decisions=decisions,
             )
+            if exchange:
+                self._require_cohort_exchange(connection, current_cohort.members, exchange)
         if not current_cohort.members:
             raise FinalistRetestError("COHORT_EMPTY", "bulk retest cohort has no runnable members")
         current_config_sha256 = finalist_retest_config_digest(
@@ -3328,6 +3342,7 @@ class PanelController:
                 test_start=start, test_end=end, include_reserve=include_reserve,
                 listing_dates=listing_dates, job_id=run_id, evaluation=evaluation,
                 decisions=decisions,             # the same registry marks as the cohort checked above
+                api_symbols=self._retest_api_symbols() if exchange == "bingx" else None,
             )
         runtime = {
             "bulk_retest": True, "scope": batch.cohort.scope, "cohort_sha256": batch.cohort.cohort_sha256,
@@ -3351,6 +3366,8 @@ class PanelController:
             },
         }
         request = {"scope": batch.cohort.scope, "test_start": start, "test_end": end, "retest": True, "clear_reports": clear_reports, "initial_balance": initial_balance}
+        preparer = (self._bingx_data_preparer(batch.manifest_path, start, end, tester_template)
+                    if exchange == "bingx" else None)
         return self._start_tracked_panel_job(
             "strategies.performance.v2.finalist-retest", request,
             ("strategies.tester", "performance-v2-finalist-retest"),
@@ -3359,8 +3376,33 @@ class PanelController:
                 tester_config_template=tester_template,
                 clear_reports=clear_reports,
                 **({"initial_balance": initial_balance} if initial_balance is not None else {}),
+                **({"prepare_data": preparer} if preparer is not None else {}),
             ), runtime=runtime,
         )
+
+    @staticmethod
+    def _require_cohort_exchange(connection: duckdb.DuckDBPyConnection, members: Sequence[Mapping[str, object]],
+                                 exchange: str) -> None:
+        """Every cohort member's result is of the retest's exchange (ADR-0083): a guard beyond the unique tagged
+        names that match the registry marks."""
+        from .performance_v2_store import home_exchange, result_exchange_sql
+
+        result_ids = [int(member["result_id"]) for member in members if member.get("result_id") is not None]
+        if not result_ids:
+            return
+        rows = connection.execute(
+            f"select r.result_id, {result_exchange_sql('r')} from strategy_results r "
+            "where r.result_id in (select unnest(?::bigint[]))", [home_exchange(connection), result_ids]).fetchall()
+        other = sorted(int(result_id) for result_id, value in rows if value != exchange.lower())
+        if other:
+            raise FinalistRetestError("COHORT_EXCHANGE_MISMATCH",
+                                      f"results of another exchange in the {exchange} cohort: {other[:10]}")
+
+    def _retest_api_symbols(self) -> dict[str, str]:
+        try:
+            return self._bingx_api_symbols()
+        except StoreReadyError as error:
+            raise FinalistRetestError("REGISTRY_UNAVAILABLE", str(error)) from None
 
     def strategies_performance_v2_finalist_retest_preview(self, include_reserve: bool = False) -> dict[str, object]:
         if type(include_reserve) is not bool:

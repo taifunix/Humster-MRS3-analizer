@@ -1271,8 +1271,34 @@ stage):
 - **Panel:** the tick test on BingX plans from the newest BingX READY folder
   and runs.
 
-**5e-3b — the BingX retest:** the finalist retest by exchange (marks,
-target, tester data), after 5e-3a.
+**5e-3b — the BingX retest** (2026-10-20):
+- **Request:** the finalist-retest request takes `exchange` (`bybit` /
+  `bingx`; absent = the home exchange). The Panel sends it on BingX only,
+  so the Bybit request is unchanged.
+- **For that exchange:**
+  - the registry marks (`_registry_finalist_decisions(connection,
+    exchange)`);
+  - the evaluation target and templates (`_evaluation_target(exchange)`);
+  - the listing sheet (`Пары_BingX`).
+- **A BingX retest needs the registry.** Without registry marks the
+  selection reviews of the whole database would decide, so it is refused
+  with `REGISTRY_REQUIRED`.
+- **The retest manifest** (`build_finalist_retest_manifest(...,
+  api_symbols)`) gives each BingX strategy the pair's API symbol. A pair
+  without one is `API_SYMBOL_MISSING`.
+- **The data step and the import:** the same as 5e-3a. The SINGLE_MODE job
+  ensures the BingX minute days first, and the retest import goes through
+  the import of the job's own exchange (target, symbol mapping, listing
+  sheet).
+- **Panel:** «Ретест» runs on BingX.
+- **Cohort guard:** every member's result must be of the retest's exchange
+  (`COHORT_EXCHANGE_MISMATCH`).
+- **The retest preview and status** («Стратегии» block) stay on the home
+  exchange. Their cohort counts and default dates are the home exchange's.
+  An exchange choice there is a follow-up.
+- **Found by the independent review:** `_bulk_retest_range` had its own
+  allow-list and refused `exchange`. The request reaches it without
+  `exchange`.
 
 Both parts ship only after 5e-2: until then some readers had no exchange
 filter (ADR-0083 «Stage order»).
@@ -1519,15 +1545,16 @@ unchanged: the same window of weekdays, `V25 × A15 = L`, K and the rounding.
 4. ✅ «Стратегии» view: tick-test metrics, column chooser, filter toggles, ranks,
    finalist marks, Excel round trip, finalist retest (4a, 4b); A/B and the
    Pareto screen removed (4c) — 2026-10-19.
-5. ⏳ BingX in the trade store, READY, tester sampling and tick tests (see
-   «Stage 5 plan»):
+5. ✅ BingX in the trade store, READY, tester sampling and tick tests (see
+   «Stage 5 plan»), 2026-10-20. The one exception is optimizer Stage 1/2 on
+   BingX, which waits for a BingX market snapshot (a later stage):
    - ✅ 5a, the minute data layer (2026-10-19);
    - ✅ 5b, BingX history and READY (2026-10-19);
    - ✅ 5c, BingX MRS2 tester sampling (2026-10-19);
    - ✅ 5d, BingX liquidity (2026-10-19);
-   - 5e pending. 5e is one PerformanceDB with an exchange
-     identifier, the BingX tick test and retest, and the exchange selector of
-     the optimizer.
+   - ✅ 5e: one PerformanceDB with an exchange identifier (5e-1, ADR-0083),
+     the optimizer by exchange (5e-2), the BingX tick test (5e-3a) and the
+     BingX retest (5e-3b), 2026-10-20.
 
 **Deferred (user, 2026-10-19; not urgent).**
 - Retire the base-lot Excel export (`scripts/calculate_bybit_base_lots.py`,

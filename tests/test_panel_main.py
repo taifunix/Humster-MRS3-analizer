@@ -179,7 +179,7 @@ def test_plans_for_history_ready_tester_and_tick(tmp_path: Path, monkeypatch) ->
         service.plan("history", "bingx")
     assert "disabled" not in service.plan("tester", "bingx")                        # 5c: tester sampling
     assert "disabled" not in service.plan("tick", "bingx")                          # 5e-3a: the BingX tick test
-    assert service.plan("retest", "bingx")["disabled"].startswith("BingX")
+    assert "disabled" not in service.plan("retest", "bingx")                        # 5e-3b: the BingX retest
     assert "disabled" not in service.plan("ready", "bingx")                         # 5b: history and READY
     assert service.plan("retest", "bybit")["options"] == {"include_reserve": False}
 
@@ -202,8 +202,6 @@ def test_runs_start_one_chain_task(tmp_path: Path) -> None:
     assert argv[3] == "--cleanup" and Path(argv[2]).parent.parent == tmp_path
     with pytest.raises(MainScreenError):
         service.run("history", "bybit", [])
-    with pytest.raises(MainScreenError):
-        service.run("retest", "bingx", [])                                          # 5e-3b
     service.run("tester", "bingx", ["AMDUSDT"])                                     # Panel stage 5c
     steps = json.loads(Path(runner.started[-1][2][2]).read_text(encoding="utf-8"))["steps"]
     assert [step["name"] for step in steps] == ["plan", "run", "import", "Конвейер"]
@@ -241,6 +239,8 @@ def test_tick_and_retest_go_through_the_controller(tmp_path: Path) -> None:
         service.run("tick", "bybit", [strategy], {"start_date": "2026-10-05", "end_date": "2026-10-01"})
     service.run("retest", "bybit", [], {"include_reserve": True})
     assert calls[-1][1] == {"kind": "strategies.performance.v2.finalist-retest.start", "request": {"include_reserve": True}}
+    service.run("retest", "bingx", [], {"include_reserve": False})                 # Panel stage 5e-3b
+    assert calls[-1][1]["request"] == {"include_reserve": False, "exchange": "bingx"}
 
 
 def test_views_report_a_missing_registry_clearly(tmp_path: Path) -> None:

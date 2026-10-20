@@ -1065,8 +1065,12 @@ def build_finalist_retest_manifest(
     job_id: str | None = None,
     evaluation: EvaluationTarget | None = None,
     decisions: Mapping[int, tuple[str | None, int | None, str | None]] | None = None,
+    api_symbols: Mapping[str, str] | None = None,
 ) -> FinalistRetestBatch:
-    """Freeze and publish one native SINGLE_MODE manifest for the cohort (`decisions`: the registry marks)."""
+    """Freeze and publish one native SINGLE_MODE manifest for the cohort (`decisions`: the registry marks).
+
+    `api_symbols` (Panel stage 5e-3b, BingX): the tester strategies trade the pair's API symbol; the database keeps
+    the human ticker, so the import maps the reports back."""
     cohort = freeze_finalist_cohort(
         connection,
         test_start=test_start,
@@ -1134,6 +1138,11 @@ def build_finalist_retest_manifest(
                 [item["order_id"] for item in member["orders"]],  # type: ignore[index]
             )
             apply_protocol_v2(strategy, evaluation)
+        if api_symbols is not None and isinstance(basic, dict):
+            api_symbol = api_symbols.get(str(member["symbol"]))
+            if not api_symbol:
+                raise FinalistRetestError("API_SYMBOL_MISSING", f"no BingX API symbol in the registry: {member['symbol']}")
+            basic["symbol"] = api_symbol
         filename = f"{member['strategy_name']}.json"
         strategy_runs[filename] = str(member["analysis_run_id"])
         candidate_identity = str(member["candidate_identity"])

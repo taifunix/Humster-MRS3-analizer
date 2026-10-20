@@ -8,6 +8,44 @@ Use [PRD.md](PRD.md) for the feature registry and [docs/README.md](docs/README.m
 for the documentation map. Read the linked contract only for the active task;
 do not treat this file as a replacement for a feature specification.
 
+## Panel stage 5e-3b: the BingX retest — Panel stage 5 complete (2026-10-20, branch `wip/period-csv-generator`)
+
+Contract: [Panel for the simulation workflow](docs/specs/2026-10-18-panel-simulation-workflow.md)
+(«Stage 5e contract», 5e-3b).
+
+- **The finalist retest by exchange:** the request takes `exchange`, which
+  sets the marks, target, templates and listing sheet.
+- **A BingX retest:**
+  - needs the registry (`REGISTRY_REQUIRED`);
+  - gives its strategies the API symbol (`API_SYMBOL_MISSING` without one);
+  - ensures the minute days before the tester;
+  - imports through the BingX target and sheet.
+- «Ретест» runs on BingX, and the Bybit request is unchanged.
+- **With this, every BingX action of the Panel works:** sync, history,
+  READY, tester sampling, tick test, retest, liquidity. The optimizer shows
+  BingX finalists, but Stage 1/2 on BingX wait for the BingX market
+  snapshot (the user's scope choice).
+- **Verification:**
+  - retest manifest with API symbols; invalid exchange; Panel request;
+  - broad run: 4,276 passed, 25 failed. All 25 are pre-existing, except one
+    retest test that patched the old call shape. It was fixed by calling
+    exactly as before when no exchange is given; the retest suites then
+    gave 267 passed.
+  - Independent review `CODE_REVIEW_FAIL`. BLOCKER: `_bulk_retest_range`
+    refused `exchange`, so no BingX retest could start. Fixed, together
+    with a cohort exchange guard, a controller-level start test, and the
+    preview documented as home-exchange only.
+  - Re-review `CODE_REVIEW_PASS` (NIT: the manifest re-freezes the cohort
+    without the guard; the race window existed before).
+- **Not run:** a real BingX tick test or retest. It needs a protocol-v2
+  database (create one on «Настройки»), the real tester and BingX
+  finalists.
+- **Next:**
+  - **open:** full BingX optimization (BingX market snapshot: margin,
+    leverage, mark price; Stage 2 on the BingX tester);
+  - **deferred:** retire the base-lot Excel export; `load_listing_dates`
+    from the registry.
+
 ## Panel stage 5e-3a: the BingX tick test (2026-10-20, branch `wip/period-csv-generator`)
 
 Contract: [Panel for the simulation workflow](docs/specs/2026-10-18-panel-simulation-workflow.md)

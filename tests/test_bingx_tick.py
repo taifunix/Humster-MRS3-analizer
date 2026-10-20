@@ -172,3 +172,103 @@ def test_a_bingx_job_is_imported_against_the_bingx_target_and_its_listing_sheet(
     controller._workflow_default = lambda name, side=None: tmp_path / "pairs.xlsx"
     controller._performance_v2_config = lambda: SimpleNamespace(exchange="Bybit", evaluation_protocol="v2")
     assert controller._listing_dates_source("BingX") == (tmp_path / "pairs.xlsx", "Пары_BingX")
+
+
+def test_the_retest_takes_only_a_known_exchange() -> None:
+    # Panel stage 5e-3b: the retest request names bybit or bingx; anything else is refused before any work
+    from mrs3.panel import PanelController
+    from mrs3.performance_v2_finalist_retest import FinalistRetestError
+
+    controller = PanelController.__new__(PanelController)
+    with pytest.raises(FinalistRetestError) as error:
+        controller.strategies_performance_v2_finalist_retest_start({"exchange": "okx"})
+    assert error.value.code == "INVALID_REQUEST"
+
+
+def test_a_bingx_retest_starts_with_bingx_marks_api_symbols_and_the_data_step(tmp_path: Path, monkeypatch) -> None:
+    # review of 5e-3b: the exchange never reaches the range check; the marks, symbols and data step are BingX's
+    from types import SimpleNamespace
+
+    import mrs3.panel as panel_module
+    from mrs3.panel import PanelController
+    from tests._protocol_v2 import use_protocol_v2_target
+
+    controller = PanelController(tmp_path, tmp_path / "config.local.json")
+    use_protocol_v2_target(monkeypatch)
+    database = tmp_path / "performance.duckdb"
+    database.touch()
+    template = tmp_path / "base.json"
+    template.write_text("{}", encoding="utf-8")
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text("{}", encoding="utf-8")
+    cohort = SimpleNamespace(scope="FINALIST", cohort_sha256="c", members=({"strategy_id": 1},), exclusions=())
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+    asked, built, started, ranges, captured = {}, {}, {}, [], {}
+
+    def listing(exchange=None):
+        asked["listing"] = exchange
+        return tmp_path / "d.xlsx", Path("d.xlsx"), "BingX sheet"
+
+    def marks(connection, exchange=None):
+        asked["marks"] = exchange
+        return {1: ("FINALIST", 1, None)}
+
+    def bulk_range(payload, *_args):
+        ranges.append(dict(payload))
+        return "2026-08-01", "2026-08-31"
+
+    def build(*_args, **kwargs):
+        built.update(kwargs)
+        return SimpleNamespace(cohort=cohort, config_sha256="x", manifest_path=manifest, run_id="run")
+
+    def start_tracked(*args, **kwargs):
+        captured["submit"] = args[3]
+        return {"job_id": "new"}
+
+    monkeypatch.setattr(controller, "_retest_listing_context", listing)
+    monkeypatch.setattr(controller, "_registry_finalist_decisions", marks)
+    monkeypatch.setattr(controller, "_retest_api_symbols", lambda: {"GOODUSDT": "NCSKGOOD2USD-USDT"})
+    monkeypatch.setattr(controller, "_bingx_data_preparer", lambda *_args: "prepare")
+    monkeypatch.setattr(controller, "_performance_v2_config",
+                        lambda: SimpleNamespace(strategy_root=tmp_path / "Output" / "s"))
+    monkeypatch.setattr(controller, "_workflow_defaults", lambda: {"strategy_templates": {"LONG": str(template)}})
+    monkeypatch.setattr(controller, "_bulk_retest_range", bulk_range)
+    monkeypatch.setattr(controller, "_require_cohort_exchange", lambda *_args: None)
+    monkeypatch.setattr(controller, "_start_tracked_panel_job", start_tracked)
+    monkeypatch.setattr(panel_module, "performance_v2_database_path", lambda _config: database)
+    monkeypatch.setattr(panel_module, "load_listing_dates", lambda *_args: {})
+    monkeypatch.setattr(panel_module.duckdb, "connect", lambda *_args, **_kwargs: Connection())
+    monkeypatch.setattr(panel_module, "freeze_finalist_cohort", lambda *_args, **_kwargs: cohort)
+    monkeypatch.setattr(panel_module, "build_finalist_retest_manifest", build)
+    controller._panel_jobs = SimpleNamespace(list=lambda: [])
+    monkeypatch.setattr(controller, "_single_mode_strategy_test",
+                        lambda: SimpleNamespace(start=lambda *_args, **kwargs: started.update(kwargs)))
+
+    assert controller.strategies_performance_v2_finalist_retest_start({"exchange": "bingx"})["job_id"] == "new"
+    captured["submit"]("new")
+    assert ranges == [{}]                                                     # `exchange` never reaches the range
+    assert asked == {"listing": "bingx", "marks": "bingx"}
+    assert built["api_symbols"] == {"GOODUSDT": "NCSKGOOD2USD-USDT"} and started["prepare_data"] == "prepare"
+
+
+def test_a_bingx_cohort_refuses_a_result_of_another_exchange(tmp_path: Path) -> None:
+    import duckdb
+
+    from mrs3.panel import PanelController
+    from mrs3.performance_v2_finalist_retest import FinalistRetestError
+    from tests.test_pair_registry_records import _performance_db
+
+    database = _performance_db(tmp_path / "perf.duckdb")
+    with duckdb.connect(str(database)) as connection:
+        connection.execute("update strategy_results set exchange = 'BingX' where result_id = 12")
+        PanelController._require_cohort_exchange(connection, [{"result_id": 12}], "bingx")
+        with pytest.raises(FinalistRetestError) as error:
+            PanelController._require_cohort_exchange(connection, [{"result_id": 11}, {"result_id": 12}], "bingx")
+    assert error.value.code == "COHORT_EXCHANGE_MISMATCH"

@@ -366,6 +366,22 @@ def test_manifest_has_one_common_period_and_native_strategy_provenance(tmp_path)
             job_id="bulk-1",
             evaluation=EvaluationTarget(Decimal("10000"), "Bybit"),
         )
+        # Panel stage 5e-3b: a BingX retest trades the pair's API symbol; a pair without one is refused
+        bingx = build_finalist_retest_manifest(
+            connection, {"LONG": Path(__file__).resolve().parents[1] / "templates/exchanges/BingX/mrs3-strategy.json"},
+            tmp_path / "output-bingx", test_start="2026-01-01", test_end="2026-06-01",
+            listing_dates={"BTCUSDT": date(2025, 12, 1)}, job_id="bulk-bingx",
+            evaluation=EvaluationTarget(Decimal("10000"), "BingX"), api_symbols={"BTCUSDT": "NCSKBTC2USD-USDT"},
+        )
+        assert json.loads((bingx.strategies_path / "final.json").read_text(encoding="utf-8"))["basic"]["symbol"] ==             "NCSKBTC2USD-USDT"
+        with pytest.raises(FinalistRetestError) as missing:
+            build_finalist_retest_manifest(
+                connection, {"LONG": Path(__file__).resolve().parents[1] / "templates/exchanges/BingX/mrs3-strategy.json"},
+                tmp_path / "output-none", test_start="2026-01-01", test_end="2026-06-01",
+                listing_dates={"BTCUSDT": date(2025, 12, 1)}, job_id="bulk-none",
+                evaluation=EvaluationTarget(Decimal("10000"), "BingX"), api_symbols={},
+            )
+        assert missing.value.code == "API_SYMBOL_MISSING"
 
     manifest = json.loads(batch.manifest_path.read_text(encoding="utf-8"))
     assert batch.strategy_count == 1
