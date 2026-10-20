@@ -8,6 +8,20 @@ Use [PRD.md](PRD.md) for the feature registry and [docs/README.md](docs/README.m
 for the documentation map. Read the linked contract only for the active task;
 do not treat this file as a replacement for a feature specification.
 
+## Next plan: one fee schedule per exchange (2026-10-20)
+
+Draft contract: [fees per exchange](docs/specs/2026-10-20-fees-per-exchange.md)
+(requirements approved, not implemented).
+
+- One schedule per exchange on «Настройки» for every calculation and test.
+- **Decision of the user, 2026-10-20:** the Stage 2 rule `MakerFee = 0` for
+  Bybit is removed (`panel_portfolio.py`); Stage 2 takes the exchange's
+  schedule.
+- **Open before the code:** where the schedule is stored (local config or
+  the synced registry), how the exchange templates and the launch check
+  (`CHECKED_TESTER_FIELDS`) follow it, and what a change does to stored
+  segments.
+
 ## Every strategy name carries its exchange tag (2026-10-20, branch `panel-sync-liquidity`)
 
 Decision: [ADR-0084](docs/decisions/0084-exchange-tag-on-every-strategy-name.md)
