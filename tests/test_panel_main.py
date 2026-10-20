@@ -432,6 +432,9 @@ def test_tick_plan_takes_the_newest_ready_folder_by_its_manifest_time(tmp_path: 
     bingx = store.root / "ready" / "2026-10-18_ready_140000"
     shutil.copytree(newer, bingx)
     manifest = json.loads((bingx / "ready_manifest.json").read_text(encoding="utf-8"))
+    for pair in manifest["pairs"]:
+        for item in pair["structures"]:                      # a BingX folder names its strategies BINGX_ (ADR-0084)
+            item["strategy"] = "BINGX_" + item["strategy"].removeprefix("BYBIT_")
     (bingx / "ready_manifest.json").write_text(json.dumps({**manifest, "exchange": "bingx"}), encoding="utf-8")
     os.utime(bingx / "ready_manifest.json", (stamp + 60, stamp + 60))
     listed = {folder["name"]: folder for folder in list_ready_folders(store.root)}

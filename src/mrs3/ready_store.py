@@ -294,10 +294,9 @@ def build_ready(store: TradeStore, symbols: Sequence[str], out_dir: Path, templa
             structure = structure_document(entry["pair"], item)
             lots = allocate_lots(structure["orders"], LotMethod.EQUAL, config)
             strategy = generate_strategy(template, structure, lots, LotMethod.EQUAL, config)
-            if exchange != "bybit":                # ADR-0083: one PerformanceDB, BingX names carry their tag
-                from .performance_v2_store import exchange_name_tag
+            from .performance_v2_store import exchange_name_tag
 
-                strategy["name"] = exchange_name_tag(exchange) + strategy["name"]
+            strategy["name"] = exchange_name_tag(exchange) + strategy["name"]      # ADR-0084: every name has its tag
             item["strategy"] = strategy["name"]
             (strategies / f"{strategy['name']}.json").write_text(
                 json.dumps(strategy, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")

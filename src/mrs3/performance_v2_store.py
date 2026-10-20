@@ -1258,11 +1258,25 @@ def result_exchange_sql(alias: str) -> str:
 
 
 def exchange_name_tag(exchange: str) -> str:
-    """The strategy-name prefix of an exchange: none for Bybit (its names stay as they are), `BINGX_` for BingX."""
+    """The strategy-name prefix of an exchange: its canonical name in upper case plus `_`, for every known exchange
+    (ADR-0084): `BYBIT_`, `BINGX_`, and any exchange added to `KNOWN_EXCHANGES` later."""
     canonical = known_exchange(exchange)
     if canonical is None:
         raise ValueError(f"unknown exchange: {exchange!r}")
-    return "" if canonical == "Bybit" else f"{canonical.upper()}_"
+    return f"{canonical.upper()}_"
+
+
+# exchanges whose tester trades another symbol than the human ticker (the registry's API symbol; BingX: NCSKAMD2USD-USDT)
+API_SYMBOL_EXCHANGES = ("BingX",)
+
+
+def exchange_needs_api_symbol(exchange: str) -> bool:
+    """Whether the tester of the exchange trades the registry's API symbol instead of the human ticker (ADR-0084:
+    this, not the name tag, is what an API symbol depends on)."""
+    canonical = known_exchange(exchange)
+    if canonical is None:
+        raise ValueError(f"unknown exchange: {exchange!r}")
+    return canonical in API_SYMBOL_EXCHANGES
 
 
 def database_identity(connection: duckdb.DuckDBPyConnection) -> tuple[str, str | None]:

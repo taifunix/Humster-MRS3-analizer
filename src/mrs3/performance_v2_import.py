@@ -743,6 +743,7 @@ def report_evaluation_protocol(
     return "v2", tuple(unmet)
 
 
+LEGACY_UNTAGGED_EXCHANGE = "Bybit"              # ADR-0084: the only exchange whose names may lack the tag
 TESTER_EXCHANGE_NAME = "tester"                 # what the real tester writes into exchange.name of its HTML
 
 
@@ -795,11 +796,13 @@ def _identity_rejection(
     name = str(entry.strategy_name)
     if canonical is not None:
         tag = exchange_name_tag(canonical)
-        if tag and not name.startswith(tag):
+        # ADR-0084: every exchange tags its names. The names made before the tags are untagged, and only Bybit
+        # existed then: it alone keeps accepting them, every later exchange is born tagged
+        if not name.startswith(tag) and canonical != LEGACY_UNTAGGED_EXCHANGE:
             return "EXCHANGE_NAME_TAG", f"a {canonical} strategy name must start with {tag}"
     for other in KNOWN_EXCHANGES:
         tag = exchange_name_tag(other)
-        if tag and other != canonical and name.startswith(tag):
+        if other != canonical and name.startswith(tag):
             return "EXCHANGE_NAME_TAG", f"a name starting with {tag} is a {other} strategy"
     return None
 

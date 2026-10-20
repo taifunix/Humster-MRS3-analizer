@@ -3948,6 +3948,31 @@ def test_one_database_holds_both_exchanges_with_tagged_bingx_names(tmp_path: Pat
             "on r.result_id = s.current_result_id order by 1").fetchall() == [("BINGX_alpha", "BingX"), ("alpha", "Bybit")]
 
 
+def test_every_exchange_tags_its_names_and_only_bybit_keeps_untagged_ones(tmp_path: Path) -> None:
+    # ADR-0084: BYBIT_ names are a Bybit strategy like BINGX_ ones are BingX; a name with another exchange's tag is
+    # refused; an untagged name is accepted only as a legacy Bybit name
+    request = _v2_request(tmp_path, ("alpha", "BYBIT_alpha", "BYBIT_beta", "BINGX_gamma", "delta"))
+    _strategy_exchange(request, "BYBIT_beta", "BingX")                  # a BingX strategy needs the BINGX_ tag
+    _strategy_exchange(request, "BINGX_gamma", "BingX")
+    _strategy_exchange(request, "delta", "BingX")                       # an untagged BingX name
+    for index, (name, exchange) in enumerate((("alpha", "Bybit"), ("BYBIT_alpha", "Bybit"), ("BYBIT_beta", "BingX"),
+                                               ("BINGX_gamma", "BingX"), ("delta", "BingX"))):
+        report = _report_2026_10(protocol_v2=True, exchange=exchange) + f"<!-- {index} -->".encode()   # distinct files
+        _write_named_report(request, name, report)
+
+    result = import_performance_v2(request)
+
+    assert (result.imported_count, result.rejected_count) == (3, 2)
+    target = performance_v2_database_path(request.config)
+    with duckdb.connect(str(target), read_only=True) as connection:
+        assert connection.execute(
+            "select s.strategy_name, r.exchange from strategies s join strategy_results r "
+            "on r.result_id = s.current_result_id order by 1").fetchall() == [
+            ("BINGX_gamma", "BingX"), ("BYBIT_alpha", "Bybit"), ("alpha", "Bybit")]
+        statuses = connection.execute("select status from import_files").fetchall()
+    assert sum(1 for (status,) in statuses if status == "REJECTED:EXCHANGE_NAME_TAG") == 2
+
+
 def test_report_evaluation_protocol_names_unmet_v2_fields() -> None:
     from mrs3.performance_v2_import import report_evaluation_protocol
 

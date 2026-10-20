@@ -152,6 +152,7 @@ from .performance_v2_store import (
     PerformanceV2StoreError,
     PerformanceV2WriterLock,
     database_identity,
+    exchange_needs_api_symbol,
     initialize_performance_v2,
     load_performance_v2_config,
     performance_v2_database_path,
@@ -1126,7 +1127,7 @@ class PanelController:
         folder = resolve_ready_folder(self._trade_store_root(), payload["ready"])
         exchange = self._ready_exchange(folder)
         target = self._evaluation_target(exchange)       # the folder's exchange (Panel stage 5e-3a)
-        api_symbols = self._bingx_api_symbols() if exchange != "bybit" else None
+        api_symbols = self._bingx_api_symbols() if exchange_needs_api_symbol(exchange) else None
         with self._store_ready_lock:                 # one preparation at a time: no race on the batch folder
             result = prepare_tick_batch(folder, self.root / "Output" / "store-ready",
                                         self._ready_strategy_template(target, "LONG"), target, strategies,

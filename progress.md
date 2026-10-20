@@ -8,6 +8,30 @@ Use [PRD.md](PRD.md) for the feature registry and [docs/README.md](docs/README.m
 for the documentation map. Read the linked contract only for the active task;
 do not treat this file as a replacement for a feature specification.
 
+## Every strategy name carries its exchange tag (2026-10-20, branch `panel-sync-liquidity`)
+
+Decision: [ADR-0084](docs/decisions/0084-exchange-tag-on-every-strategy-name.md)
+(amends ADR-0083, decision 5). The user: «приводи к единому виду, в будущем
+может добавиться 3 и 4я биржи».
+
+- **Tags:** `exchange_name_tag` gives every known exchange `<NAME>_`:
+  `BYBIT_`, `BINGX_`, and any exchange added to `KNOWN_EXCHANGES`.
+- **Generation:** READY and the tick batch tag every name, Bybit included.
+  The API symbol is no longer tied to the tag: it follows
+  `exchange_needs_api_symbol` (`API_SYMBOL_EXCHANGES`, BingX).
+- **Import:** a name with another exchange's tag is refused; a known
+  exchange other than Bybit needs its tag. Bybit alone keeps accepting
+  untagged names (`LEGACY_UNTAGGED_EXCHANGE`): the names made before the
+  tags. A strict rule for Bybit would break 77 of 144 import tests for no
+  gain.
+- **After this, READY folders of the trade store must be rebuilt** (their
+  Bybit names have no tag): «Пересобрать READY».
+- **Tests:** new `tests/test_exchange_tags.py` and an import test;
+  `test_performance_v2_import`, `test_store_ready_tick`, `test_bingx_tick`,
+  `test_ready_store`: 187 passed; Panel, registry, retest, strategies,
+  databases, portfolio, protocol v2, exchange profiles, BingX history and
+  tester jobs: 671 passed, 6 skipped.
+
 ## BingX gap check: one hourly request per 40 days (2026-10-20, branch `panel-sync-liquidity`)
 
 Contract: [sync by exchange](docs/specs/2026-10-20-panel-sync-by-exchange.md),

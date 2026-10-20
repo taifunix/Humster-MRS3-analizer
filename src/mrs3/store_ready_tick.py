@@ -75,6 +75,17 @@ def _zone_problem(items: list[tuple[dict, dict]]) -> str | None:
     return None
 
 
+def _tag_problem(document: dict, items: list[tuple[dict, dict]]) -> str | None:
+    """A folder built before ADR-0084 has untagged names: rebuild it (the same answer the batch gives later)."""
+    from .performance_v2_store import exchange_name_tag
+
+    try:
+        tag = exchange_name_tag(str(document.get("exchange") or "bybit"))
+    except ValueError:
+        return None                                   # an unknown exchange: the batch refuses it with its own text
+    return REBUILD if any(not str(item.get("strategy", "")).startswith(tag) for _pair, item in items) else None
+
+
 def list_ready_folders(store_root: Path) -> list[dict[str, object]]:
     """READY folders of a trade store (newest first by name) with their counts and whether they can be tested."""
     root = Path(store_root) / "ready"
@@ -95,7 +106,8 @@ def list_ready_folders(store_root: Path) -> list[dict[str, object]]:
         except StoreReadyError as error:
             entries.append({**entry, "testable": False, "reason": str(error)})
             continue
-        problem = _zone_problem(items) or (None if items else "в папке READY нет стратегий для теста")
+        problem = _zone_problem(items) or _tag_problem(document, items) or (
+            None if items else "в папке READY нет стратегий для теста")
         entries.append({
             **entry,
             "rule_version": document.get("rule_version"), "exchange": document.get("exchange"),
@@ -150,14 +162,16 @@ def prepare_tick_batch(ready_dir: Path, out_root: Path, template_path: Path, tar
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise StoreReadyError("шаблон стратегии MRS3 не читается") from error
     exchange = str(document.get("exchange") or "bybit")
-    # Panel stage 5e-3a: a folder is tested only on its own exchange; a BingX strategy carries its tag and the pair's
-    # API symbol (the tester and the bot trade the API symbol; the PerformanceDB maps it back to the human ticker)
+    # Panel stage 5e-3a: a folder is tested only on its own exchange. Every strategy carries the tag of its exchange
+    # (ADR-0084); one whose tester trades the registry's API symbol (BingX) also takes it (the tester and the bot
+    # trade the API symbol; the PerformanceDB maps it back to the human ticker)
     if exchange.casefold() != str(target.exchange).casefold():
         raise StoreReadyError(f"папка READY биржи {exchange}, а тест для {target.exchange}")
-    from .performance_v2_store import exchange_name_tag
+    from .performance_v2_store import exchange_name_tag, exchange_needs_api_symbol
 
     tag = exchange_name_tag(exchange)
-    if tag:
+    needs_api = exchange_needs_api_symbol(exchange)
+    if needs_api:
         missing = sorted({str(pair["pair"]) for pair, _item in items} - set(api_symbols or {}))
         if missing:
             raise StoreReadyError(f"нет API-символа в реестре: {', '.join(missing)}")
@@ -167,7 +181,7 @@ def prepare_tick_batch(ready_dir: Path, out_root: Path, template_path: Path, tar
         "strategy_exchange": [list(pair) for pair in target.strategy_exchange],
         **({"strategies": sorted(set(strategies))} if strategies is not None else {}),
         **({"api_symbols": {pair: api_symbols[pair] for pair in sorted({str(p["pair"]) for p, _i in items})}}
-           if tag else {}),
+           if needs_api else {}),
     }
     run_id = _digest(_canonical(identity))
     out_root = Path(out_root)
@@ -194,12 +208,12 @@ def prepare_tick_batch(ready_dir: Path, out_root: Path, template_path: Path, tar
         strategy = generate_strategy(template, structure, allocate_lots(structure["orders"], LotMethod.EQUAL, config),
                                      LotMethod.EQUAL, config)
         apply_protocol_v2(strategy, target)
-        if tag:
-            strategy["name"] = tag + str(strategy["name"])
+        strategy["name"] = tag + str(strategy["name"])
+        if needs_api:
             strategy["basic"]["symbol"] = api_symbols[symbol]
         name = str(strategy["name"])
-        if tag and not str(item.get("strategy", "")).startswith(tag):
-            raise StoreReadyError("папка READY BingX собрана до имён BINGX_ — пересоберите READY")
+        if not str(item.get("strategy", "")).startswith(tag):
+            raise StoreReadyError(f"папка READY собрана до имён {tag} — пересоберите READY")
         if name != item.get("strategy"):
             raise StoreReadyError(f"имя стратегии {name} не совпадает с папкой READY")
         if name in strategies:
